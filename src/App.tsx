@@ -200,6 +200,11 @@ function App() {
           <IconBtn title="Command palette (⌘K)" onClick={() => setPaletteOpen(true)}>
             <Search size={15} />
           </IconBtn>
+          <span className="mx-1 h-4 w-px bg-[var(--color-border)]" />
+          <VoiceButton onTranscript={handleTranscript} />
+          <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
+            <Camera size={15} />
+          </IconBtn>
         </div>
 
         <div className="flex items-center gap-2">
@@ -236,10 +241,6 @@ function App() {
               </div>
             </>
           )}
-          <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
-            <Camera size={15} />
-          </IconBtn>
-          <VoiceButton onTranscript={handleTranscript} />
         </div>
       </header>
 

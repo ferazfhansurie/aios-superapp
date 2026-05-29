@@ -91,16 +91,23 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     onData.onmessage = (chunk) => {
       if (disposed) return;
       term.write(chunk);
-      // scan a rolling window for the button sentinel across chunk boundaries
-      const buf = (bufRef.current + chunk).slice(-3000);
-      bufRef.current = buf;
-      const matches = [...buf.matchAll(/\[\[btn:\s*([^\]]+?)\]\]/gi)];
+      // scan a rolling window for the button sentinel across chunk boundaries.
+      // strip ANSI/OSC escapes first — the raw PTY stream interleaves cursor
+      // moves (\x1b[10G) + colors with the text, which garbles the labels.
+      const raw = (bufRef.current + chunk).slice(-4000);
+      bufRef.current = raw;
+      // eslint-disable-next-line no-control-regex
+      const clean = raw
+        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+        .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+      const matches = [...clean.matchAll(/\[\[btn:\s*([^\]]+?)\]\]/gi)];
       const last = matches[matches.length - 1];
       if (last && last[1] !== lastBtnRef.current) {
         lastBtnRef.current = last[1];
         const opts = last[1]
           .split("|")
-          .map((s) => s.trim())
+          // eslint-disable-next-line no-control-regex
+          .map((s) => s.replace(/[\x00-\x1f]/g, "").trim())
           .filter(Boolean)
           .slice(0, 5);
         if (opts.length) setButtons(opts);
