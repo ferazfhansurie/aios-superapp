@@ -43,7 +43,7 @@ const FONT_FAMILY =
   '"SF Mono", "Menlo", "Monaco", "JetBrains Mono", "Consolas", ui-monospace, monospace';
 
 export type PaneKind =
-  | { type: "shell" }
+  | { type: "shell"; cmd?: string }
   | { type: "oracle"; identity: string }
   | { type: "tmux"; socket: string; session: string };
 
@@ -137,6 +137,14 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
       inputDisposer = term.onData((d) => {
         if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
       });
+      // auto-run an init command (e.g. `aios`) once the shell is ready
+      if (kind.type === "shell" && kind.cmd) {
+        const c = kind.cmd;
+        const sid = sessionId;
+        setTimeout(() => {
+          if (!disposed && sid != null) ptyWrite(sid, `${c}\r`).catch(() => {});
+        }, 300);
+      }
     })();
 
     const onResize = () => {

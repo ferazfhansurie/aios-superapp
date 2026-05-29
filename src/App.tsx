@@ -7,6 +7,7 @@ import {
   Folder,
   Globe,
   PanelLeft,
+  Play,
   Plus,
   Radio,
   Search,
@@ -26,6 +27,7 @@ import { OracleRoster } from "./components/OracleRoster";
 import { Settings } from "./components/Settings";
 import { TerminalPane, type PaneKind } from "./components/TerminalPane";
 import { appshot } from "./lib/pty";
+import { monitorStart, monitorStop } from "./lib/monitor";
 
 /** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
 type PaneContent =
@@ -225,7 +227,7 @@ function App() {
               <OracleRoster
                 onAttachOracle={addOracle}
                 onAttachTmux={addTmux}
-                onAttachRoot={() => spawn({ type: "shell" }, "root")}
+                onAttachRoot={() => spawn({ type: "shell", cmd: "aios" }, "root")}
               />
             </div>
             <div className="border-t border-[var(--color-border)] p-2">
@@ -239,7 +241,7 @@ function App() {
 
         <main className="min-h-0 flex-1">
           {panes.length === 0 ? (
-            <EmptyState onSpawn={spawn} />
+            <EmptyState onSpawn={spawn} onStart={() => spawn({ type: "shell", cmd: "aios" }, "root")} />
           ) : (
             <div
               className="grid h-full w-full gap-2 p-2"
@@ -315,6 +317,21 @@ function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onCl
   const t = pane.kind.type;
   const label =
     t === "oracle" ? `oracle: ${pane.label}` : t === "tmux" ? `tmux: ${pane.label}` : pane.label;
+  // Monitoring works on real tmux sessions (oracle/tmux panes) — the watcher
+  // capture-panes them and reports to WhatsApp.
+  const monTarget =
+    pane.kind.type === "oracle"
+      ? { socket: "adletic", session: `aios-${pane.kind.identity}` }
+      : pane.kind.type === "tmux"
+        ? { socket: pane.kind.socket, session: pane.kind.session }
+        : null;
+  const [mon, setMon] = useState(false);
+  const toggleMon = () => {
+    if (!monTarget) return;
+    if (mon) monitorStop(monTarget.session).catch(() => {});
+    else monitorStart(monTarget.socket, monTarget.session).catch(() => {});
+    setMon((v) => !v);
+  };
   return (
     <div className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-pane)] transition-colors hover:border-[var(--color-border-strong)]">
       <div className="flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-white/[0.02] px-2.5">
@@ -322,14 +339,30 @@ function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onCl
           <span className={`status-dot ${DOT[t] ?? "status-dot--cold"}`} />
           <span className="truncate font-mono text-[11px] text-[var(--color-muted)]">{label}</span>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-          title="Close pane"
-        >
-          <X size={12} />
-        </button>
+        <div className="flex items-center gap-0.5">
+          {monTarget && (
+            <button
+              type="button"
+              onClick={toggleMon}
+              title={mon ? "monitoring → WhatsApp · click to stop" : "monitor this pane → WhatsApp"}
+              className={`rounded p-0.5 transition-colors ${
+                mon
+                  ? "text-[var(--color-accent)]"
+                  : "text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              }`}
+            >
+              <Radio size={12} className={mon ? "animate-pulse" : ""} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+            title="Close pane"
+          >
+            <X size={12} />
+          </button>
+        </div>
       </div>
       <div className="min-h-0 flex-1">
         {isTerminal(pane.kind) ? (
@@ -350,42 +383,73 @@ function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onCl
   );
 }
 
-function EmptyState({ onSpawn }: { onSpawn: (kind: PaneContent, label: string) => void }) {
+function EmptyState({
+  onSpawn,
+  onStart,
+}: {
+  onSpawn: (kind: PaneContent, label: string) => void;
+  onStart: () => void;
+}) {
   return (
     <div className="relative flex h-full flex-col items-center justify-center overflow-hidden">
-      {/* subtle radial accent glow on the pure bg — flashy but clean, no raster */}
+      {/* layered radial glow — game-menu backdrop */}
       <div
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            "radial-gradient(60% 50% at 50% 42%, color-mix(in srgb, var(--color-accent) 10%, transparent), transparent 70%)",
+            "radial-gradient(55% 45% at 50% 38%, color-mix(in srgb, var(--color-accent) 13%, transparent), transparent 70%)",
         }}
       />
-      <div className="relative flex flex-col items-center gap-8">
-        <div className="flex flex-col items-center gap-2">
-          <div className="flex items-baseline gap-2">
-            <span className="font-mono text-5xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_24px_color-mix(in_srgb,var(--color-accent)_45%,transparent)]">
+      <div
+        className="pointer-events-none absolute inset-0 opacity-[0.04]"
+        style={{
+          backgroundImage:
+            "radial-gradient(var(--color-text) 1px, transparent 1px)",
+          backgroundSize: "26px 26px",
+        }}
+      />
+
+      <div className="relative flex flex-col items-center gap-10">
+        {/* wordmark */}
+        <div className="flex flex-col items-center gap-1.5">
+          <div className="flex items-baseline gap-2.5">
+            <span className="font-mono text-6xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_32px_color-mix(in_srgb,var(--color-accent)_50%,transparent)]">
               cockpit
             </span>
-            <span className="text-[10px] font-medium uppercase tracking-[0.3em] text-[var(--color-muted)]">
+            <span className="text-[11px] font-medium uppercase tracking-[0.4em] text-[var(--color-muted)]">
               aios
             </span>
           </div>
-          <p className="text-[12px] text-[var(--color-faint)]">your command deck · spawn anything</p>
+          <p className="text-[12px] tracking-wide text-[var(--color-faint)]">
+            your command deck
+          </p>
         </div>
 
+        {/* START — boots the master AIOS session */}
+        <button
+          onClick={onStart}
+          className="group relative flex items-center gap-3 rounded-2xl border border-[var(--color-accent)]/60 bg-[var(--color-accent)]/10 px-10 py-4 transition-all hover:-translate-y-0.5 hover:bg-[var(--color-accent)] hover:shadow-[0_0_40px_color-mix(in_srgb,var(--color-accent)_45%,transparent)]"
+        >
+          <Play size={18} className="text-[var(--color-accent)] transition-colors group-hover:text-[var(--color-bg)]" fill="currentColor" />
+          <span className="text-lg font-bold uppercase tracking-[0.2em] text-[var(--color-accent)] transition-colors group-hover:text-[var(--color-bg)]">
+            start
+          </span>
+        </button>
+        <p className="-mt-6 text-[10px] text-[var(--color-faint)]">boots your master aios session</p>
+
+        {/* spawn tiles */}
         <div className="flex flex-wrap items-stretch justify-center gap-2.5">
-          {SPAWN.map((s) => (
+          {SPAWN.filter((s) => s.label !== "terminal").map((s) => (
             <button
               key={s.label}
               onClick={() => onSpawn(s.kind, s.label)}
-              className="group flex w-28 flex-col items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/40 px-3 py-4 transition-all hover:-translate-y-0.5 hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
+              className="group flex w-24 flex-col items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/40 px-3 py-3.5 transition-all hover:-translate-y-0.5 hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
             >
               <s.icon
-                size={22}
+                size={20}
                 className="text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
               />
-              <span className="text-[12px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+              <span className="text-[11px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
                 {s.label}
               </span>
             </button>

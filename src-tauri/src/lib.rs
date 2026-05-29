@@ -6,6 +6,7 @@ mod bridges;
 mod browser;
 mod files;
 mod memory;
+mod monitor;
 mod oracles;
 mod pty;
 mod stats;
@@ -48,6 +49,9 @@ pub fn run() {
             automations::set_automation_enabled,
             bridges::list_bridges,
             bridges::bridge_activity,
+            monitor::monitor_start,
+            monitor::monitor_stop,
+            monitor::list_monitors,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_navigate,
