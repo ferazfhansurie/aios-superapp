@@ -148,7 +148,7 @@ export function AccountMenu({
           className="modal-in glass fixed z-[60] w-80 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/90 p-1.5 shadow-2xl"
         >
           <div className="flex items-center gap-2 px-2 py-2">
-            <img src="/mascot.png" alt="" className="h-6 w-6 rounded-full object-cover" />
+            <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-[var(--color-accent)] text-[10px] font-bold text-[var(--color-bg)]">f</span>
             <div className="min-w-0">
               <div className="truncate text-[12px] text-[var(--color-text)]">firaz · adletic</div>
               <div className="truncate text-[10px] text-[var(--color-muted)]">owner</div>
@@ -302,7 +302,7 @@ export function AccountMenu({
         onClick={() => setOpen((v) => !v)}
         className="flex w-full items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-border-strong)]"
       >
-        <img src="/mascot.png" alt="" className="h-6 w-6 rounded-full object-cover" />
+        <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-[var(--color-accent)] text-[10px] font-bold text-[var(--color-bg)]">f</span>
         <div className="min-w-0 flex-1">
           <div className="truncate text-[12px] text-[var(--color-text)]">firaz</div>
           <div className="truncate text-[10px] text-[var(--color-muted)]">

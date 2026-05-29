@@ -10,18 +10,51 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The permanent MASTER (root) session — the mothership running at the root
-/// home dir `/Users/firazfhansurie`, on its own socket. Always pinned top,
-/// crowned, undeletable. This is NOT an `aios-*` bridge oracle.
-const MASTER_SOCKET: &str = "aios";
-const MASTER_SESSION: &str = "aios";
+/// The permanent MASTER (root) session — the mothership running at the user's
+/// home dir, on its own tmux socket. Always pinned top, crowned, undeletable.
+/// This is NOT an `aios-*` bridge oracle.
+///
+/// The socket/session names are env-overridable so the cockpit can target any
+/// AIOS deployment (defaults preserve the original author's setup):
+///   - `AIOS_ORACLE_SOCKET` — socket the bridge runs oracles on (default `adletic`)
+///   - `AIOS_MASTER_SOCKET` — socket the master session lives on (default `aios`)
+///   - `AIOS_MASTER_SESSION` — name of the master session (default `aios`)
+/// On machines with no tmux / no AIOS sessions, every list command simply
+/// returns empty — the graceful path for non-AIOS users.
 const MASTER_LABEL: &str = "master";
 
-/// The tmux socket the bridge runs oracles on.
-const ORACLE_SOCKET: &str = "adletic";
+/// Reads an env var, falling back to a default. Resolved per-call (cheap) so a
+/// running cockpit can be retargeted without a rebuild.
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
 
-/// Sockets we scan for the all-tmux attach surface, in display order.
-const KNOWN_SOCKETS: &[&str] = &["adletic", "aios", "default"];
+/// The tmux socket the bridge runs oracles on. Override: `AIOS_ORACLE_SOCKET`.
+fn oracle_socket() -> String {
+    env_or("AIOS_ORACLE_SOCKET", "adletic")
+}
+
+/// The tmux socket the master session lives on. Override: `AIOS_MASTER_SOCKET`.
+fn master_socket() -> String {
+    env_or("AIOS_MASTER_SOCKET", "aios")
+}
+
+/// The name of the master (root) tmux session. Override: `AIOS_MASTER_SESSION`.
+fn master_session() -> String {
+    env_or("AIOS_MASTER_SESSION", "aios")
+}
+
+/// Sockets scanned for the all-tmux attach surface, in display order. Built from
+/// the (possibly overridden) oracle + master sockets, plus the default socket.
+fn known_sockets() -> Vec<String> {
+    let mut out = vec![oracle_socket(), master_socket(), "default".to_string()];
+    out.dedup();
+    out
+}
 
 /// One oracle in the roster, surfaced to the frontend.
 #[derive(Debug, Clone, Serialize)]
@@ -100,7 +133,8 @@ fn read_instances() -> Vec<Instance> {
 
 /// Runs a tmux command on the oracle socket, returning stdout on success.
 fn tmux_oracle(args: &[&str]) -> Result<String, String> {
-    let mut full = vec!["-L", ORACLE_SOCKET];
+    let socket = oracle_socket();
+    let mut full = vec!["-L", socket.as_str()];
     full.extend_from_slice(args);
     let output = std::process::Command::new(tmux_bin())
         .args(&full)
@@ -115,10 +149,12 @@ fn tmux_oracle(args: &[&str]) -> Result<String, String> {
 /// Checks the master session on its socket: `Some(attached)` if it exists,
 /// `None` if not running.
 fn master_state() -> Option<bool> {
+    let master_socket = master_socket();
+    let master_session = master_session();
     let out = std::process::Command::new(tmux_bin())
         .args([
             "-L",
-            MASTER_SOCKET,
+            master_socket.as_str(),
             "list-sessions",
             "-F",
             "#{session_name}|#{session_attached}",
@@ -130,7 +166,7 @@ fn master_state() -> Option<bool> {
     }
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let mut p = line.splitn(2, '|');
-        if p.next().map(|s| s.trim()) == Some(MASTER_SESSION) {
+        if p.next().map(|s| s.trim()) == Some(master_session.as_str()) {
             return Some(p.next().unwrap_or("0").trim() != "0");
         }
     }
@@ -173,7 +209,7 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
             let identity = session.trim_start_matches("aios-").to_string();
             let display_name = display_name_for(&identity, &session, &instances);
             oracles.push(OracleInfo {
-                socket: ORACLE_SOCKET.to_string(),
+                socket: oracle_socket(),
                 is_master: false,
                 running: true,
                 identity,
@@ -187,8 +223,8 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
         let master_attached = master_state();
         oracles.push(OracleInfo {
             identity: MASTER_LABEL.to_string(),
-            session: MASTER_SESSION.to_string(),
-            socket: MASTER_SOCKET.to_string(),
+            session: master_session(),
+            socket: master_socket(),
             display_name: MASTER_LABEL.to_string(),
             attached: master_attached.unwrap_or(false),
             is_master: true,
@@ -218,11 +254,12 @@ pub fn list_tmux_sessions() -> Result<Vec<TmuxSession>, String> {
     #[cfg(unix)]
     {
         let mut sessions = Vec::new();
-        for &socket in KNOWN_SOCKETS {
+        let oracle_sock = oracle_socket();
+        for socket in known_sockets() {
             let output = std::process::Command::new(tmux_bin())
                 .args([
                     "-L",
-                    socket,
+                    socket.as_str(),
                     "list-sessions",
                     "-F",
                     "#{session_name}|#{session_attached}|#{session_windows}",
@@ -240,9 +277,9 @@ pub fn list_tmux_sessions() -> Result<Vec<TmuxSession>, String> {
                 }
                 let attached = p.next().unwrap_or("0").trim() != "0";
                 let windows = p.next().unwrap_or("1").trim().parse().unwrap_or(1);
-                let is_oracle = socket == ORACLE_SOCKET && name.starts_with("aios-");
+                let is_oracle = socket == oracle_sock && name.starts_with("aios-");
                 sessions.push(TmuxSession {
-                    socket: socket.to_string(),
+                    socket: socket.clone(),
                     name,
                     attached,
                     windows,
@@ -324,8 +361,18 @@ pub fn appshot(identity: Option<String>) -> Result<String, String> {
             let _ = tmux_oracle(&["send-keys", "-t", &session, "-l", &keys]);
         }
         None => {
+            let master_socket = master_socket();
+            let master_session = master_session();
             let _ = std::process::Command::new(tmux_bin())
-                .args(["-L", MASTER_SOCKET, "send-keys", "-t", MASTER_SESSION, "-l", &keys])
+                .args([
+                    "-L",
+                    master_socket.as_str(),
+                    "send-keys",
+                    "-t",
+                    master_session.as_str(),
+                    "-l",
+                    &keys,
+                ])
                 .status();
         }
     }

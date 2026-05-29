@@ -27,6 +27,7 @@ import {
   chatStart,
   chatStop,
   CHAT_MODELS,
+  EFFORTS,
   PERMISSION_MODES,
   type ChatEvent,
   type ChatModel,
@@ -50,13 +51,6 @@ type Turn =
 let _uid = 0;
 const uid = () => `t${++_uid}`;
 
-// ── effort levels (maps to claude --effort; surfaced as a dropdown) ─────────
-
-const EFFORTS = [
-  { id: "low", label: "low" },
-  { id: "medium", label: "medium" },
-  { id: "high", label: "high" },
-] as const;
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -258,6 +252,7 @@ export function ChatPane({ cwd }: { cwd?: string }) {
       cwd: cwd ?? null,
       model: model.disabled ? null : model.id,
       permissionMode: permission.id,
+      effort: effort.id,
     })
       .then((id) => {
         if (disposed) {
@@ -281,9 +276,9 @@ export function ChatPane({ cwd }: { cwd?: string }) {
       const id = sessionIdRef.current;
       if (id != null) chatStop(id).catch(() => {});
     };
-    // model/permission are captured at start; changing them restarts the session
+    // model/permission/effort are captured at start; changing them restarts the session
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model.id, permission.id, cwd]);
+  }, [model.id, permission.id, effort.id, cwd]);
 
   // autoscroll on new content
   useEffect(() => {

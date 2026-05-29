@@ -36,7 +36,23 @@ export interface ChatStartOpts {
   model?: string | null;
   /** claude permission mode: bypassPermissions | plan | default | acceptEdits. */
   permissionMode?: string | null;
+  /** reasoning effort: low | medium | high | xhigh | max. */
+  effort?: string | null;
 }
+
+/** Reasoning effort levels claude exposes via `--effort` (all models accept
+ *  these; xhigh/max are the deepest tiers — the "ultracode" end). */
+export interface EffortOption {
+  id: string;
+  label: string;
+}
+export const EFFORTS: EffortOption[] = [
+  { id: "low", label: "low" },
+  { id: "medium", label: "medium" },
+  { id: "high", label: "high" },
+  { id: "xhigh", label: "xhigh" },
+  { id: "max", label: "max" },
+];
 
 /**
  * A streamed claude event. Intentionally LOOSE — the component narrows on
@@ -142,6 +158,7 @@ export async function chatStart(
     cwd: opts.cwd ?? null,
     model: opts.model ?? null,
     permissionMode: opts.permissionMode ?? null,
+    effort: opts.effort ?? null,
   });
 }
 

@@ -103,10 +103,11 @@ export function VoiceButton({ onTranscript }: { onTranscript: (text: string) => 
     return () => window.removeEventListener("keydown", onKey);
   }, [phase, abort]);
 
-  // Global hotkey: ⌘ + Left Shift toggles voice mode (start / stop) from anywhere.
+  // Global hotkey: ⌘J (Ctrl+J on Windows/Linux) toggles voice — a real chord, so
+  // it won't misfire on ⌘-Shift combos (e.g. shift-tab) like the old binding did.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.metaKey && e.code === "ShiftLeft" && !e.repeat) {
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "j" && !e.repeat) {
         e.preventDefault();
         if (phaseRef.current === "idle") void begin();
         else if (phaseRef.current === "recording") void finish();

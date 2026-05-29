@@ -157,6 +157,7 @@ pub fn chat_start(
     cwd: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    effort: Option<String>,
 ) -> Result<u32, String> {
     let mut cmd = Command::new(claude_bin());
     cmd.arg("-p")
@@ -172,6 +173,10 @@ pub fn chat_start(
     }
     if let Some(pm) = permission_mode.as_deref().filter(|s| !s.is_empty()) {
         cmd.arg("--permission-mode").arg(pm);
+    }
+    // reasoning effort: low | medium | high | xhigh | max
+    if let Some(ef) = effort.as_deref().filter(|s| !s.is_empty()) {
+        cmd.arg("--effort").arg(ef);
     }
     match cwd {
         Some(dir) if !dir.is_empty() => {

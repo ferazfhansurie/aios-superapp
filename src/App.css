@@ -45,6 +45,85 @@
     "Fira Code", Consolas, ui-monospace, monospace;
 }
 
+/* ============================================================
+   Theme overrides — toggled via <html data-theme="light|dark">.
+   The @theme block above stays the DARK fallback default (used
+   before initTheme runs / if data-theme is absent). We redeclare
+   the full dark token set explicitly so toggling back from light
+   fully restores dark, then a clean professional light palette.
+   Adletic orange (--color-accent + variants) is kept in BOTH so
+   brand identity holds across modes.
+   NOTE: xterm terminals keep their own hardcoded dark THEME (in
+   TerminalPane) — terminals stay dark in light mode by design,
+   like most IDEs. --color-pane below only affects pane chrome.
+   ============================================================ */
+
+html[data-theme="dark"] {
+  /* ground & surfaces */
+  --color-bg: oklch(0.145 0.012 250);
+  --color-panel: oklch(0.175 0.006 255);
+  --color-panel-2: oklch(0.205 0.006 255);
+  --color-pane: oklch(0.12 0.008 255);
+  --color-border: oklch(1 0 0 / 8%);
+  --color-border-strong: oklch(1 0 0 / 14%);
+
+  /* text */
+  --color-text: oklch(0.96 0 0);
+  --color-text-2: oklch(0.78 0.005 255);
+  --color-muted: oklch(0.62 0.005 255);
+  --color-faint: oklch(0.45 0.005 255);
+
+  /* accent — adletic orange */
+  --color-accent: oklch(0.72 0.18 50);
+  --color-accent-hover: oklch(0.78 0.16 60);
+  --color-accent-dim: oklch(0.45 0.13 50);
+  --color-accent-soft: oklch(0.72 0.18 50 / 18%);
+  --color-cursor: #f97316;
+  --color-selection: rgba(249, 115, 22, 0.30);
+  --color-highlight: #fbbf24;
+
+  /* status */
+  --color-success: #4ade80;
+  --color-success-glow: rgba(74, 222, 128, 0.6);
+  --color-warning: #facc15;
+  --color-info: #60a5fa;
+  --color-danger: #fca5a5;
+  --color-cold: #555555;
+}
+
+html[data-theme="light"] {
+  /* ground & surfaces — near-white, soft elevation */
+  --color-bg: #f7f7f8;                       /* app background */
+  --color-panel: #ffffff;                    /* rails / sticky header */
+  --color-panel-2: #f0f0f2;                  /* cards / buttons */
+  --color-pane: #1b1b1f;                     /* terminal chrome interior — kept dark so the dark xterm reads seamlessly */
+  --color-border: oklch(0 0 0 / 10%);
+  --color-border-strong: oklch(0 0 0 / 16%);
+
+  /* text — dark ink on light */
+  --color-text: #1a1a1a;
+  --color-text-2: #3f3f46;
+  --color-muted: #6b7280;                    /* ≈ slate-500 */
+  --color-faint: #9ca3af;                    /* ≈ slate-400 */
+
+  /* accent — adletic orange (unchanged across modes) */
+  --color-accent: oklch(0.66 0.19 48);       /* ~#e85d1a — nudged a touch darker for contrast on white */
+  --color-accent-hover: oklch(0.60 0.18 45);
+  --color-accent-dim: oklch(0.80 0.10 55);
+  --color-accent-soft: oklch(0.72 0.18 50 / 14%);
+  --color-cursor: #f97316;
+  --color-selection: rgba(242, 101, 34, 0.22);
+  --color-highlight: #d97706;                /* amber-600 — readable on light */
+
+  /* status — darkened so they read on light surfaces */
+  --color-success: #16a34a;
+  --color-success-glow: rgba(22, 163, 74, 0.45);
+  --color-warning: #d97706;
+  --color-info: #2563eb;
+  --color-danger: #dc2626;
+  --color-cold: #9ca3af;
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;

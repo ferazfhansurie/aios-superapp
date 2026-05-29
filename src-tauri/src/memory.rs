@@ -6,18 +6,21 @@
 //! `*.md` in the vault, extracts node metadata + outbound links, and returns a
 //! graph (`nodes` + `edges`) the cockpit renders as a force-directed view.
 //!
-//! Vault path resolves from `$HOME` + a fixed suffix (Firaz's auto-memory dir),
-//! with an env-independent absolute fallback so the command still works when a
-//! GUI app launches with a stripped environment.
+//! Vault path resolves portably so the cockpit works for ANY user, not just the
+//! original author. Resolution order (first that exists wins):
+//!   1. `$AIOS_MEMORY_VAULT` — explicit override, used verbatim if it's a dir.
+//!   2. `$HOME/.claude/projects/<encoded-$HOME>/memory` — Claude Code encodes a
+//!      project's cwd by replacing `/` with `-`; for the user's home dir this is
+//!      their canonical per-project auto-memory vault.
+//!   3. `$HOME/.claude/projects/*/memory` — first existing per-project memory
+//!      dir for whatever user (sorted for determinism).
+//!   4. `$HOME/.claude/memory` — a flat top-level vault, if present.
+//! When none exist the graph command returns an empty (but valid) graph rather
+//! than panicking — graceful degradation on machines without AIOS memory.
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
-
-/// Fixed suffix under `$HOME` where the auto-memory vault lives.
-const VAULT_SUFFIX: &str = ".claude/projects/-Users-firazfhansurie/memory";
-/// Env-independent fallback (used when `$HOME` is unset or wrong).
-const VAULT_FALLBACK: &str = "/Users/firazfhansurie/.claude/projects/-Users-firazfhansurie/memory";
 
 /// A single memory note surfaced to the frontend.
 #[derive(Debug, Clone, Serialize)]
@@ -37,15 +40,62 @@ struct MemoryNode {
     links: Vec<String>,
 }
 
-/// Resolves the vault directory, preferring `$HOME` then the absolute fallback.
+/// Resolves the memory vault directory in a portable, env-overridable way.
+/// See the module header for the full precedence. Returns whatever path we
+/// settle on — callers tolerate it being absent (empty graph).
 fn vault_dir() -> std::path::PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = std::path::PathBuf::from(home).join(VAULT_SUFFIX);
+    // 1. Explicit override wins, used verbatim when it points at a real dir.
+    if let Some(v) = std::env::var_os("AIOS_MEMORY_VAULT") {
+        let p = std::path::PathBuf::from(v);
         if p.is_dir() {
             return p;
         }
     }
-    std::path::PathBuf::from(VAULT_FALLBACK)
+
+    let home = match std::env::var_os("HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        // No $HOME (rare for a GUI app) — nothing portable to resolve.
+        None => return std::path::PathBuf::new(),
+    };
+
+    let projects = home.join(".claude").join("projects");
+
+    // 2. Canonical per-project vault for the user's own home dir. Claude Code
+    //    encodes a cwd by swapping every `/` (and `.`) for `-`; for `$HOME` this
+    //    yields e.g. `-Users-alice`. Resolves to the author's existing path too.
+    if let Some(home_str) = home.to_str() {
+        let encoded: String = home_str
+            .chars()
+            .map(|c| if c == '/' || c == '.' { '-' } else { c })
+            .collect();
+        let p = projects.join(&encoded).join("memory");
+        if p.is_dir() {
+            return p;
+        }
+    }
+
+    // 3. Otherwise pick the first existing `*/memory` under projects/ (sorted so
+    //    the choice is stable across runs).
+    if let Ok(rd) = std::fs::read_dir(&projects) {
+        let mut candidates: Vec<std::path::PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("memory"))
+            .filter(|p| p.is_dir())
+            .collect();
+        candidates.sort();
+        if let Some(first) = candidates.into_iter().next() {
+            return first;
+        }
+    }
+
+    // 4. A flat top-level vault, if the user keeps one there.
+    let flat = home.join(".claude").join("memory");
+    if flat.is_dir() {
+        return flat;
+    }
+
+    // Nothing found — return an empty path; the walk below yields no nodes.
+    std::path::PathBuf::new()
 }
 
 /// Extracts a top-level scalar frontmatter field (`name:`/`description:`) from a

@@ -36,10 +36,12 @@ import { OracleRoster } from "./components/OracleRoster";
 import { PluginsPane } from "./components/PluginsPane";
 import { Settings } from "./components/Settings";
 import { TerminalPane, type PaneKind } from "./components/TerminalPane";
+import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { VoiceButton } from "./components/VoiceButton";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 import { appshot } from "./lib/pty";
+import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import { paneWriters } from "./lib/paneBus";
 
@@ -92,6 +94,8 @@ function App() {
     const t = setTimeout(() => setSplash(false), 850);
     return () => clearTimeout(t);
   }, []);
+
+  useEffect(() => initTheme(), []);
 
   const flash = useCallback((msg: string) => {
     setToast(msg);
@@ -240,14 +244,17 @@ function App() {
         </div>
 
         <div className="flex items-center gap-2">
-          <img src="/mascot.png" alt="aios" className="brand-logo h-[22px] w-[22px] object-contain" />
-          <span className="font-mono text-sm font-semibold tracking-tight">cockpit</span>
-          <span className="text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--color-accent)]">
+          <span className="font-mono text-sm font-semibold tracking-tight text-[var(--color-accent)]">
+            cockpit
+          </span>
+          <span className="text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--color-muted)]">
             aios
           </span>
         </div>
 
         <div className="flex items-center gap-1">
+          <ThemeSwitcher />
+          <span className="mx-0.5 h-4 w-px bg-[var(--color-border)]" />
           <VoiceButton onTranscript={handleTranscript} />
           <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
             <Camera size={15} />
@@ -587,7 +594,9 @@ function IdleAction({
 function Splash() {
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-[var(--color-bg)]">
-      <img src="/mascot.png" alt="aios" className="brand-logo brand-logo--splash h-24 w-24 object-contain" />
+      <span className="brand-logo--splash font-mono text-5xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_32px_color-mix(in_srgb,var(--color-accent)_50%,transparent)]">
+        cockpit
+      </span>
     </div>
   );
 }
