@@ -310,14 +310,7 @@ function OracleRow({
           />
         )}
         <div className="flex min-w-0 flex-1 flex-col">
-          <span className="flex items-center gap-1.5 truncate text-[13px] text-[var(--color-text)]">
-            {oracle.display_name}
-            {oracle.is_master && (
-              <span className="rounded bg-[var(--color-accent)]/20 px-1 py-px text-[8px] font-semibold uppercase tracking-wider text-[var(--color-accent)]">
-                master
-              </span>
-            )}
-          </span>
+          <span className="truncate text-[13px] text-[var(--color-text)]">{oracle.display_name}</span>
           <span className="truncate text-[10px] text-[var(--color-muted)]">
             {oracle.running ? oracle.session : "not running · click to start"}
           </span>

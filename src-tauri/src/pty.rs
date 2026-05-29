@@ -161,7 +161,11 @@ pub fn pty_spawn_oracle(
     let tmux = tmux_bin();
     let mut cmd = CommandBuilder::new("/bin/sh");
     cmd.arg("-c");
-    cmd.arg(format!("exec {} -L adletic attach -t aios-{}", tmux, identity));
+    // enable mouse so the wheel scrolls inside tmux (it owns the alt-screen, so
+    // xterm's own scrollback is bypassed), then attach.
+    cmd.arg(format!(
+        "{tmux} -L adletic set -g mouse on 2>/dev/null; exec {tmux} -L adletic attach -t aios-{identity}"
+    ));
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     spawn_internal(app, &state, on_data, cmd, cols, rows)
@@ -189,7 +193,9 @@ pub fn pty_spawn_tmux(
     let tmux = tmux_bin();
     let mut cmd = CommandBuilder::new("/bin/sh");
     cmd.arg("-c");
-    cmd.arg(format!("exec {tmux} -L {socket} attach -t {session}"));
+    cmd.arg(format!(
+        "{tmux} -L {socket} set -g mouse on 2>/dev/null; exec {tmux} -L {socket} attach -t {session}"
+    ));
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     spawn_internal(app, &state, on_data, cmd, cols, rows)

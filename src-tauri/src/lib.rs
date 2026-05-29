@@ -4,6 +4,7 @@
 mod automations;
 mod bridges;
 mod browser;
+mod chat;
 mod files;
 mod memory;
 mod monitor;
@@ -63,6 +64,9 @@ pub fn run() {
             voice::dictate_start,
             voice::dictate_stop,
             voice::dictate_cancel,
+            chat::chat_start,
+            chat::chat_send,
+            chat::chat_stop,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_navigate,

@@ -2,24 +2,33 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import {
   Blocks,
+  Bot,
   Brain,
   Camera,
   Clock,
+  Code,
   Folder,
   Globe,
+  HelpCircle,
+  MessageSquare,
   PanelLeft,
-  Play,
+  Power,
   Radio,
+  RotateCcw,
   Search,
   Settings as SettingsIcon,
+  Sparkles,
   TerminalSquare,
   X,
 } from "lucide-react";
+
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { AccountMenu } from "./components/AccountMenu";
 import { AutomationsPane } from "./components/AutomationsPane";
 import { BridgesPane } from "./components/BridgesPane";
 import { BrowserPane } from "./components/BrowserPane";
+import { ChatPane } from "./components/ChatPane";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FilesPane } from "./components/FilesPane";
 import { MemoryPane } from "./components/MemoryPane";
@@ -42,7 +51,8 @@ type PaneContent =
   | { type: "memory" }
   | { type: "automations" }
   | { type: "bridges" }
-  | { type: "plugins" };
+  | { type: "plugins" }
+  | { type: "chat" };
 interface Pane {
   key: string;
   label: string;
@@ -56,6 +66,7 @@ let seq = 0;
 const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
 
 const SPAWN: { kind: PaneContent; icon: typeof Folder; label: string }[] = [
+  { kind: { type: "chat" }, icon: MessageSquare, label: "chat" },
   { kind: { type: "shell" }, icon: TerminalSquare, label: "terminal" },
   { kind: { type: "files" }, icon: Folder, label: "files" },
   { kind: { type: "browser" }, icon: Globe, label: "browser" },
@@ -270,11 +281,23 @@ function App() {
                     </button>
                   ))}
                 </div>
+                <button
+                  onClick={() => setSettingsOpen(true)}
+                  className="group flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
+                >
+                  <SettingsIcon
+                    size={13}
+                    className="shrink-0 text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
+                  />
+                  <span className="text-[11px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+                    settings
+                  </span>
+                </button>
               </div>
               <OracleRoster
                 onAttachOracle={addOracle}
                 onAttachTmux={addTmux}
-                onAttachRoot={() => spawn({ type: "shell", cmd: "aios" }, "root")}
+                onAttachRoot={() => spawn({ type: "shell", cmd: "aios" }, "master")}
               />
             </div>
             <div className="border-t border-[var(--color-border)] p-2">
@@ -288,7 +311,11 @@ function App() {
 
         <main className="min-h-0 flex-1">
           {panes.length === 0 ? (
-            <EmptyState onSpawn={spawn} onStart={() => spawn({ type: "shell", cmd: "aios" }, "root")} />
+            <EmptyState
+              onSpawn={spawn}
+              onHelp={() => setPaletteOpen(true)}
+              onQuit={() => void getCurrentWindow().close()}
+            />
           ) : (
             <div
               className="grid h-full w-full gap-2 p-2"
@@ -360,6 +387,7 @@ const DOT: Record<string, string> = {
   automations: "status-dot--cold",
   bridges: "status-dot--cold",
   plugins: "status-dot--cold",
+  chat: "status-dot--active",
 };
 
 function PaneCard({
@@ -440,24 +468,43 @@ function PaneCard({
           <AutomationsPane />
         ) : pane.kind.type === "bridges" ? (
           <BridgesPane />
-        ) : (
+        ) : pane.kind.type === "plugins" ? (
           <PluginsPane />
+        ) : (
+          <ChatPane />
         )}
       </div>
     </div>
   );
 }
 
+/** Start engines — picked on the idle page. "aios" = our Codex-style chat pane
+ *  (claude under the hood); the rest open a session running that CLI. */
+const ENGINES: {
+  id: string;
+  label: string;
+  sub: string;
+  icon: typeof Bot;
+  primary?: boolean;
+  spawn: (s: (k: PaneContent, l: string) => void) => void;
+}[] = [
+  { id: "aios", label: "aios chat", sub: "codex-style · claude", icon: MessageSquare, primary: true, spawn: (s) => s({ type: "chat" }, "chat") },
+  { id: "claude", label: "claude", sub: "claude code", icon: Sparkles, spawn: (s) => s({ type: "shell", cmd: "claude" }, "claude") },
+  { id: "codex", label: "codex", sub: "openai codex", icon: Bot, spawn: (s) => s({ type: "shell", cmd: "codex" }, "codex") },
+  { id: "opencode", label: "opencode", sub: "open-source", icon: Code, spawn: (s) => s({ type: "shell", cmd: "opencode" }, "opencode") },
+];
+
 function EmptyState({
   onSpawn,
-  onStart,
+  onHelp,
+  onQuit,
 }: {
   onSpawn: (kind: PaneContent, label: string) => void;
-  onStart: () => void;
+  onHelp: () => void;
+  onQuit: () => void;
 }) {
   return (
     <div className="relative flex h-full flex-col items-center justify-center overflow-hidden">
-      {/* layered radial glow — game-menu backdrop */}
       <div
         className="pointer-events-none absolute inset-0"
         style={{
@@ -468,14 +515,12 @@ function EmptyState({
       <div
         className="pointer-events-none absolute inset-0 opacity-[0.04]"
         style={{
-          backgroundImage:
-            "radial-gradient(var(--color-text) 1px, transparent 1px)",
+          backgroundImage: "radial-gradient(var(--color-text) 1px, transparent 1px)",
           backgroundSize: "26px 26px",
         }}
       />
 
-      <div className="relative flex flex-col items-center gap-10">
-        {/* wordmark */}
+      <div className="relative flex flex-col items-center gap-9">
         <div className="flex flex-col items-center gap-1.5">
           <div className="flex items-baseline gap-2.5">
             <span className="font-mono text-6xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_32px_color-mix(in_srgb,var(--color-accent)_50%,transparent)]">
@@ -486,39 +531,43 @@ function EmptyState({
             </span>
           </div>
           <p className="text-[12px] tracking-wide text-[var(--color-faint)]">
-            your command deck
+            your command deck · pick an engine
           </p>
         </div>
 
-        {/* START — boots the master AIOS session */}
-        <button
-          onClick={onStart}
-          className="group relative flex items-center gap-3 rounded-2xl border border-[var(--color-accent)]/60 bg-[var(--color-accent)]/10 px-10 py-4 transition-all hover:-translate-y-0.5 hover:bg-[var(--color-accent)] hover:shadow-[0_0_40px_color-mix(in_srgb,var(--color-accent)_45%,transparent)]"
-        >
-          <Play size={18} className="text-[var(--color-accent)] transition-colors group-hover:text-[var(--color-bg)]" fill="currentColor" />
-          <span className="text-lg font-bold uppercase tracking-[0.2em] text-[var(--color-accent)] transition-colors group-hover:text-[var(--color-bg)]">
-            start
-          </span>
-        </button>
-        <p className="-mt-6 text-[10px] text-[var(--color-faint)]">boots your master aios session</p>
-
-        {/* spawn tiles */}
-        <div className="flex flex-wrap items-stretch justify-center gap-2.5">
-          {SPAWN.filter((s) => s.label !== "terminal").map((s) => (
+        {/* engine picker */}
+        <div className="flex flex-wrap items-stretch justify-center gap-3">
+          {ENGINES.map((e) => (
             <button
-              key={s.label}
-              onClick={() => onSpawn(s.kind, s.label)}
-              className="group flex w-24 flex-col items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/40 px-3 py-3.5 transition-all hover:-translate-y-0.5 hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
+              key={e.id}
+              onClick={() => e.spawn(onSpawn)}
+              className={`group flex w-36 flex-col items-center gap-2 rounded-2xl border px-4 py-5 transition-all hover:-translate-y-0.5 ${
+                e.primary
+                  ? "border-[var(--color-accent)]/60 bg-[var(--color-accent)]/10 hover:bg-[var(--color-accent)]/20 hover:shadow-[0_0_32px_color-mix(in_srgb,var(--color-accent)_30%,transparent)]"
+                  : "border-[var(--color-border)] bg-[var(--color-panel)]/40 hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
+              }`}
             >
-              <s.icon
-                size={20}
-                className="text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
+              <e.icon
+                size={24}
+                className={
+                  e.primary
+                    ? "text-[var(--color-accent)]"
+                    : "text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
+                }
               />
-              <span className="text-[11px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
-                {s.label}
-              </span>
+              <span className="text-[13px] font-medium text-[var(--color-text)]">{e.label}</span>
+              <span className="text-[10px] text-[var(--color-muted)]">{e.sub}</span>
             </button>
           ))}
+        </div>
+
+        {/* resume · help · quit */}
+        <div className="flex items-center gap-2 text-[12px]">
+          <IdleAction icon={<RotateCcw size={13} />} label="resume" onClick={() => onSpawn({ type: "shell", cmd: "claude --continue" }, "resume")} />
+          <span className="text-[var(--color-faint)]">·</span>
+          <IdleAction icon={<HelpCircle size={13} />} label="help" onClick={onHelp} />
+          <span className="text-[var(--color-faint)]">·</span>
+          <IdleAction icon={<Power size={13} />} label="quit" onClick={onQuit} />
         </div>
 
         <p className="font-mono text-[10px] tracking-wide text-[var(--color-faint)]">
@@ -526,6 +575,26 @@ function EmptyState({
         </p>
       </div>
     </div>
+  );
+}
+
+function IdleAction({
+  icon,
+  label,
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex items-center gap-1.5 rounded-md px-2 py-1 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+    >
+      {icon}
+      {label}
+    </button>
   );
 }
 

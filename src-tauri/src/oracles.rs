@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// crowned, undeletable. This is NOT an `aios-*` bridge oracle.
 const MASTER_SOCKET: &str = "aios";
 const MASTER_SESSION: &str = "aios";
-const MASTER_LABEL: &str = "root";
+const MASTER_LABEL: &str = "master";
 
 /// The tmux socket the bridge runs oracles on.
 const ORACLE_SOCKET: &str = "adletic";
