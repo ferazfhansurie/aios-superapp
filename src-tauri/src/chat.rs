@@ -179,6 +179,7 @@ pub fn chat_start(
     model: Option<String>,
     permission_mode: Option<String>,
     effort: Option<String>,
+    resume: Option<String>,
 ) -> Result<u32, String> {
     let mut cmd = Command::new(claude_bin());
     cmd.arg("-p")
@@ -189,6 +190,10 @@ pub fn chat_start(
         .arg("--include-partial-messages")
         .arg("--verbose");
 
+    // resume a prior session id (continues that conversation's history)
+    if let Some(r) = resume.as_deref().filter(|s| !s.is_empty()) {
+        cmd.arg("--resume").arg(r);
+    }
     if let Some(m) = model.as_deref().filter(|s| !s.is_empty()) {
         cmd.arg("--model").arg(m);
     }
@@ -368,4 +373,154 @@ pub fn chat_stop(session_id: u32) -> Result<(), String> {
         let _ = s.child.lock().wait();
     }
     Ok(())
+}
+
+/// One past chat session the user had IN the chat pane (not arbitrary terminal
+/// claude sessions) — surfaced to the `/resume` picker.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct ChatSessionInfo {
+    /// The claude session id — passed to `--resume` to continue it.
+    pub id: String,
+    /// A human title (the first user message).
+    pub title: String,
+    /// The working dir the chat ran in.
+    pub cwd: String,
+    /// Last-used unix seconds, for recency sorting.
+    pub mtime: u64,
+}
+
+/// One rendered turn loaded from a transcript, to repaint a resumed conversation.
+#[derive(serde::Serialize)]
+pub struct ChatTurn {
+    pub role: String, // "user" | "assistant"
+    pub text: String,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn sessions_store() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".aios/state/chat-sessions.json"))
+}
+
+fn load_store() -> Vec<ChatSessionInfo> {
+    sessions_store()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<ChatSessionInfo>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Records (upserts) a chat-pane session so `/resume` can list ONLY the chats
+/// started here. Called by the frontend when a session's `system init` arrives.
+#[tauri::command]
+pub fn record_chat_session(id: String, title: String, cwd: Option<String>) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Ok(());
+    }
+    let mut store = load_store();
+    let trimmed = {
+        let t = title.trim().replace('\n', " ");
+        if t.chars().count() > 90 {
+            format!("{}…", t.chars().take(90).collect::<String>())
+        } else if t.is_empty() {
+            "(untitled chat)".to_string()
+        } else {
+            t
+        }
+    };
+    let now = now_secs();
+    if let Some(existing) = store.iter_mut().find(|s| s.id == id) {
+        existing.mtime = now;
+        if !title.trim().is_empty() {
+            existing.title = trimmed;
+        }
+    } else {
+        store.push(ChatSessionInfo {
+            id,
+            title: trimmed,
+            cwd: cwd.unwrap_or_default(),
+            mtime: now,
+        });
+    }
+    store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    store.truncate(200);
+    if let Some(path) = sessions_store() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(json) = serde_json::to_string(&store) {
+            let _ = std::fs::write(&tmp, json);
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    Ok(())
+}
+
+/// Lists chat-pane sessions (from the store), newest first.
+#[tauri::command]
+pub fn list_chat_sessions(limit: Option<u32>) -> Vec<ChatSessionInfo> {
+    let mut store = load_store();
+    store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    store.truncate(limit.unwrap_or(40) as usize);
+    store
+}
+
+/// Loads a past session's conversation (user + assistant text turns) so the pane
+/// can repaint it before resuming. Finds `~/.claude/projects/*/<id>.jsonl`.
+#[tauri::command]
+pub fn read_chat_transcript(id: String) -> Vec<ChatTurn> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    let projects = std::path::PathBuf::from(&home).join(".claude/projects");
+    let Ok(dirs) = std::fs::read_dir(&projects) else {
+        return Vec::new();
+    };
+    let mut file: Option<std::path::PathBuf> = None;
+    for dir in dirs.flatten() {
+        let cand = dir.path().join(format!("{id}.jsonl"));
+        if cand.is_file() {
+            file = Some(cand);
+            break;
+        }
+    }
+    let Some(fp) = file else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(&fp) else {
+        return Vec::new();
+    };
+    let mut turns = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let role = match v.get("type").and_then(|t| t.as_str()) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let Some(msg) = v.get("message") else { continue };
+        let mut text_acc = String::new();
+        if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
+            text_acc.push_str(s);
+        } else if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+            for b in arr {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        text_acc.push_str(t);
+                    }
+                }
+            }
+        }
+        let text_acc = text_acc.trim().to_string();
+        if !text_acc.is_empty() {
+            turns.push(ChatTurn { role: role.to_string(), text: text_acc });
+        }
+    }
+    turns
 }

@@ -99,6 +99,16 @@ fn api_key() -> Option<String> {
             }
         }
     }
+    // Fallback: a key file at ~/.aios/state/motion.key (kept out of source so
+    // the GUI app — which doesn't inherit the shell env — can still authenticate).
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(v) = std::fs::read_to_string(format!("{home}/.aios/state/motion.key")) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
     None
 }
 

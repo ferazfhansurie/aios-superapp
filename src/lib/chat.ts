@@ -38,6 +38,37 @@ export interface ChatStartOpts {
   permissionMode?: string | null;
   /** reasoning effort: low | medium | high | xhigh | max. */
   effort?: string | null;
+  /** resume a prior claude session id (continues that conversation). */
+  resume?: string | null;
+}
+
+/** A past chat session for the /resume picker. */
+export interface ChatSessionInfo {
+  id: string;
+  title: string;
+  cwd: string;
+  mtime: number;
+}
+
+/** Lists the chats started in the chat pane (from the chat store) for /resume. */
+export async function listChatSessions(limit = 40): Promise<ChatSessionInfo[]> {
+  return invoke<ChatSessionInfo[]>("list_chat_sessions", { limit });
+}
+
+/** Records (upserts) a chat-pane session so /resume lists only chats started here. */
+export async function recordChatSession(id: string, title: string, cwd?: string | null): Promise<void> {
+  return invoke("record_chat_session", { id, title, cwd: cwd ?? null });
+}
+
+/** A past turn loaded from a transcript, to repaint a resumed conversation. */
+export interface ChatTurnInfo {
+  role: "user" | "assistant";
+  text: string;
+}
+
+/** Loads a past session's conversation (user/assistant text) to repaint it. */
+export async function readChatTranscript(id: string): Promise<ChatTurnInfo[]> {
+  return invoke<ChatTurnInfo[]>("read_chat_transcript", { id });
 }
 
 /** Reasoning effort levels claude exposes via `--effort` (all models accept
@@ -178,6 +209,7 @@ export async function chatStart(
     model: opts.model ?? null,
     permissionMode: opts.permissionMode ?? null,
     effort: opts.effort ?? null,
+    resume: opts.resume ?? null,
   });
 }
 
