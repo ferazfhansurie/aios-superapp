@@ -13,6 +13,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 
 import { ptyKill, ptyResize, ptyWrite, spawnOracle, spawnShell, spawnTmux } from "../lib/pty";
+import { paneWriters } from "../lib/paneBus";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
 const THEME = {
@@ -47,7 +48,7 @@ export type PaneKind =
   | { type: "oracle"; identity: string }
   | { type: "tmux"; socket: string; session: string };
 
-export function TerminalPane({ kind }: { kind: PaneKind }) {
+export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: string }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<number | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -134,6 +135,7 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
       }
 
       sessionIdRef.current = sessionId;
+      if (paneKey) paneWriters.set(paneKey, (t) => ptyWrite(sessionId!, t).catch(() => {}));
       inputDisposer = term.onData((d) => {
         if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
       });
@@ -160,6 +162,7 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
 
     return () => {
       disposed = true;
+      if (paneKey) paneWriters.delete(paneKey);
       ro.disconnect();
       inputDisposer?.dispose();
       if (sessionId != null) ptyKill(sessionId).catch(() => {});

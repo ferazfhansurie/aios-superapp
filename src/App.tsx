@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
+  Blocks,
   Brain,
   Camera,
   Clock,
@@ -24,10 +25,13 @@ import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FilesPane } from "./components/FilesPane";
 import { MemoryPane } from "./components/MemoryPane";
 import { OracleRoster } from "./components/OracleRoster";
+import { PluginsPane } from "./components/PluginsPane";
 import { Settings } from "./components/Settings";
 import { TerminalPane, type PaneKind } from "./components/TerminalPane";
+import { VoiceButton } from "./components/VoiceButton";
 import { appshot } from "./lib/pty";
 import { monitorStart, monitorStop } from "./lib/monitor";
+import { paneWriters } from "./lib/paneBus";
 
 /** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
 type PaneContent =
@@ -36,7 +40,8 @@ type PaneContent =
   | { type: "browser" }
   | { type: "memory" }
   | { type: "automations" }
-  | { type: "bridges" };
+  | { type: "bridges" }
+  | { type: "plugins" };
 interface Pane {
   key: string;
   label: string;
@@ -56,6 +61,7 @@ const SPAWN: { kind: PaneContent; icon: typeof Folder; label: string }[] = [
   { kind: { type: "memory" }, icon: Brain, label: "memory" },
   { kind: { type: "automations" }, icon: Clock, label: "automations" },
   { kind: { type: "bridges" }, icon: Radio, label: "bridges" },
+  { kind: { type: "plugins" }, icon: Blocks, label: "plugins" },
 ];
 
 function App() {
@@ -105,6 +111,23 @@ function App() {
       flash(`appshot failed: ${e}`);
     }
   }, [flash]);
+
+  // voice dictation → the focused terminal pane, else clipboard.
+  const focusedPane = useRef<string | null>(null);
+  const handleTranscript = useCallback(
+    (text: string) => {
+      const k = focusedPane.current;
+      const w = k ? paneWriters.get(k) : null;
+      if (w) {
+        w(text.endsWith(" ") ? text : `${text} `);
+        flash("dictated → pane");
+      } else {
+        navigator.clipboard?.writeText(text).catch(() => {});
+        flash("transcribed → ⌘V to paste");
+      }
+    },
+    [flash],
+  );
 
   // ---- keyboard: ⌘B sidebar · ⌘K palette · ⌘T terminal · ⌘, settings · ⌘⌘ appshot
   const lastMeta = useRef(0);
@@ -216,6 +239,7 @@ function App() {
           <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
             <Camera size={15} />
           </IconBtn>
+          <VoiceButton onTranscript={handleTranscript} />
         </div>
       </header>
 
@@ -256,6 +280,7 @@ function App() {
                   pane={pane}
                   active={!overlayOpen}
                   onClose={() => closePane(pane.key)}
+                  onFocus={() => (focusedPane.current = pane.key)}
                 />
               ))}
             </div>
@@ -311,9 +336,20 @@ const DOT: Record<string, string> = {
   memory: "status-dot--cold",
   automations: "status-dot--cold",
   bridges: "status-dot--cold",
+  plugins: "status-dot--cold",
 };
 
-function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onClose: () => void }) {
+function PaneCard({
+  pane,
+  active,
+  onClose,
+  onFocus,
+}: {
+  pane: Pane;
+  active: boolean;
+  onClose: () => void;
+  onFocus: () => void;
+}) {
   const t = pane.kind.type;
   const label =
     t === "oracle" ? `oracle: ${pane.label}` : t === "tmux" ? `tmux: ${pane.label}` : pane.label;
@@ -333,7 +369,10 @@ function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onCl
     setMon((v) => !v);
   };
   return (
-    <div className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-pane)] transition-colors hover:border-[var(--color-border-strong)]">
+    <div
+      onMouseDownCapture={onFocus}
+      className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-pane)] transition-colors hover:border-[var(--color-border-strong)]"
+    >
       <div className="flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-white/[0.02] px-2.5">
         <div className="flex min-w-0 items-center gap-1.5">
           <span className={`status-dot ${DOT[t] ?? "status-dot--cold"}`} />
@@ -366,7 +405,7 @@ function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onCl
       </div>
       <div className="min-h-0 flex-1">
         {isTerminal(pane.kind) ? (
-          <TerminalPane kind={pane.kind} />
+          <TerminalPane kind={pane.kind} paneKey={pane.key} />
         ) : pane.kind.type === "files" ? (
           <FilesPane />
         ) : pane.kind.type === "browser" ? (
@@ -375,8 +414,10 @@ function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onCl
           <MemoryPane />
         ) : pane.kind.type === "automations" ? (
           <AutomationsPane />
-        ) : (
+        ) : pane.kind.type === "bridges" ? (
           <BridgesPane />
+        ) : (
+          <PluginsPane />
         )}
       </div>
     </div>

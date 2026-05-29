@@ -114,3 +114,113 @@ pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Sets the page zoom via CSS `body.style.zoom`. The frontend tracks the
+/// percentage and passes the factor (e.g. 1.25 for 125%).
+#[tauri::command]
+pub fn browser_zoom(app: AppHandle, label: String, factor: f64) -> Result<(), String> {
+    if let Some(wv) = app.get_webview(&label) {
+        let _ = wv.eval(&format!("document.body.style.zoom={factor}"));
+    }
+    Ok(())
+}
+
+/// Best-effort cookie/storage clear. NOTE: true cookie-store wiping isn't
+/// available via `eval` (HttpOnly cookies + the WKWebView cookie store can't be
+/// reached from page JS), so we do the JS-accessible clears — `document.cookie`
+/// wipe for each non-HttpOnly cookie + localStorage/sessionStorage clear — then
+/// reload so the page re-runs with cleared client state.
+#[tauri::command]
+pub fn browser_clear_cookies(app: AppHandle, label: String) -> Result<(), String> {
+    if let Some(wv) = app.get_webview(&label) {
+        let _ = wv.eval(
+            "(function(){\
+                try{document.cookie.split(';').forEach(function(c){\
+                    var n=c.split('=')[0].trim();\
+                    if(n){\
+                        document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';\
+                        document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain='+location.hostname;\
+                    }\
+                });}catch(e){}\
+                try{localStorage.clear();}catch(e){}\
+                try{sessionStorage.clear();}catch(e){}\
+                location.reload();\
+            })()",
+        );
+    }
+    Ok(())
+}
+
+/// Toggles a mobile-viewport approximation. NOTE: real device emulation needs
+/// CDP (touch events, DPR, real UA override) which we don't have, so this is a
+/// CSS-based approximation — inject a `meta[name=viewport]` + constrain the
+/// document width to a phone-ish 420px centered; turning it off resets those.
+#[tauri::command]
+pub fn browser_device_mode(app: AppHandle, label: String, mobile: bool) -> Result<(), String> {
+    if let Some(wv) = app.get_webview(&label) {
+        if mobile {
+            let _ = wv.eval(
+                "(function(){\
+                    var m=document.querySelector('meta[name=viewport][data-cockpit]');\
+                    if(!m){m=document.createElement('meta');m.name='viewport';m.setAttribute('data-cockpit','1');document.head.appendChild(m);}\
+                    m.content='width=420, initial-scale=1';\
+                    document.documentElement.style.maxWidth='420px';\
+                    document.documentElement.style.margin='0 auto';\
+                })()",
+            );
+        } else {
+            let _ = wv.eval(
+                "(function(){\
+                    var m=document.querySelector('meta[name=viewport][data-cockpit]');\
+                    if(m){m.remove();}\
+                    document.documentElement.style.maxWidth='';\
+                    document.documentElement.style.margin='';\
+                })()",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Captures the browser's on-screen region to a PNG via `screencapture` and
+/// returns the saved path. The frontend passes the webview slot's screen rect
+/// (its `getBoundingClientRect`). Requires Screen Recording permission — a
+/// non-zero exit (denied / failed) surfaces as an error.
+#[tauri::command]
+pub fn browser_screenshot(
+    app: AppHandle,
+    label: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<String, String> {
+    // Touch `app`/`label` so the call shape matches the other commands and the
+    // capture is clearly scoped to a live pane.
+    let _ = app.get_webview(&label).ok_or("browser not open")?;
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis();
+    let path = format!("/tmp/cockpit-shot-{epoch}.png");
+    let region = format!(
+        "{},{},{},{}",
+        x.round() as i64,
+        y.round() as i64,
+        width.round().max(1.0) as i64,
+        height.round().max(1.0) as i64,
+    );
+    let status = std::process::Command::new("/usr/sbin/screencapture")
+        .arg("-x")
+        .arg(format!("-R{region}"))
+        .arg(&path)
+        .status()
+        .map_err(|e| format!("screencapture failed to launch: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "screencapture exited with {} (check Screen Recording permission)",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(path)
+}

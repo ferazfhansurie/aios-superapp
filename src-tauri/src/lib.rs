@@ -7,6 +7,8 @@ mod browser;
 mod files;
 mod memory;
 mod monitor;
+mod plugins;
+mod voice;
 mod oracles;
 mod pty;
 mod stats;
@@ -39,6 +41,12 @@ pub fn run() {
             oracles::appshot,
             files::read_dir,
             files::home_dir,
+            files::read_file_preview,
+            plugins::list_plugins,
+            browser::browser_zoom,
+            browser::browser_clear_cookies,
+            browser::browser_device_mode,
+            browser::browser_screenshot,
             usage::usage_stats,
             memory::memory_graph,
             memory::memory_file,
@@ -52,6 +60,9 @@ pub fn run() {
             monitor::monitor_start,
             monitor::monitor_stop,
             monitor::list_monitors,
+            voice::dictate_start,
+            voice::dictate_stop,
+            voice::dictate_cancel,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_navigate,

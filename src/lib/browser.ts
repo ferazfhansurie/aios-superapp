@@ -20,3 +20,11 @@ export const browserForward = (label: string) => invoke("browser_forward", { lab
 export const browserReload = (label: string) => invoke("browser_reload", { label });
 export const browserHide = (label: string) => invoke("browser_hide", { label });
 export const browserClose = (label: string) => invoke("browser_close", { label });
+export const browserZoom = (label: string, factor: number) =>
+  invoke("browser_zoom", { label, factor });
+export const browserClearCookies = (label: string) =>
+  invoke("browser_clear_cookies", { label });
+export const browserDeviceMode = (label: string, mobile: boolean) =>
+  invoke("browser_device_mode", { label, mobile });
+export const browserScreenshot = (label: string, r: Rect) =>
+  invoke<string>("browser_screenshot", { label, ...r });
