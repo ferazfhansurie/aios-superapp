@@ -103,6 +103,19 @@ export function VoiceButton({ onTranscript }: { onTranscript: (text: string) => 
     return () => window.removeEventListener("keydown", onKey);
   }, [phase, abort]);
 
+  // Global hotkey: ⌘ + Left Shift toggles voice mode (start / stop) from anywhere.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey && e.code === "ShiftLeft" && !e.repeat) {
+        e.preventDefault();
+        if (phaseRef.current === "idle") void begin();
+        else if (phaseRef.current === "recording") void finish();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [begin, finish]);
+
   // ── pointer handling: hold-to-talk vs click-to-toggle ──────────────────────
   const onPointerDown = useCallback(() => {
     if (phaseRef.current === "transcribing") return;

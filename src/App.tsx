@@ -9,7 +9,6 @@ import {
   Globe,
   PanelLeft,
   Play,
-  Plus,
   Radio,
   Search,
   Settings as SettingsIcon,
@@ -29,6 +28,8 @@ import { PluginsPane } from "./components/PluginsPane";
 import { Settings } from "./components/Settings";
 import { TerminalPane, type PaneKind } from "./components/TerminalPane";
 import { VoiceButton } from "./components/VoiceButton";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+
 import { appshot } from "./lib/pty";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import { paneWriters } from "./lib/paneBus";
@@ -70,12 +71,11 @@ function App() {
   const [splash, setSplash] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [spawnOpen, setSpawnOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   // Native browser webviews paint ABOVE html, so any floating overlay (modals,
-  // the +new dropdown, the account popup) must hide them or it gets occluded.
-  const overlayOpen = settingsOpen || paletteOpen || spawnOpen || accountOpen;
+  // the account popup) must hide them or it gets occluded.
+  const overlayOpen = settingsOpen || paletteOpen || accountOpen;
 
   useEffect(() => {
     const t = setTimeout(() => setSplash(false), 850);
@@ -161,6 +161,32 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [addShell, fireAppshot]);
 
+  // Native OS drag-drop (Finder files/folders) → insert paths into the terminal
+  // pane under the cursor. Tauri gives real filesystem paths the webview can't.
+  useEffect(() => {
+    const un = getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type !== "drop") return;
+      const { paths, position } = event.payload;
+      if (!paths?.length) return;
+      const dpr = window.devicePixelRatio || 1;
+      const el = document.elementFromPoint(position.x / dpr, position.y / dpr);
+      const key = el?.closest<HTMLElement>("[data-pane-key]")?.getAttribute("data-pane-key");
+      const w = key ? paneWriters.get(key) : null;
+      if (!w) {
+        flash("drop onto a terminal pane to insert the path");
+        return;
+      }
+      const text = paths
+        .map((p) => (/[\s'"\\]/.test(p) ? `'${p.replace(/'/g, "'\\''")}' ` : `${p} `))
+        .join("");
+      w(text);
+      flash(`dropped ${paths.length} item${paths.length > 1 ? "s" : ""}`);
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [flash]);
+
   const { cols, rows } = useMemo(() => {
     const n = panes.length || 1;
     const c = Math.ceil(Math.sqrt(n));
@@ -200,11 +226,6 @@ function App() {
           <IconBtn title="Command palette (⌘K)" onClick={() => setPaletteOpen(true)}>
             <Search size={15} />
           </IconBtn>
-          <span className="mx-1 h-4 w-px bg-[var(--color-border)]" />
-          <VoiceButton onTranscript={handleTranscript} />
-          <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
-            <Camera size={15} />
-          </IconBtn>
         </div>
 
         <div className="flex items-center gap-2">
@@ -215,32 +236,11 @@ function App() {
           </span>
         </div>
 
-        <div className="relative flex items-center gap-1">
-          <button
-            onClick={() => setSpawnOpen((v) => !v)}
-            className="flex items-center gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-2.5 py-1 text-[11px] transition-colors hover:border-[var(--color-accent)]/50"
-          >
-            <Plus size={12} /> new
-          </button>
-          {spawnOpen && (
-            <>
-              <div className="fixed inset-0 z-40" onClick={() => setSpawnOpen(false)} />
-              <div className="modal-in absolute right-9 top-9 z-50 w-44 overflow-hidden rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] p-1 shadow-2xl">
-                {SPAWN.map((s) => (
-                  <button
-                    key={s.label}
-                    onClick={() => {
-                      spawn(s.kind, s.label);
-                      setSpawnOpen(false);
-                    }}
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-                  >
-                    <s.icon size={13} className="text-[var(--color-muted)]" /> {s.label}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
+        <div className="flex items-center gap-1">
+          <VoiceButton onTranscript={handleTranscript} />
+          <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
+            <Camera size={15} />
+          </IconBtn>
         </div>
       </header>
 
@@ -248,7 +248,29 @@ function App() {
       <div className="flex min-h-0 flex-1">
         {sidebarOpen && (
           <aside className="flex w-60 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
-            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+            <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-3">
+              <div className="flex flex-col gap-1.5">
+                <span className="text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
+                  launch
+                </span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {SPAWN.map((s) => (
+                    <button
+                      key={s.label}
+                      onClick={() => spawn(s.kind, s.label)}
+                      className="group flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
+                    >
+                      <s.icon
+                        size={13}
+                        className="shrink-0 text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
+                      />
+                      <span className="truncate text-[11px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+                        {s.label}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
               <OracleRoster
                 onAttachOracle={addOracle}
                 onAttachTmux={addTmux}
@@ -371,6 +393,7 @@ function PaneCard({
   };
   return (
     <div
+      data-pane-key={pane.key}
       onMouseDownCapture={onFocus}
       className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-pane)] transition-colors hover:border-[var(--color-border-strong)]"
     >
