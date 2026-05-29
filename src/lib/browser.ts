@@ -1,4 +1,5 @@
-/** Wrappers over the native embedded-browser (child webview) commands. */
+/** Wrappers over the native embedded-browser (child webview) commands. Each
+ *  browser pane drives its own webview, addressed by a per-pane `label`. */
 import { invoke } from "@tauri-apps/api/core";
 
 export interface Rect {
@@ -8,12 +9,14 @@ export interface Rect {
   height: number;
 }
 
-export const browserShow = (url: string, r: Rect) =>
-  invoke("browser_show", { url, ...r });
-export const browserSetBounds = (r: Rect) => invoke("browser_set_bounds", { ...r });
-export const browserNavigate = (url: string) => invoke("browser_navigate", { url });
-export const browserBack = () => invoke("browser_back");
-export const browserForward = () => invoke("browser_forward");
-export const browserReload = () => invoke("browser_reload");
-export const browserHide = () => invoke("browser_hide");
-export const browserClose = () => invoke("browser_close");
+export const browserShow = (label: string, url: string, r: Rect) =>
+  invoke("browser_show", { label, url, ...r });
+export const browserSetBounds = (label: string, r: Rect) =>
+  invoke("browser_set_bounds", { label, ...r });
+export const browserNavigate = (label: string, url: string) =>
+  invoke("browser_navigate", { label, url });
+export const browserBack = (label: string) => invoke("browser_back", { label });
+export const browserForward = (label: string) => invoke("browser_forward", { label });
+export const browserReload = (label: string) => invoke("browser_reload", { label });
+export const browserHide = (label: string) => invoke("browser_hide", { label });
+export const browserClose = (label: string) => invoke("browser_close", { label });

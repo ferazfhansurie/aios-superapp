@@ -1,8 +1,8 @@
 /** Browser pane — drives a NATIVE child webview (real WebKit, renders any site,
- *  no iframe X-Frame-Options blocking). This component is just the chrome
- *  (url bar + nav) plus a placeholder div whose on-screen rect the webview
- *  tracks. The webview floats above this region; we sync its bounds on resize
- *  and a light poll, hide it when the tab is inactive, and close it on unmount. */
+ *  no iframe blocking). Each pane owns its own webview keyed by `label`. The
+ *  component is just the chrome (url bar + nav) plus a placeholder div whose
+ *  on-screen rect the webview tracks. `active=false` (a modal is open, or the
+ *  pane is hidden) shrinks the webview to 0 so HTML modals aren't occluded. */
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -28,10 +28,10 @@ function normalizeUrl(input: string): string {
   return `https://www.google.com/search?q=${encodeURIComponent(t)}`;
 }
 
-export function BrowserPane({ active }: { active: boolean }) {
+export function BrowserPane({ label, active = true }: { label: string; active?: boolean }) {
   const slotRef = useRef<HTMLDivElement>(null);
-  const [input, setInput] = useState("https://vercel.com");
-  const [current, setCurrent] = useState("https://vercel.com");
+  const [input, setInput] = useState("https://google.com");
+  const [current, setCurrent] = useState("https://google.com");
   const shownRef = useRef(false);
 
   const rect = useCallback((): Rect | null => {
@@ -42,10 +42,9 @@ export function BrowserPane({ active }: { active: boolean }) {
     return { x: r.x, y: r.y, width: r.width, height: r.height };
   }, []);
 
-  // Show + keep the webview glued to the slot while active; hide when inactive.
   useEffect(() => {
     if (!active) {
-      if (shownRef.current) browserHide().catch(() => {});
+      if (shownRef.current) browserHide(label).catch(() => {});
       return;
     }
     let raf = 0;
@@ -54,16 +53,15 @@ export function BrowserPane({ active }: { active: boolean }) {
       if (!r) return;
       if (!shownRef.current) {
         shownRef.current = true;
-        browserShow(current, r).catch(() => {});
+        browserShow(label, current, r).catch(() => {});
       } else {
-        browserSetBounds(r).catch(() => {});
+        browserSetBounds(label, r).catch(() => {});
       }
     };
     raf = requestAnimationFrame(() => requestAnimationFrame(sync));
     const ro = new ResizeObserver(sync);
     if (slotRef.current) ro.observe(slotRef.current);
     window.addEventListener("resize", sync);
-    // poll catches pure position moves (sidebar toggle, dock reposition).
     const poll = setInterval(sync, 300);
     return () => {
       cancelAnimationFrame(raf);
@@ -71,35 +69,33 @@ export function BrowserPane({ active }: { active: boolean }) {
       window.removeEventListener("resize", sync);
       clearInterval(poll);
     };
-  }, [active, current, rect]);
+  }, [active, current, label, rect]);
 
-  // Tear down the webview entirely when the pane unmounts.
   useEffect(() => {
     return () => {
-      browserClose().catch(() => {});
+      browserClose(label).catch(() => {});
       shownRef.current = false;
     };
-  }, []);
+  }, [label]);
 
   const go = useCallback(() => {
     const url = normalizeUrl(input);
     if (!url) return;
     setCurrent(url);
     setInput(url);
-    if (shownRef.current) browserNavigate(url).catch(() => {});
-  }, [input]);
+    if (shownRef.current) browserNavigate(label, url).catch(() => {});
+  }, [input, label]);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
-      {/* chrome */}
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-2">
-        <NavBtn title="Back" onClick={() => browserBack().catch(() => {})}>
+        <NavBtn title="Back" onClick={() => browserBack(label).catch(() => {})}>
           <ArrowLeft size={14} />
         </NavBtn>
-        <NavBtn title="Forward" onClick={() => browserForward().catch(() => {})}>
+        <NavBtn title="Forward" onClick={() => browserForward(label).catch(() => {})}>
           <ArrowRight size={14} />
         </NavBtn>
-        <NavBtn title="Reload" onClick={() => browserReload().catch(() => {})}>
+        <NavBtn title="Reload" onClick={() => browserReload(label).catch(() => {})}>
           <RotateCw size={13} />
         </NavBtn>
         <form
@@ -122,7 +118,6 @@ export function BrowserPane({ active }: { active: boolean }) {
         </NavBtn>
       </div>
 
-      {/* webview slot — the native webview overlays this exact rect */}
       <div ref={slotRef} className="relative min-h-0 flex-1">
         <div className="pointer-events-none absolute inset-0 grid place-items-center text-[11px] text-[var(--color-faint)]">
           loading native browser…

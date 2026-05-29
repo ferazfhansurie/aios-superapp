@@ -1,11 +1,13 @@
 //! AIOS — desktop cockpit. Lean Tauri shell: multi-pane PTY terminals + the
 //! oracle roster (attach to bridge-managed tmux sessions). No IDE cruft.
 
+mod automations;
 mod browser;
 mod files;
 mod memory;
 mod oracles;
 mod pty;
+mod stats;
 mod telemetry;
 mod usage;
 
@@ -38,6 +40,8 @@ pub fn run() {
             usage::usage_stats,
             memory::memory_graph,
             memory::memory_file,
+            stats::usage_extras,
+            automations::list_automations,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_navigate,

@@ -5,7 +5,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronUp, LogOut, Settings as SettingsIcon } from "lucide-react";
+import { Activity, ChevronUp, Flame, LogOut, Settings as SettingsIcon } from "lucide-react";
+
+import { usageExtras, type UsageExtras } from "../lib/stats";
 
 interface Window {
   used_percentage: number | null;
@@ -38,9 +40,28 @@ function barColor(pct: number): string {
   return "var(--color-accent)";
 }
 
+/** Heatmap square fill — quantize a day's count to 5 buckets scaling the accent
+ *  (orange) up toward warning (yellow). 0 = the faint panel-2 base. */
+function heatColor(count: number, max: number): string {
+  if (count <= 0) return "var(--color-panel-2)";
+  const t = max > 0 ? count / max : 0;
+  if (t > 0.75) return "var(--color-warning)"; // brightest = yellow
+  const opacity = 0.35 + Math.min(t, 1) * 0.6; // 0.35 → 0.95 accent
+  return `color-mix(in srgb, var(--color-accent) ${Math.round(opacity * 100)}%, transparent)`;
+}
+
+/** Compact integer formatting for big token/message numbers: 12.3k, 1.2M. */
+function compact(n: number | null): string {
+  if (n == null) return "—";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${n}`;
+}
+
 export function AccountMenu({ onOpenSettings }: { onOpenSettings?: () => void }) {
   const [open, setOpen] = useState(false);
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [extras, setExtras] = useState<UsageExtras | null>(null);
   const [, force] = useState(0); // re-render so countdowns tick
   const ref = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -60,6 +81,22 @@ export function AccountMenu({ onOpenSettings }: { onOpenSettings?: () => void })
       setUsage(null);
     }
   }, []);
+
+  // Long-horizon stats (heatmap/streaks/totals) — fetched on open + every 60s.
+  const refreshExtras = useCallback(async () => {
+    try {
+      setExtras(await usageExtras());
+    } catch {
+      setExtras(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    refreshExtras();
+    const t = setInterval(refreshExtras, 60_000);
+    return () => clearInterval(t);
+  }, [open, refreshExtras]);
 
   // poll the shared file + tick the countdown every 30s (and on open).
   useEffect(() => {
@@ -99,7 +136,7 @@ export function AccountMenu({ onOpenSettings }: { onOpenSettings?: () => void })
       {open && (
         <div
           style={{ left: pos.left, bottom: pos.bottom }}
-          className="modal-in glass fixed z-[60] w-72 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/90 p-1.5 shadow-2xl"
+          className="modal-in glass fixed z-[60] w-80 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/90 p-1.5 shadow-2xl"
         >
           <div className="flex items-center gap-2 px-2 py-2">
             <img src="/mascot.png" alt="" className="h-6 w-6 rounded-full object-cover" />
@@ -166,6 +203,82 @@ export function AccountMenu({ onOpenSettings }: { onOpenSettings?: () => void })
                 <span>session ${usage.cost.total_cost_usd.toFixed(2)}</span>
               )}
             </div>
+          )}
+
+          {extras && extras.heatmap.length > 0 && (
+            <>
+              <div className="my-1 h-px bg-[var(--color-border)]" />
+              {(() => {
+                const max = extras.heatmap.reduce((m, d) => Math.max(m, d.count), 0);
+                // Last 70 days, ascending → 10 cols (weeks) × 7 rows (days).
+                // CSS grid flows column-major so each column is one week.
+                return (
+                  <div className="px-2 py-1">
+                    <div className="mb-1.5 flex items-center gap-1 text-[9px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
+                      <Activity size={10} /> activity · 10 weeks
+                    </div>
+                    <div
+                      className="grid w-fit gap-[2px]"
+                      style={{ gridTemplateRows: "repeat(7, 9px)", gridAutoFlow: "column" }}
+                    >
+                      {extras.heatmap.map((d) => (
+                        <div
+                          key={d.date}
+                          title={`${d.date} · ${d.count}`}
+                          className="h-[9px] w-[9px] rounded-[2px]"
+                          style={{ background: heatColor(d.count, max) }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-[var(--color-text-2)]">
+                <Flame size={11} className="text-[var(--color-accent)]" />
+                <span>
+                  current <span className="font-mono">{extras.currentStreak}</span>d
+                </span>
+                <span className="text-[var(--color-faint)]">·</span>
+                <span>
+                  longest <span className="font-mono">{extras.longestStreak}</span>d
+                </span>
+                <span className="text-[var(--color-faint)]">·</span>
+                <span>
+                  active <span className="font-mono">{extras.active7d}</span>/7
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-x-1 px-2 pb-1 text-[10px] text-[var(--color-faint)]">
+                {extras.totalSessions != null && (
+                  <span>
+                    <span className="font-mono">{compact(extras.totalSessions)}</span> sessions
+                  </span>
+                )}
+                {extras.totalMessages != null && (
+                  <>
+                    <span>·</span>
+                    <span>
+                      <span className="font-mono">{compact(extras.totalMessages)}</span> msgs
+                    </span>
+                  </>
+                )}
+                {extras.favoriteModel && (
+                  <>
+                    <span>·</span>
+                    <span>{extras.favoriteModel}</span>
+                  </>
+                )}
+                {extras.tokensTotal != null && (
+                  <>
+                    <span>·</span>
+                    <span>
+                      <span className="font-mono">{compact(extras.tokensTotal)}</span> tok
+                    </span>
+                  </>
+                )}
+              </div>
+            </>
           )}
 
           <div className="my-1 h-px bg-[var(--color-border)]" />
