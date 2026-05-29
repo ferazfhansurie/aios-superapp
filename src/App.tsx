@@ -8,6 +8,7 @@ import {
   Globe,
   PanelLeft,
   Plus,
+  Radio,
   Search,
   Settings as SettingsIcon,
   TerminalSquare,
@@ -16,6 +17,7 @@ import {
 
 import { AccountMenu } from "./components/AccountMenu";
 import { AutomationsPane } from "./components/AutomationsPane";
+import { BridgesPane } from "./components/BridgesPane";
 import { BrowserPane } from "./components/BrowserPane";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FilesPane } from "./components/FilesPane";
@@ -31,7 +33,8 @@ type PaneContent =
   | { type: "files" }
   | { type: "browser" }
   | { type: "memory" }
-  | { type: "automations" };
+  | { type: "automations" }
+  | { type: "bridges" };
 interface Pane {
   key: string;
   label: string;
@@ -50,6 +53,7 @@ const SPAWN: { kind: PaneContent; icon: typeof Folder; label: string }[] = [
   { kind: { type: "browser" }, icon: Globe, label: "browser" },
   { kind: { type: "memory" }, icon: Brain, label: "memory" },
   { kind: { type: "automations" }, icon: Clock, label: "automations" },
+  { kind: { type: "bridges" }, icon: Radio, label: "bridges" },
 ];
 
 function App() {
@@ -175,9 +179,9 @@ function App() {
 
         <div className="flex items-center gap-2">
           <img src="/mascot.png" alt="aios" className="brand-logo h-[22px] w-[22px] object-contain" />
-          <span className="font-mono text-sm font-semibold tracking-tight">aios</span>
+          <span className="font-mono text-sm font-semibold tracking-tight">cockpit</span>
           <span className="text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--color-accent)]">
-            cockpit
+            aios
           </span>
         </div>
 
@@ -218,7 +222,11 @@ function App() {
         {sidebarOpen && (
           <aside className="flex w-60 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
             <div className="min-h-0 flex-1 overflow-y-auto p-3">
-              <OracleRoster onAttachOracle={addOracle} onAttachTmux={addTmux} />
+              <OracleRoster
+                onAttachOracle={addOracle}
+                onAttachTmux={addTmux}
+                onAttachRoot={() => spawn({ type: "shell" }, "root")}
+              />
             </div>
             <div className="border-t border-[var(--color-border)] p-2">
               <AccountMenu
@@ -300,6 +308,7 @@ const DOT: Record<string, string> = {
   browser: "status-dot--cold",
   memory: "status-dot--cold",
   automations: "status-dot--cold",
+  bridges: "status-dot--cold",
 };
 
 function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onClose: () => void }) {
@@ -331,8 +340,10 @@ function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onCl
           <BrowserPane label={pane.key} active={active} />
         ) : pane.kind.type === "memory" ? (
           <MemoryPane />
-        ) : (
+        ) : pane.kind.type === "automations" ? (
           <AutomationsPane />
+        ) : (
+          <BridgesPane />
         )}
       </div>
     </div>
@@ -354,10 +365,10 @@ function EmptyState({ onSpawn }: { onSpawn: (kind: PaneContent, label: string) =
         <div className="flex flex-col items-center gap-2">
           <div className="flex items-baseline gap-2">
             <span className="font-mono text-5xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_24px_color-mix(in_srgb,var(--color-accent)_45%,transparent)]">
-              aios
+              cockpit
             </span>
             <span className="text-[10px] font-medium uppercase tracking-[0.3em] text-[var(--color-muted)]">
-              cockpit
+              aios
             </span>
           </div>
           <p className="text-[12px] text-[var(--color-faint)]">your command deck · spawn anything</p>

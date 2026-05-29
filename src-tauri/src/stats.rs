@@ -1,14 +1,22 @@
 //! Long-horizon usage stats for the account menu, absorbed from the retired
-//! terminal HUD. Reads `~/.claude/stats-cache.json` (written by the claude-code
-//! stats pipeline) and derives an activity heatmap, streaks, session/message
-//! totals, favorite model, and token totals.
+//! terminal HUD. The activity heatmap, streaks, active-day windows, and token
+//! total come from LIVE `ccusage daily --json --offline` data (the same source
+//! the terminal HUD used) so streaks stay accurate. Session/message totals and
+//! the favorite model are merged in from `~/.claude/stats-cache.json` when
+//! present, falling back to ccusage-derived values otherwise.
+//!
+//! Why the merge: the on-disk `stats-cache.json` goes stale (its latest day can
+//! be weeks old), so deriving streaks from it computes 0. ccusage reflects real
+//! per-day usage. But ccusage's `daily` array has no session/message counts, so
+//! those still come from the cache when available.
 //!
 //! Distinct from `usage.rs`, which surfaces the LIVE 5h/7d rate-limit %. This is
-//! the slow-moving historical layer. Defensive throughout: a missing or invalid
-//! cache file yields nulls/empties, never a panic.
+//! the slow-moving historical layer. Defensive throughout: ccusage failing or
+//! the cache being missing/invalid yields nulls/empties, never a panic.
 
 use std::collections::HashMap;
 
+use chrono::Local;
 use serde_json::{json, Value};
 
 /// Number of trailing days the heatmap covers (10 weeks).
@@ -44,6 +52,98 @@ fn read_cache() -> Option<StatsCache> {
 /// Pulls a number out of a `Value` regardless of int/float encoding.
 fn as_num(v: &Value) -> Option<f64> {
     v.as_f64()
+}
+
+/// Live usage derived from `ccusage daily --json --offline`. The activity map is
+/// `"YYYY-MM-DD" → totalTokens` for every day ccusage reports (a day's presence
+/// with tokens > 0 means it was active). `tokens_total` prefers the top-level
+/// `totals.totalTokens` grand total, else sums the per-day values. `model_freq`
+/// counts how often each model appears across days for a favorite fallback.
+#[derive(Debug, Default)]
+struct LiveUsage {
+    /// "YYYY-MM-DD" → that day's totalTokens (used as heatmap count + activity).
+    daily_activity: HashMap<String, f64>,
+    tokens_total: Option<f64>,
+    /// modelName → number of days it appears (favorite fallback when no cache).
+    model_freq: HashMap<String, f64>,
+}
+
+/// Runs ccusage and parses its daily output. Returns `None` on any failure
+/// (binary missing, non-zero exit, unparseable JSON, empty data) so callers can
+/// fall back to the stale on-disk cache. Never panics.
+fn read_live_usage() -> Option<LiveUsage> {
+    // Resolve the binary: prefer the known nvm path, fall back to PATH lookup.
+    let home = std::env::var("HOME").ok();
+    let nvm_bin = home
+        .as_deref()
+        .map(|h| format!("{h}/.nvm/versions/node/v22.12.0/bin/ccusage"));
+    let candidates: Vec<&str> = nvm_bin
+        .as_deref()
+        .filter(|p| std::path::Path::new(p).exists())
+        .into_iter()
+        .chain(std::iter::once("ccusage"))
+        .collect();
+
+    let mut output = None;
+    for bin in candidates {
+        if let Ok(out) = std::process::Command::new(bin)
+            .args(["daily", "--json", "--offline"])
+            .output()
+        {
+            if out.status.success() {
+                output = Some(out.stdout);
+                break;
+            }
+        }
+    }
+    let stdout = output?;
+    let root: Value = serde_json::from_slice(&stdout).ok()?;
+    let daily = root.get("daily")?.as_array()?;
+    if daily.is_empty() {
+        return None;
+    }
+
+    let mut daily_activity: HashMap<String, f64> = HashMap::new();
+    let mut model_freq: HashMap<String, f64> = HashMap::new();
+    let mut per_day_sum = 0.0;
+    for entry in daily {
+        let Value::Object(o) = entry else { continue };
+        // ccusage labels the day under `period` (fall back to `date` defensively).
+        let Some(date) = o
+            .get("period")
+            .or_else(|| o.get("date"))
+            .and_then(|d| d.as_str())
+        else {
+            continue;
+        };
+        let tokens = o.get("totalTokens").and_then(as_num).unwrap_or(0.0);
+        // A day can appear more than once in theory; accumulate.
+        *daily_activity.entry(date.to_string()).or_insert(0.0) += tokens;
+        per_day_sum += tokens;
+        if let Some(models) = o.get("modelsUsed").and_then(|m| m.as_array()) {
+            for m in models {
+                if let Some(name) = m.as_str() {
+                    *model_freq.entry(name.to_string()).or_insert(0.0) += 1.0;
+                }
+            }
+        }
+    }
+    if daily_activity.is_empty() {
+        return None;
+    }
+
+    // Grand total: prefer ccusage's own `totals.totalTokens`, else the per-day sum.
+    let tokens_total = root
+        .get("totals")
+        .and_then(|t| t.get("totalTokens"))
+        .and_then(as_num)
+        .or(Some(per_day_sum));
+
+    Some(LiveUsage {
+        daily_activity,
+        tokens_total,
+        model_freq,
+    })
 }
 
 /// Walks a `dailyActivity`-style field into a `date → count` map. Accepts both
@@ -185,17 +285,19 @@ fn date_string(z: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Today as an epoch-day number, in local time.
+/// Today as an epoch-day number, in LOCAL time (the machine is MYT/UTC+8, and
+/// both ccusage and the cache key days by local date). Uses chrono so the day
+/// boundary matches the data; falls back to UTC epoch-days if chrono somehow
+/// yields a date that doesn't round-trip.
 fn today_day_number() -> i64 {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    // Local offset: derive from the difference the OS reports is hard without a
-    // crate; the cache keys are local dates, so treat "today" in UTC. Good
-    // enough for a heatmap — at worst a day boundary is off by the tz offset,
-    // and streaks tolerate that gracefully.
-    secs / 86_400
+    let local_date = Local::now().date_naive();
+    day_number(&local_date.format("%Y-%m-%d").to_string()).unwrap_or_else(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        secs / 86_400
+    })
 }
 
 /// Pretty model label, e.g. `claude-opus-4-8` → `Opus 4.8`. Falls back to the
@@ -229,10 +331,18 @@ fn pretty_model(id: &str) -> String {
 #[tauri::command]
 pub fn usage_extras() -> Value {
     let cache = read_cache();
+    let live = read_live_usage();
     let today = today_day_number();
 
+    // --- Activity source: LIVE ccusage when available, else the on-disk cache.
+    // Streaks/heatmap/active-windows/tokens all key off this map so the numbers
+    // match the terminal HUD rather than the stale cache. ---
+    let activity: Option<&HashMap<String, f64>> = live
+        .as_ref()
+        .map(|l| &l.daily_activity)
+        .or_else(|| cache.as_ref().map(|c| &c.daily_activity));
+
     // --- Heatmap: last HEATMAP_DAYS days ascending, missing filled with 0. ---
-    let activity = cache.as_ref().map(|c| &c.daily_activity);
     let mut heatmap = Vec::with_capacity(HEATMAP_DAYS as usize);
     for offset in (0..HEATMAP_DAYS).rev() {
         let day = today - offset;
@@ -298,26 +408,41 @@ pub fn usage_extras() -> Value {
     }
 
     // --- Totals + favorite model + token total. ---
-    let (total_sessions, total_messages, favorite_model, first_session_date) = match &cache {
-        Some(c) => {
-            let fav = c
-                .model_usage
-                .iter()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(id, _)| pretty_model(id));
-            (
-                c.total_sessions.map(|v| v as i64),
-                c.total_messages.map(|v| v as i64),
-                fav,
-                c.first_session_date.clone(),
-            )
-        }
-        None => (None, None, None, None),
+    // Sessions/messages/firstSessionDate only exist in the on-disk cache (ccusage
+    // daily has no such counts), so read them there; null when no cache.
+    let (total_sessions, total_messages, first_session_date) = match &cache {
+        Some(c) => (
+            c.total_sessions.map(|v| v as i64),
+            c.total_messages.map(|v| v as i64),
+            c.first_session_date.clone(),
+        ),
+        None => (None, None, None),
     };
 
-    let tokens_total: Option<i64> = cache
+    // Favorite model: prefer the cache's token-weighted modelUsage; if that's
+    // empty/absent, fall back to the most-frequently-used model from ccusage.
+    let favorite_model = cache
         .as_ref()
-        .and_then(|c| c.tokens_total)
+        .and_then(|c| {
+            c.model_usage
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _)| pretty_model(id))
+        })
+        .or_else(|| {
+            live.as_ref().and_then(|l| {
+                l.model_freq
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(id, _)| pretty_model(id))
+            })
+        });
+
+    // Token total: prefer LIVE ccusage grand total, fall back to the cache.
+    let tokens_total: Option<i64> = live
+        .as_ref()
+        .and_then(|l| l.tokens_total)
+        .or_else(|| cache.as_ref().and_then(|c| c.tokens_total))
         .map(|t| t.round() as i64);
 
     json!({

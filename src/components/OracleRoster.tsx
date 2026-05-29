@@ -33,6 +33,8 @@ import {
 interface Props {
   onAttachOracle: (identity: string) => void;
   onAttachTmux: (socket: string, session: string) => void;
+  /** Master/root → a clean shell at the root folder (no launcher HUD). */
+  onAttachRoot: () => void;
 }
 
 const HIDDEN_KEY = "aios.hiddenOracles";
@@ -44,7 +46,7 @@ const loadHidden = (): Set<string> => {
   }
 };
 
-export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
+export function OracleRoster({ onAttachOracle, onAttachTmux, onAttachRoot }: Props) {
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -137,9 +139,7 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
             <OracleRow
               key={o.session}
               oracle={o}
-              onAttach={() =>
-                o.is_master ? onAttachTmux(o.socket, o.session) : onAttachOracle(o.identity)
-              }
+              onAttach={() => (o.is_master ? onAttachRoot() : onAttachOracle(o.identity))}
               onHide={() => toggleHidden(o.identity, true)}
               onRename={async (to) => {
                 try {

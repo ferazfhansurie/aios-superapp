@@ -2,6 +2,7 @@
 //! oracle roster (attach to bridge-managed tmux sessions). No IDE cruft.
 
 mod automations;
+mod bridges;
 mod browser;
 mod files;
 mod memory;
@@ -42,6 +43,7 @@ pub fn run() {
             memory::memory_file,
             stats::usage_extras,
             automations::list_automations,
+            bridges::list_bridges,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_navigate,
