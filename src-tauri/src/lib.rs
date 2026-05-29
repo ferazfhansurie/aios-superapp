@@ -1,9 +1,11 @@
 //! AIOS — desktop cockpit. Lean Tauri shell: multi-pane PTY terminals + the
 //! oracle roster (attach to bridge-managed tmux sessions). No IDE cruft.
 
+mod files;
 mod oracles;
 mod pty;
 mod telemetry;
+mod usage;
 
 #[tauri::command]
 fn read_telemetry() -> telemetry::Telemetry {
@@ -23,6 +25,9 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             oracles::list_oracles,
+            files::read_dir,
+            files::home_dir,
+            usage::usage_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

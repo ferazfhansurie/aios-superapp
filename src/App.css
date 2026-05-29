@@ -1,33 +1,105 @@
 @import "tailwindcss";
-
 @import "@xterm/xterm/css/xterm.css";
 
 @theme {
-  /* Antigravity-inspired palette: dark with orange accent matching adletic brand */
-  --color-bg: oklch(0.13 0.005 270);
-  --color-panel: oklch(0.16 0.005 270);
-  --color-panel-2: oklch(0.19 0.005 270);
+  /* ============================================================
+     AIOS cockpit theme — dark navy spacefield + adletic orange.
+     Accent hex anchor #f26522 ≈ oklch(0.72 0.18 50).
+     ============================================================ */
+
+  /* ground & surfaces */
+  --color-bg: oklch(0.145 0.012 250);        /* deep navy spacefield ≈ #08131f */
+  --color-panel: oklch(0.175 0.006 255);     /* rails / sticky header */
+  --color-panel-2: oklch(0.205 0.006 255);   /* cards / buttons */
+  --color-pane: oklch(0.12 0.008 255);       /* terminal interior ≈ #0a0a0c */
   --color-border: oklch(1 0 0 / 8%);
+  --color-border-strong: oklch(1 0 0 / 14%);
+
+  /* text */
   --color-text: oklch(0.96 0 0);
-  --color-muted: oklch(0.62 0.005 270);
-  --color-accent: oklch(0.72 0.18 50);    /* adletic orange */
+  --color-text-2: oklch(0.78 0.005 255);
+  --color-muted: oklch(0.62 0.005 255);      /* ≈ #a0a0a0 */
+  --color-faint: oklch(0.45 0.005 255);
+
+  /* accent — adletic orange */
+  --color-accent: oklch(0.72 0.18 50);       /* ≈ #f26522 */
+  --color-accent-hover: oklch(0.78 0.16 60); /* warms toward #fbbf24 */
   --color-accent-dim: oklch(0.45 0.13 50);
+  --color-accent-soft: oklch(0.72 0.18 50 / 18%);
+  --color-cursor: #f97316;
+  --color-selection: rgba(249, 115, 22, 0.30);
+  --color-highlight: #fbbf24;
+
+  /* status — distinct semantic vocabulary */
+  --color-success: #4ade80;
+  --color-success-glow: rgba(74, 222, 128, 0.6);
+  --color-warning: #facc15;
+  --color-info: #60a5fa;
+  --color-danger: #fca5a5;
+  --color-cold: #555555;
+
+  /* type families */
+  --font-sans: -apple-system, "SF Pro Text", "SF Pro Display", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", Menlo, Monaco, "JetBrains Mono", "Cascadia Code",
+    "Fira Code", Consolas, ui-monospace, monospace;
 }
 
 html, body, #root {
   height: 100%;
+  margin: 0;
   background: var(--color-bg);
   color: var(--color-text);
-  font-family: -apple-system, "SF Pro Text", "SF Pro Display", "Segoe UI",
-    Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
+::selection { background: var(--color-selection); }
+
 ::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: oklch(0.55 0.005 270 / 25%); border-radius: 8px; }
-::-webkit-scrollbar-thumb:hover { background: oklch(0.55 0.005 270 / 45%); }
+::-webkit-scrollbar-thumb { background: oklch(0.55 0.005 255 / 25%); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: oklch(0.55 0.005 255 / 45%); }
 ::-webkit-scrollbar-track { background: transparent; }
 
 .xterm-viewport { background: transparent !important; }
 .xterm .xterm-screen { padding: 8px 12px; }
+/* let xterm own wheel scrolling inside its viewport */
+.xterm-viewport { overflow-y: auto !important; }
+
+/* ---- brand motion ---- */
+@keyframes aios-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+@keyframes aios-breathe { 0%, 100% { transform: scale(1); opacity: 0.85; } 50% { transform: scale(1.02); opacity: 1; } }
+@keyframes aios-dot-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--color-success-glow); }
+  50% { box-shadow: 0 0 0 4px transparent; }
+}
+@keyframes aios-modal-in {
+  from { opacity: 0; transform: translateY(12px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.brand-logo { animation: aios-pulse 3s ease-in-out infinite;
+  filter: drop-shadow(0 0 6px rgba(242, 101, 34, 0.25)); }
+.brand-logo--splash { filter: drop-shadow(0 0 24px rgba(242, 101, 34, 0.40)); }
+.mascot-idle { animation: aios-breathe 4s ease-in-out infinite; }
+.modal-in { animation: aios-modal-in 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
+
+.status-dot { width: 8px; height: 8px; border-radius: 9999px; }
+.status-dot--active { background: var(--color-success); animation: aios-dot-pulse 3s ease-in-out infinite; }
+.status-dot--idle { background: var(--color-warning); }
+.status-dot--dormant { background: var(--color-info); opacity: 0.6; }
+.status-dot--cold { background: var(--color-cold); opacity: 0.4; }
+
+/* glass surfaces */
+.glass { backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); }
+
+/* resizable panel handles (react-resizable-panels) */
+[data-panel-resize-handle-id] {
+  background: transparent;
+  transition: background 120ms ease;
+}
+[data-panel-resize-handle-id]:hover,
+[data-panel-resize-handle-id][data-resize-handle-state="drag"] {
+  background: var(--color-accent-soft);
+}
