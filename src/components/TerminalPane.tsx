@@ -5,6 +5,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 
+import { X } from "lucide-react";
 import { Channel } from "@tauri-apps/api/core";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -50,6 +51,10 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<number | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
+  const [buttons, setButtons] = useState<string[] | null>(null);
+  const bufRef = useRef("");
+  const lastBtnRef = useRef("");
 
   useEffect(() => {
     const host = hostRef.current;
@@ -83,7 +88,22 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
 
     const onData = new Channel<string>();
     onData.onmessage = (chunk) => {
-      if (!disposed) term.write(chunk);
+      if (disposed) return;
+      term.write(chunk);
+      // scan a rolling window for the button sentinel across chunk boundaries
+      const buf = (bufRef.current + chunk).slice(-3000);
+      bufRef.current = buf;
+      const matches = [...buf.matchAll(/\[\[btn:\s*([^\]]+?)\]\]/gi)];
+      const last = matches[matches.length - 1];
+      if (last && last[1] !== lastBtnRef.current) {
+        lastBtnRef.current = last[1];
+        const opts = last[1]
+          .split("|")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .slice(0, 5);
+        if (opts.length) setButtons(opts);
+      }
     };
 
     (async () => {
@@ -141,6 +161,14 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Click a button → "type" that choice into the session (text + Enter).
+  const sendChoice = (opt: string) => {
+    const id = sessionIdRef.current;
+    if (id != null) ptyWrite(id, `${opt}\r`).catch(() => {});
+    setButtons(null);
+    bufRef.current = "";
+  };
+
   // Drop a file/folder (dragged from the Files pane) → insert its path into
   // this session's PTY, shell-quoted, with a trailing space.
   const onDrop = (e: React.DragEvent) => {
@@ -168,6 +196,26 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
       onDrop={onDrop}
     >
       <div ref={hostRef} className="h-full min-h-0 w-full" />
+      {buttons && (
+        <div className="absolute inset-x-0 bottom-0 z-20 flex flex-wrap items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-panel)]/95 p-2 backdrop-blur">
+          {buttons.map((b, i) => (
+            <button
+              key={i}
+              onClick={() => sendChoice(b)}
+              className="rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)]"
+            >
+              {b}
+            </button>
+          ))}
+          <button
+            onClick={() => setButtons(null)}
+            className="ml-auto rounded p-1 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+            title="dismiss"
+          >
+            <X size={13} />
+          </button>
+        </div>
+      )}
       {dragOver && (
         <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center border-2 border-dashed border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10">
           <span className="rounded-md bg-[var(--color-panel)]/90 px-3 py-1.5 text-[12px] text-[var(--color-text)]">

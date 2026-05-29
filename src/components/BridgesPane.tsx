@@ -4,9 +4,25 @@
  *  activity stat row (sent · today · last seen), and faint pid/launchd/log meta. */
 import { useCallback, useEffect, useState } from "react";
 
-import { Activity, MessageCircle, Plug, Radio, RefreshCw, Zap } from "lucide-react";
+import {
+  Activity,
+  ArrowDownLeft,
+  ArrowUpRight,
+  ChevronRight,
+  MessageCircle,
+  Plug,
+  Radio,
+  RefreshCw,
+  Zap,
+} from "lucide-react";
 
-import { listBridges, type Bridge, type Bridges } from "../lib/bridges";
+import {
+  bridgeActivity,
+  listBridges,
+  type Bridge,
+  type BridgeMessage,
+  type Bridges,
+} from "../lib/bridges";
 
 /** Icon for a bridge's channel type. */
 function kindIcon(kind: string) {
@@ -100,6 +116,10 @@ function BridgeCard({ bridge: b }: { bridge: Bridge }) {
   const statusLabel = b.alive ? (b.uptime ? `alive · up ${b.uptime}` : "alive") : "down";
   const statusColor = b.alive ? "text-[var(--color-success)]" : "text-[var(--color-danger)]";
 
+  // the primary (first/whatsapp) bridge opens its feed by default — that's the
+  // one worth watching; others stay collapsed behind the chevron.
+  const [open, setOpen] = useState(b.kind === "whatsapp");
+
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/30 px-3 py-2.5">
       {/* header row: status + name + type chip */}
@@ -147,7 +167,96 @@ function BridgeCard({ bridge: b }: { bridge: Bridge }) {
             {b.lastActivity && <span className="font-mono">last {b.lastActivity}</span>}
             {b.logPath && <span className="truncate font-mono">{b.logPath}</span>}
           </div>
+
+          {/* recent activity — expandable chat-style feed */}
+          <button
+            onClick={() => setOpen((v) => !v)}
+            className="-mx-1 mt-0.5 flex items-center gap-1 rounded px-1 py-0.5 text-left text-[11px] text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]/50 hover:text-[var(--color-text-2)]"
+          >
+            <ChevronRight
+              size={11}
+              className={`transition-transform ${open ? "rotate-90" : ""}`}
+            />
+            <MessageCircle size={11} />
+            <span>recent activity</span>
+          </button>
+
+          {open && <ActivityFeed bridgeId={b.id} />}
         </>
+      )}
+    </div>
+  );
+}
+
+/** A scrollable, chat-style feed of the messages flowing through a bridge.
+ *  Newest at top. Polls every 10s while mounted (i.e. while expanded). */
+function ActivityFeed({ bridgeId }: { bridgeId: string }) {
+  const [messages, setMessages] = useState<BridgeMessage[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await bridgeActivity(bridgeId, 25);
+      setMessages(res.messages);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [bridgeId]);
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 10_000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  if (error) {
+    return <p className="text-[11px] text-[var(--color-danger)]">{error}</p>;
+  }
+  if (messages == null) {
+    return <p className="text-[11px] text-[var(--color-muted)]/60">loading…</p>;
+  }
+  if (messages.length === 0) {
+    return <p className="text-[11px] text-[var(--color-muted)]/60">no recent messages.</p>;
+  }
+
+  return (
+    <div className="flex max-h-64 flex-col gap-1.5 overflow-y-auto rounded-md border border-[var(--color-border)]/60 bg-[var(--color-bg)]/40 p-2">
+      {messages.map((m, i) => (
+        <MessageRow key={`${m.ts}-${i}`} msg={m} />
+      ))}
+    </div>
+  );
+}
+
+/** One feed row. Outbound = accent-tinted, right-aligned, "→"/↗ marker.
+ *  Inbound = panel-2 bubble, left-aligned, "←"/↙ marker. */
+function MessageRow({ msg: m }: { msg: BridgeMessage }) {
+  const out = m.direction === "out";
+  const bubble = out
+    ? "self-end bg-[var(--color-accent)]/12 border-[var(--color-accent)]/30"
+    : "self-start bg-[var(--color-panel-2)]/60 border-[var(--color-border)]";
+  const DirIcon = out ? ArrowUpRight : ArrowDownLeft;
+  const dirColor = out ? "text-[var(--color-accent)]" : "text-[var(--color-info)]";
+
+  return (
+    <div className={`flex max-w-[88%] flex-col gap-0.5 rounded-md border px-2 py-1 ${bubble}`}>
+      {/* meta line: direction marker · peer · timestamp + ago */}
+      <div className="flex items-center gap-1.5 text-[10px]">
+        <DirIcon size={10} className={`shrink-0 ${dirColor}`} />
+        <span className={`truncate font-mono ${out ? "text-[var(--color-accent)]" : "text-[var(--color-text-2)]"}`}>
+          {m.peer}
+        </span>
+        <span className="ml-auto shrink-0 font-mono text-[var(--color-faint)]">{m.ts}</span>
+        {m.tsAgo && (
+          <span className="shrink-0 font-mono text-[var(--color-faint)]">· {m.tsAgo} ago</span>
+        )}
+      </div>
+      {/* message text */}
+      {m.text && (
+        <p className="whitespace-pre-wrap break-words text-[11px] leading-snug text-[var(--color-text)]">
+          {m.text}
+        </p>
       )}
     </div>
   );

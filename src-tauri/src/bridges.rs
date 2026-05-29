@@ -391,3 +391,168 @@ pub fn list_bridges() -> Value {
     let bridges: Vec<Value> = bridge_probes().iter().map(probe_bridge).collect();
     json!({ "bridges": bridges })
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// 4. activity feed — the actual messages flowing through a bridge
+// ════════════════════════════════════════════════════════════════════════
+
+/// Candidate INBOUND/conversation logs to merge into the feed, probed in order.
+/// These complement the outbound log so the feed can show both sides when a
+/// matching inbound source exists. Best-effort — missing files are skipped.
+fn inbound_candidates(id: &str) -> &'static [&'static str] {
+    match id {
+        "whatsapp" => &[".aios/state/personal-wa-events.jsonl"],
+        _ => &[],
+    }
+}
+
+/// Trims `s` to at most `max` chars (char-safe), appending `…` if truncated.
+/// Also collapses interior runs of whitespace/newlines into single spaces so a
+/// multi-line WA message renders as one tidy feed row.
+fn trim_text(s: &str, max: usize) -> String {
+    let collapsed: String = {
+        let mut out = String::with_capacity(s.len());
+        let mut prev_ws = false;
+        for ch in s.trim().chars() {
+            if ch.is_whitespace() {
+                if !prev_ws {
+                    out.push(' ');
+                }
+                prev_ws = true;
+            } else {
+                out.push(ch);
+                prev_ws = false;
+            }
+        }
+        out
+    };
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let truncated: String = collapsed.chars().take(max).collect();
+    format!("{}…", truncated.trim_end())
+}
+
+/// Pulls the first present string value among `keys` from a JSON object.
+fn first_str(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    for k in keys {
+        if let Some(s) = obj.get(*k).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return Some(s.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parses one JSON log line into a feed message. `default_dir` is the direction
+/// assigned when the line carries no direction field (outbound log → "out").
+/// Returns `None` on parse failure / no usable timestamp — tolerated per-line.
+fn parse_feed_line(line: &str, default_dir: &str) -> Option<Value> {
+    let ts = extract_timestamp(line)?;
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    let obj = v.as_object()?;
+
+    // direction: explicit field wins (in/out/inbound/outbound/sent/received),
+    // else fall back to the log's default.
+    let direction = match first_str(obj, &["direction", "dir", "from", "type"]) {
+        Some(d) => {
+            let d = d.to_lowercase();
+            if d.contains("in") || d == "received" || d == "recv" {
+                "in"
+            } else if d.contains("out") || d == "sent" {
+                "out"
+            } else {
+                default_dir
+            }
+        }
+        None => default_dir,
+    };
+
+    // peer: a name first, then a phone/id. Different shapes across logs.
+    let peer = first_str(
+        obj,
+        &[
+            "peer", "name", "chatName", "to", "recipient", "chat", "from", "target", "phone",
+        ],
+    )
+    .unwrap_or_else(|| "unknown".to_string());
+
+    // text: prefer real message bodies; fall back to a media tag.
+    let text = first_str(obj, &["text", "body", "message", "content", "body_preview"])
+        .or_else(|| {
+            first_str(obj, &["media"]).map(|m| format!("[{m}]"))
+        })
+        .unwrap_or_default();
+
+    Some(json!({
+        "ts": format_local(&ts),
+        "tsAgo": humanize_ago(&ts),
+        "direction": direction,
+        "peer": trim_text(&peer, 48),
+        "text": trim_text(&text, 280),
+        "_sort": ts.timestamp_millis(),
+    }))
+}
+
+/// Reads the last `limit` lines of a log file and parses each into a feed
+/// message with the given default direction. Best-effort: missing/garbage
+/// files yield an empty vec, bad lines are skipped.
+fn read_feed(candidates: &[&str], default_dir: &str, limit: usize) -> Vec<Value> {
+    let Some(path) = resolve_log(candidates) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(limit);
+    lines[start..]
+        .iter()
+        .filter_map(|l| parse_feed_line(l, default_dir))
+        .collect()
+}
+
+/// Recent messages flowing through a bridge, newest-first. Merges the outbound
+/// log (everything `out`) with an inbound/conversation log when one exists, then
+/// sorts by timestamp and caps at `limit`. For an unknown bridge id with no log,
+/// returns `{ "messages": [] }`. Never panics — every source fails soft.
+#[tauri::command]
+pub fn bridge_activity(id: String, limit: u32) -> Value {
+    let limit = (limit.max(1) as usize).min(500);
+
+    // Find the matching probe to reuse its outbound log candidates.
+    let probes = bridge_probes();
+    let probe = probes.iter().find(|p| p.id == id);
+
+    let mut messages: Vec<Value> = Vec::new();
+
+    if let Some(p) = probe {
+        // Outbound log — every entry is a sent (out) message. Pull extra so the
+        // merge+trim still leaves `limit` after interleaving with inbound.
+        messages.extend(read_feed(p.log_candidates, "out", limit));
+    }
+
+    // Inbound/conversation log (if any) — these default to "in".
+    let inbound = inbound_candidates(&id);
+    if !inbound.is_empty() {
+        messages.extend(read_feed(inbound, "in", limit));
+    }
+
+    // Newest-first across both sources.
+    messages.sort_by(|a, b| {
+        let bk = b.get("_sort").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ak = a.get("_sort").and_then(|v| v.as_i64()).unwrap_or(0);
+        bk.cmp(&ak)
+    });
+    messages.truncate(limit);
+
+    // Drop the internal sort key from the public shape.
+    for m in messages.iter_mut() {
+        if let Some(o) = m.as_object_mut() {
+            o.remove("_sort");
+        }
+    }
+
+    json!({ "messages": messages })
+}

@@ -4,9 +4,27 @@
  *  schedules, and a one-line "what it does". */
 import { useCallback, useEffect, useState } from "react";
 
-import { Activity, Clock, Cpu, RefreshCw, Zap } from "lucide-react";
+import {
+  Activity,
+  ChevronRight,
+  Clock,
+  Cpu,
+  FileText,
+  Play,
+  Power,
+  RefreshCw,
+  Zap,
+} from "lucide-react";
 
-import { listAutomations, type Automations, type Job } from "../lib/automations";
+import {
+  automationDetail,
+  listAutomations,
+  runAutomation,
+  setAutomationEnabled,
+  type Automations,
+  type Job,
+  type JobDetail,
+} from "../lib/automations";
 
 /** Strip the noise prefix and turn `nightly-planner` → `Nightly planner`. */
 function friendlyName(label: string): string {
@@ -159,33 +177,229 @@ export function AutomationsPane() {
           {jobs.length === 0 && !loading ? (
             <p className="text-[11px] text-[var(--color-muted)]/60">no scheduled jobs found.</p>
           ) : (
-            jobs.map((j) => {
-              const st = jobStatus(j);
-              return (
-                <div
-                  key={j.label}
-                  className="flex items-center gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/30 px-3 py-2"
-                  title={j.command}
-                >
-                  <span className={`status-dot shrink-0 ${st.dot}`} />
-                  <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="truncate text-[12px] text-[var(--color-text)]">
-                      {friendlyName(j.label)}
-                    </span>
-                    <span className="truncate text-[10px] text-[var(--color-muted)]">
-                      {describe(j.label)} · {st.text}
-                    </span>
-                  </div>
-                  <span className="shrink-0 rounded-full bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-2)]">
-                    {humanSchedule(j.schedule)}
-                  </span>
-                </div>
-              );
-            })
+            jobs.map((j) => <JobRow key={j.label} job={j} onAction={refresh} />)
           )}
         </Section>
       </div>
     </div>
+  );
+}
+
+/** A single scheduled-job row: collapsed compact view, expands inline to show
+ *  the full command, plist path, flags, log tail, and run/enable controls.
+ *  Detail is fetched lazily the first time the row is opened. */
+function JobRow({ job, onAction }: { job: Job; onAction: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [detail, setDetail] = useState<JobDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+
+  const [started, setStarted] = useState(false);
+  const [confirmDisable, setConfirmDisable] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const st = jobStatus(job);
+
+  const loadDetail = useCallback(async () => {
+    setDetailLoading(true);
+    setDetailError(null);
+    try {
+      setDetail(await automationDetail(job.label));
+    } catch (e) {
+      setDetailError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDetailLoading(false);
+    }
+  }, [job.label]);
+
+  const toggle = useCallback(() => {
+    setOpen((prev) => {
+      const next = !prev;
+      if (next && !detail && !detailLoading) loadDetail();
+      return next;
+    });
+  }, [detail, detailLoading, loadDetail]);
+
+  const onRunNow = useCallback(async () => {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await runAutomation(job.label);
+      setStarted(true);
+      setTimeout(() => setStarted(false), 2500);
+      await loadDetail();
+      onAction();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [job.label, loadDetail, onAction]);
+
+  const loaded = detail?.loaded ?? false;
+
+  const onToggleEnabled = useCallback(async () => {
+    // Disabling stops a real job — require a two-click confirm.
+    if (loaded && !confirmDisable) {
+      setConfirmDisable(true);
+      setTimeout(() => setConfirmDisable(false), 4000);
+      return;
+    }
+    setBusy(true);
+    setActionError(null);
+    setConfirmDisable(false);
+    try {
+      await setAutomationEnabled(job.label, !loaded);
+      await loadDetail();
+      onAction();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [job.label, loaded, confirmDisable, loadDetail, onAction]);
+
+  return (
+    <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/30">
+      {/* collapsed row — clickable header */}
+      <button
+        type="button"
+        onClick={toggle}
+        className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-[var(--color-panel-2)]/50"
+      >
+        <ChevronRight
+          size={12}
+          className={`shrink-0 text-[var(--color-muted)] transition-transform ${open ? "rotate-90" : ""}`}
+        />
+        <span className={`status-dot shrink-0 ${st.dot}`} />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate text-[12px] text-[var(--color-text)]">
+            {friendlyName(job.label)}
+          </span>
+          <span className="truncate text-[10px] text-[var(--color-muted)]">
+            {describe(job.label)} · {st.text}
+          </span>
+        </div>
+        <span className="shrink-0 rounded-full bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-2)]">
+          {humanSchedule(job.schedule)}
+        </span>
+      </button>
+
+      {/* expanded detail */}
+      {open && (
+        <div className="flex flex-col gap-3 border-t border-[var(--color-border)] px-3 py-3">
+          {detailLoading && (
+            <p className="text-[11px] text-[var(--color-muted)]">loading detail…</p>
+          )}
+          {detailError && (
+            <p className="text-[11px] text-[var(--color-danger)]">{detailError}</p>
+          )}
+
+          {detail && (
+            <>
+              {/* command */}
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+                  command
+                </span>
+                <pre className="max-h-24 overflow-auto whitespace-pre-wrap break-all rounded bg-[var(--color-bg)] px-2 py-1.5 font-mono text-[11px] text-[var(--color-text-2)]">
+                  {detail.command || "(none)"}
+                </pre>
+              </div>
+
+              {/* plist path */}
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+                  plist
+                </span>
+                <span className="break-all font-mono text-[10px] text-[var(--color-faint)]">
+                  {detail.plistPath}
+                </span>
+              </div>
+
+              {/* schedule + flags */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Chip>{humanSchedule(detail.schedule)}</Chip>
+                {detail.runAtLoad && <Chip>runAtLoad</Chip>}
+                {detail.keepAlive && <Chip>keepAlive</Chip>}
+                <Chip>
+                  {detail.loaded
+                    ? `loaded${detail.pid != null ? ` · pid ${detail.pid}` : ""}`
+                    : "not loaded"}
+                </Chip>
+                <Chip>last exit {detail.lastExit ?? job.last_exit}</Chip>
+              </div>
+
+              {/* recent log */}
+              <div className="flex flex-col gap-1">
+                <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+                  <FileText size={11} /> recent log
+                </span>
+                {detail.recentLog.length > 0 ? (
+                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-[var(--color-bg)] px-2 py-1.5 font-mono text-[10px] text-[var(--color-faint)]">
+                    {detail.recentLog.join("\n")}
+                  </pre>
+                ) : (
+                  <span className="text-[10px] text-[var(--color-muted)]/60">no log output</span>
+                )}
+              </div>
+
+              {/* actions */}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={onRunNow}
+                  className="flex items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1 text-[11px] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] disabled:opacity-50"
+                >
+                  <Play size={11} /> run now
+                </button>
+                {started && (
+                  <span className="text-[10px] text-[var(--color-accent)]">started</span>
+                )}
+
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={onToggleEnabled}
+                  className={`flex items-center gap-1.5 rounded border px-2.5 py-1 text-[11px] disabled:opacity-50 ${
+                    confirmDisable
+                      ? "border-[var(--color-danger)] bg-[var(--color-bg)] text-[var(--color-danger)]"
+                      : "border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)]"
+                  }`}
+                >
+                  <Power size={11} />
+                  {loaded ? (confirmDisable ? "confirm disable" : "disable") : "enable"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={loadDetail}
+                  disabled={detailLoading}
+                  className="ml-auto rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                  title="refresh detail"
+                >
+                  <RefreshCw size={11} className={detailLoading ? "animate-spin" : ""} />
+                </button>
+              </div>
+              {actionError && (
+                <p className="text-[10px] text-[var(--color-danger)]">{actionError}</p>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A small faint pill for flags / status facts. */
+function Chip({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="rounded-full bg-[var(--color-bg)] px-2 py-0.5 font-mono text-[10px] text-[var(--color-text-2)]">
+      {children}
+    </span>
   );
 }
 

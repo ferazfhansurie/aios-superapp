@@ -469,3 +469,241 @@ pub fn list_automations() -> Value {
         "agents": collect_agents(),
     })
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// 4. per-job detail + control (CRUD over real launchd jobs)
+// ════════════════════════════════════════════════════════════════════════
+
+/// The plist path for a label, in the user's LaunchAgents directory.
+fn plist_path_for(label: &str) -> String {
+    format!("{}/Library/LaunchAgents/{label}.plist", home())
+}
+
+/// The effective uid as a string, used in `gui/<uid>` launchctl domains.
+/// Prefers `id -u` (matches the GUI session) and falls back to a sane default.
+fn current_uid() -> String {
+    #[cfg(unix)]
+    {
+        if let Ok(out) = std::process::Command::new("id").arg("-u").output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                    return s;
+                }
+            }
+        }
+    }
+    // Fall back to the UID env var if present, else "501" (common macOS first user).
+    std::env::var("UID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "501".into())
+}
+
+/// Resolves a usable `launchctl` binary path. GUI apps inherit a minimal PATH.
+fn launchctl_bin() -> &'static str {
+    if std::path::Path::new("/bin/launchctl").exists() {
+        "/bin/launchctl"
+    } else {
+        "launchctl"
+    }
+}
+
+/// Reads the `<string>` value that immediately follows `<key>NAME</key>`.
+fn string_for_key(xml: &str, key: &str) -> Option<String> {
+    let key_tag = format!("<key>{key}</key>");
+    let key_pos = xml.find(&key_tag)?;
+    let after = &xml[key_pos + key_tag.len()..];
+    let start = after.find("<string>")?;
+    let body = &after[start + "<string>".len()..];
+    let end = body.find("</string>")?;
+    Some(unescape_xml(body[..end].trim()))
+}
+
+/// Reads the last `n` lines of a file. Best-effort → empty vec on any failure.
+/// Reads the whole file (log files are small/rotated) then tails — no deps.
+fn tail_lines(path: &str, n: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].iter().map(|s| s.to_string()).collect()
+}
+
+/// Queries `launchctl list <label>` for live state: loaded, pid, last exit.
+/// `launchctl list <label>` prints a property dict when the job is loaded, and
+/// fails when it isn't — so a non-success status means "not loaded".
+fn live_state(label: &str) -> (bool, Option<i64>, Option<i64>) {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new(launchctl_bin())
+            .args(["list", label])
+            .output();
+        let Ok(out) = out else { return (false, None, None) };
+        if !out.status.success() {
+            return (false, None, None);
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Lines look like:  "PID" = 1234;  /  "LastExitStatus" = 0;
+        let pid = grep_dict_int(&text, "PID");
+        let last_exit = grep_dict_int(&text, "LastExitStatus");
+        (true, pid, last_exit)
+    }
+    #[cfg(not(unix))]
+    {
+        (false, None, None)
+    }
+}
+
+/// Extracts the integer value for a `"KEY" = NNN;` line from launchctl's
+/// property-list-ish list output.
+fn grep_dict_int(text: &str, key: &str) -> Option<i64> {
+    let needle = format!("\"{key}\"");
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with(&needle) {
+            if let Some(eq) = t.find('=') {
+                let val = t[eq + 1..].trim().trim_end_matches(';').trim();
+                if let Ok(n) = val.parse::<i64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Full detail for one launchd job: command, schedule, flags, log tail, live
+/// state. Always returns a Value (never errors) — missing pieces are null/empty.
+#[tauri::command]
+pub fn automation_detail(label: String) -> Value {
+    let path = plist_path_for(&label);
+    let xml = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let command = parse_program_arguments(&xml);
+    let schedule = parse_schedule(&xml);
+    let run_at_load = bool_for_key(&xml, "RunAtLoad");
+    let keep_alive = bool_for_key(&xml, "KeepAlive") || keepalive_is_dict(&xml);
+    let stdout_path = string_for_key(&xml, "StandardOutPath");
+    let stderr_path = string_for_key(&xml, "StandardErrorPath");
+
+    let (loaded, pid, last_exit) = live_state(&label);
+
+    // Prefer stdout for the recent log; fall back to stderr if stdout is empty.
+    let recent_log: Vec<String> = match &stdout_path {
+        Some(p) if !p.is_empty() => {
+            let t = tail_lines(p, 25);
+            if t.is_empty() {
+                stderr_path.as_deref().map(|s| tail_lines(s, 25)).unwrap_or_default()
+            } else {
+                t
+            }
+        }
+        _ => stderr_path.as_deref().map(|s| tail_lines(s, 25)).unwrap_or_default(),
+    };
+
+    json!({
+        "label": label,
+        "command": command,
+        "plistPath": path,
+        "schedule": schedule,
+        "runAtLoad": run_at_load,
+        "keepAlive": keep_alive,
+        "loaded": loaded,
+        "pid": pid,
+        "lastExit": last_exit,
+        "stdoutPath": stdout_path,
+        "stderrPath": stderr_path,
+        "recentLog": recent_log,
+    })
+}
+
+/// Validates a label is one of ours before mutating — defence in depth so the
+/// control commands can never be aimed at an arbitrary system job.
+fn ensure_aios(label: &str) -> Result<(), String> {
+    if is_aios_label(label) {
+        Ok(())
+    } else {
+        Err(format!("refusing to act on non-aios label: {label}"))
+    }
+}
+
+/// Runs launchctl with the given args, returning a readable error on failure.
+#[cfg(unix)]
+fn launchctl(args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new(launchctl_bin())
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to spawn launchctl: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let msg = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        format!("exit {}", out.status.code().unwrap_or(-1))
+    };
+    Err(msg)
+}
+
+/// `launchctl start <label>` — kick a run right now.
+#[tauri::command]
+pub fn run_automation(label: String) -> Result<(), String> {
+    ensure_aios(&label)?;
+    #[cfg(unix)]
+    {
+        launchctl(&["start", &label]).map_err(|e| format!("could not start {label}: {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        Err("unsupported on this platform".into())
+    }
+}
+
+/// Enable (bootstrap/load) or disable (bootout/unload) a job. Tries the modern
+/// `bootstrap`/`bootout` API first, falling back to legacy `load`/`unload`.
+#[tauri::command]
+pub fn set_automation_enabled(label: String, enabled: bool) -> Result<(), String> {
+    ensure_aios(&label)?;
+    let path = plist_path_for(&label);
+    if !std::path::Path::new(&path).exists() {
+        return Err(format!("plist not found: {path}"));
+    }
+
+    #[cfg(unix)]
+    {
+        let uid = current_uid();
+        if enabled {
+            let domain = format!("gui/{uid}");
+            // Modern: bootstrap the plist into the GUI domain.
+            match launchctl(&["bootstrap", &domain, &path]) {
+                Ok(()) => Ok(()),
+                Err(modern_err) => {
+                    // Legacy fallback.
+                    launchctl(&["load", &path]).map_err(|legacy_err| {
+                        format!("could not enable {label}: {modern_err} (fallback: {legacy_err})")
+                    })
+                }
+            }
+        } else {
+            let target = format!("gui/{uid}/{label}");
+            // Modern: bootout the service from the GUI domain.
+            match launchctl(&["bootout", &target]) {
+                Ok(()) => Ok(()),
+                Err(modern_err) => {
+                    // Legacy fallback.
+                    launchctl(&["unload", &path]).map_err(|legacy_err| {
+                        format!("could not disable {label}: {modern_err} (fallback: {legacy_err})")
+                    })
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = enabled;
+        Err("unsupported on this platform".into())
+    }
+}

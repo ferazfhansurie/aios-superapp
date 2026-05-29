@@ -42,3 +42,34 @@ export interface Bridges {
 export async function listBridges(): Promise<Bridges> {
   return invoke<Bridges>("list_bridges");
 }
+
+/**
+ * One message flowing through a bridge — a row in the recent-activity feed.
+ * Sourced from the bridge's outbound log (and an inbound/conversation log when
+ * one exists), best-effort and tolerant of malformed lines.
+ */
+export interface BridgeMessage {
+  /** Local timestamp, "YYYY-MM-DD HH:MM". */
+  ts: string;
+  /** Time since the message, e.g. "4m" — null if unparseable. */
+  tsAgo: string | null;
+  /** "out" = sent by AIOS, "in" = received. */
+  direction: "out" | "in";
+  /** Counterparty — a name when known, else a phone/id. */
+  peer: string;
+  /** Message text, trimmed to ~280 chars (whitespace collapsed). */
+  text: string;
+}
+
+/** Recent messages for a bridge, newest-first. */
+export interface BridgeActivity {
+  messages: BridgeMessage[];
+}
+
+/** Fetches the recent message feed for a bridge (newest-first, capped). */
+export async function bridgeActivity(
+  id: string,
+  limit: number,
+): Promise<BridgeActivity> {
+  return invoke<BridgeActivity>("bridge_activity", { id, limit });
+}

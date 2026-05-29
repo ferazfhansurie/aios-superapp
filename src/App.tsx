@@ -195,7 +195,7 @@ function App() {
           {spawnOpen && (
             <>
               <div className="fixed inset-0 z-40" onClick={() => setSpawnOpen(false)} />
-              <div className="modal-in glass absolute right-9 top-9 z-50 w-44 overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/95 p-1 shadow-2xl">
+              <div className="modal-in absolute right-9 top-9 z-50 w-44 overflow-hidden rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] p-1 shadow-2xl">
                 {SPAWN.map((s) => (
                   <button
                     key={s.label}
