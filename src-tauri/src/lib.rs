@@ -5,9 +5,12 @@ mod automations;
 mod bridges;
 mod browser;
 mod chat;
+mod crm;
+mod inbox;
 mod files;
 mod memory;
 mod monitor;
+mod motion;
 mod plugins;
 mod voice;
 mod oracles;
@@ -62,6 +65,16 @@ pub fn run() {
             automations::set_automation_enabled,
             bridges::list_bridges,
             bridges::bridge_activity,
+            crm::crm_load,
+            crm::crm_save_contact,
+            crm::crm_delete_contact,
+            inbox::list_customers,
+            inbox::customer_thread,
+            inbox::send_message,
+            motion::motion_models,
+            motion::motion_generate,
+            motion::motion_status,
+            motion::motion_credits,
             monitor::monitor_start,
             monitor::monitor_stop,
             monitor::list_monitors,

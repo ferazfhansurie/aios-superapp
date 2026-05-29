@@ -161,9 +161,17 @@ function baseName(p: string): string {
 
 // ── component ────────────────────────────────────────────────────────────────
 
-export function ChatPane({ cwd, paneKey }: { cwd?: string; paneKey?: string }) {
+export function ChatPane({
+  cwd,
+  paneKey,
+  seed,
+}: {
+  cwd?: string;
+  paneKey?: string;
+  seed?: string;
+}) {
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState(seed ?? "");
   const [streaming, setStreaming] = useState(false);
   const [started, setStarted] = useState(false);
 

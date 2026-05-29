@@ -11,13 +11,14 @@ import {
   FileText,
   Folder,
   Home,
+  Maximize2,
   RefreshCw,
   Search,
 } from "lucide-react";
 
 import { fileSrc, homeDir, readDir, readFilePreview, type DirEntry, type FilePreview } from "../lib/fs";
 
-export function FilesPane() {
+export function FilesPane({ onOpenFile }: { onOpenFile?: (path: string, name: string) => void }) {
   const [cwd, setCwd] = useState("");
   const [entries, setEntries] = useState<DirEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -164,13 +165,24 @@ export function FilesPane() {
                 <span className="truncate font-mono text-[11px] text-[var(--color-text-2)]">
                   {preview?.name ?? selected.split("/").pop()}
                 </span>
-                <button
-                  onClick={() => openPath(selected).catch(() => {})}
-                  className="flex items-center gap-1 rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-                  title="Open externally"
-                >
-                  <ExternalLink size={12} />
-                </button>
+                <div className="flex items-center gap-0.5">
+                  {onOpenFile && (
+                    <button
+                      onClick={() => onOpenFile(selected, preview?.name ?? selected.split("/").pop() ?? "file")}
+                      className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                      title="Open in its own pane"
+                    >
+                      <Maximize2 size={12} />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => openPath(selected).catch(() => {})}
+                    className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                    title="Open externally"
+                  >
+                    <ExternalLink size={12} />
+                  </button>
+                </div>
               </div>
               <div className="min-h-0 flex-1 overflow-auto">
                 {previewLoading ? (

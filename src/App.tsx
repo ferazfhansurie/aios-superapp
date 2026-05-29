@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
+  ArrowUp,
   Blocks,
   Bot,
   Brain,
@@ -11,7 +12,7 @@ import {
   Folder,
   Globe,
   HelpCircle,
-  Play,
+  MessageCircle,
   MessageSquare,
   PanelLeft,
   Power,
@@ -21,6 +22,7 @@ import {
   Settings as SettingsIcon,
   Sparkles,
   TerminalSquare,
+  Wand2,
   X,
 } from "lucide-react";
 
@@ -32,8 +34,11 @@ import { BridgesPane } from "./components/BridgesPane";
 import { BrowserPane } from "./components/BrowserPane";
 import { ChatPane } from "./components/ChatPane";
 import { CommandPalette, type Command } from "./components/CommandPalette";
+import { CrmPane } from "./components/CrmPane";
 import { FilesPane } from "./components/FilesPane";
+import { FileViewerPane } from "./components/FileViewerPane";
 import { MemoryPane } from "./components/MemoryPane";
+import { MotionPane } from "./components/MotionPane";
 import { OracleRoster } from "./components/OracleRoster";
 import { PluginsPane } from "./components/PluginsPane";
 import { Settings } from "./components/Settings";
@@ -56,7 +61,10 @@ type PaneContent =
   | { type: "automations" }
   | { type: "bridges" }
   | { type: "plugins" }
-  | { type: "chat" };
+  | { type: "chat"; seed?: string }
+  | { type: "customers" }
+  | { type: "motion" }
+  | { type: "file"; path: string; name: string };
 interface Pane {
   key: string;
   label: string;
@@ -76,6 +84,8 @@ const SPAWN: { kind: PaneContent; icon: typeof Folder; label: string }[] = [
   { kind: { type: "browser" }, icon: Globe, label: "browser" },
   { kind: { type: "memory" }, icon: Brain, label: "memory" },
   { kind: { type: "automations" }, icon: Clock, label: "automations" },
+  { kind: { type: "customers" }, icon: MessageCircle, label: "customers" },
+  { kind: { type: "motion" }, icon: Wand2, label: "studio" },
   { kind: { type: "bridges" }, icon: Radio, label: "channels" },
   { kind: { type: "plugins" }, icon: Blocks, label: "plugins" },
 ];
@@ -333,6 +343,7 @@ function App() {
                   onClose={() => closePane(pane.key)}
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
+                  onOpenFile={(path, name) => spawn({ type: "file", path, name }, name)}
                 />
               ))}
             </div>
@@ -410,6 +421,9 @@ const DOT: Record<string, string> = {
   bridges: "status-dot--cold",
   plugins: "status-dot--cold",
   chat: "status-dot--active",
+  customers: "status-dot--active",
+  motion: "status-dot--cold",
+  file: "status-dot--cold",
 };
 
 function PaneCard({
@@ -418,12 +432,14 @@ function PaneCard({
   onClose,
   onFocus,
   onAnnotate,
+  onOpenFile,
 }: {
   pane: Pane;
   active: boolean;
   onClose: () => void;
   onFocus: () => void;
   onAnnotate: (text: string) => void;
+  onOpenFile: (path: string, name: string) => void;
 }) {
   const t = pane.kind.type;
   const label =
@@ -483,7 +499,7 @@ function PaneCard({
         {isTerminal(pane.kind) ? (
           <TerminalPane kind={pane.kind} paneKey={pane.key} />
         ) : pane.kind.type === "files" ? (
-          <FilesPane />
+          <FilesPane onOpenFile={onOpenFile} />
         ) : pane.kind.type === "browser" ? (
           <BrowserPane label={pane.key} active={active} onAnnotate={onAnnotate} />
         ) : pane.kind.type === "memory" ? (
@@ -494,8 +510,14 @@ function PaneCard({
           <BridgesPane />
         ) : pane.kind.type === "plugins" ? (
           <PluginsPane />
+        ) : pane.kind.type === "customers" ? (
+          <CrmPane />
+        ) : pane.kind.type === "motion" ? (
+          <MotionPane />
+        ) : pane.kind.type === "file" ? (
+          <FileViewerPane path={pane.kind.path} />
         ) : (
-          <ChatPane paneKey={pane.key} />
+          <ChatPane paneKey={pane.key} seed={pane.kind.type === "chat" ? pane.kind.seed : undefined} />
         )}
       </div>
     </div>
@@ -527,63 +549,100 @@ function EmptyState({
   onHelp: () => void;
   onQuit: () => void;
 }) {
-  const [enginesOpen, setEnginesOpen] = useState(false);
-  const start = ENGINES[0];
-  const others = ENGINES.slice(1);
+  const [text, setText] = useState("");
+  const [engineId, setEngineId] = useState("aios");
+  const [engineMenu, setEngineMenu] = useState(false);
+  const [hi, setHi] = useState(0);
+  // cycle the headline through variations
+  useEffect(() => {
+    const t = setInterval(() => setHi((i) => (i + 1) % HEADLINES.length), 4000);
+    return () => clearInterval(t);
+  }, []);
+  const engine = ENGINES.find((e) => e.id === engineId) ?? ENGINES[0];
+
+  const launch = () => {
+    if (engine.id === "aios") {
+      onSpawn({ type: "chat", seed: text.trim() || undefined }, "chat");
+    } else {
+      engine.spawn(onSpawn);
+    }
+  };
+
   return (
     <div className="relative flex h-full flex-col items-center justify-center overflow-hidden">
-      {/* calm, chat-like backdrop — restrained accent per the design system */}
       <div
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            "radial-gradient(50% 40% at 50% 42%, color-mix(in srgb, var(--color-accent) 7%, transparent), transparent 72%)",
+            "radial-gradient(50% 40% at 50% 40%, color-mix(in srgb, var(--color-accent) 6%, transparent), transparent 72%)",
         }}
       />
 
-      <div className="relative flex w-full max-w-xl flex-col items-center gap-8 px-6">
-        <h1 className="hero-title text-center text-[var(--color-text)]">what should we work on?</h1>
+      <div className="relative flex w-full max-w-2xl flex-col items-center gap-7 px-6">
+        <h1 className="hero-title text-center text-[var(--color-text)] transition-opacity duration-500">
+          {HEADLINES[hi]}
+        </h1>
 
-        {/* single START + a sub-menu for the other engines */}
-        <div className="flex items-center gap-2.5">
-          <button
-            onClick={() => start.spawn(onSpawn)}
-            className="flex items-center gap-2.5 rounded-[var(--aios-radius-xl)] border border-[var(--color-accent)]/60 bg-[var(--color-accent)]/12 px-8 py-3.5 text-[15px] font-semibold text-[var(--color-accent)] transition-all hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)] hover:shadow-[var(--aios-shadow-pop)]"
-          >
-            <Play size={15} fill="currentColor" /> start
-          </button>
-          <div className="relative">
+        {/* chat-composer-style launcher */}
+        <div className="focus-accent w-full rounded-[var(--aios-radius-xl)] border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-4 pb-3 pt-3.5">
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                launch();
+              }
+            }}
+            rows={1}
+            placeholder="do anything"
+            className="block max-h-40 min-h-[28px] w-full resize-none bg-transparent text-[15px] text-[var(--color-text)] outline-none placeholder:text-[var(--color-faint)]"
+          />
+          <div className="mt-2 flex items-center justify-between">
+            {/* engine pill */}
+            <div className="relative">
+              <button
+                onClick={() => setEngineMenu((v) => !v)}
+                className="flex items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border)] px-2.5 py-1 text-[12px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)]"
+              >
+                <engine.icon size={13} className="text-[var(--color-accent)]" />
+                {engine.label}
+                <ChevronDown size={12} className="text-[var(--color-muted)]" />
+              </button>
+              {engineMenu && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setEngineMenu(false)} />
+                  <div className="surface-pop absolute bottom-full left-0 z-50 mb-1.5 w-48 p-1">
+                    {ENGINES.map((e) => (
+                      <button
+                        key={e.id}
+                        onClick={() => {
+                          setEngineId(e.id);
+                          setEngineMenu(false);
+                        }}
+                        className="flex w-full items-center gap-2 rounded-[var(--aios-radius-sm)] px-2 py-1.5 text-left text-[12px] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                      >
+                        <e.icon size={14} className="shrink-0 text-[var(--color-muted)]" />
+                        <span className="flex-1">{e.label}</span>
+                        <span className="text-[10px] text-[var(--color-faint)]">{e.sub}</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+            {/* send */}
             <button
-              onClick={() => setEnginesOpen((v) => !v)}
-              className="flex items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border)] px-3 py-2 text-[12px] text-[var(--color-muted)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+              onClick={launch}
+              title="start (↵)"
+              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
             >
-              other engines <ChevronDown size={13} />
+              <ArrowUp size={15} />
             </button>
-            {enginesOpen && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setEnginesOpen(false)} />
-                <div className="surface-pop absolute left-0 top-full z-50 mt-1.5 w-48 p-1">
-                  {others.map((e) => (
-                    <button
-                      key={e.id}
-                      onClick={() => {
-                        e.spawn(onSpawn);
-                        setEnginesOpen(false);
-                      }}
-                      className="flex w-full items-center gap-2 rounded-[var(--aios-radius-sm)] px-2 py-1.5 text-left text-[12px] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-                    >
-                      <e.icon size={14} className="shrink-0 text-[var(--color-muted)]" />
-                      <span className="flex-1">{e.label}</span>
-                      <span className="text-[10px] text-[var(--color-faint)]">{e.sub}</span>
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
           </div>
         </div>
 
-        <p className="helper-line">aios chat · or open claude / codex / opencode</p>
+        <p className="helper-line">{engine.sub} · ↵ to start</p>
 
         <div className="flex items-center gap-2 text-[12px]">
           <IdleAction icon={<RotateCcw size={13} />} label="resume" onClick={() => onSpawn({ type: "shell", cmd: "claude --continue" }, "resume")} />
@@ -592,14 +651,18 @@ function EmptyState({
           <span className="text-[var(--color-faint)]">·</span>
           <IdleAction icon={<Power size={13} />} label="quit" onClick={onQuit} />
         </div>
-
-        <p className="font-mono text-[10px] tracking-wide text-[var(--color-faint)]">
-          ⌘T terminal · ⌘K palette · ⌘B sidebar · ⌘⌘ appshot
-        </p>
       </div>
     </div>
   );
 }
+
+const HEADLINES = [
+  "what should we work on?",
+  "what are we building?",
+  "what's the move?",
+  "what do you need done?",
+  "where do we start?",
+];
 
 function IdleAction({
   icon,
