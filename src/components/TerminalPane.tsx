@@ -3,7 +3,7 @@
  * per-session Channel. Mounts once, spawns its session, and cleans up (kills
  * the session) on unmount.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Channel } from "@tauri-apps/api/core";
 import { Terminal as Xterm } from "@xterm/xterm";
@@ -48,6 +48,8 @@ export type PaneKind =
 
 export function TerminalPane({ kind }: { kind: PaneKind }) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const sessionIdRef = useRef<number | null>(null);
+  const [dragOver, setDragOver] = useState(false);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -111,6 +113,7 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
         return;
       }
 
+      sessionIdRef.current = sessionId;
       inputDisposer = term.onData((d) => {
         if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
       });
@@ -138,5 +141,40 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return <div ref={hostRef} className="h-full min-h-0 w-full" />;
+  // Drop a file/folder (dragged from the Files pane) → insert its path into
+  // this session's PTY, shell-quoted, with a trailing space.
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const path =
+      e.dataTransfer.getData("application/x-aios-path") || e.dataTransfer.getData("text/plain");
+    const id = sessionIdRef.current;
+    if (!path || id == null) return;
+    const quoted = /[\s'"\\]/.test(path) ? `'${path.replace(/'/g, "'\\''")}' ` : `${path} `;
+    ptyWrite(id, quoted).catch(() => {});
+  };
+
+  return (
+    <div
+      className="relative h-full min-h-0 w-full"
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+        if (!dragOver) setDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setDragOver(false);
+      }}
+      onDrop={onDrop}
+    >
+      <div ref={hostRef} className="h-full min-h-0 w-full" />
+      {dragOver && (
+        <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center border-2 border-dashed border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10">
+          <span className="rounded-md bg-[var(--color-panel)]/90 px-3 py-1.5 text-[12px] text-[var(--color-text)]">
+            drop to insert path
+          </span>
+        </div>
+      )}
+    </div>
+  );
 }

@@ -10,6 +10,8 @@ import {
   Check,
   ChevronRight,
   Crown,
+  Eye,
+  EyeOff,
   Pencil,
   Plus,
   RefreshCw,
@@ -33,6 +35,15 @@ interface Props {
   onAttachTmux: (socket: string, session: string) => void;
 }
 
+const HIDDEN_KEY = "aios.hiddenOracles";
+const loadHidden = (): Set<string> => {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(HIDDEN_KEY) || "[]"));
+  } catch {
+    return new Set();
+  }
+};
+
 export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
@@ -40,6 +51,18 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [showAll, setShowAll] = useState(false);
+  const [showHidden, setShowHidden] = useState(false);
+  const [hidden, setHidden] = useState<Set<string>>(loadHidden);
+
+  const toggleHidden = useCallback((identity: string, hide: boolean) => {
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (hide) next.add(identity);
+      else next.delete(identity);
+      localStorage.setItem(HIDDEN_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -62,6 +85,9 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
 
   // Non-oracle sessions only (oracles already live in the roster above).
   const otherSessions = sessions.filter((s) => !s.is_oracle);
+  // Master is never hideable; everything else honors the hidden set.
+  const visibleOracles = oracles.filter((o) => o.is_master || !hidden.has(o.identity));
+  const hiddenOracles = oracles.filter((o) => !o.is_master && hidden.has(o.identity));
 
   return (
     <div className="flex flex-col gap-3">
@@ -107,11 +133,14 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
         {error && <p className="text-[11px] leading-snug text-[var(--color-danger)]">{error}</p>}
 
         <div className="flex flex-col gap-1">
-          {oracles.map((o) => (
+          {visibleOracles.map((o) => (
             <OracleRow
               key={o.session}
               oracle={o}
-              onAttach={() => onAttachOracle(o.identity)}
+              onAttach={() =>
+                o.is_master ? onAttachTmux(o.socket, o.session) : onAttachOracle(o.identity)
+              }
+              onHide={() => toggleHidden(o.identity, true)}
               onRename={async (to) => {
                 try {
                   await renameOracle(o.identity, to);
@@ -131,6 +160,37 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
             />
           ))}
         </div>
+
+        {hiddenOracles.length > 0 && (
+          <div className="flex flex-col gap-1">
+            <button
+              onClick={() => setShowHidden((v) => !v)}
+              className="flex items-center gap-1 text-[10px] font-medium uppercase tracking-widest text-[var(--color-faint)] transition-colors hover:text-[var(--color-muted)]"
+            >
+              <ChevronRight size={11} className={`transition-transform ${showHidden ? "rotate-90" : ""}`} />
+              hidden ({hiddenOracles.length})
+            </button>
+            {showHidden &&
+              hiddenOracles.map((o) => (
+                <div
+                  key={o.session}
+                  className="group flex items-center gap-2 rounded-md px-2 py-1.5 opacity-60 transition-opacity hover:opacity-100"
+                >
+                  <span className="status-dot status-dot--cold shrink-0" />
+                  <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--color-muted)]">
+                    {o.display_name}
+                  </span>
+                  <button
+                    onClick={() => toggleHidden(o.identity, false)}
+                    className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                    title="unhide"
+                  >
+                    <Eye size={12} />
+                  </button>
+                </div>
+              ))}
+          </div>
+        )}
       </div>
 
       {/* ---- all tmux sessions ---- */}
@@ -183,11 +243,13 @@ function OracleRow({
   onAttach,
   onRename,
   onDelete,
+  onHide,
 }: {
   oracle: OracleInfo;
   onAttach: () => void;
   onRename: (to: string) => void;
   onDelete: () => void;
+  onHide: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
@@ -266,6 +328,13 @@ function OracleRow({
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
         {!oracle.is_master && (
           <>
+            <button
+              onClick={onHide}
+              className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)]"
+              title="hide"
+            >
+              <EyeOff size={11} />
+            </button>
             <button
               onClick={() => {
                 setDraft(oracle.identity);

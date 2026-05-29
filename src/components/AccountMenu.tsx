@@ -43,6 +43,15 @@ export function AccountMenu({ onOpenSettings }: { onOpenSettings?: () => void })
   const [usage, setUsage] = useState<Usage | null>(null);
   const [, force] = useState(0); // re-render so countdowns tick
   const ref = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  // Fixed-position anchor so the popup escapes the sidebar panel's overflow
+  // clipping (was getting cut off / overlapped by the terminal pane).
+  const [pos, setPos] = useState<{ left: number; bottom: number }>({ left: 8, bottom: 56 });
+  useEffect(() => {
+    if (!open) return;
+    const b = btnRef.current?.getBoundingClientRect();
+    if (b) setPos({ left: b.left, bottom: window.innerHeight - b.top + 8 });
+  }, [open]);
 
   const refresh = useCallback(async () => {
     try {
@@ -88,7 +97,10 @@ export function AccountMenu({ onOpenSettings }: { onOpenSettings?: () => void })
   return (
     <div ref={ref} className="relative">
       {open && (
-        <div className="modal-in glass absolute bottom-11 left-0 w-64 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/85 p-1.5 shadow-2xl">
+        <div
+          style={{ left: pos.left, bottom: pos.bottom }}
+          className="modal-in glass fixed z-[60] w-72 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/90 p-1.5 shadow-2xl"
+        >
           <div className="flex items-center gap-2 px-2 py-2">
             <img src="/mascot.png" alt="" className="h-6 w-6 rounded-full object-cover" />
             <div className="min-w-0">
@@ -164,6 +176,7 @@ export function AccountMenu({ onOpenSettings }: { onOpenSettings?: () => void })
       )}
 
       <button
+        ref={btnRef}
         onClick={() => setOpen((v) => !v)}
         className="flex w-full items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-border-strong)]"
       >

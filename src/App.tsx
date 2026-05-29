@@ -31,7 +31,8 @@ interface Pane {
   kind: PaneKind;
   label: string;
 }
-type DockKind = "files" | "browser" | "terminal" | "memory";
+type DockContentKind = "files" | "browser" | "terminal" | "memory";
+type DockKind = DockContentKind | "launcher";
 interface DockTab {
   key: string;
   kind: DockKind;
@@ -92,6 +93,10 @@ function App() {
       if (next.length === 0) setDockOpen(false);
       return next;
     });
+  }, []);
+  // The `+` opens a picker tab; choosing a tool converts that tab in place.
+  const convertDockTab = useCallback((key: string, kind: DockKind) => {
+    setDockTabs((t) => t.map((x) => (x.key === key ? { ...x, kind } : x)));
   }, []);
 
   const fireAppshot = useCallback(async () => {
@@ -192,6 +197,7 @@ function App() {
       onSelect={setActiveDock}
       onOpen={openDock}
       onCloseTab={closeDockTab}
+      onConvert={convertDockTab}
       onCloseDock={() => setDockOpen(false)}
       pos={dockPos}
       onTogglePos={() => setDockPos((p) => (p === "bottom" ? "right" : "bottom"))}
@@ -364,12 +370,33 @@ function PaneCard({ pane, onClose }: { pane: Pane; onClose: () => void }) {
   );
 }
 
-const DOCK_LAUNCH: { kind: DockKind; icon: typeof Folder; title: string; sub: string }[] = [
+const DOCK_LAUNCH: { kind: DockContentKind; icon: typeof Folder; title: string; sub: string }[] = [
   { kind: "files", icon: Folder, title: "Files", sub: "Browse the filesystem" },
   { kind: "browser", icon: Globe, title: "Browser", sub: "Open a website" },
   { kind: "memory", icon: Brain, title: "Memory", sub: "Explore the memory vault" },
   { kind: "terminal", icon: TerminalSquare, title: "Terminal", sub: "Start an interactive shell" },
 ];
+
+/** The picker grid — shown for empty dock and for `launcher` (new-tab) tabs. */
+function DockPicker({ onPick }: { onPick: (kind: DockContentKind) => void }) {
+  return (
+    <div className="grid h-full place-items-center p-4">
+      <div className="grid w-full max-w-2xl grid-cols-4 gap-2">
+        {DOCK_LAUNCH.map((l) => (
+          <button
+            key={l.kind}
+            onClick={() => onPick(l.kind)}
+            className="flex flex-col items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-4 py-6 transition-colors hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
+          >
+            <l.icon size={22} className="text-[var(--color-muted)]" />
+            <span className="text-[13px] font-medium text-[var(--color-text)]">{l.title}</span>
+            <span className="text-[10px] text-[var(--color-muted)]">{l.sub}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function Dock({
   tabs,
@@ -377,6 +404,7 @@ function Dock({
   onSelect,
   onOpen,
   onCloseTab,
+  onConvert,
   onCloseDock,
   pos,
   onTogglePos,
@@ -386,6 +414,7 @@ function Dock({
   onSelect: (key: string) => void;
   onOpen: (kind: DockKind) => void;
   onCloseTab: (key: string) => void;
+  onConvert: (key: string, kind: DockKind) => void;
   onCloseDock: () => void;
   pos: DockPos;
   onTogglePos: () => void;
@@ -404,22 +433,23 @@ function Dock({
                 : "text-[var(--color-muted)] hover:text-[var(--color-text)]"
             }`}
           >
-            <span className="capitalize">{t.kind}</span>
+            <span className="capitalize">{t.kind === "launcher" ? "new" : t.kind}</span>
             <button
               onClick={(e) => {
                 e.stopPropagation();
                 onCloseTab(t.key);
               }}
-              className="opacity-0 transition-opacity group-hover:opacity-100"
+              className="rounded p-0.5 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)]"
+              title="Close tab"
             >
               <X size={11} />
             </button>
           </div>
         ))}
         <button
-          onClick={() => onOpen("terminal")}
+          onClick={() => onOpen("launcher")}
           className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-          title="New terminal in dock"
+          title="New tab"
         >
           <Plus size={13} />
         </button>
@@ -439,21 +469,7 @@ function Dock({
       {/* content */}
       <div className="relative min-h-0 flex-1">
         {tabs.length === 0 ? (
-          <div className="grid h-full place-items-center p-4">
-            <div className="grid w-full max-w-2xl grid-cols-4 gap-2">
-              {DOCK_LAUNCH.map((l) => (
-                <button
-                  key={l.kind}
-                  onClick={() => onOpen(l.kind)}
-                  className="flex flex-col items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-4 py-6 transition-colors hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
-                >
-                  <l.icon size={22} className="text-[var(--color-muted)]" />
-                  <span className="text-[13px] font-medium text-[var(--color-text)]">{l.title}</span>
-                  <span className="text-[10px] text-[var(--color-muted)]">{l.sub}</span>
-                </button>
-              ))}
-            </div>
-          </div>
+          <DockPicker onPick={(kind) => onOpen(kind)} />
         ) : (
           tabs.map((t) => (
             <div
@@ -461,8 +477,11 @@ function Dock({
               className="absolute inset-0"
               style={{ display: active === t.key ? "block" : "none" }}
             >
+              {t.kind === "launcher" && (
+                <DockPicker onPick={(kind) => onConvert(t.key, kind)} />
+              )}
               {t.kind === "files" && <FilesPane />}
-              {t.kind === "browser" && <BrowserPane />}
+              {t.kind === "browser" && <BrowserPane active={active === t.key} />}
               {t.kind === "memory" && <MemoryPane />}
               {t.kind === "terminal" && <TerminalPane kind={{ type: "shell" }} />}
             </div>

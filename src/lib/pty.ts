@@ -8,6 +8,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 export interface OracleInfo {
   identity: string;
   session: string;
+  socket: string;
   display_name: string;
   attached: boolean;
   is_master: boolean;

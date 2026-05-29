@@ -10,10 +10,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The permanent root oracle. Always present in the roster, always pinned top,
-/// never deletable. If its tmux session isn't running yet, the roster still
-/// shows it (running=false) so it can be spun up on demand.
-const MASTER_IDENTITY: &str = "firaz";
+/// The permanent MASTER (root) session — the mothership running at the root
+/// home dir `/Users/firazfhansurie`, on its own socket. Always pinned top,
+/// crowned, undeletable. This is NOT an `aios-*` bridge oracle.
+const MASTER_SOCKET: &str = "aios";
+const MASTER_SESSION: &str = "aios";
+const MASTER_LABEL: &str = "root";
 
 /// The tmux socket the bridge runs oracles on.
 const ORACLE_SOCKET: &str = "adletic";
@@ -24,15 +26,17 @@ const KNOWN_SOCKETS: &[&str] = &["adletic", "aios", "default"];
 /// One oracle in the roster, surfaced to the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct OracleInfo {
-    /// Identity slug, e.g. `firaz` (from session `aios-firaz`).
+    /// Identity slug, e.g. `firaz` (from session `aios-firaz`); `root` for master.
     pub identity: String,
-    /// Full tmux session name, e.g. `aios-firaz`.
+    /// Full tmux session name, e.g. `aios-firaz` (or `aios` for master).
     pub session: String,
+    /// The tmux socket this session lives on (`adletic`, or `aios` for master).
+    pub socket: String,
     /// Human label from instances.json, falling back to the identity.
     pub display_name: String,
     /// Whether a client is currently attached to this session.
     pub attached: bool,
-    /// Whether this is the permanent, undeletable master oracle.
+    /// Whether this is the permanent, undeletable master (root) session.
     pub is_master: bool,
     /// Whether the underlying tmux session actually exists right now.
     pub running: bool,
@@ -108,6 +112,31 @@ fn tmux_oracle(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Checks the master session on its socket: `Some(attached)` if it exists,
+/// `None` if not running.
+fn master_state() -> Option<bool> {
+    let out = std::process::Command::new(tmux_bin())
+        .args([
+            "-L",
+            MASTER_SOCKET,
+            "list-sessions",
+            "-F",
+            "#{session_name}|#{session_attached}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut p = line.splitn(2, '|');
+        if p.next().map(|s| s.trim()) == Some(MASTER_SESSION) {
+            return Some(p.next().unwrap_or("0").trim() != "0");
+        }
+    }
+    None
+}
+
 /// Resolves an `aios-*` session's display name from the instance registry.
 fn display_name_for(identity: &str, session: &str, instances: &[Instance]) -> String {
     instances
@@ -144,7 +173,8 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
             let identity = session.trim_start_matches("aios-").to_string();
             let display_name = display_name_for(&identity, &session, &instances);
             oracles.push(OracleInfo {
-                is_master: identity == MASTER_IDENTITY,
+                socket: ORACLE_SOCKET.to_string(),
+                is_master: false,
                 running: true,
                 identity,
                 session,
@@ -153,21 +183,17 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
             });
         }
 
-        // Guarantee the master is present even when its session isn't running.
-        if !oracles.iter().any(|o| o.is_master) {
-            oracles.push(OracleInfo {
-                identity: MASTER_IDENTITY.to_string(),
-                session: format!("aios-{MASTER_IDENTITY}"),
-                display_name: display_name_for(
-                    MASTER_IDENTITY,
-                    &format!("aios-{MASTER_IDENTITY}"),
-                    &instances,
-                ),
-                attached: false,
-                is_master: true,
-                running: false,
-            });
-        }
+        // Prepend the MASTER (root) session from its own socket — always present.
+        let master_attached = master_state();
+        oracles.push(OracleInfo {
+            identity: MASTER_LABEL.to_string(),
+            session: MASTER_SESSION.to_string(),
+            socket: MASTER_SOCKET.to_string(),
+            display_name: MASTER_LABEL.to_string(),
+            attached: master_attached.unwrap_or(false),
+            is_master: true,
+            running: master_attached.is_some(),
+        });
 
         // Master first, then running-attached, then alpha.
         oracles.sort_by(|a, b| {
@@ -258,9 +284,6 @@ pub fn create_oracle(identity: String, command: Option<String>) -> Result<String
 #[tauri::command]
 pub fn rename_oracle(from: String, to: String) -> Result<String, String> {
     let from_id = sanitize_identity(&from);
-    if from_id == MASTER_IDENTITY {
-        return Err("the master oracle can't be renamed".into());
-    }
     let to_id = sanitize_identity(&to);
     if to_id.is_empty() {
         return Err("new name must contain letters or digits".into());
@@ -292,11 +315,20 @@ pub fn appshot(identity: Option<String>) -> Result<String, String> {
     if !status.success() {
         return Err("screencapture returned non-zero".into());
     }
-    let id = sanitize_identity(&identity.unwrap_or_else(|| MASTER_IDENTITY.into()));
-    let session = format!("aios-{id}");
-    // Best-effort route into the oracle; the file is saved regardless. `-l`
-    // sends the path literally (no key interpretation), no Enter.
-    let _ = tmux_oracle(&["send-keys", "-t", &session, "-l", &format!("{path} ")]);
+    // Route into the chosen oracle, or the master (root) session by default.
+    // `-l` sends the path literally (no key interpretation), no Enter.
+    let keys = format!("{path} ");
+    match identity.map(|i| sanitize_identity(&i)).filter(|i| !i.is_empty()) {
+        Some(id) => {
+            let session = format!("aios-{id}");
+            let _ = tmux_oracle(&["send-keys", "-t", &session, "-l", &keys]);
+        }
+        None => {
+            let _ = std::process::Command::new(tmux_bin())
+                .args(["-L", MASTER_SOCKET, "send-keys", "-t", MASTER_SESSION, "-l", &keys])
+                .status();
+        }
+    }
     Ok(path)
 }
 
@@ -304,9 +336,6 @@ pub fn appshot(identity: Option<String>) -> Result<String, String> {
 #[tauri::command]
 pub fn delete_oracle(identity: String) -> Result<(), String> {
     let id = sanitize_identity(&identity);
-    if id == MASTER_IDENTITY {
-        return Err("the master oracle can't be deleted".into());
-    }
     if id.is_empty() {
         return Err("invalid identity".into());
     }

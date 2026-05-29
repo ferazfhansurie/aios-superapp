@@ -1,6 +1,7 @@
 //! AIOS — desktop cockpit. Lean Tauri shell: multi-pane PTY terminals + the
 //! oracle roster (attach to bridge-managed tmux sessions). No IDE cruft.
 
+mod browser;
 mod files;
 mod memory;
 mod oracles;
@@ -37,6 +38,14 @@ pub fn run() {
             usage::usage_stats,
             memory::memory_graph,
             memory::memory_file,
+            browser::browser_show,
+            browser::browser_set_bounds,
+            browser::browser_navigate,
+            browser::browser_back,
+            browser::browser_forward,
+            browser::browser_reload,
+            browser::browser_hide,
+            browser::browser_close,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
