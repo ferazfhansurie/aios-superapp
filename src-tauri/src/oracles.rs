@@ -219,25 +219,8 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
             });
         }
 
-        // Prepend the MASTER (root) session from its own socket — always present.
-        let master_attached = master_state();
-        oracles.push(OracleInfo {
-            identity: MASTER_LABEL.to_string(),
-            session: master_session(),
-            socket: master_socket(),
-            display_name: MASTER_LABEL.to_string(),
-            attached: master_attached.unwrap_or(false),
-            is_master: true,
-            running: master_attached.is_some(),
-        });
-
-        // Master first, then running-attached, then alpha.
-        oracles.sort_by(|a, b| {
-            b.is_master
-                .cmp(&a.is_master)
-                .then(b.attached.cmp(&a.attached))
-                .then(a.identity.cmp(&b.identity))
-        });
+        // Flat, open "agents" list — no special master. Attached first, then alpha.
+        oracles.sort_by(|a, b| b.attached.cmp(&a.attached).then(a.identity.cmp(&b.identity)));
         Ok(oracles)
     }
 

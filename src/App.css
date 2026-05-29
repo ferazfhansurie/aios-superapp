@@ -3,34 +3,59 @@
 
 @theme {
   /* ============================================================
-     AIOS cockpit theme — dark navy spacefield + adletic orange.
+     AIOS DESIGN SYSTEM — token layer.  See /DESIGN.md for the
+     written spec, usage rules, and component patterns.
+
+     Derived from the CHAT surface (ChatPane.tsx), which is the
+     gold standard: calm near-black ground, generously layered
+     surfaces, soft borders, restrained adletic-orange accent
+     (accent only on primary / active / focus — never every
+     border or hover).  These VALUES were retuned to read like
+     the chat everywhere; the token NAMES are frozen because
+     lib/theme.ts overrides --color-accent* + cursor/selection at
+     runtime and ThemeSwitcher/accent swatches bind to them.
+
+     The @theme block below is also the DARK fallback (used before
+     initTheme() runs / if data-theme is absent); html[data-theme]
+     blocks redeclare the same names for explicit dark + light.
      Accent hex anchor #f26522 ≈ oklch(0.72 0.18 50).
      ============================================================ */
 
-  /* ground & surfaces */
-  --color-bg: oklch(0.145 0.012 250);        /* deep navy spacefield ≈ #08131f */
-  --color-panel: oklch(0.175 0.006 255);     /* rails / sticky header */
-  --color-panel-2: oklch(0.205 0.006 255);   /* cards / buttons */
-  --color-pane: oklch(0.12 0.008 255);       /* terminal interior ≈ #0a0a0c */
-  --color-border: oklch(1 0 0 / 8%);
-  --color-border-strong: oklch(1 0 0 / 14%);
+  /* ---- ground & surfaces -------------------------------------
+     Layered near-blacks, like the chat.  Hue pulled toward a calm
+     neutral charcoal (240) and chroma dropped (0.012→0.006 on bg)
+     so the old blue-navy cast reads quieter; the bg→panel→panel-2
+     steps were tightened (was 0.030/0.030 L apart, now ~0.022 each)
+     so elevation feels soft rather than stacked/heavy. */
+  --color-bg: oklch(0.155 0.006 240);        /* app ground — calm near-black */
+  --color-panel: oklch(0.183 0.005 240);     /* rails / sticky header / chrome */
+  --color-panel-2: oklch(0.205 0.005 240);   /* the standard card / composer surface */
+  --color-pane: oklch(0.132 0.006 240);      /* terminal interior — deepest layer */
+  --color-border: oklch(1 0 0 / 7%);         /* hairline — the default divider */
+  --color-border-strong: oklch(1 0 0 / 12%); /* emphasis edge — cards, composer, menus */
 
-  /* text */
-  --color-text: oklch(0.96 0 0);
-  --color-text-2: oklch(0.78 0.005 255);
-  --color-muted: oklch(0.62 0.005 255);      /* ≈ #a0a0a0 */
-  --color-faint: oklch(0.45 0.005 255);
+  /* ---- text — four-step hierarchy from the chat ---------------
+     text = headings / strong; text-2 = body & assistant prose (the
+     chat sets bodies one notch under pure white for calm); muted =
+     labels / tool args; faint = helper / footer / placeholder. */
+  --color-text: oklch(0.95 0 0);             /* primary — headings, active labels */
+  --color-text-2: oklch(0.77 0.004 240);     /* body / assistant prose */
+  --color-muted: oklch(0.60 0.004 240);      /* secondary labels, tool args */
+  --color-faint: oklch(0.46 0.004 240);      /* helper text, placeholders, dividers·dots */
 
-  /* accent — adletic orange */
-  --color-accent: oklch(0.72 0.18 50);       /* ≈ #f26522 */
-  --color-accent-hover: oklch(0.78 0.16 60); /* warms toward #fbbf24 */
-  --color-accent-dim: oklch(0.45 0.13 50);
-  --color-accent-soft: oklch(0.72 0.18 50 / 18%);
-  --color-cursor: #f97316;
-  --color-selection: rgba(249, 115, 22, 0.30);
+  /* ---- accent — adletic orange (RESTRAINED use; see DESIGN.md)
+     primary buttons, active state, focus rings ONLY.  NOTE: these
+     six are overridden at runtime by lib/theme.ts applyAccent();
+     keep names + meaning, values here are the orange default. */
+  --color-accent: oklch(0.72 0.18 50);       /* ≈ #f26522 — primary / active / focus */
+  --color-accent-hover: oklch(0.78 0.16 60); /* hover / pressed on accent surfaces */
+  --color-accent-dim: oklch(0.45 0.13 50);   /* low-emphasis / disabled accent */
+  --color-accent-soft: oklch(0.72 0.18 50 / 16%); /* wash — active pill bg, user bubble, nav-active */
+  --color-cursor: #f97316;                   /* terminal caret (runtime-overridden) */
+  --color-selection: rgba(249, 115, 22, 0.30); /* text selection (runtime-overridden) */
   --color-highlight: #fbbf24;
 
-  /* status — distinct semantic vocabulary */
+  /* ---- status — semantic, used sparingly ---------------------- */
   --color-success: #4ade80;
   --color-success-glow: rgba(74, 222, 128, 0.6);
   --color-warning: #facc15;
@@ -38,11 +63,55 @@
   --color-danger: #fca5a5;
   --color-cold: #555555;
 
-  /* type families */
+  /* ---- type families ------------------------------------------ */
   --font-sans: -apple-system, "SF Pro Text", "SF Pro Display", "Segoe UI",
     Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: "SF Mono", Menlo, Monaco, "JetBrains Mono", "Cascadia Code",
     "Fira Code", Consolas, ui-monospace, monospace;
+
+  /* ============================================================
+     SCALES — radii, type, spacing.  Namespaced --aios-* on purpose:
+     Tailwind v4 treats --radius-* / --text-* inside @theme as
+     reserved utility namespaces, so using those would silently
+     re-map `rounded-md`/`text-sm` across every existing component.
+     These neutral names are PURELY additive — reference as
+     var(--aios-radius-lg) etc.  Values mirror the chat's exact
+     measurements (composer rounded-2xl=16, cards rounded-xl=12,
+     code rounded-lg=8, pills rounded-full).  See DESIGN.md.
+     ============================================================ */
+
+  /* radii — the chat's rounding language */
+  --aios-radius-xs: 6px;    /* inline code chip, tiny tags */
+  --aios-radius-sm: 8px;    /* pane-card chrome, code blocks, menu rows */
+  --aios-radius-md: 10px;   /* small buttons, approval action buttons */
+  --aios-radius-lg: 12px;   /* tool cards, dropdown menus, overlays */
+  --aios-radius-xl: 16px;   /* the composer surface — the signature radius */
+  --aios-radius-pill: 9999px; /* pills, status dots, accent send button */
+
+  /* type scale — px sizes lifted from the chat surface */
+  --aios-text-hero: 30px;   /* empty-state hero "what should we work on?" (text-3xl) */
+  --aios-text-title: 17px;  /* H1 inside prose / section titles */
+  --aios-text-lg: 15px;     /* composer input */
+  --aios-text-body: 14px;   /* default body / bubbles */
+  --aios-text-sm: 12.5px;   /* dense UI, menu items, code */
+  --aios-text-xs: 11.5px;   /* pill labels, tool args */
+  --aios-text-2xs: 11px;    /* mono footer helper, pane-header titles */
+  --aios-text-micro: 10.5px; /* result footers, code-fence lang label */
+
+  /* spacing — 4px base rhythm (matches the chat's gap-/px- usage) */
+  --aios-space-1: 4px;
+  --aios-space-2: 8px;
+  --aios-space-3: 12px;   /* standard pane-header horizontal padding */
+  --aios-space-4: 16px;
+  --aios-space-5: 20px;   /* composer horizontal padding */
+  --aios-space-6: 24px;
+
+  /* header heights — the two header conventions in the app */
+  --aios-h-chrome: 28px;  /* outer pane-card title strip (PaneCard) */
+  --aios-h-header: 36px;  /* in-pane tool toolbar (.pane-header) */
+
+  /* the chat's signature soft elevation for floating surfaces */
+  --aios-shadow-pop: 0 12px 32px -8px rgba(0, 0, 0, 0.5);
 }
 
 /* ============================================================
@@ -59,25 +128,25 @@
    ============================================================ */
 
 html[data-theme="dark"] {
-  /* ground & surfaces */
-  --color-bg: oklch(0.145 0.012 250);
-  --color-panel: oklch(0.175 0.006 255);
-  --color-panel-2: oklch(0.205 0.006 255);
-  --color-pane: oklch(0.12 0.008 255);
-  --color-border: oklch(1 0 0 / 8%);
-  --color-border-strong: oklch(1 0 0 / 14%);
+  /* ground & surfaces — calm layered near-blacks (mirrors @theme) */
+  --color-bg: oklch(0.155 0.006 240);
+  --color-panel: oklch(0.183 0.005 240);
+  --color-panel-2: oklch(0.205 0.005 240);
+  --color-pane: oklch(0.132 0.006 240);
+  --color-border: oklch(1 0 0 / 7%);
+  --color-border-strong: oklch(1 0 0 / 12%);
 
-  /* text */
-  --color-text: oklch(0.96 0 0);
-  --color-text-2: oklch(0.78 0.005 255);
-  --color-muted: oklch(0.62 0.005 255);
-  --color-faint: oklch(0.45 0.005 255);
+  /* text — four-step hierarchy */
+  --color-text: oklch(0.95 0 0);
+  --color-text-2: oklch(0.77 0.004 240);
+  --color-muted: oklch(0.60 0.004 240);
+  --color-faint: oklch(0.46 0.004 240);
 
-  /* accent — adletic orange */
+  /* accent — adletic orange (runtime-overridden by lib/theme.ts) */
   --color-accent: oklch(0.72 0.18 50);
   --color-accent-hover: oklch(0.78 0.16 60);
   --color-accent-dim: oklch(0.45 0.13 50);
-  --color-accent-soft: oklch(0.72 0.18 50 / 18%);
+  --color-accent-soft: oklch(0.72 0.18 50 / 16%);
   --color-cursor: #f97316;
   --color-selection: rgba(249, 115, 22, 0.30);
   --color-highlight: #fbbf24;
@@ -92,28 +161,31 @@ html[data-theme="dark"] {
 }
 
 html[data-theme="light"] {
-  /* ground & surfaces — near-white, soft elevation */
-  --color-bg: #f7f7f8;                       /* app background */
-  --color-panel: #ffffff;                    /* rails / sticky header */
-  --color-panel-2: #f0f0f2;                  /* cards / buttons */
-  --color-pane: #1b1b1f;                     /* terminal chrome interior — kept dark so the dark xterm reads seamlessly */
-  --color-border: oklch(0 0 0 / 10%);
-  --color-border-strong: oklch(0 0 0 / 16%);
+  /* ground & surfaces — near-white, calm soft elevation that mirrors
+     the dark chat's layered feel: a faintly toned ground, a clean
+     white sticky chrome, and a subtle card a notch below ground.
+     Borders softened (10%→8% / 16%→13%) to match the dark hairlines. */
+  --color-bg: #f6f6f7;                        /* app ground — faintly toned, not stark white */
+  --color-panel: #ffffff;                     /* rails / sticky header / chrome */
+  --color-panel-2: #f1f1f3;                   /* the standard card / composer surface */
+  --color-pane: #1b1b1f;                      /* terminal interior — kept dark so the dark xterm reads seamlessly */
+  --color-border: oklch(0 0 0 / 8%);          /* hairline divider */
+  --color-border-strong: oklch(0 0 0 / 13%);  /* emphasis edge */
 
-  /* text — dark ink on light */
-  --color-text: #1a1a1a;
-  --color-text-2: #3f3f46;
-  --color-muted: #6b7280;                    /* ≈ slate-500 */
-  --color-faint: #9ca3af;                    /* ≈ slate-400 */
+  /* text — dark-ink four-step hierarchy (parallels the dark scale) */
+  --color-text: #18181b;                      /* primary — headings, active labels */
+  --color-text-2: #3f3f46;                    /* body / prose */
+  --color-muted: #6b7280;                     /* secondary labels ≈ slate-500 */
+  --color-faint: #9ca3af;                     /* helper / placeholder ≈ slate-400 */
 
-  /* accent — adletic orange (unchanged across modes) */
-  --color-accent: oklch(0.66 0.19 48);       /* ~#e85d1a — nudged a touch darker for contrast on white */
+  /* accent — adletic orange (runtime-overridden by lib/theme.ts) */
+  --color-accent: oklch(0.66 0.19 48);        /* ~#e85d1a — nudged darker for contrast on white */
   --color-accent-hover: oklch(0.60 0.18 45);
   --color-accent-dim: oklch(0.80 0.10 55);
-  --color-accent-soft: oklch(0.72 0.18 50 / 14%);
+  --color-accent-soft: oklch(0.72 0.18 50 / 14%); /* slightly lower alpha reads right on white */
   --color-cursor: #f97316;
   --color-selection: rgba(242, 101, 34, 0.22);
-  --color-highlight: #d97706;                /* amber-600 — readable on light */
+  --color-highlight: #d97706;                 /* amber-600 — readable on light */
 
   /* status — darkened so they read on light surfaces */
   --color-success: #16a34a;
@@ -181,4 +253,126 @@ html, body, #root {
 [data-panel-resize-handle-id]:hover,
 [data-panel-resize-handle-id][data-resize-handle-state="drag"] {
   background: var(--color-accent-soft);
+}
+
+/* ============================================================
+   AIOS SYSTEM UTILITY CLASSES
+   ------------------------------------------------------------
+   A small, documented set of classes that capture the chat
+   surface's recurring patterns at their EXACT measurements, so
+   panes can converge on one look over time without per-file
+   rewrites.  All values trace to ChatPane.tsx / App.tsx and the
+   --aios-* scales above.  Full guidance lives in /DESIGN.md.
+
+   Convention: these are plain CSS classes (not Tailwind @apply)
+   so they survive independent of the utility pipeline and can be
+   dropped onto any element.  Use a class for the shared skeleton,
+   then layer Tailwind utilities for one-off tweaks.
+   ============================================================ */
+
+/* --- .pane-header ------------------------------------------------
+   The consistent top bar of an in-pane tool view (Files, Memory,
+   Automations, Bridges, Plugins, Browser already share this shape:
+   h-9 / border-b / px-3).  Fixed 36px height, hairline bottom
+   border, 12px horizontal padding, vertically centered.  Pair the
+   title text with .pane-header__title.  (The OUTER pane-card title
+   strip in App.tsx PaneCard is a separate, denser 28px chrome —
+   see --aios-h-chrome / DESIGN.md; don't conflate the two.) */
+.pane-header {
+  display: flex;
+  align-items: center;
+  height: var(--aios-h-header);              /* 36px */
+  flex-shrink: 0;
+  padding-inline: var(--aios-space-3);       /* 12px */
+  border-bottom: 1px solid var(--color-border);
+}
+/* the label inside a pane header — mono, muted, quiet (chat footer voice) */
+.pane-header__title {
+  font-family: var(--font-mono);
+  font-size: var(--aios-text-2xs);           /* 11px */
+  color: var(--color-muted);
+  letter-spacing: 0.01em;
+}
+
+/* --- .surface / .surface-card -----------------------------------
+   The standard panel surface.  .surface is the base fill+edge used
+   for inset regions (lists, toolbars).  .surface-card is the chat's
+   tool/info card: rounded-lg, hairline border, panel fill — the
+   default "thing sitting on the ground" container. */
+.surface {
+  background: var(--color-panel);
+  border: 1px solid var(--color-border);
+}
+.surface-card {
+  background: var(--color-panel-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--aios-radius-lg);      /* 12px — chat tool card */
+  overflow: hidden;
+}
+/* the chat's composer/menu elevation: stronger edge + soft pop shadow.
+   Use for floating things (popovers, the hero composer, dropdowns). */
+.surface-pop {
+  background: var(--color-panel-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--aios-radius-xl);      /* 16px — composer signature */
+  box-shadow: var(--aios-shadow-pop);
+}
+
+/* --- .pill -------------------------------------------------------
+   The small rounded control from the composer (permission / effort /
+   model chips, plan/goal toggles).  Resting state is quiet — panel
+   fill, hairline border, secondary text.  Hover lifts the border +
+   text one step.  Add .pill--active for the selected/on state (the
+   ONLY place accent appears on a pill — soft wash + accent edge). */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--aios-radius-pill);
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-panel) 50%, transparent);
+  padding: 4px 10px;                          /* py-1 px-2.5 */
+  font-family: var(--font-sans);
+  font-size: var(--aios-text-xs);             /* 11.5px */
+  color: var(--color-text-2);
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.pill:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+.pill--active {
+  border-color: color-mix(in srgb, var(--color-accent) 50%, transparent);
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+/* --- .hero-title -------------------------------------------------
+   The chat empty-state headline "what should we work on?" — large,
+   medium weight, tight tracking, primary text.  The single biggest
+   type moment in the app; use once per empty/landing surface. */
+.hero-title {
+  font-family: var(--font-sans);
+  font-size: var(--aios-text-hero);           /* 30px (text-3xl) */
+  font-weight: 500;
+  letter-spacing: -0.02em;                    /* tracking-tight */
+  color: var(--color-text);
+}
+
+/* --- .helper-line ------------------------------------------------
+   The faint mono helper under the composer ("claude · ready ·
+   /commands @files").  Quiet, monospaced, faint — for ambient hints
+   and status footers, never primary content. */
+.helper-line {
+  font-family: var(--font-mono);
+  font-size: var(--aios-text-2xs);            /* 11px */
+  color: var(--color-faint);
+}
+
+/* --- .focus-accent -----------------------------------------------
+   The chat composer's focus treatment: a restrained accent edge on
+   focus-within (no glow, no ring spam).  Apply to text-entry
+   surfaces so focus is the accent's job — consistent everywhere. */
+.focus-accent:focus-within {
+  border-color: color-mix(in srgb, var(--color-accent) 50%, transparent);
 }

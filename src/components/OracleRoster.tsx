@@ -9,7 +9,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronRight,
-  Crown,
   Eye,
   EyeOff,
   Pencil,
@@ -33,8 +32,6 @@ import {
 interface Props {
   onAttachOracle: (identity: string) => void;
   onAttachTmux: (socket: string, session: string) => void;
-  /** Master/root → a clean shell at the root folder (no launcher HUD). */
-  onAttachRoot: () => void;
 }
 
 const HIDDEN_KEY = "aios.hiddenOracles";
@@ -46,7 +43,7 @@ const loadHidden = (): Set<string> => {
   }
 };
 
-export function OracleRoster({ onAttachOracle, onAttachTmux, onAttachRoot }: Props) {
+export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -88,8 +85,8 @@ export function OracleRoster({ onAttachOracle, onAttachTmux, onAttachRoot }: Pro
   // Non-oracle sessions only (oracles already live in the roster above).
   const otherSessions = sessions.filter((s) => !s.is_oracle);
   // Master is never hideable; everything else honors the hidden set.
-  const visibleOracles = oracles.filter((o) => o.is_master || !hidden.has(o.identity));
-  const hiddenOracles = oracles.filter((o) => !o.is_master && hidden.has(o.identity));
+  const visibleOracles = oracles.filter((o) => !hidden.has(o.identity));
+  const hiddenOracles = oracles.filter((o) => hidden.has(o.identity));
 
   return (
     <div className="flex flex-col gap-3">
@@ -97,7 +94,7 @@ export function OracleRoster({ onAttachOracle, onAttachTmux, onAttachRoot }: Pro
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
           <span className="text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
-            oracles
+            agents
           </span>
           <div className="flex items-center gap-0.5">
             <button
@@ -139,7 +136,7 @@ export function OracleRoster({ onAttachOracle, onAttachTmux, onAttachRoot }: Pro
             <OracleRow
               key={o.session}
               oracle={o}
-              onAttach={() => (o.is_master ? onAttachRoot() : onAttachOracle(o.identity))}
+              onAttach={() => onAttachOracle(o.identity)}
               onHide={() => toggleHidden(o.identity, true)}
               onRename={async (to) => {
                 try {
@@ -288,27 +285,17 @@ function OracleRow({
   }
 
   return (
-    <div
-      className={`group flex items-center gap-2.5 rounded-lg border px-2.5 py-2 transition-colors ${
-        oracle.is_master
-          ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)]"
-          : "border-[var(--color-border)] bg-[var(--color-panel-2)]/40 hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
-      }`}
-    >
+    <div className="group flex items-center gap-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2.5 py-2 transition-colors hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]">
       <button onClick={onAttach} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
-        {oracle.is_master ? (
-          <Crown size={13} className="shrink-0 text-[var(--color-accent)]" />
-        ) : (
-          <span
-            className={`status-dot shrink-0 ${
-              oracle.attached
-                ? "status-dot--active"
-                : oracle.running
-                  ? "status-dot--idle"
-                  : "status-dot--cold"
-            }`}
-          />
-        )}
+        <span
+          className={`status-dot shrink-0 ${
+            oracle.attached
+              ? "status-dot--active"
+              : oracle.running
+                ? "status-dot--idle"
+                : "status-dot--cold"
+          }`}
+        />
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="truncate text-[13px] text-[var(--color-text)]">{oracle.display_name}</span>
           <span className="truncate text-[10px] text-[var(--color-muted)]">
@@ -319,43 +306,39 @@ function OracleRow({
 
       {/* row actions */}
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-        {!oracle.is_master && (
-          <>
-            <button
-              onClick={onHide}
-              className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)]"
-              title="hide"
-            >
-              <EyeOff size={11} />
-            </button>
-            <button
-              onClick={() => {
-                setDraft(oracle.identity);
-                setEditing(true);
-              }}
-              className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)]"
-              title="rename"
-            >
-              <Pencil size={11} />
-            </button>
-            {confirmDel ? (
-              <button
-                onClick={onDelete}
-                className="rounded p-1 text-[var(--color-danger)] hover:bg-[var(--color-danger)]/15"
-                title="click again to confirm"
-              >
-                <Check size={12} />
-              </button>
-            ) : (
-              <button
-                onClick={() => setConfirmDel(true)}
-                className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-danger)]"
-                title="delete"
-              >
-                <Trash2 size={11} />
-              </button>
-            )}
-          </>
+        <button
+          onClick={onHide}
+          className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)]"
+          title="hide"
+        >
+          <EyeOff size={11} />
+        </button>
+        <button
+          onClick={() => {
+            setDraft(oracle.identity);
+            setEditing(true);
+          }}
+          className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)]"
+          title="rename"
+        >
+          <Pencil size={11} />
+        </button>
+        {confirmDel ? (
+          <button
+            onClick={onDelete}
+            className="rounded p-1 text-[var(--color-danger)] hover:bg-[var(--color-danger)]/15"
+            title="click again to confirm"
+          >
+            <Check size={12} />
+          </button>
+        ) : (
+          <button
+            onClick={() => setConfirmDel(true)}
+            className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-danger)]"
+            title="delete"
+          >
+            <Trash2 size={11} />
+          </button>
         )}
       </div>
     </div>

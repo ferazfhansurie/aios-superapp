@@ -5,11 +5,13 @@ import {
   Bot,
   Brain,
   Camera,
+  ChevronDown,
   Clock,
   Code,
   Folder,
   Globe,
   HelpCircle,
+  Play,
   MessageSquare,
   PanelLeft,
   Power,
@@ -296,11 +298,7 @@ function App() {
                   <NavRow key={s.label} icon={s.icon} label={s.label} onClick={() => spawn(s.kind, s.label)} />
                 ))}
               </div>
-              <OracleRoster
-                onAttachOracle={addOracle}
-                onAttachTmux={addTmux}
-                onAttachRoot={() => spawn({ type: "shell", cmd: "aios" }, "master")}
-              />
+              <OracleRoster onAttachOracle={addOracle} onAttachTmux={addTmux} />
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
               <NavRow icon={SettingsIcon} label="settings" onClick={() => setSettingsOpen(true)} />
@@ -529,65 +527,64 @@ function EmptyState({
   onHelp: () => void;
   onQuit: () => void;
 }) {
+  const [enginesOpen, setEnginesOpen] = useState(false);
+  const start = ENGINES[0];
+  const others = ENGINES.slice(1);
   return (
     <div className="relative flex h-full flex-col items-center justify-center overflow-hidden">
+      {/* calm, chat-like backdrop — restrained accent per the design system */}
       <div
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            "radial-gradient(55% 45% at 50% 38%, color-mix(in srgb, var(--color-accent) 13%, transparent), transparent 70%)",
-        }}
-      />
-      <div
-        className="pointer-events-none absolute inset-0 opacity-[0.04]"
-        style={{
-          backgroundImage: "radial-gradient(var(--color-text) 1px, transparent 1px)",
-          backgroundSize: "26px 26px",
+            "radial-gradient(50% 40% at 50% 42%, color-mix(in srgb, var(--color-accent) 7%, transparent), transparent 72%)",
         }}
       />
 
-      <div className="relative flex flex-col items-center gap-9">
-        <div className="flex flex-col items-center gap-1.5">
-          <div className="flex items-baseline gap-2.5">
-            <span className="font-mono text-6xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_32px_color-mix(in_srgb,var(--color-accent)_50%,transparent)]">
-              aios
-            </span>
-            <span className="text-[11px] font-medium uppercase tracking-[0.4em] text-[var(--color-muted)]">
-              superapp
-            </span>
-          </div>
-          <p className="text-[12px] tracking-wide text-[var(--color-faint)]">
-            one chat, every channel, any pane · pick an engine
-          </p>
-        </div>
+      <div className="relative flex w-full max-w-xl flex-col items-center gap-8 px-6">
+        <h1 className="hero-title text-center text-[var(--color-text)]">what should we work on?</h1>
 
-        {/* engine picker */}
-        <div className="flex flex-wrap items-stretch justify-center gap-3">
-          {ENGINES.map((e) => (
+        {/* single START + a sub-menu for the other engines */}
+        <div className="flex items-center gap-2.5">
+          <button
+            onClick={() => start.spawn(onSpawn)}
+            className="flex items-center gap-2.5 rounded-[var(--aios-radius-xl)] border border-[var(--color-accent)]/60 bg-[var(--color-accent)]/12 px-8 py-3.5 text-[15px] font-semibold text-[var(--color-accent)] transition-all hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)] hover:shadow-[var(--aios-shadow-pop)]"
+          >
+            <Play size={15} fill="currentColor" /> start
+          </button>
+          <div className="relative">
             <button
-              key={e.id}
-              onClick={() => e.spawn(onSpawn)}
-              className={`group flex w-36 flex-col items-center gap-2 rounded-2xl border px-4 py-5 transition-all hover:-translate-y-0.5 ${
-                e.primary
-                  ? "border-[var(--color-accent)]/60 bg-[var(--color-accent)]/10 hover:bg-[var(--color-accent)]/20 hover:shadow-[0_0_32px_color-mix(in_srgb,var(--color-accent)_30%,transparent)]"
-                  : "border-[var(--color-border)] bg-[var(--color-panel)]/40 hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
-              }`}
+              onClick={() => setEnginesOpen((v) => !v)}
+              className="flex items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border)] px-3 py-2 text-[12px] text-[var(--color-muted)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
             >
-              <e.icon
-                size={24}
-                className={
-                  e.primary
-                    ? "text-[var(--color-accent)]"
-                    : "text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
-                }
-              />
-              <span className="text-[13px] font-medium text-[var(--color-text)]">{e.label}</span>
-              <span className="text-[10px] text-[var(--color-muted)]">{e.sub}</span>
+              other engines <ChevronDown size={13} />
             </button>
-          ))}
+            {enginesOpen && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setEnginesOpen(false)} />
+                <div className="surface-pop absolute left-0 top-full z-50 mt-1.5 w-48 p-1">
+                  {others.map((e) => (
+                    <button
+                      key={e.id}
+                      onClick={() => {
+                        e.spawn(onSpawn);
+                        setEnginesOpen(false);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-[var(--aios-radius-sm)] px-2 py-1.5 text-left text-[12px] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                    >
+                      <e.icon size={14} className="shrink-0 text-[var(--color-muted)]" />
+                      <span className="flex-1">{e.label}</span>
+                      <span className="text-[10px] text-[var(--color-faint)]">{e.sub}</span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         </div>
 
-        {/* resume · help · quit */}
+        <p className="helper-line">aios chat · or open claude / codex / opencode</p>
+
         <div className="flex items-center gap-2 text-[12px]">
           <IdleAction icon={<RotateCcw size={13} />} label="resume" onClick={() => onSpawn({ type: "shell", cmd: "claude --continue" }, "resume")} />
           <span className="text-[var(--color-faint)]">·</span>
