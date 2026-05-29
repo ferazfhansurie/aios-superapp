@@ -58,8 +58,17 @@ function compact(n: number | null): string {
   return `${n}`;
 }
 
-export function AccountMenu({ onOpenSettings }: { onOpenSettings?: () => void }) {
+export function AccountMenu({
+  onOpenSettings,
+  onOpenChange,
+}: {
+  onOpenSettings?: () => void;
+  onOpenChange?: (open: boolean) => void;
+}) {
   const [open, setOpen] = useState(false);
+  useEffect(() => {
+    onOpenChange?.(open);
+  }, [open, onOpenChange]);
   const [usage, setUsage] = useState<Usage | null>(null);
   const [extras, setExtras] = useState<UsageExtras | null>(null);
   const [, force] = useState(0); // re-render so countdowns tick

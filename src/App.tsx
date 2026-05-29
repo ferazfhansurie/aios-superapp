@@ -59,8 +59,11 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [spawnOpen, setSpawnOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
-  const modalOpen = settingsOpen || paletteOpen;
+  // Native browser webviews paint ABOVE html, so any floating overlay (modals,
+  // the +new dropdown, the account popup) must hide them or it gets occluded.
+  const overlayOpen = settingsOpen || paletteOpen || spawnOpen || accountOpen;
 
   useEffect(() => {
     const t = setTimeout(() => setSplash(false), 850);
@@ -218,14 +221,17 @@ function App() {
               <OracleRoster onAttachOracle={addOracle} onAttachTmux={addTmux} />
             </div>
             <div className="border-t border-[var(--color-border)] p-2">
-              <AccountMenu onOpenSettings={() => setSettingsOpen(true)} />
+              <AccountMenu
+                onOpenSettings={() => setSettingsOpen(true)}
+                onOpenChange={setAccountOpen}
+              />
             </div>
           </aside>
         )}
 
         <main className="min-h-0 flex-1">
           {panes.length === 0 ? (
-            <EmptyState onAddShell={addShell} />
+            <EmptyState onSpawn={spawn} />
           ) : (
             <div
               className="grid h-full w-full gap-2 p-2"
@@ -238,7 +244,7 @@ function App() {
                 <PaneCard
                   key={pane.key}
                   pane={pane}
-                  active={!modalOpen}
+                  active={!overlayOpen}
                   onClose={() => closePane(pane.key)}
                 />
               ))}
@@ -333,23 +339,52 @@ function PaneCard({ pane, active, onClose }: { pane: Pane; active: boolean; onCl
   );
 }
 
-function EmptyState({ onAddShell }: { onAddShell: () => void }) {
+function EmptyState({ onSpawn }: { onSpawn: (kind: PaneContent, label: string) => void }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-5 text-center">
-      <img src="/mascot.png" alt="" className="mascot-idle h-24 w-24 object-contain" />
-      <div className="flex flex-col gap-1">
-        <p className="text-sm text-[var(--color-text)]">no panes open</p>
-        <p className="text-xs text-[var(--color-muted)]">
-          click an oracle, hit + new, or open a terminal
+    <div className="relative flex h-full flex-col items-center justify-center overflow-hidden">
+      {/* subtle radial accent glow on the pure bg — flashy but clean, no raster */}
+      <div
+        className="pointer-events-none absolute inset-0"
+        style={{
+          background:
+            "radial-gradient(60% 50% at 50% 42%, color-mix(in srgb, var(--color-accent) 10%, transparent), transparent 70%)",
+        }}
+      />
+      <div className="relative flex flex-col items-center gap-8">
+        <div className="flex flex-col items-center gap-2">
+          <div className="flex items-baseline gap-2">
+            <span className="font-mono text-5xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_24px_color-mix(in_srgb,var(--color-accent)_45%,transparent)]">
+              aios
+            </span>
+            <span className="text-[10px] font-medium uppercase tracking-[0.3em] text-[var(--color-muted)]">
+              cockpit
+            </span>
+          </div>
+          <p className="text-[12px] text-[var(--color-faint)]">your command deck · spawn anything</p>
+        </div>
+
+        <div className="flex flex-wrap items-stretch justify-center gap-2.5">
+          {SPAWN.map((s) => (
+            <button
+              key={s.label}
+              onClick={() => onSpawn(s.kind, s.label)}
+              className="group flex w-28 flex-col items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/40 px-3 py-4 transition-all hover:-translate-y-0.5 hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
+            >
+              <s.icon
+                size={22}
+                className="text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
+              />
+              <span className="text-[12px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+                {s.label}
+              </span>
+            </button>
+          ))}
+        </div>
+
+        <p className="font-mono text-[10px] tracking-wide text-[var(--color-faint)]">
+          ⌘T terminal · ⌘K palette · ⌘B sidebar · ⌘⌘ appshot
         </p>
       </div>
-      <button
-        type="button"
-        onClick={onAddShell}
-        className="flex items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-xs font-semibold text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
-      >
-        <Plus size={13} /> new terminal
-      </button>
     </div>
   );
 }
