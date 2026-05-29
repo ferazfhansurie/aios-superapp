@@ -28,3 +28,25 @@ export const browserDeviceMode = (label: string, mobile: boolean) =>
   invoke("browser_device_mode", { label, mobile });
 export const browserScreenshot = (label: string, r: Rect) =>
   invoke<string>("browser_screenshot", { label, ...r });
+
+// ─── Annotate mode (Codex-style select-on-page → send to chat) ──────────────
+// Clipboard-bridge: the injected annotator writes `AIOS_ANNOT:<json>` to the
+// system clipboard; the pane polls `readClipboard()` and parses the sentinel.
+export const browserEnterAnnotate = (label: string) =>
+  invoke("browser_enter_annotate", { label });
+export const browserExitAnnotate = (label: string) =>
+  invoke("browser_exit_annotate", { label });
+export const browserCopySelection = (label: string) =>
+  invoke("browser_copy_selection", { label });
+export const readClipboard = () => invoke<string>("read_clipboard");
+
+/** Shape the injected annotator (and selection-copy) serialize into the
+ *  clipboard behind the `AIOS_ANNOT:` sentinel. */
+export interface BrowserAnnotation {
+  selector: string;
+  tagName: string;
+  text: string;
+  note: string;
+  rect: { x: number; y: number; width: number; height: number } | null;
+  url: string;
+}

@@ -1,50 +1,109 @@
-/** Bridges — at-a-glance health of every channel bridge AIOS runs. Today the
- *  WhatsApp bridge; the shape is extensible so future bridges just appear. Each
- *  card: a big ALIVE/DOWN status (pulsing dot), the bridge name + type chip, an
- *  activity stat row (sent · today · last seen), and faint pid/launchd/log meta. */
-import { useCallback, useEffect, useState } from "react";
+/** Channels — the AIOS dispatch center. Every messaging channel AIOS speaks
+ *  through, in one hub: which are connected + alive, and what's flowing through
+ *  them. WhatsApp is the live, fully-detected proof (status + stats + an
+ *  expandable conversation feed); the rest are connectors on the way, shown in
+ *  the same visual language with a clear status + a "connect" affordance.
+ *
+ *  (File + export kept as BridgesPane — the nav relabel to "channels" happens in
+ *  App.tsx. This is purely the reframed UI.) */
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Activity,
   ArrowDownLeft,
   ArrowUpRight,
+  AtSign,
+  Camera,
   ChevronRight,
+  Hash,
+  Mail,
   MessageCircle,
+  MessageSquare,
+  MessageSquareDot,
   Plug,
   Radio,
   RefreshCw,
+  Send,
   Zap,
 } from "lucide-react";
 
 import {
   bridgeActivity,
   listBridges,
-  type Bridge,
+  type Channel,
   type BridgeMessage,
   type Bridges,
 } from "../lib/bridges";
 
-/** Icon for a bridge's channel type. */
-function kindIcon(kind: string) {
-  if (kind === "whatsapp") return <MessageCircle size={13} className="text-[var(--color-success)]" />;
-  return <Plug size={13} className="text-[var(--color-info)]" />;
+/** Brand-ish icon per channel id (falls back to a generic plug). lucide only. */
+function channelIcon(id: string, size = 13, className = "") {
+  const cls = className || "text-[var(--color-text-2)]";
+  switch (id) {
+    case "whatsapp":
+      return <MessageCircle size={size} className={className || "text-[var(--color-success)]"} />;
+    case "instagram":
+      return <Camera size={size} className={cls} />;
+    case "threads":
+      return <AtSign size={size} className={cls} />;
+    case "gchat":
+      return <MessageSquare size={size} className={cls} />;
+    case "x":
+      return <Hash size={size} className={cls} />;
+    case "telegram":
+      return <Send size={size} className={cls} />;
+    case "gmail":
+      return <Mail size={size} className={cls} />;
+    case "imessage":
+      return <MessageSquareDot size={size} className={cls} />;
+    default:
+      return <Plug size={size} className={cls} />;
+  }
 }
 
-/** True when a bridge surfaced zero useful data from any source. */
-function hasNoData(b: Bridge): boolean {
-  return (
-    !b.alive &&
-    b.pid == null &&
-    !b.loaded &&
-    b.messagesTotal == null &&
-    b.lastActivity == null
-  );
+/** Maps a channel's status (+ liveness) to its dot class, label, and colour.
+ *  connected → green (pulsing when a live process is up).
+ *  disconnected → amber, "not connected".
+ *  soon → grey, "coming soon". */
+function statusView(c: Channel): { dot: string; label: string; color: string } {
+  if (c.status === "connected") {
+    return {
+      // green dot — pulses live (status-dot--active is the only green class).
+      dot: "status-dot--active",
+      label: c.uptime ? `connected · up ${c.uptime}` : "connected",
+      color: "text-[var(--color-success)]",
+    };
+  }
+  if (c.status === "disconnected") {
+    return {
+      dot: "status-dot--idle",
+      label: "not connected",
+      color: "text-[var(--color-warning)]",
+    };
+  }
+  // soon
+  return {
+    dot: "status-dot--cold",
+    label: "coming soon",
+    color: "text-[var(--color-muted)]",
+  };
 }
 
 export function BridgesPane() {
   const [data, setData] = useState<Bridges | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // lightweight self-contained toast (connect button is an honest no-op).
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2500);
+  }, []);
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, []);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -59,23 +118,23 @@ export function BridgesPane() {
 
   useEffect(() => {
     refresh();
-    // bridges should feel live — poll fast.
+    // channels should feel live — poll fast.
     const t = setInterval(refresh, 10_000);
     return () => clearInterval(t);
   }, [refresh]);
 
-  const bridges = data?.bridges ?? [];
-  const aliveCount = bridges.filter((b) => b.alive).length;
+  const channels = data?.bridges ?? [];
+  const connectedCount = channels.filter((c) => c.status === "connected").length;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--color-border)] px-3">
         <div className="flex items-center gap-2">
           <Radio size={14} className="text-[var(--color-accent)]" />
-          <span className="text-[13px] font-medium text-[var(--color-text)]">bridges</span>
-          {bridges.length > 0 && (
+          <span className="text-[13px] font-medium text-[var(--color-text)]">channels</span>
+          {channels.length > 0 && (
             <span className="text-[11px] text-[var(--color-muted)]">
-              {aliveCount}/{bridges.length} alive
+              {connectedCount} connected
             </span>
           )}
         </div>
@@ -90,66 +149,90 @@ export function BridgesPane() {
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
         <p className="mb-3 text-[11px] leading-relaxed text-[var(--color-muted)]">
-          channel bridges connecting AIOS to the outside — is each one alive, and what's it been doing.
+          every channel AIOS speaks through — dispatch, monitor, and reply across all of them.
         </p>
 
         {error && <p className="text-[12px] text-[var(--color-danger)]">{error}</p>}
 
-        {bridges.length === 0 && !loading && !error && (
-          <p className="text-[11px] text-[var(--color-muted)]/60">no bridges detected.</p>
+        {channels.length === 0 && !loading && !error && (
+          <p className="text-[11px] text-[var(--color-muted)]/60">no channels detected.</p>
         )}
 
         <div className="flex flex-col gap-2.5">
-          {bridges.map((b) => (
-            <BridgeCard key={b.id} bridge={b} />
+          {channels.map((c) => (
+            <ChannelCard key={c.id} channel={c} onConnect={showToast} />
           ))}
         </div>
       </div>
+
+      {toast && (
+        <div className="pointer-events-none absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-1.5 text-[11px] text-[var(--color-text)] shadow-lg">
+          {toast}
+        </div>
+      )}
     </div>
   );
 }
 
-function BridgeCard({ bridge: b }: { bridge: Bridge }) {
-  const noData = hasNoData(b);
-  // status-dot--active (green pulse) when alive, --cold (greyed) when down.
-  const dot = b.alive ? "status-dot--active" : "status-dot--cold";
-  const statusLabel = b.alive ? (b.uptime ? `alive · up ${b.uptime}` : "alive") : "down";
-  const statusColor = b.alive ? "text-[var(--color-success)]" : "text-[var(--color-danger)]";
+/** One channel card — same visual language for every channel. Connected ones
+ *  show the stats row + an expandable activity feed; the rest show a clear
+ *  status + a "connect" affordance. */
+function ChannelCard({
+  channel: c,
+  onConnect,
+}: {
+  channel: Channel;
+  onConnect: (msg: string) => void;
+}) {
+  const connected = c.status === "connected";
+  const { dot, label, color } = statusView(c);
 
-  // the primary (first/whatsapp) bridge opens its feed by default — that's the
-  // one worth watching; others stay collapsed behind the chevron.
-  const [open, setOpen] = useState(b.kind === "whatsapp");
+  // connected channels open their feed by default — those are worth watching;
+  // the rest have nothing to expand.
+  const [open, setOpen] = useState(connected);
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/30 px-3 py-2.5">
-      {/* header row: status + name + type chip */}
+    <div
+      className={`flex flex-col gap-2 rounded-lg border px-3 py-2.5 ${
+        connected
+          ? "border-[var(--color-border)] bg-[var(--color-panel-2)]/30"
+          : "border-[var(--color-border)]/60 bg-[var(--color-panel-2)]/15"
+      }`}
+    >
+      {/* header row: brand icon + name + type chip · status dot + label */}
       <div className="flex items-center gap-2.5">
-        <span className={`status-dot shrink-0 ${dot}`} />
-        <span className={`text-[12px] font-medium ${statusColor}`}>{statusLabel}</span>
+        <span
+          className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${
+            connected ? "bg-[var(--color-bg)]" : "bg-[var(--color-bg)]/50"
+          }`}
+        >
+          {channelIcon(c.id, 14, connected ? "" : "text-[var(--color-muted)]")}
+        </span>
+        <span className={`truncate text-[12px] font-medium ${connected ? "text-[var(--color-text)]" : "text-[var(--color-text-2)]"}`}>
+          {c.name}
+        </span>
+        <span className="flex items-center rounded-full bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-2)]">
+          {c.kind}
+        </span>
         <span className="ml-auto flex items-center gap-1.5">
-          <span className="truncate text-[12px] text-[var(--color-text)]">{b.name}</span>
-          <span className="flex items-center gap-1 rounded-full bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-2)]">
-            {kindIcon(b.kind)}
-            {b.kind}
-          </span>
+          <span className={`status-dot shrink-0 ${dot}`} />
+          <span className={`text-[11px] ${color}`}>{label}</span>
         </span>
       </div>
 
-      {noData ? (
-        <p className="text-[11px] text-[var(--color-muted)]/70">no data — bridge may be offline.</p>
-      ) : (
+      {connected ? (
         <>
           {/* activity stat row */}
           <div className="flex items-center gap-1.5 text-[12px] text-[var(--color-text-2)]">
             <Activity size={12} className="text-[var(--color-accent)]" />
-            <span className="font-mono">{b.messagesTotal ?? "–"}</span>
+            <span className="font-mono">{c.messagesTotal ?? "–"}</span>
             <span className="text-[var(--color-muted)]">sent ·</span>
-            <span className="font-mono">{b.today ?? "–"}</span>
+            <span className="font-mono">{c.today ?? "–"}</span>
             <span className="text-[var(--color-muted)]">today</span>
-            {b.lastActivityAgo && (
+            {c.lastActivityAgo && (
               <>
                 <span className="text-[var(--color-muted)]">· last</span>
-                <span className="font-mono">{b.lastActivityAgo}</span>
+                <span className="font-mono">{c.lastActivityAgo}</span>
                 <span className="text-[var(--color-muted)]">ago</span>
               </>
             )}
@@ -157,15 +240,15 @@ function BridgeCard({ bridge: b }: { bridge: Bridge }) {
 
           {/* faint meta: pid · launchd · log path */}
           <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-[var(--color-faint)]">
-            {b.pid != null && (
+            {c.pid != null && (
               <span className="flex items-center gap-1">
                 <Zap size={9} />
-                <span className="font-mono">pid {b.pid}</span>
+                <span className="font-mono">pid {c.pid}</span>
               </span>
             )}
-            {b.launchd && <span className="font-mono">{b.launchd}</span>}
-            {b.lastActivity && <span className="font-mono">last {b.lastActivity}</span>}
-            {b.logPath && <span className="truncate font-mono">{b.logPath}</span>}
+            {c.launchd && <span className="font-mono">{c.launchd}</span>}
+            {c.lastActivity && <span className="font-mono">last {c.lastActivity}</span>}
+            {c.logPath && <span className="truncate font-mono">{c.logPath}</span>}
           </div>
 
           {/* recent activity — expandable chat-style feed */}
@@ -181,28 +264,57 @@ function BridgeCard({ bridge: b }: { bridge: Bridge }) {
             <span>recent activity</span>
           </button>
 
-          {open && <ActivityFeed bridgeId={b.id} />}
+          {open && <ActivityFeed channelId={c.id} />}
         </>
+      ) : (
+        <NotConnectedRow channel={c} onConnect={onConnect} />
       )}
     </div>
   );
 }
 
-/** A scrollable, chat-style feed of the messages flowing through a bridge.
+/** The row shown for a not-yet-connected channel: a terse hint + an honest
+ *  "connect" button (no-op for now — it just surfaces a "coming" toast). */
+function NotConnectedRow({
+  channel: c,
+  onConnect,
+}: {
+  channel: Channel;
+  onConnect: (msg: string) => void;
+}) {
+  const soon = c.status === "soon";
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-[11px] text-[var(--color-muted)]/80">
+        {soon ? "connector on the way" : "wired but offline — reconnect"}
+      </span>
+      <button
+        onClick={() => onConnect("channel connectors coming — not wired yet")}
+        className="flex items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-0.5 text-[11px] text-[var(--color-text-2)] hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+        title="channel connectors coming soon"
+      >
+        <Plug size={11} />
+        <span>connect</span>
+      </button>
+    </div>
+  );
+}
+
+/** A scrollable, chat-style feed of the messages flowing through a channel.
  *  Newest at top. Polls every 10s while mounted (i.e. while expanded). */
-function ActivityFeed({ bridgeId }: { bridgeId: string }) {
+function ActivityFeed({ channelId }: { channelId: string }) {
   const [messages, setMessages] = useState<BridgeMessage[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const res = await bridgeActivity(bridgeId, 25);
+      const res = await bridgeActivity(channelId, 25);
       setMessages(res.messages);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [bridgeId]);
+  }, [channelId]);
 
   useEffect(() => {
     load();

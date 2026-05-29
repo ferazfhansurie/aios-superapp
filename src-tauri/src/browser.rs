@@ -224,3 +224,188 @@ pub fn browser_screenshot(
     }
     Ok(path)
 }
+
+// ─── Annotate mode (Codex-style "select-on-page → send to chat") ──────────────
+//
+// CLIPBOARD-BRIDGE design (read this before touching it):
+//
+// A native child webview cannot call our Tauri IPC, and `wv.eval()` is
+// fire-and-forget — it returns no value to Rust. So neither process can read
+// the other's DOM directly. The robust channel that works TODAY with zero new
+// deps is the **system clipboard**:
+//
+//   1. We `eval()` a small annotator into the page. It highlights the hovered
+//      element, captures `{selector, tagName, text, rect, url}` on click, shows
+//      an inline note box, and on submit writes
+//      `"AIOS_ANNOT:" + JSON.stringify(payload)` to the clipboard via
+//      `navigator.clipboard.writeText(...)`.
+//   2. The FRONTEND (main webview) polls `read_clipboard()` (below), which runs
+//      `pbpaste` on macOS. When it sees the `AIOS_ANNOT:` sentinel prefix it
+//      parses the JSON, formats a line, fires `onAnnotate`, and exits annotate
+//      mode. The sentinel prefix means we never grab unrelated clipboard text.
+//
+// The same path powers "send selection to chat" (selection → clipboard → read).
+
+/// Injects the annotator overlay + listeners into the page. Idempotent: tears
+/// down any prior instance first, so re-entering is safe. On submit the
+/// annotation JSON is copied to the clipboard with the `AIOS_ANNOT:` sentinel
+/// (the frontend polls `read_clipboard` to pick it up).
+#[tauri::command]
+pub fn browser_enter_annotate(app: AppHandle, label: String) -> Result<(), String> {
+    let wv = app.get_webview(&label).ok_or("browser not open")?;
+    // Wrapped in an IIFE; all state hangs off `window.__aiosAnnot` so
+    // `browser_exit_annotate` can clean up listeners + DOM precisely.
+    let _ = wv.eval(
+        r#"(function(){
+  try{
+    if(window.__aiosAnnot&&window.__aiosAnnot.teardown){window.__aiosAnnot.teardown();}
+    var SENT='AIOS_ANNOT:';
+    var hl=document.createElement('div');
+    hl.style.cssText='position:fixed;z-index:2147483646;pointer-events:none;border:2px solid #6ea8fe;background:rgba(110,168,254,.12);border-radius:3px;transition:all .03s linear;display:none;';
+    document.documentElement.appendChild(hl);
+    var box=null,cur=null;
+    function cssPath(el){
+      if(!(el instanceof Element))return'';
+      if(el.id)return'#'+CSS.escape(el.id);
+      var parts=[];
+      while(el&&el.nodeType===1&&parts.length<6){
+        var sel=el.nodeName.toLowerCase();
+        if(el.classList&&el.classList.length){sel+='.'+Array.from(el.classList).slice(0,2).map(function(c){return CSS.escape(c);}).join('.');}
+        var p=el.parentNode;
+        if(p){
+          var sibs=Array.prototype.filter.call(p.children,function(c){return c.nodeName===el.nodeName;});
+          if(sibs.length>1){sel+=':nth-of-type('+(Array.prototype.indexOf.call(sibs,el)+1)+')';}
+        }
+        parts.unshift(sel);
+        if(el.id){parts[0]='#'+CSS.escape(el.id);break;}
+        el=el.parentElement;
+      }
+      return parts.join(' > ');
+    }
+    function move(e){
+      if(box)return;
+      var el=document.elementFromPoint(e.clientX,e.clientY);
+      if(!el||el===hl){hl.style.display='none';cur=null;return;}
+      cur=el;
+      var r=el.getBoundingClientRect();
+      hl.style.display='block';hl.style.left=r.left+'px';hl.style.top=r.top+'px';hl.style.width=r.width+'px';hl.style.height=r.height+'px';
+    }
+    function buildBox(el){
+      var r=el.getBoundingClientRect();
+      box=document.createElement('div');
+      box.style.cssText='position:fixed;z-index:2147483647;left:'+Math.max(8,Math.min(r.left,window.innerWidth-300))+'px;top:'+Math.min(r.bottom+8,window.innerHeight-130)+'px;width:280px;background:#1b1d22;color:#e6e6e6;border:1px solid #3a3d44;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.45);font:13px/1.4 -apple-system,system-ui,sans-serif;padding:10px;';
+      var ta=document.createElement('textarea');
+      ta.placeholder='describe these changes…';
+      ta.style.cssText='width:100%;box-sizing:border-box;height:60px;resize:none;background:#101216;color:#e6e6e6;border:1px solid #3a3d44;border-radius:5px;padding:6px 8px;font:13px/1.4 inherit;outline:none;';
+      var row=document.createElement('div');
+      row.style.cssText='display:flex;gap:6px;justify-content:flex-end;margin-top:8px;';
+      var cancel=document.createElement('button');
+      cancel.textContent='cancel';
+      cancel.style.cssText='background:transparent;color:#9aa0a6;border:1px solid #3a3d44;border-radius:5px;padding:4px 10px;cursor:pointer;font:12px inherit;';
+      var send=document.createElement('button');
+      send.textContent='send to chat';
+      send.style.cssText='background:#6ea8fe;color:#0b0c0f;border:none;border-radius:5px;padding:4px 10px;cursor:pointer;font:12px inherit;font-weight:600;';
+      row.appendChild(cancel);row.appendChild(send);
+      box.appendChild(ta);box.appendChild(row);
+      document.documentElement.appendChild(box);
+      setTimeout(function(){ta.focus();},0);
+      cancel.onclick=function(ev){ev.preventDefault();ev.stopPropagation();closeBox();};
+      send.onclick=function(ev){
+        ev.preventDefault();ev.stopPropagation();
+        var rect=el.getBoundingClientRect();
+        var payload={
+          selector:cssPath(el),
+          tagName:el.tagName?el.tagName.toLowerCase():'',
+          text:(el.innerText||el.textContent||'').trim().slice(0,200),
+          note:ta.value.trim(),
+          rect:{x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(rect.width),height:Math.round(rect.height)},
+          url:location.href
+        };
+        try{navigator.clipboard.writeText(SENT+JSON.stringify(payload));}catch(_){
+          try{window.__aiosAnnotation=payload;}catch(__){}
+        }
+        window.__aiosAnnotation=payload;
+        closeBox();
+      };
+    }
+    function closeBox(){if(box){box.remove();box=null;}hl.style.display='none';}
+    function click(e){
+      if(box){return;}
+      if(!cur)return;
+      e.preventDefault();e.stopPropagation();
+      buildBox(cur);
+    }
+    function key(e){if(e.key==='Escape'){closeBox();}}
+    document.addEventListener('mousemove',move,true);
+    document.addEventListener('click',click,true);
+    document.addEventListener('keydown',key,true);
+    window.__aiosAnnot={
+      teardown:function(){
+        try{document.removeEventListener('mousemove',move,true);}catch(_){}
+        try{document.removeEventListener('click',click,true);}catch(_){}
+        try{document.removeEventListener('keydown',key,true);}catch(_){}
+        try{closeBox();}catch(_){}
+        try{hl.remove();}catch(_){}
+        try{delete window.__aiosAnnot;}catch(_){window.__aiosAnnot=null;}
+      }
+    };
+  }catch(e){}
+})()"#,
+    );
+    Ok(())
+}
+
+/// Removes the annotator overlay + listeners injected by
+/// `browser_enter_annotate`. Safe to call even if annotate mode isn't active.
+#[tauri::command]
+pub fn browser_exit_annotate(app: AppHandle, label: String) -> Result<(), String> {
+    if let Some(wv) = app.get_webview(&label) {
+        let _ = wv.eval(
+            "(function(){try{if(window.__aiosAnnot&&window.__aiosAnnot.teardown){window.__aiosAnnot.teardown();}}catch(e){}})()",
+        );
+    }
+    Ok(())
+}
+
+/// Evals a copy of the current text selection into the clipboard with the
+/// `AIOS_ANNOT:` sentinel so the frontend's existing poll picks it up. Used by
+/// the "send selection to chat" button. The payload shape mirrors the annotator
+/// (note carries the selection, text is empty) so one parser handles both.
+#[tauri::command]
+pub fn browser_copy_selection(app: AppHandle, label: String) -> Result<(), String> {
+    let wv = app.get_webview(&label).ok_or("browser not open")?;
+    let _ = wv.eval(
+        r#"(function(){
+  try{
+    var SENT='AIOS_ANNOT:';
+    var sel=(window.getSelection?window.getSelection().toString():'').trim();
+    if(!sel)return;
+    var payload={selector:'',tagName:'selection',text:'',note:sel,rect:null,url:location.href};
+    try{navigator.clipboard.writeText(SENT+JSON.stringify(payload));}catch(_){window.__aiosAnnotation=payload;}
+    window.__aiosAnnotation=payload;
+  }catch(e){}
+})()"#,
+    );
+    Ok(())
+}
+
+/// Reads the system clipboard as text — the receive end of the clipboard-bridge.
+/// macOS: `pbpaste`. The frontend polls this and filters for the `AIOS_ANNOT:`
+/// sentinel, so unrelated clipboard contents are ignored.
+///
+/// Windows fallback (not compiled here — macOS-only build): run
+/// `powershell -NoProfile -Command Get-Clipboard` and read its stdout instead.
+/// Linux fallback: `xclip -selection clipboard -o` (or `wl-paste`).
+#[tauri::command]
+pub fn read_clipboard() -> Result<String, String> {
+    let out = std::process::Command::new("/usr/bin/pbpaste")
+        .output()
+        .map_err(|e| format!("pbpaste failed to launch: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pbpaste exited with {}",
+            out.status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}

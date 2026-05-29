@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -58,6 +58,8 @@ struct ChatSession {
 /// `static` Mutex<HashMap>) so no Tauri `State` wiring is required in `lib.rs`.
 static SESSIONS: Mutex<Option<HashMap<u32, Arc<ChatSession>>>> = Mutex::new(None);
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// Monotonic counter for control_request `request_id`s (interrupts, decisions).
+static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
 
 /// Runs `f` against the (lazily-initialised) session map.
 fn with_sessions<R>(f: impl FnOnce(&mut HashMap<u32, Arc<ChatSession>>) -> R) -> R {
@@ -126,6 +128,25 @@ fn user_line(text: &str) -> String {
         "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
         json_escape(text)
     )
+}
+
+/// Writes one already-formed line to a live session's stdin, flushing it. Shared
+/// by every "push a line to claude" path (turns, interrupts, control replies).
+/// `line` should already end in `\n`. No-op error text if the session is gone.
+fn write_line(session_id: u32, line: &str) -> Result<(), String> {
+    let session = with_sessions(|m| m.get(&session_id).cloned());
+    let session = match session {
+        Some(s) => s,
+        None => return Err(format!("chat session {session_id} not found")),
+    };
+    let mut stdin = session.stdin.lock();
+    stdin
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("failed to write to claude stdin: {e}"))?;
+    stdin
+        .flush()
+        .map_err(|e| format!("failed to flush claude stdin: {e}"))?;
+    Ok(())
 }
 
 /// Splits a byte buffer at the last valid UTF-8 boundary, returning the decoded
@@ -298,20 +319,42 @@ pub fn chat_start(
 /// session's Channel (set at `chat_start`). No-op if the session is gone.
 #[tauri::command]
 pub fn chat_send(session_id: u32, text: String) -> Result<(), String> {
-    let session = with_sessions(|m| m.get(&session_id).cloned());
-    let session = match session {
-        Some(s) => s,
-        None => return Err(format!("chat session {session_id} not found")),
+    write_line(session_id, &user_line(&text))
+}
+
+/// Interrupts the in-flight turn of a live chat session.
+///
+/// Uses claude's stream-json **control protocol** (verified live against claude
+/// 2.1.156): we write a `control_request` with `subtype:"interrupt"` to stdin.
+/// claude replies on stdout with
+/// `{"type":"control_response","response":{"subtype":"success","request_id":..}}`
+/// and ends the current turn with a `result` of subtype `error_during_execution`.
+/// Crucially the **process stays alive** — the very next `chat_send` runs a new
+/// turn normally — so this is a true interrupt, not a kill/respawn. The frontend
+/// stops consuming deltas and re-enables the composer when it sees the result.
+#[tauri::command]
+pub fn chat_interrupt(session_id: u32) -> Result<(), String> {
+    let rid = NEXT_REQ.fetch_add(1, Ordering::SeqCst);
+    let line = format!(
+        "{{\"type\":\"control_request\",\"request_id\":\"int-{rid}\",\"request\":{{\"subtype\":\"interrupt\"}}}}\n"
+    );
+    write_line(session_id, &line)
+}
+
+/// Writes a raw, already-formed JSON line to a session's stdin (must end in
+/// `\n`). Used by the frontend to reply to claude's control protocol — e.g.
+/// permission/approval decisions in `default` mode, which arrive as a
+/// `control_request` with `subtype:"can_use_tool"` and expect a matching
+/// `control_response`. Kept generic so the control schema can evolve in TS
+/// without touching Rust (same philosophy as the dumb-pipe stdout reader).
+#[tauri::command]
+pub fn chat_send_raw(session_id: u32, line: String) -> Result<(), String> {
+    let line = if line.ends_with('\n') {
+        line
+    } else {
+        format!("{line}\n")
     };
-    let line = user_line(&text);
-    let mut stdin = session.stdin.lock();
-    stdin
-        .write_all(line.as_bytes())
-        .map_err(|e| format!("failed to write to claude stdin: {e}"))?;
-    stdin
-        .flush()
-        .map_err(|e| format!("failed to flush claude stdin: {e}"))?;
-    Ok(())
+    write_line(session_id, &line)
 }
 
 /// Kills a chat session and removes it from the registry. Defensive: ignores

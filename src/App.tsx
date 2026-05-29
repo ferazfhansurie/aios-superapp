@@ -74,7 +74,7 @@ const SPAWN: { kind: PaneContent; icon: typeof Folder; label: string }[] = [
   { kind: { type: "browser" }, icon: Globe, label: "browser" },
   { kind: { type: "memory" }, icon: Brain, label: "memory" },
   { kind: { type: "automations" }, icon: Clock, label: "automations" },
-  { kind: { type: "bridges" }, icon: Radio, label: "bridges" },
+  { kind: { type: "bridges" }, icon: Radio, label: "channels" },
   { kind: { type: "plugins" }, icon: Blocks, label: "plugins" },
 ];
 
@@ -142,6 +142,23 @@ function App() {
       }
     },
     [flash],
+  );
+
+  // Browser annotations / selections → into a chat pane (the superapp loop).
+  const routeToChat = useCallback(
+    (text: string) => {
+      const chatPane = panes.find((p) => p.kind.type === "chat");
+      const w = chatPane ? paneWriters.get(chatPane.key) : null;
+      if (w) {
+        w(text);
+        flash("→ chat");
+      } else {
+        navigator.clipboard?.writeText(text).catch(() => {});
+        spawn({ type: "chat" }, "chat");
+        flash("opened chat · annotation copied (⌘V)");
+      }
+    },
+    [panes, flash, spawn],
   );
 
   // ---- keyboard: ⌘B sidebar · ⌘K palette · ⌘T terminal · ⌘, settings · ⌘⌘ appshot
@@ -245,10 +262,10 @@ function App() {
 
         <div className="flex items-center gap-2">
           <span className="font-mono text-sm font-semibold tracking-tight text-[var(--color-accent)]">
-            cockpit
+            aios
           </span>
           <span className="text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--color-muted)]">
-            aios
+            superapp
           </span>
         </div>
 
@@ -267,25 +284,17 @@ function App() {
         {sidebarOpen && (
           <aside className="flex w-60 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
             <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-2">
-              {/* Codex-style nav list */}
+              {/* sessions */}
               <div className="flex flex-col gap-0.5">
-                {SPAWN.map((s) => (
-                  <button
-                    key={s.label}
-                    onClick={() => spawn(s.kind, s.label)}
-                    className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-                  >
-                    <s.icon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
-                    {s.label === "chat" ? "new chat" : s.label}
-                  </button>
+                {SPAWN.filter((s) => s.label === "chat" || s.label === "terminal").map((s) => (
+                  <NavRow key={s.label} icon={s.icon} label={s.label === "chat" ? "new chat" : s.label} onClick={() => spawn(s.kind, s.label)} />
                 ))}
-                <button
-                  onClick={() => setSettingsOpen(true)}
-                  className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-                >
-                  <SettingsIcon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
-                  settings
-                </button>
+              </div>
+              {/* tools */}
+              <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] pt-2">
+                {SPAWN.filter((s) => s.label !== "chat" && s.label !== "terminal").map((s) => (
+                  <NavRow key={s.label} icon={s.icon} label={s.label} onClick={() => spawn(s.kind, s.label)} />
+                ))}
               </div>
               <OracleRoster
                 onAttachOracle={addOracle}
@@ -293,7 +302,8 @@ function App() {
                 onAttachRoot={() => spawn({ type: "shell", cmd: "aios" }, "master")}
               />
             </div>
-            <div className="border-t border-[var(--color-border)] p-2">
+            <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
+              <NavRow icon={SettingsIcon} label="settings" onClick={() => setSettingsOpen(true)} />
               <AccountMenu
                 onOpenSettings={() => setSettingsOpen(true)}
                 onOpenChange={setAccountOpen}
@@ -324,6 +334,7 @@ function App() {
                   active={!overlayOpen}
                   onClose={() => closePane(pane.key)}
                   onFocus={() => (focusedPane.current = pane.key)}
+                  onAnnotate={routeToChat}
                 />
               ))}
             </div>
@@ -370,6 +381,26 @@ function IconBtn({
   );
 }
 
+function NavRow({
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  icon: typeof Folder;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+    >
+      <Icon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
+      {label}
+    </button>
+  );
+}
+
 const DOT: Record<string, string> = {
   oracle: "status-dot--active",
   tmux: "status-dot--dormant",
@@ -388,11 +419,13 @@ function PaneCard({
   active,
   onClose,
   onFocus,
+  onAnnotate,
 }: {
   pane: Pane;
   active: boolean;
   onClose: () => void;
   onFocus: () => void;
+  onAnnotate: (text: string) => void;
 }) {
   const t = pane.kind.type;
   const label =
@@ -454,7 +487,7 @@ function PaneCard({
         ) : pane.kind.type === "files" ? (
           <FilesPane />
         ) : pane.kind.type === "browser" ? (
-          <BrowserPane label={pane.key} active={active} />
+          <BrowserPane label={pane.key} active={active} onAnnotate={onAnnotate} />
         ) : pane.kind.type === "memory" ? (
           <MemoryPane />
         ) : pane.kind.type === "automations" ? (
@@ -464,7 +497,7 @@ function PaneCard({
         ) : pane.kind.type === "plugins" ? (
           <PluginsPane />
         ) : (
-          <ChatPane />
+          <ChatPane paneKey={pane.key} />
         )}
       </div>
     </div>
@@ -517,14 +550,14 @@ function EmptyState({
         <div className="flex flex-col items-center gap-1.5">
           <div className="flex items-baseline gap-2.5">
             <span className="font-mono text-6xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_32px_color-mix(in_srgb,var(--color-accent)_50%,transparent)]">
-              cockpit
+              aios
             </span>
             <span className="text-[11px] font-medium uppercase tracking-[0.4em] text-[var(--color-muted)]">
-              aios
+              superapp
             </span>
           </div>
           <p className="text-[12px] tracking-wide text-[var(--color-faint)]">
-            your command deck · pick an engine
+            one chat, every channel, any pane · pick an engine
           </p>
         </div>
 
@@ -595,7 +628,7 @@ function Splash() {
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-[var(--color-bg)]">
       <span className="brand-logo--splash font-mono text-5xl font-bold tracking-tighter text-[var(--color-accent)] [text-shadow:0_0_32px_color-mix(in_srgb,var(--color-accent)_50%,transparent)]">
-        cockpit
+        aios
       </span>
     </div>
   );

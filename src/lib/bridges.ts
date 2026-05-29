@@ -1,20 +1,31 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /**
- * One bridge — a long-running process connecting AIOS to an external channel
- * (WhatsApp today). Health + recent activity, all best-effort: any field may be
- * null when its source is unavailable.
+ * Headline state of a channel:
+ *  - "connected"    — wired + reachable (a live process / running launchd / log).
+ *  - "disconnected" — known connector, but nothing alive right now.
+ *  - "soon"         — connector not built yet (the honest default).
  */
-export interface Bridge {
-  /** Stable slug, e.g. "whatsapp". */
+export type ChannelStatus = "connected" | "disconnected" | "soon";
+
+/**
+ * One channel AIOS speaks through. WhatsApp is the live, fully-detected proof;
+ * the rest are connectors on the way. Health + recent activity are best-effort:
+ * any field may be null when its source is unavailable (or the channel is
+ * "soon" — connectors that don't exist yet carry null stats).
+ */
+export interface Channel {
+  /** Stable slug, e.g. "whatsapp", "telegram". */
   id: string;
-  /** Human label, e.g. "WhatsApp bridge". */
+  /** Human label shown on the card, e.g. "whatsapp", "google chat". */
   name: string;
-  /** Channel type chip, e.g. "whatsapp". */
+  /** Channel-type chip, e.g. "messaging", "dm", "social", "chat", "email". */
   kind: string;
+  /** Headline state — drives the status dot + label + affordance. */
+  status: ChannelStatus;
   /** True when a live process exists, or launchd reports it running. */
   alive: boolean;
-  /** PID of the matched bridge process, if found. */
+  /** PID of the matched channel process, if found. */
   pid: number | null;
   /** Humanized process uptime, e.g. "3h 12m". */
   uptime: string | null;
@@ -22,7 +33,7 @@ export interface Bridge {
   launchd: string | null;
   /** Whether a matching launchd job is loaded. */
   loaded: boolean;
-  /** Total log lines (≈ messages sent). */
+  /** Total log lines (≈ messages sent). Null for channels with no log. */
   messagesTotal: number | null;
   /** Local timestamp of the last activity, "YYYY-MM-DD HH:MM". */
   lastActivity: string | null;
@@ -34,14 +45,30 @@ export interface Bridge {
   logPath: string | null;
 }
 
-/** The bridges roster, shaped so future bridges slot straight in. */
-export interface Bridges {
-  bridges: Bridge[];
+/**
+ * Back-compat alias — the live, fully-detected channels (WhatsApp today) are
+ * still shaped like the old `Bridge`. `Channel` is the canonical name now.
+ */
+export type Bridge = Channel;
+
+/**
+ * The channels roster. The wire key stays `bridges` (the Rust command is still
+ * `list_bridges`) so nothing downstream of the IPC boundary had to change.
+ */
+export interface Channels {
+  bridges: Channel[];
 }
 
-export async function listBridges(): Promise<Bridges> {
-  return invoke<Bridges>("list_bridges");
+/** Back-compat alias for the roster shape. */
+export type Bridges = Channels;
+
+/** Fetches every channel AIOS speaks through, with status + live health. */
+export async function listBridges(): Promise<Channels> {
+  return invoke<Channels>("list_bridges");
 }
+
+/** Alias under the channels naming — same IPC call. */
+export const listChannels = listBridges;
 
 /**
  * One message flowing through a bridge — a row in the recent-activity feed.

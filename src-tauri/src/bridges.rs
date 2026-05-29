@@ -1,10 +1,15 @@
-//! BRIDGES health surface — is each external-channel bridge ALIVE, and what's
-//! it been doing lately, at a glance.
+//! CHANNELS dispatch surface — every messaging channel AIOS speaks through, and
+//! for the live ones, are they connected/ALIVE and what's flowing through them.
 //!
-//! A "bridge" here is a long-running process that connects AIOS to an external
-//! channel (WhatsApp today; more to come). For each bridge we probe THREE
-//! read-only macOS sources, each independently best-effort — any source failing
-//! yields an empty field, never an error for the whole call:
+//! AIOS is a superapp hub: one place to dispatch, monitor, and reply across ALL
+//! channels — WhatsApp, Instagram, Threads, Google Chat, X/Twitter, Telegram,
+//! Gmail, iMessage, and more. Each channel is a `ChannelProbe` descriptor;
+//! `channel_probes()` returns the roster. Adding a channel = pushing one more.
+//!
+//! WhatsApp is the proof — fully detected. For it (and any future fully-wired
+//! channel) we probe THREE read-only macOS sources, each independently
+//! best-effort — any source failing yields an empty field, never an error for
+//! the whole call:
 //!
 //!   1. process liveness — `/bin/ps -axo pid,etime,command`, matched against a
 //!      set of command substrings (e.g. `inbox-worker`, `push.js`,
@@ -17,9 +22,13 @@
 //!      LAST entry (parsed from a `ts`/`timestamp`/`time` field), "X ago", and
 //!      today's entry count.
 //!
-//! Designed to be EXTENSIBLE: a `BridgeProbe` descriptor describes one bridge;
-//! `bridge_probes()` returns the list. Adding a second bridge later = pushing
-//! another descriptor — `list_bridges` maps over them uniformly.
+//! Every channel carries a `status`:
+//!   - `connected`    — wired + reachable (a live proc / running launchd / log).
+//!   - `disconnected` — known connector, but nothing alive right now.
+//!   - `soon`         — connector not built yet (the honest default).
+//!
+//! Channels marked `soon` (or with no detectable footprint) return null stats —
+//! we don't fabricate liveness for connectors that don't exist yet.
 //!
 //! Mirrors the clean, commented style of `oracles.rs` / `automations.rs`. No new
 //! deps: `chrono` for timestamp math, `serde_json` for the output shape.
@@ -31,40 +40,127 @@ fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".into())
 }
 
-/// Static descriptor for one bridge. Add a new bridge = add one of these to
-/// `bridge_probes()` — everything downstream maps over the list uniformly.
-struct BridgeProbe {
+/// How hard a channel's connector is wired, which drives how we detect it.
+#[derive(Clone, Copy, PartialEq)]
+enum Wiring {
+    /// Fully built connector — run the full 3-source probe (proc + launchd +
+    /// log). Resolves to `connected` (alive) / `disconnected` (a footprint but
+    /// nothing live) — but never `soon`. WhatsApp today.
+    Live,
+    /// Connector not built. Still does a *light* best-effort footprint check
+    /// (any matching launchd job, or any candidate log present) so that if a
+    /// connector quietly lands later it lights up on its own — otherwise the
+    /// channel honestly reports `soon` with null stats.
+    Soon,
+}
+
+/// Static descriptor for one channel. Add a channel = add one of these to
+/// `channel_probes()` — everything downstream maps over the list uniformly.
+struct ChannelProbe {
     /// Stable slug, e.g. `whatsapp`.
     id: &'static str,
-    /// Human label, e.g. `WhatsApp bridge`.
+    /// Human label shown on the card, e.g. `whatsapp`.
     name: &'static str,
-    /// Channel type chip, e.g. `whatsapp`.
+    /// Channel type chip, e.g. `whatsapp`, `dm`, `email`, `chat`.
     kind: &'static str,
-    /// Command substrings that identify the bridge process(es) in `ps` output.
-    /// First matching process wins (pid + uptime).
+    /// How wired the connector is — drives detection + the floor status.
+    wiring: Wiring,
+    /// Command substrings that identify the channel's process(es) in `ps`
+    /// output. First matching process wins (pid + uptime).
     proc_match: &'static [&'static str],
-    /// Substring a `launchctl list` LABEL must contain to count as this bridge's
-    /// job (matched case-insensitively against `*bridge*`-style labels).
+    /// Substring a `launchctl list` LABEL must contain to count as this
+    /// channel's job (matched case-insensitively against `*bridge*`-style
+    /// labels for the live ones; used as a loose footprint hint otherwise).
     launchd_match: &'static str,
     /// Candidate activity-log paths (relative to `$HOME` if not absolute),
     /// probed in order — first that exists is used.
     log_candidates: &'static [&'static str],
 }
 
-/// The registry of known bridges. WhatsApp today; push more here later.
-fn bridge_probes() -> Vec<BridgeProbe> {
-    vec![BridgeProbe {
-        id: "whatsapp",
-        name: "WhatsApp bridge",
-        kind: "whatsapp",
-        proc_match: &["inbox-worker", "push.js", "meta-webhook", "aios-bridge", "aios/bridge"],
-        launchd_match: "bridge",
-        log_candidates: &[
-            "Repo/firaz/aios/bridge/scripts/outbound-log.jsonl",
-            "Repo/firaz/aios-bridge/scripts/outbound-log.jsonl",
-            ".aios/state/outbound-log.jsonl",
-        ],
-    }]
+/// The roster of channels AIOS speaks through. WhatsApp is the live proof; the
+/// rest are connectors on the way — push more / promote to `Wiring::Live` as
+/// they get built.
+fn channel_probes() -> Vec<ChannelProbe> {
+    vec![
+        // ── live, fully-detected proof ──────────────────────────────────────
+        ChannelProbe {
+            id: "whatsapp",
+            name: "whatsapp",
+            kind: "messaging",
+            wiring: Wiring::Live,
+            proc_match: &["inbox-worker", "push.js", "meta-webhook", "aios-bridge", "aios/bridge"],
+            launchd_match: "bridge",
+            log_candidates: &[
+                "Repo/firaz/aios/bridge/scripts/outbound-log.jsonl",
+                "Repo/firaz/aios-bridge/scripts/outbound-log.jsonl",
+                ".aios/state/outbound-log.jsonl",
+            ],
+        },
+        // ── connectors on the way (light footprint check, else `soon`) ──────
+        ChannelProbe {
+            id: "instagram",
+            name: "instagram",
+            kind: "dm",
+            wiring: Wiring::Soon,
+            proc_match: &[],
+            launchd_match: "instagram",
+            log_candidates: &[".aios/state/instagram-log.jsonl"],
+        },
+        ChannelProbe {
+            id: "threads",
+            name: "threads",
+            kind: "social",
+            wiring: Wiring::Soon,
+            proc_match: &[],
+            launchd_match: "threads",
+            log_candidates: &[".aios/state/threads-log.jsonl"],
+        },
+        ChannelProbe {
+            id: "gchat",
+            name: "google chat",
+            kind: "chat",
+            wiring: Wiring::Soon,
+            proc_match: &[],
+            launchd_match: "gchat",
+            log_candidates: &[".aios/state/gchat-log.jsonl"],
+        },
+        ChannelProbe {
+            id: "x",
+            name: "x / twitter",
+            kind: "social",
+            wiring: Wiring::Soon,
+            proc_match: &[],
+            launchd_match: "twitter",
+            log_candidates: &[".aios/state/x-log.jsonl"],
+        },
+        ChannelProbe {
+            id: "telegram",
+            name: "telegram",
+            kind: "messaging",
+            wiring: Wiring::Soon,
+            proc_match: &[],
+            launchd_match: "telegram",
+            log_candidates: &[".aios/state/telegram-log.jsonl"],
+        },
+        ChannelProbe {
+            id: "gmail",
+            name: "gmail",
+            kind: "email",
+            wiring: Wiring::Soon,
+            proc_match: &[],
+            launchd_match: "gmail",
+            log_candidates: &[".aios/state/gmail-log.jsonl"],
+        },
+        ChannelProbe {
+            id: "imessage",
+            name: "imessage",
+            kind: "messaging",
+            wiring: Wiring::Soon,
+            proc_match: &[],
+            launchd_match: "imessage",
+            log_candidates: &[".aios/state/imessage-log.jsonl"],
+        },
+    ]
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -80,6 +176,9 @@ struct ProcHit {
 /// Runs `ps -axo pid,etime,command` and returns the first process whose command
 /// contains any of `needles`. Best-effort → `None` on any failure / no match.
 fn find_process(needles: &[&str]) -> Option<ProcHit> {
+    if needles.is_empty() {
+        return None;
+    }
     #[cfg(unix)]
     {
         let out = std::process::Command::new("/bin/ps")
@@ -159,9 +258,11 @@ struct LaunchdHit {
     running: bool,
 }
 
-/// Runs `launchctl list` and finds the first job whose label contains both
-/// `bridge` and the bridge's `launchd_match` substring. `running` = it has a
-/// live pid (not `-`). Best-effort → `None`.
+/// Runs `launchctl list` and finds the first job whose label contains the
+/// channel's `launchd_match` substring (case-insensitively). For WhatsApp the
+/// needle is `bridge`, which still matches its `*aios-bridge*` labels; for other
+/// channels it's the connector slug (e.g. `telegram`). `running` = it has a live
+/// pid (not `-`). Best-effort → `None`.
 fn find_launchd(needle: &str) -> Option<LaunchdHit> {
     #[cfg(unix)]
     {
@@ -175,6 +276,9 @@ fn find_launchd(needle: &str) -> Option<LaunchdHit> {
         }
         let text = String::from_utf8_lossy(&out.stdout);
         let needle_l = needle.to_lowercase();
+        if needle_l.is_empty() {
+            return None;
+        }
         // Columns: PID(or `-`)\tEXIT\tLABEL. Skip the header line.
         for line in text.lines().skip(1) {
             let mut cols = line.split('\t');
@@ -182,7 +286,7 @@ fn find_launchd(needle: &str) -> Option<LaunchdHit> {
             let _exit = cols.next();
             let label = cols.next().unwrap_or("").trim();
             let label_l = label.to_lowercase();
-            if label.is_empty() || !label_l.contains("bridge") || !label_l.contains(&needle_l) {
+            if label.is_empty() || !label_l.contains(&needle_l) {
                 continue;
             }
             let running = pid_raw != "-" && pid_raw.parse::<i64>().is_ok();
@@ -337,14 +441,44 @@ fn humanize_ago(ts: &chrono::DateTime<chrono::Utc>) -> Option<String> {
 // assembly
 // ════════════════════════════════════════════════════════════════════════
 
-/// Probes a single bridge across all three sources and returns its descriptor.
-fn probe_bridge(p: &BridgeProbe) -> Value {
+/// Probes a single channel across all three sources and returns its descriptor.
+/// For `Wiring::Live` channels (WhatsApp) we trust the full probe and resolve
+/// `connected`/`disconnected`. For `Wiring::Soon` channels we do only a light
+/// footprint check — if a connector quietly lands (a matching launchd job or a
+/// candidate log shows up) we promote it, otherwise it honestly reports `soon`
+/// with null stats.
+fn probe_channel(p: &ChannelProbe) -> Value {
     let proc_hit = find_process(p.proc_match);
     let launchd_hit = find_launchd(p.launchd_match);
     let log = read_log(p.log_candidates);
 
     // ALIVE = a live process, OR launchd reports it running.
     let alive = proc_hit.is_some() || launchd_hit.as_ref().map(|l| l.running).unwrap_or(false);
+    // Any footprint at all — a loaded job (even if not running) or a present log.
+    let has_footprint = launchd_hit.is_some() || log.is_some();
+
+    // status: the channel's headline state.
+    //   Live  → connected when alive, else disconnected (footprint but no proc).
+    //   Soon  → promote to connected/disconnected only if a footprint surfaced,
+    //           otherwise the honest `soon`.
+    let status = match p.wiring {
+        Wiring::Live => {
+            if alive {
+                "connected"
+            } else {
+                "disconnected"
+            }
+        }
+        Wiring::Soon => {
+            if alive {
+                "connected"
+            } else if has_footprint {
+                "disconnected"
+            } else {
+                "soon"
+            }
+        }
+    };
 
     let pid = proc_hit.as_ref().map(|h| h.pid);
     let uptime = proc_hit
@@ -370,6 +504,7 @@ fn probe_bridge(p: &BridgeProbe) -> Value {
         "id": p.id,
         "name": p.name,
         "kind": p.kind,
+        "status": status,
         "alive": alive,
         "pid": pid,
         "uptime": uptime,
@@ -383,13 +518,17 @@ fn probe_bridge(p: &BridgeProbe) -> Value {
     })
 }
 
-/// Lists every known bridge with its health + recent activity. The whole call is
-/// best-effort: each source per-bridge fails soft to an empty field, never an
-/// error. Returns `{ "bridges": [ … ] }` so future bridges slot straight in.
+/// Lists every channel AIOS speaks through, with `status` + (for the live ones)
+/// health + recent activity. The whole call is best-effort: each source
+/// per-channel fails soft to an empty field, never an error.
+///
+/// Returns `{ "bridges": [ … ] }` — the key is kept as `bridges` for backward
+/// compat (the command is still `list_bridges`, registered in `lib.rs`). The
+/// frontend reads each entry's `status` to drive the channels view.
 #[tauri::command]
 pub fn list_bridges() -> Value {
-    let bridges: Vec<Value> = bridge_probes().iter().map(probe_bridge).collect();
-    json!({ "bridges": bridges })
+    let channels: Vec<Value> = channel_probes().iter().map(probe_channel).collect();
+    json!({ "bridges": channels })
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -513,16 +652,17 @@ fn read_feed(candidates: &[&str], default_dir: &str, limit: usize) -> Vec<Value>
         .collect()
 }
 
-/// Recent messages flowing through a bridge, newest-first. Merges the outbound
+/// Recent messages flowing through a channel, newest-first. Merges the outbound
 /// log (everything `out`) with an inbound/conversation log when one exists, then
-/// sorts by timestamp and caps at `limit`. For an unknown bridge id with no log,
-/// returns `{ "messages": [] }`. Never panics — every source fails soft.
+/// sorts by timestamp and caps at `limit`. For an unknown channel id with no log
+/// (e.g. a `soon` channel), returns `{ "messages": [] }`. Never panics — every
+/// source fails soft.
 #[tauri::command]
 pub fn bridge_activity(id: String, limit: u32) -> Value {
     let limit = (limit.max(1) as usize).min(500);
 
     // Find the matching probe to reuse its outbound log candidates.
-    let probes = bridge_probes();
+    let probes = channel_probes();
     let probe = probes.iter().find(|p| p.id == id);
 
     let mut messages: Vec<Value> = Vec::new();

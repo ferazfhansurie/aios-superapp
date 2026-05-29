@@ -104,9 +104,28 @@ export interface ChatEvent {
   permissionMode?: string;
   // synthetic stderr
   text?: string;
+  // control protocol (interrupts + permission/approval requests in non-bypass
+  // modes). claude → us: `control_request` (subtype `can_use_tool`) and
+  // `control_response` (ack of our interrupt). We reply via `chatSendRaw`.
+  request_id?: string;
+  request?: {
+    subtype?: string; // "interrupt" | "can_use_tool" | ...
+    tool_name?: string;
+    input?: Record<string, unknown>;
+    permission_suggestions?: unknown;
+    [key: string]: unknown;
+  };
+  response?: {
+    subtype?: string; // "success" | "error"
+    request_id?: string;
+    [key: string]: unknown;
+  };
   // catch-all
   [key: string]: unknown;
 }
+
+/** A permission/approval decision sent back over the control protocol. */
+export type ApprovalDecision = "allow" | "allow_always" | "deny";
 
 /** One selectable chat model in the composer's model picker. */
 export interface ChatModel {
@@ -170,4 +189,53 @@ export async function chatSend(id: number, text: string): Promise<void> {
 /** Kills a chat session and frees its claude process. */
 export async function chatStop(id: number): Promise<void> {
   return invoke("chat_stop", { sessionId: id });
+}
+
+/**
+ * Interrupts the in-flight turn via claude's control protocol (sends a
+ * `control_request`/`interrupt`). The process survives — the next `chatSend`
+ * runs a fresh turn — so this is a true stop, not a kill. Verified live: claude
+ * acks with a `control_response` then ends the turn with a `result` of subtype
+ * `error_during_execution`.
+ */
+export async function chatInterrupt(id: number): Promise<void> {
+  return invoke("chat_interrupt", { sessionId: id });
+}
+
+/**
+ * Writes a raw JSON control line to the session's stdin. Used to reply to
+ * claude's permission/approval requests (a `control_request` with subtype
+ * `can_use_tool` in non-bypass modes) with a matching `control_response`.
+ */
+export async function chatSendRaw(id: number, line: string): Promise<void> {
+  return invoke("chat_send_raw", { sessionId: id, line });
+}
+
+/**
+ * Builds the `control_response` line replying to a `can_use_tool` permission
+ * request. `allow` → permit once; `allow_always` → permit + remember for the
+ * session (updatedPermissions); `deny` → refuse with a short reason.
+ *
+ * The exact reply schema is claude's SDK control protocol. We keep this in TS
+ * (not Rust) so it can evolve without a rebuild. If a future claude expects a
+ * slightly different shape, this is the one place to adjust.
+ */
+export function buildApprovalLine(
+  requestId: string,
+  decision: ApprovalDecision,
+  toolName?: string,
+): string {
+  const allow = decision === "allow" || decision === "allow_always";
+  const inner: Record<string, unknown> = allow
+    ? { behavior: "allow", updatedInput: {} }
+    : { behavior: "deny", message: "Denied by user." };
+  if (decision === "allow_always" && toolName) {
+    inner.updatedPermissions = [
+      { type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" },
+    ];
+  }
+  return JSON.stringify({
+    type: "control_response",
+    response: { subtype: "success", request_id: requestId, response: inner },
+  });
 }

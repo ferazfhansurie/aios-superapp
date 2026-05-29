@@ -10,10 +10,13 @@ import {
   ArrowLeft,
   ArrowRight,
   Camera,
+  Crosshair,
   ExternalLink,
+  MessageSquarePlus,
   MoreVertical,
   RotateCw,
   Smartphone,
+  SquareDashedMousePointer,
   Trash2,
   ZoomIn,
   ZoomOut,
@@ -23,7 +26,10 @@ import {
   browserBack,
   browserClearCookies,
   browserClose,
+  browserCopySelection,
   browserDeviceMode,
+  browserEnterAnnotate,
+  browserExitAnnotate,
   browserForward,
   browserHide,
   browserNavigate,
@@ -32,8 +38,13 @@ import {
   browserSetBounds,
   browserShow,
   browserZoom,
+  readClipboard,
+  type BrowserAnnotation,
   type Rect,
 } from "../lib/browser";
+
+const ANNOT_SENTINEL = "AIOS_ANNOT:";
+const ANNOT_POLL_MS = 700;
 
 const ZOOM_MIN = 50;
 const ZOOM_MAX = 200;
@@ -47,7 +58,17 @@ function normalizeUrl(input: string): string {
   return `https://www.google.com/search?q=${encodeURIComponent(t)}`;
 }
 
-export function BrowserPane({ label, active = true }: { label: string; active?: boolean }) {
+export function BrowserPane({
+  label,
+  active = true,
+  onAnnotate,
+}: {
+  label: string;
+  active?: boolean;
+  /** Fired when an annotation or page-selection is captured (clipboard-bridge),
+   *  with a formatted, chat-ready string. App wires this to the active chat. */
+  onAnnotate?: (text: string) => void;
+}) {
   const slotRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const [input, setInput] = useState("https://google.com");
@@ -55,9 +76,16 @@ export function BrowserPane({ label, active = true }: { label: string; active?: 
   const [menuOpen, setMenuOpen] = useState(false);
   const [zoom, setZoom] = useState(100);
   const [deviceMode, setDeviceMode] = useState(false);
+  const [annotating, setAnnotating] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const shownRef = useRef(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Last clipboard payload we already consumed — so the poll only fires
+  // `onAnnotate` once per fresh annotation, never re-emitting stale text.
+  const lastAnnotRef = useRef<string | null>(null);
+  // Latest `onAnnotate` without making it a poll-effect dependency.
+  const onAnnotateRef = useRef(onAnnotate);
+  onAnnotateRef.current = onAnnotate;
 
   const rect = useCallback((): Rect | null => {
     const el = slotRef.current;
@@ -167,6 +195,100 @@ export function BrowserPane({ label, active = true }: { label: string; active?: 
     showToast("cleared cookies + storage");
   }, [label, showToast]);
 
+  // Turn a captured annotation/selection into one chat-ready line.
+  const formatAnnotation = useCallback((a: BrowserAnnotation): string => {
+    const note = a.note || "(no note)";
+    if (a.tagName === "selection" || !a.selector) {
+      return `selection: "${note}" (${a.url})`;
+    }
+    const text = a.text ? ` — element text: "${a.text}"` : "";
+    return `annotation on ${a.selector}: "${note}"${text} (${a.url})`;
+  }, []);
+
+  // Read the clipboard, and if it carries a FRESH AIOS_ANNOT payload, emit it.
+  // Returns true when an annotation was consumed (so the caller can exit mode).
+  const consumeAnnotation = useCallback((): Promise<boolean> => {
+    return readClipboard()
+      .then((raw) => {
+        if (!raw || !raw.startsWith(ANNOT_SENTINEL)) return false;
+        if (raw === lastAnnotRef.current) return false; // already handled
+        lastAnnotRef.current = raw;
+        let parsed: BrowserAnnotation;
+        try {
+          parsed = JSON.parse(raw.slice(ANNOT_SENTINEL.length)) as BrowserAnnotation;
+        } catch {
+          return false;
+        }
+        onAnnotateRef.current?.(formatAnnotation(parsed));
+        return true;
+      })
+      .catch(() => false);
+  }, [formatAnnotation]);
+
+  const exitAnnotate = useCallback(() => {
+    setAnnotating(false);
+    browserExitAnnotate(label).catch(() => {});
+  }, [label]);
+
+  const toggleAnnotate = useCallback(() => {
+    if (annotating) {
+      exitAnnotate();
+      return;
+    }
+    // Snapshot current clipboard as already-seen so we don't grab a stale
+    // AIOS_ANNOT left over from a previous session as if it were new.
+    readClipboard()
+      .then((raw) => {
+        lastAnnotRef.current = raw && raw.startsWith(ANNOT_SENTINEL) ? raw : null;
+      })
+      .catch(() => {})
+      .finally(() => {
+        setAnnotating(true);
+        browserEnterAnnotate(label)
+          .then(() => showToast("annotate: click an element on the page"))
+          .catch((e) => {
+            setAnnotating(false);
+            showToast(typeof e === "string" ? e : "annotate failed");
+          });
+      });
+  }, [annotating, exitAnnotate, label, showToast]);
+
+  // "Send selection to chat": copy the page's current text selection to the
+  // clipboard (sentinel-tagged), then read it straight back and emit.
+  const sendSelection = useCallback(() => {
+    browserCopySelection(label)
+      .then(() => new Promise((r) => setTimeout(r, 120))) // let clipboard settle
+      .then(() => consumeAnnotation())
+      .then((ok) => showToast(ok ? "selection sent to chat" : "no text selected"))
+      .catch((e) => showToast(typeof e === "string" ? e : "selection failed"));
+  }, [consumeAnnotation, label, showToast]);
+
+  // While annotating, poll the clipboard for a submitted annotation, then exit.
+  useEffect(() => {
+    if (!annotating) return;
+    let stop = false;
+    const id = setInterval(() => {
+      if (stop) return;
+      consumeAnnotation().then((ok) => {
+        if (ok && !stop) exitAnnotate();
+      });
+    }, ANNOT_POLL_MS);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [annotating, consumeAnnotation, exitAnnotate]);
+
+  // Tear down annotate mode if the pane is hidden or unmounts.
+  useEffect(() => {
+    if (!active && annotating) exitAnnotate();
+  }, [active, annotating, exitAnnotate]);
+  useEffect(() => {
+    return () => {
+      browserExitAnnotate(label).catch(() => {});
+    };
+  }, [label]);
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-2">
@@ -200,6 +322,26 @@ export function BrowserPane({ label, active = true }: { label: string; active?: 
         <NavBtn title="Screenshot" onClick={onScreenshot}>
           <Camera size={13} />
         </NavBtn>
+        <NavBtn title="Send selection to chat" onClick={sendSelection}>
+          <MessageSquarePlus size={14} />
+        </NavBtn>
+        <button
+          type="button"
+          onClick={toggleAnnotate}
+          title={annotating ? "Stop annotating" : "Annotate page → chat"}
+          aria-pressed={annotating}
+          className={
+            annotating
+              ? "rounded p-1.5 bg-[var(--color-accent)]/15 text-[var(--color-accent)] transition-colors"
+              : "rounded p-1.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          }
+        >
+          {annotating ? (
+            <Crosshair size={14} />
+          ) : (
+            <SquareDashedMousePointer size={14} />
+          )}
+        </button>
         <div ref={menuRef} className="relative">
           <NavBtn title="Options" onClick={() => setMenuOpen((o) => !o)}>
             <MoreVertical size={14} />
@@ -280,6 +422,12 @@ export function BrowserPane({ label, active = true }: { label: string; active?: 
         <div className="pointer-events-none absolute inset-0 grid place-items-center text-[11px] text-[var(--color-faint)]">
           loading native browser…
         </div>
+        {annotating && (
+          <div className="pointer-events-none absolute left-1/2 top-2 z-50 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-panel-2)] px-3 py-1 text-[11px] text-[var(--color-accent)] shadow-lg">
+            <Crosshair size={12} />
+            annotating… click an element, then describe it
+          </div>
+        )}
         {toast && (
           <div className="pointer-events-none absolute bottom-2 left-1/2 z-50 -translate-x-1/2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-1.5 text-[11px] text-[var(--color-text)] shadow-lg">
             {toast}
