@@ -1,29 +1,37 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import {
+  Brain,
+  Camera,
   Folder,
   Globe,
   PanelBottom,
   PanelLeft,
   PanelRight,
   Plus,
+  Search,
+  Settings as SettingsIcon,
   TerminalSquare,
   X,
 } from "lucide-react";
 
 import { AccountMenu } from "./components/AccountMenu";
 import { BrowserPane } from "./components/BrowserPane";
+import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FilesPane } from "./components/FilesPane";
+import { MemoryPane } from "./components/MemoryPane";
 import { OracleRoster } from "./components/OracleRoster";
+import { Settings } from "./components/Settings";
 import { TerminalPane, type PaneKind } from "./components/TerminalPane";
+import { appshot } from "./lib/pty";
 
 interface Pane {
   key: string;
   kind: PaneKind;
   label: string;
 }
-type DockKind = "files" | "browser" | "terminal";
+type DockKind = "files" | "browser" | "terminal" | "memory";
 interface DockTab {
   key: string;
   kind: DockKind;
@@ -41,10 +49,18 @@ function App() {
   const [dockTabs, setDockTabs] = useState<DockTab[]>([]);
   const [activeDock, setActiveDock] = useState<string | null>(null);
   const [splash, setSplash] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
 
   useEffect(() => {
     const t = setTimeout(() => setSplash(false), 850);
     return () => clearTimeout(t);
+  }, []);
+
+  const flash = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 2600);
   }, []);
 
   const addShell = useCallback(() => {
@@ -52,6 +68,12 @@ function App() {
   }, []);
   const addOracle = useCallback((identity: string) => {
     setPanes((p) => [...p, { key: nextKey(), kind: { type: "oracle", identity }, label: identity }]);
+  }, []);
+  const addTmux = useCallback((socket: string, session: string) => {
+    setPanes((p) => [
+      ...p,
+      { key: nextKey(), kind: { type: "tmux", socket, session }, label: session },
+    ]);
   }, []);
   const closePane = useCallback((key: string) => {
     setPanes((p) => p.filter((x) => x.key !== key));
@@ -72,19 +94,76 @@ function App() {
     });
   }, []);
 
+  const fireAppshot = useCallback(async () => {
+    try {
+      const path = await appshot();
+      flash(`appshot → master oracle · ${path.split("/").pop()}`);
+    } catch (e) {
+      flash(`appshot failed: ${e}`);
+    }
+  }, [flash]);
+
+  // ---- keyboard: ⌘B sidebar · ⌘K palette · ⌘T terminal · ⌘, settings · ⌘⌘ appshot
+  const lastMeta = useRef(0);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+      } else if (mod && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        setSidebarOpen((v) => !v);
+      } else if (mod && e.key.toLowerCase() === "t") {
+        e.preventDefault();
+        addShell();
+      } else if (mod && e.key === ",") {
+        e.preventDefault();
+        setSettingsOpen(true);
+      }
+      // ⌘⌘ — double-tap the Meta key alone within 400ms.
+      if (e.key === "Meta") {
+        const now = e.timeStamp || performance.now();
+        if (now - lastMeta.current < 400) {
+          lastMeta.current = 0;
+          fireAppshot();
+        } else {
+          lastMeta.current = now;
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [addShell, fireAppshot]);
+
   const { cols, rows } = useMemo(() => {
     const n = panes.length || 1;
     const c = Math.ceil(Math.sqrt(n));
     return { cols: c, rows: Math.ceil(n / c) };
   }, [panes.length]);
 
+  const commands: Command[] = useMemo(
+    () => [
+      { id: "term", title: "new terminal", subtitle: "⌘T", group: "panes", icon: <TerminalSquare size={14} />, keywords: "shell pane", run: addShell },
+      { id: "files", title: "open files", group: "panes", icon: <Folder size={14} />, keywords: "browse filesystem", run: () => openDock("files") },
+      { id: "browser", title: "open browser", group: "panes", icon: <Globe size={14} />, keywords: "web chrome url", run: () => openDock("browser") },
+      { id: "memory", title: "open memory explorer", group: "panes", icon: <Brain size={14} />, keywords: "obsidian graph vault notes", run: () => openDock("memory") },
+      { id: "sidebar", title: "toggle sidebar", subtitle: "⌘B", group: "view", icon: <PanelLeft size={14} />, run: () => setSidebarOpen((v) => !v) },
+      { id: "dock-b", title: "dock to bottom", group: "view", icon: <PanelBottom size={14} />, run: () => { setDockPos("bottom"); setDockOpen(true); } },
+      { id: "dock-r", title: "dock to right", group: "view", icon: <PanelRight size={14} />, run: () => { setDockPos("right"); setDockOpen(true); } },
+      { id: "appshot", title: "appshot — screenshot to oracle", subtitle: "⌘⌘", group: "actions", icon: <Camera size={14} />, keywords: "screenshot capture screen", run: fireAppshot },
+      { id: "settings", title: "settings", subtitle: "⌘,", group: "app", icon: <SettingsIcon size={14} />, run: () => setSettingsOpen(true) },
+    ],
+    [addShell, openDock, fireAppshot],
+  );
+
   const sidebar = (
     <div className="flex h-full min-h-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        <OracleRoster onAttach={addOracle} />
+        <OracleRoster onAttachOracle={addOracle} onAttachTmux={addTmux} />
       </div>
       <div className="border-t border-[var(--color-border)] p-2">
-        <AccountMenu />
+        <AccountMenu onOpenSettings={() => setSettingsOpen(true)} />
       </div>
     </div>
   );
@@ -132,6 +211,9 @@ function App() {
           <IconBtn title="Toggle sidebar (⌘B)" onClick={() => setSidebarOpen((v) => !v)} active={sidebarOpen}>
             <PanelLeft size={15} />
           </IconBtn>
+          <IconBtn title="Command palette (⌘K)" onClick={() => setPaletteOpen(true)}>
+            <Search size={15} />
+          </IconBtn>
         </div>
 
         <div className="flex items-center gap-2">
@@ -149,6 +231,9 @@ function App() {
           >
             <Plus size={12} /> terminal
           </button>
+          <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
+            <Camera size={15} />
+          </IconBtn>
           <IconBtn
             title="Bottom dock"
             active={dockOpen && dockPos === "bottom"}
@@ -210,6 +295,15 @@ function App() {
           )}
         </PanelGroup>
       </div>
+
+      {toast && (
+        <div className="modal-in glass absolute bottom-4 left-1/2 z-40 -translate-x-1/2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/90 px-3 py-2 text-[12px] text-[var(--color-text)] shadow-2xl">
+          {toast}
+        </div>
+      )}
+
+      <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} commands={commands} />
     </div>
   );
 }
@@ -243,20 +337,22 @@ function IconBtn({
 
 function PaneCard({ pane, onClose }: { pane: Pane; onClose: () => void }) {
   const isOracle = pane.kind.type === "oracle";
+  const isTmux = pane.kind.type === "tmux";
+  const label = isOracle ? `oracle: ${pane.label}` : isTmux ? `tmux: ${pane.label}` : pane.label;
   return (
     <div className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-pane)] transition-colors hover:border-[var(--color-border-strong)]">
       <div className="flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-white/[0.02] px-2.5">
         <div className="flex min-w-0 items-center gap-1.5">
-          <span className={`status-dot ${isOracle ? "status-dot--active" : "status-dot--idle"}`} />
-          <span className="truncate font-mono text-[11px] text-[var(--color-muted)]">
-            {isOracle ? `oracle: ${pane.label}` : pane.label}
-          </span>
+          <span
+            className={`status-dot ${isOracle ? "status-dot--active" : isTmux ? "status-dot--dormant" : "status-dot--idle"}`}
+          />
+          <span className="truncate font-mono text-[11px] text-[var(--color-muted)]">{label}</span>
         </div>
         <button
           type="button"
           onClick={onClose}
           className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-          title="Close pane"
+          title="Close pane (detaches — session keeps running)"
         >
           <X size={12} />
         </button>
@@ -271,6 +367,7 @@ function PaneCard({ pane, onClose }: { pane: Pane; onClose: () => void }) {
 const DOCK_LAUNCH: { kind: DockKind; icon: typeof Folder; title: string; sub: string }[] = [
   { kind: "files", icon: Folder, title: "Files", sub: "Browse the filesystem" },
   { kind: "browser", icon: Globe, title: "Browser", sub: "Open a website" },
+  { kind: "memory", icon: Brain, title: "Memory", sub: "Explore the memory vault" },
   { kind: "terminal", icon: TerminalSquare, title: "Terminal", sub: "Start an interactive shell" },
 ];
 
@@ -343,7 +440,7 @@ function Dock({
       <div className="relative min-h-0 flex-1">
         {tabs.length === 0 ? (
           <div className="grid h-full place-items-center p-4">
-            <div className="grid w-full max-w-2xl grid-cols-3 gap-2">
+            <div className="grid w-full max-w-2xl grid-cols-4 gap-2">
               {DOCK_LAUNCH.map((l) => (
                 <button
                   key={l.kind}
@@ -366,6 +463,7 @@ function Dock({
             >
               {t.kind === "files" && <FilesPane />}
               {t.kind === "browser" && <BrowserPane />}
+              {t.kind === "memory" && <MemoryPane />}
               {t.kind === "terminal" && <TerminalPane kind={{ type: "shell" }} />}
             </div>
           ))

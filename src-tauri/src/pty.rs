@@ -167,6 +167,34 @@ pub fn pty_spawn_oracle(
     spawn_internal(app, &state, on_data, cmd, cols, rows)
 }
 
+/// Attaches a pane to ANY tmux session on a given socket — the all-tmux attach
+/// surface (oracles, the bridge, even the session you're typing in now). `exec`
+/// replaces the shell so closing the pane detaches the client without killing
+/// the underlying session.
+#[tauri::command]
+pub fn pty_spawn_tmux(
+    app: AppHandle,
+    state: State<PtyState>,
+    on_data: Channel<String>,
+    socket: String,
+    session: String,
+    cols: u16,
+    rows: u16,
+) -> Result<u32, String> {
+    // Guard against shell-injection via socket/session names.
+    let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    if !safe(&socket) || !safe(&session) {
+        return Err("invalid socket or session name".into());
+    }
+    let tmux = tmux_bin();
+    let mut cmd = CommandBuilder::new("/bin/sh");
+    cmd.arg("-c");
+    cmd.arg(format!("exec {tmux} -L {socket} attach -t {session}"));
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    spawn_internal(app, &state, on_data, cmd, cols, rows)
+}
+
 /// Writes raw input bytes to a session's PTY stdin.
 #[tauri::command]
 pub fn pty_write(state: State<PtyState>, id: u32, data: String) -> Result<(), String> {

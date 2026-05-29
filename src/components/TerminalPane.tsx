@@ -11,7 +11,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 
-import { ptyKill, ptyResize, ptyWrite, spawnOracle, spawnShell } from "../lib/pty";
+import { ptyKill, ptyResize, ptyWrite, spawnOracle, spawnShell, spawnTmux } from "../lib/pty";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
 const THEME = {
@@ -41,7 +41,10 @@ const THEME = {
 const FONT_FAMILY =
   '"SF Mono", "Menlo", "Monaco", "JetBrains Mono", "Consolas", ui-monospace, monospace';
 
-export type PaneKind = { type: "shell" } | { type: "oracle"; identity: string };
+export type PaneKind =
+  | { type: "shell" }
+  | { type: "oracle"; identity: string }
+  | { type: "tmux"; socket: string; session: string };
 
 export function TerminalPane({ kind }: { kind: PaneKind }) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -95,7 +98,9 @@ export function TerminalPane({ kind }: { kind: PaneKind }) {
         sessionId =
           kind.type === "oracle"
             ? await spawnOracle(onData, kind.identity, cols, rows)
-            : await spawnShell(onData, null, cols, rows);
+            : kind.type === "tmux"
+              ? await spawnTmux(onData, kind.socket, kind.session, cols, rows)
+              : await spawnShell(onData, null, cols, rows);
       } catch (e) {
         term.write(`\r\n\x1b[31m[aios] spawn failed: ${e}\x1b[0m\r\n`);
         return;

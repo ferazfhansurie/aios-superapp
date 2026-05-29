@@ -2,6 +2,7 @@
 //! oracle roster (attach to bridge-managed tmux sessions). No IDE cruft.
 
 mod files;
+mod memory;
 mod oracles;
 mod pty;
 mod telemetry;
@@ -21,13 +22,21 @@ pub fn run() {
             read_telemetry,
             pty::pty_spawn,
             pty::pty_spawn_oracle,
+            pty::pty_spawn_tmux,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
             oracles::list_oracles,
+            oracles::list_tmux_sessions,
+            oracles::create_oracle,
+            oracles::rename_oracle,
+            oracles::delete_oracle,
+            oracles::appshot,
             files::read_dir,
             files::home_dir,
             usage::usage_stats,
+            memory::memory_graph,
+            memory::memory_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
