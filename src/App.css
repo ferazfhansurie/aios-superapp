@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+@import "@xterm/xterm/css/xterm.css";
+
+@theme {
+  /* Antigravity-inspired palette: dark with orange accent matching adletic brand */
+  --color-bg: oklch(0.13 0.005 270);
+  --color-panel: oklch(0.16 0.005 270);
+  --color-panel-2: oklch(0.19 0.005 270);
+  --color-border: oklch(1 0 0 / 8%);
+  --color-text: oklch(0.96 0 0);
+  --color-muted: oklch(0.62 0.005 270);
+  --color-accent: oklch(0.72 0.18 50);    /* adletic orange */
+  --color-accent-dim: oklch(0.45 0.13 50);
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: -apple-system, "SF Pro Text", "SF Pro Display", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: oklch(0.55 0.005 270 / 25%); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: oklch(0.55 0.005 270 / 45%); }
+::-webkit-scrollbar-track { background: transparent; }
+
+.xterm-viewport { background: transparent !important; }
+.xterm .xterm-screen { padding: 8px 12px; }
