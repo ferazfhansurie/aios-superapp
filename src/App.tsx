@@ -259,39 +259,25 @@ function App() {
       <div className="flex min-h-0 flex-1">
         {sidebarOpen && (
           <aside className="flex w-60 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
-            <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-3">
-              <div className="flex flex-col gap-1.5">
-                <span className="text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
-                  launch
-                </span>
-                <div className="grid grid-cols-2 gap-1.5">
-                  {SPAWN.map((s) => (
-                    <button
-                      key={s.label}
-                      onClick={() => spawn(s.kind, s.label)}
-                      className="group flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
-                    >
-                      <s.icon
-                        size={13}
-                        className="shrink-0 text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
-                      />
-                      <span className="truncate text-[11px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
-                        {s.label}
-                      </span>
-                    </button>
-                  ))}
-                </div>
+            <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-2">
+              {/* Codex-style nav list */}
+              <div className="flex flex-col gap-0.5">
+                {SPAWN.map((s) => (
+                  <button
+                    key={s.label}
+                    onClick={() => spawn(s.kind, s.label)}
+                    className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                  >
+                    <s.icon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
+                    {s.label === "chat" ? "new chat" : s.label}
+                  </button>
+                ))}
                 <button
                   onClick={() => setSettingsOpen(true)}
-                  className="group flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]"
+                  className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
                 >
-                  <SettingsIcon
-                    size={13}
-                    className="shrink-0 text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]"
-                  />
-                  <span className="text-[11px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
-                    settings
-                  </span>
+                  <SettingsIcon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
+                  settings
                 </button>
               </div>
               <OracleRoster
