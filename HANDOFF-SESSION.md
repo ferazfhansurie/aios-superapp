@@ -34,6 +34,10 @@
    pkill -f "AIOS.app/Contents/MacOS"; cp -R ~/Repo/firaz/aios/shell/src-tauri/target/release/bundle/macos/AIOS.app /Applications/AIOS.app; open /Applications/AIOS.app
    ```
 
+## New idea captured (not built — for the task board)
+- **Wire AIOS skills into the composer slash menu** — firaz wants `/handoff` (and other AIOS skills) to appear in the terminal composer's `/` menu alongside `/clear /plan /resume /model /help` (TerminalComposer.tsx `slashCommands` ~line 471). Today that menu only sends claude-code TUI commands to the PTY. AIOS skills are a different channel (they invoke the oracle), so this needs a second class of slash entries that fire a skill/prompt rather than PTY bytes. Small-medium feature.
+- **`/handoff` skill now EXISTS**: `~/.claude/skills/handoff/SKILL.md` — type `/handoff` in any session to auto-package (doc + commit + task sync). This doc was the manual version; the skill automates it.
+
 ## Other live context
 - Threads MCP now in GLOBAL `~/.claude.json` (motion, memory, threads) — token valid ~until late July 2026 (60-day rolling from 2026-05-23).
 - Launch kit (for WHEN firaz wants it, currently deferred): `~/Repo/firaz/adletic/aios-firaz/outputs/2026-05-30-aios-launch-kit.md`.
