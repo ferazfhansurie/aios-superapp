@@ -195,12 +195,12 @@ export const CHAT_MODELS: ChatModel[] = [
   { id: "claude-haiku-4-5", label: "haiku 4.5", engine: "claude" },
   // ChatGPT subscription via Codex — no API key, no per-token billing.
   { id: "gpt-5.5", label: "gpt-5.5 · codex", engine: "codex" },
-  { id: "gpt-5.3-codex", label: "gpt-5.3-codex", engine: "codex" },
-  // opencode — openrouter + everything; free fallback when the sub runs out.
-  { id: "opencode/gpt-5.5", label: "gpt-5.5 · opencode", engine: "opencode" },
+  // ONE free fallback for when the ChatGPT sub hits its rate window:
+  // NVIDIA Nemotron (Llama-based, US) via opencode — best free non-Chinese
+  // model in the catalog. Deliberately the only free entry; no model sprawl.
   {
-    id: "opencode/deepseek-v4-flash-free",
-    label: "deepseek v4 · free",
+    id: "opencode/nemotron-3-super-free",
+    label: "nemotron · free",
     engine: "opencode",
   },
 ];
