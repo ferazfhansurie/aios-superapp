@@ -83,7 +83,7 @@ import {
   type ChatSessionInfo,
   type ChatTurnInfo,
 } from "../lib/chat";
-import { readDir, type DirEntry } from "../lib/fs";
+import { readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { chatHandles, paneWriters, paneSubmitters } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
 
@@ -141,6 +141,27 @@ type RenderBlock =
 
 let _uid = 0;
 const uid = () => `t${++_uid}`;
+
+/** A pasted/attached image: live thumbnail + its saved temp path (null while saving). */
+interface ImageChip {
+  id: string;
+  url: string;
+  path: string | null;
+}
+let _imgSeq = 0;
+/** Shell-quote a path for embedding in a message (single-quote, escape inner '). */
+function quotePath(path: string): string {
+  return `'${path.replace(/'/g, "'\\''")}'`;
+}
+/** File extension for a clipboard/file image mime. */
+function extFromMime(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("png")) return "png";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("webp")) return "webp";
+  return "png";
+}
 
 // instruction prefixes for the composer modes
 const PLAN_PREFIX =
@@ -568,6 +589,58 @@ export function ChatPane({
     setInput((v) => (v ? v.trimEnd() + " " + path + " " : path + " "));
     taRef.current?.focus();
   }, []);
+
+  // ── image attach: paste a screenshot / pick a file → temp file + thumbnail ──
+  const [images, setImages] = useState<ImageChip[]>([]);
+  const imgInputRef = useRef<HTMLInputElement>(null);
+  const addImage = useCallback(async (file: Blob, mime: string) => {
+    const id = `img${++_imgSeq}`;
+    const url = URL.createObjectURL(file);
+    setImages((prev) => [...prev, { id, url, path: null }]);
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+      }
+      const path = await saveImageTemp(btoa(bin), extFromMime(mime));
+      setImages((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
+    } catch {
+      setImages((prev) => {
+        const gone = prev.find((im) => im.id === id);
+        if (gone) URL.revokeObjectURL(gone.url);
+        return prev.filter((im) => im.id !== id);
+      });
+    }
+  }, []);
+  const removeImage = useCallback((id: string) => {
+    setImages((prev) => {
+      const gone = prev.find((im) => im.id === id);
+      if (gone) URL.revokeObjectURL(gone.url);
+      return prev.filter((im) => im.id !== id);
+    });
+  }, []);
+  // paste an image off the clipboard → thumbnail chip (temp file saved in bg)
+  const onPasteImage = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const it of items) {
+        if (it.kind === "file" && it.type.startsWith("image/")) {
+          const file = it.getAsFile();
+          if (file) {
+            e.preventDefault();
+            void addImage(file, it.type);
+            return;
+          }
+        }
+      }
+    },
+    [addImage],
+  );
+  const savingImg = images.some((im) => im.path == null);
 
   // ── event ingestion ───────────────────────────────────────────────────────
 
@@ -1033,7 +1106,13 @@ export function ChatPane({
   const sendText = useCallback(
     (raw: string) => {
       const text = raw.trim();
-      if (!text || streaming || sessionIdRef.current == null) return;
+      // attached images go in as quoted temp paths the model can read; allow a
+      // send with images even when the text is empty.
+      const imgPaths = images
+        .filter((im) => im.path)
+        .map((im) => quotePath(im.path as string));
+      if ((!text && imgPaths.length === 0) || streaming || sessionIdRef.current == null)
+        return;
       // Record this chat into the /resume list on its FIRST user send, titled by
       // that first message. claude's session_id (from the init event) is the key
       // used later to resume + repaint. Fire-and-forget; never blocks the send.
@@ -1051,10 +1130,18 @@ export function ChatPane({
         }
       }
       setInput("");
+      setImages((prev) => {
+        prev.forEach((im) => URL.revokeObjectURL(im.url));
+        return [];
+      });
       setOverlay(null);
-      dispatch(text);
+      // prepend the image paths so the model sees them with the message
+      const full = imgPaths.length
+        ? imgPaths.join(" ") + (text ? " " + text : "")
+        : text;
+      dispatch(full);
     },
-    [streaming, dispatch, cwd],
+    [streaming, dispatch, cwd, images],
   );
 
   const send = useCallback(() => sendText(input), [sendText, input]);
@@ -1436,7 +1523,10 @@ export function ChatPane({
     }
   };
 
-  const canSend = input.trim().length > 0 && !streaming && started;
+  const canSend =
+    (input.trim().length > 0 || images.some((im) => im.path)) &&
+    !streaming &&
+    started;
 
   // ── composer (shared between empty hero + docked) ──────────────────────────
 
@@ -1543,18 +1633,57 @@ export function ChatPane({
           />
         )}
 
-        <div className="rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
+        <div className="flash-composer relative overflow-hidden rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
+          {/* attached-image thumbnails (paste a screenshot / + attach) */}
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3 pt-3">
+              {images.map((im) => (
+                <div
+                  key={im.id}
+                  className="group relative h-14 w-14 overflow-hidden rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-panel)]"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={im.url} alt="" className="h-full w-full object-cover" />
+                  {im.path == null && (
+                    <div className="absolute inset-0 grid place-items-center bg-[var(--color-bg)]/60">
+                      <Loader2 size={14} className="animate-spin text-[var(--color-accent)]" />
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => removeImage(im.id)}
+                    className="absolute right-0.5 top-0.5 grid h-4 w-4 place-items-center rounded-full bg-[var(--color-bg)]/80 text-[var(--color-muted)] opacity-0 transition-opacity hover:text-[var(--color-text)] group-hover:opacity-100"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <input
+            ref={imgInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const files = e.target.files;
+              if (files) for (const f of files) void addImage(f, f.type);
+              e.target.value = "";
+            }}
+          />
           <textarea
             ref={taRef}
             value={input}
             onChange={(e) => onChangeInput(e.target.value)}
             onKeyDown={onKeyDown}
+            onPaste={onPasteImage}
             rows={1}
             placeholder={planMode ? "describe the task to plan…" : "do anything"}
             spellCheck={false}
             className="block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
           />
-          <div className="flex items-center gap-1.5 px-3 pb-3 pt-1">
+          <div className="flex flex-wrap items-center gap-1.5 px-3 pb-3 pt-1">
             {/* permission chip */}
             <Dropdown
               open={openMenu === "perm"}
@@ -1675,8 +1804,9 @@ export function ChatPane({
               <span>goal</span>
             </button>
 
-            <div className="flex-1" />
-
+            {/* right action cluster — pinned right (ml-auto), stays together and
+                wraps to its own line on a narrow pane so send is never clipped */}
+            <div className="ml-auto flex shrink-0 items-center gap-1.5">
             {/* model selector (right) */}
             <Dropdown
               open={openMenu === "model"}
@@ -1728,6 +1858,18 @@ export function ChatPane({
               </span>
             )}
 
+            {/* attach image (or paste a screenshot / drag a file in) */}
+            <button
+              type="button"
+              onClick={() => imgInputRef.current?.click()}
+              className={`grid h-8 w-8 place-items-center rounded-full transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)] ${
+                savingImg ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]"
+              }`}
+              title="attach image (or ⌘V a screenshot)"
+            >
+              <ImageIcon size={16} />
+            </button>
+
             {/* mic */}
             <button
               type="button"
@@ -1758,11 +1900,13 @@ export function ChatPane({
                 <ArrowUp size={16} />
               </button>
             )}
+            </div>
           </div>
         </div>
       </div>
     ),
     // re-render composer on the inputs that affect it
+    // (images: chip row + attach-button state)
     [
       input,
       openMenu,
@@ -1770,6 +1914,7 @@ export function ChatPane({
       effort,
       model,
       ctxTokens,
+      images,
       streaming,
       canSend,
       send,
