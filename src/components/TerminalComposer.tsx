@@ -41,12 +41,15 @@ function extFromMime(mime: string): string {
 export function TerminalComposer({
   onSend,
   onInterrupt,
+  onEscape,
   onClose,
 }: {
   /** Write the composed text to the PTY (the pane appends the CR). */
   onSend: (text: string) => void;
   /** Send Ctrl-C (^C) to the PTY. */
   onInterrupt: () => void;
+  /** Send ESC to the PTY — claude code: stop / double-Esc = edit previous. */
+  onEscape: () => void;
   /** Hide the composer. */
   onClose: () => void;
 }) {
@@ -111,6 +114,13 @@ export function TerminalComposer({
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
+      return;
+    }
+    // Escape → forward ESC to the PTY (claude code: stop generating; press twice
+    // to edit the previous message). Keep composer focus so you can repeat it.
+    if (e.key === "Escape") {
+      e.preventDefault();
+      onEscape();
     }
   };
 

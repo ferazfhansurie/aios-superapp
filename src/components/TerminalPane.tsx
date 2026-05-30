@@ -384,6 +384,13 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     if (id != null) ptyWrite(id, "\x03").catch(() => {});
   };
 
+  // ESC → PTY. Claude code: stop generating; press again to edit the previous
+  // message. Lets you drive claude's Esc behaviour from the compose box.
+  const sendEscape = () => {
+    const id = sessionIdRef.current;
+    if (id != null) ptyWrite(id, "\x1b").catch(() => {});
+  };
+
   // Save a dropped image → temp file → insert its quoted path into the PTY.
   const insertImagePath = async (blob: Blob, mime: string) => {
     const id = sessionIdRef.current;
@@ -485,6 +492,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         <TerminalComposer
           onSend={composerSend}
           onInterrupt={interrupt}
+          onEscape={sendEscape}
           onClose={() => setComposerOpen(false)}
         />
       )}
