@@ -46,8 +46,8 @@ export type AppDef = {
 
 /** Default app catalog — order here == the seeded default sidebar order. */
 export const SPAWN: AppDef[] = [
-  { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "sessions" },
-  { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "sessions" },
+  { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "tools" },
+  { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "tools" },
   { id: "claude-code", kind: { type: "shell", cmd: "claude --dangerously-skip-permissions" }, icon: Bot, label: "claude code", group: "tools" },
   { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools" },
   { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools" },

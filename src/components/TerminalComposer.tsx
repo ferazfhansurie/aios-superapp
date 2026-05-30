@@ -896,9 +896,9 @@ export function TerminalComposer({
           />
         )}
 
-        <div className="flex items-center gap-1.5 px-3 pb-2.5 pt-1">
+        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2.5 pt-1">
           {/* "+" → add photos & files */}
-          <div ref={plusWrapRef} className="relative">
+          <div ref={plusWrapRef} className="relative shrink-0">
             <button
               type="button"
               onClick={() => setPlusOpen((o) => !o)}
@@ -936,7 +936,7 @@ export function TerminalComposer({
             type="button"
             onClick={() => onRaw?.("\x1b[Z")}
             title="cycle claude permission mode (Shift+Tab)"
-            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
           >
             <ShieldCheck size={13} className="text-[var(--color-muted)]" />
             <span>permissions</span>
@@ -949,7 +949,7 @@ export function TerminalComposer({
             type="button"
             onClick={() => onRaw?.("\x1b[Z")}
             title="toggle plan mode (Shift+Tab)"
-            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
           >
             <ListChecks size={13} />
             <span>plan</span>
@@ -965,7 +965,7 @@ export function TerminalComposer({
               onRaw?.("/model\r");
             }}
             title="switch model (opens claude's picker)"
-            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
           >
             <Sparkles size={13} className="text-[var(--color-muted)]" />
             <span>model</span>
@@ -977,7 +977,7 @@ export function TerminalComposer({
             type="button"
             onClick={onInterrupt}
             title="interrupt (send Ctrl-C)"
-            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-danger)]/50 hover:text-[var(--color-danger)]"
+            className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-danger)]/50 hover:text-[var(--color-danger)]"
           >
             <Square size={11} />
             <span>stop</span>
@@ -989,8 +989,10 @@ export function TerminalComposer({
             </span>
           )}
 
-          <div className="flex-1" />
-
+          {/* action cluster — pinned right (ml-auto) and kept together so the
+              send button is ALWAYS visible no matter how narrow the pane: the
+              left pills wrap to a new line instead of shoving these off-screen. */}
+          <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {/* dismiss the composer */}
           <button
             type="button"
@@ -1032,6 +1034,7 @@ export function TerminalComposer({
               <ArrowUp size={16} />
             </button>
           )}
+          </div>
         </div>
 
         {dragOver && (

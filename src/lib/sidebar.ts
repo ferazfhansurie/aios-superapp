@@ -7,7 +7,7 @@
 import { SPAWN } from "./apps";
 
 const STORAGE_KEY = "aios.sidebar";
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /** A space = a named, collapsible section of the rail. The three built-ins
  *  (sessions / tools / pinned) are `system` — they can be renamed + collapsed +
@@ -15,9 +15,8 @@ const SCHEMA_VERSION = 2;
  *  apps + pinned sites into them. An item's `group` is the id of its space. */
 export type SidebarGroup = string;
 
-export const SYSTEM_SPACES = ["sessions", "tools", "pinned"] as const;
+export const SYSTEM_SPACES = ["tools", "pinned"] as const;
 const SYSTEM_SPACE_NAMES: Record<string, string> = {
-  sessions: "sessions",
   tools: "tools",
   pinned: "pinned",
 };
@@ -138,8 +137,16 @@ export function loadSidebar(): SidebarState {
       );
       spaces = [...defaultSpaces(), ...custom.map((id) => ({ id, name: id }))];
     }
+    // v2→v3: the "sessions" group was folded into "tools". Drop the sessions
+    // space and move anything that lived there into tools.
+    spaces = spaces.filter((s) => s.id !== "sessions");
+    const remapped = items.map((it) =>
+      it.group === "sessions" ? { ...it, group: "tools" } : it,
+    );
     const knownSpaces = new Set(spaces.map((s) => s.id));
-    const fixed = items.map((it) => (knownSpaces.has(it.group) ? it : { ...it, group: "pinned" }));
+    const fixed = remapped.map((it) =>
+      knownSpaces.has(it.group) ? it : { ...it, group: "pinned" },
+    );
     cache = { version: SCHEMA_VERSION, spaces, items: fixed };
   } catch {
     cache = seeded;
