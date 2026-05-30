@@ -277,7 +277,25 @@ function App() {
 
   const spawn = useCallback((kind: PaneContent, label: string): string => {
     const key = nextKey();
-    setPanes((p) => [...p, { key, kind, label }]);
+    setPanes((p) => {
+      // Make every pane label identifiable at a glance:
+      //  - shell/claude panes with a cwd → suffix the dir basename ("terminal · shell")
+      //  - then de-dupe: if that label is already open, append " 2", " 3", …
+      // so the OPEN rail + overview never show two indistinguishable "terminal"s.
+      let base = label;
+      if ((kind.type === "shell") && kind.cwd) {
+        const dir = kind.cwd.replace(/\/+$/, "").split("/").pop();
+        if (dir) base = `${label} · ${dir}`;
+      }
+      const taken = new Set(p.map((x) => x.label));
+      let next = base;
+      if (taken.has(next)) {
+        let n = 2;
+        while (taken.has(`${base} ${n}`)) n++;
+        next = `${base} ${n}`;
+      }
+      return [...p, { key, kind, label: next }];
+    });
     return key;
   }, []);
 
@@ -447,6 +465,12 @@ function App() {
     setHiddenKeys((h) => h.filter((k) => k !== key));
     focusedPane.current = key;
     setActiveKey(key);
+  }, []);
+  // Rename a pane (double-click its OPEN-rail row) — persists via the layout save.
+  const renamePane = useCallback((key: string, label: string) => {
+    const v = label.trim();
+    if (!v) return;
+    setPanes((p) => p.map((x) => (x.key === key ? { ...x, label: v } : x)));
   }, []);
   const handleTranscript = useCallback(
     (text: string) => {
@@ -854,6 +878,7 @@ function App() {
                   onSelect={focusPane}
                   onToggleHide={toggleHide}
                   onClose={requestClose}
+                  onRename={renamePane}
                 />
               )}
               <SidebarRail
@@ -1792,6 +1817,7 @@ function OpenPanesList({
   onSelect,
   onToggleHide,
   onClose,
+  onRename,
 }: {
   panes: Pane[];
   hiddenKeys: string[];
@@ -1800,7 +1826,15 @@ function OpenPanesList({
   onSelect: (key: string) => void;
   onToggleHide: (key: string) => void;
   onClose: (key: string) => void;
+  onRename: (key: string, label: string) => void;
 }) {
+  // double-click a row → inline rename (this key + its draft text).
+  const [editKey, setEditKey] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const commit = () => {
+    if (editKey) onRename(editKey, draft);
+    setEditKey(null);
+  };
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 px-1.5 py-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-faint)]">
@@ -1812,6 +1846,25 @@ function OpenPanesList({
         const hidden = hiddenKeys.includes(p.key);
         const active = activeKey === p.key && !hidden;
         const maximized = maximizedKey === p.key;
+        if (editKey === p.key) {
+          return (
+            <div key={p.key} className="flex items-center gap-2 rounded-md px-2.5 py-1">
+              <span className={`status-dot shrink-0 ${DOT[p.kind.type] ?? "status-dot--cold"}`} />
+              <input
+                autoFocus
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onBlur={commit}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commit();
+                  else if (e.key === "Escape") setEditKey(null);
+                }}
+                spellCheck={false}
+                className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-0.5 text-[13px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+              />
+            </div>
+          );
+        }
         return (
           <div
             key={p.key}
@@ -1823,16 +1876,31 @@ function OpenPanesList({
           >
             <button
               onClick={() => onSelect(p.key)}
+              onDoubleClick={() => {
+                setDraft(p.label);
+                setEditKey(p.key);
+              }}
               className={`flex min-w-0 flex-1 items-center gap-2.5 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
                 hidden ? "text-[var(--color-faint)]" : "text-[var(--color-text-2)] group-hover:text-[var(--color-text)]"
               }`}
-              title={hidden ? "restore pane" : "focus pane"}
+              title={hidden ? "restore pane" : "focus pane · double-click to rename"}
             >
               <span className={`status-dot shrink-0 ${hidden ? "status-dot--cold" : DOT[p.kind.type] ?? "status-dot--cold"}`} />
               <span className="truncate">{p.label}</span>
               {maximized && <Maximize2 size={10} className="shrink-0 text-[var(--color-accent)]" />}
             </button>
             <div className="flex shrink-0 items-center pr-1 opacity-0 transition-opacity group-hover:opacity-100">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setDraft(p.label);
+                  setEditKey(p.key);
+                }}
+                className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+                title="rename"
+              >
+                <Pencil size={11} />
+              </button>
               <button
                 onClick={(e) => (e.stopPropagation(), onToggleHide(p.key))}
                 className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
