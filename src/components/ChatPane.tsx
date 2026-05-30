@@ -1680,7 +1680,7 @@ export function ChatPane({
 
         {/* slash / @-mention overlay */}
         {overlay === "slash" && slashFiltered.length > 0 && (
-          <OverlayPanel>
+          <OverlayPanel compact>
             {slashFiltered.map((c, i) => (
               <OverlayRow
                 key={c.id}
@@ -3293,9 +3293,20 @@ interface SlashCommand {
 }
 
 /** The floating panel that sits just above the composer for `/` and `@`. */
-function OverlayPanel({ children }: { children: React.ReactNode }) {
+function OverlayPanel({
+  children,
+  compact = false,
+}: {
+  children: React.ReactNode;
+  /** compact = a left-anchored dropdown (slash menu) vs the full-width panel. */
+  compact?: boolean;
+}) {
   return (
-    <div className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50">
+    <div
+      className={`absolute bottom-full z-40 mb-2 max-h-64 overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50 ${
+        compact ? "left-3 min-w-[220px] max-w-[min(360px,90%)]" : "left-0 right-0"
+      }`}
+    >
       {children}
     </div>
   );
