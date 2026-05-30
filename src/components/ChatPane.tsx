@@ -27,6 +27,7 @@ import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
   ArrowUp,
+  ArrowDown,
   AtSign,
   Check,
   CheckCheck,
@@ -433,7 +434,31 @@ export function ChatPane({
   onOpenUrl?: (url: string) => void;
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [input, setInput] = useState(seed ?? "");
+  // composer draft persists per pane so /clear, a restart, or a remount never
+  // loses what you were typing. Keyed by paneKey; seed (e.g. notes "send to AI")
+  // still wins on first mount.
+  const draftKey = paneKey ? `aios-chat-draft:${paneKey}` : null;
+  const [input, setInput] = useState<string>(() => {
+    if (seed) return seed;
+    if (draftKey) {
+      try {
+        return localStorage.getItem(draftKey) ?? "";
+      } catch {
+        /* ignore */
+      }
+    }
+    return "";
+  });
+  // persist the draft as it changes (cleared on send).
+  useEffect(() => {
+    if (!draftKey) return;
+    try {
+      if (input) localStorage.setItem(draftKey, input);
+      else localStorage.removeItem(draftKey);
+    } catch {
+      /* ignore */
+    }
+  }, [input, draftKey]);
   const [streaming, setStreaming] = useState(false);
   const [started, setStarted] = useState(false);
   // claude's init event arrived (session_id known) — gates the seed auto-send
@@ -897,11 +922,35 @@ export function ChatPane({
     };
   }, [paneKey]);
 
-  // autoscroll on new content
+  // autoscroll on new content — but ONLY while pinned to the bottom. If you've
+  // scrolled up to read backlog mid-stream, we stop yanking you down and show a
+  // "jump to latest" pill instead (daily-driver staple).
+  const atBottomRef = useRef(true);
+  const [showJump, setShowJump] = useState(false);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [turns]);
+  // track whether the viewport is near the bottom; drives autoscroll + the pill.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+      const bottom = dist < 80;
+      atBottomRef.current = bottom;
+      setShowJump(!bottom);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+  const jumpToLatest = useCallback(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    atBottomRef.current = true;
+    setShowJump(false);
+  }, []);
 
   // autosize textarea
   useEffect(() => {
@@ -1840,7 +1889,7 @@ export function ChatPane({
 
   return (
     <PaneDropZone onPath={insertPath} label="drop to add to message">
-    <div className="flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
+    <div className="relative flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-2xl flex-col gap-5 px-6 py-8">
           {resumedTitle && (
@@ -1901,6 +1950,18 @@ export function ChatPane({
             )}
         </div>
       </div>
+      {/* jump-to-latest pill — appears when you've scrolled up off the bottom */}
+      {showJump && (
+        <button
+          type="button"
+          onClick={jumpToLatest}
+          title="jump to latest"
+          className="absolute bottom-28 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/90 px-3 py-1.5 font-sans text-[12px] text-[var(--color-text-2)] shadow-2xl shadow-black/40 backdrop-blur transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+        >
+          <ArrowDown size={13} />
+          latest
+        </button>
+      )}
       <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg)]/80 px-6 pb-5 pt-3 backdrop-blur">
         <div className="mx-auto max-w-2xl">{composer}</div>
       </div>
