@@ -106,8 +106,13 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   const [dragOver, setDragOver] = useState(false);
   // Compose box (multi-line prompt affordance). Default-open for the dedicated
   // "claude code" pane so the chat-grade surface is there from the first frame.
+  // Default the compose box open wherever you're talking to a CLI AI — the
+  // "claude code" pane AND any agent/oracle or attached tmux session (those run
+  // claude too). A plain raw "terminal" stays closed-by-default (toggle button).
   const [composerOpen, setComposerOpen] = useState(
-    kind.type === "shell" && kind.cmd === "claude",
+    kind.type === "oracle" ||
+      kind.type === "tmux" ||
+      (kind.type === "shell" && kind.cmd === "claude"),
   );
   const [savingImg, setSavingImg] = useState(false);
   // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
