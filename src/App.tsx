@@ -290,7 +290,8 @@ function App() {
       } else if (mod && e.key.toLowerCase() === "b") {
         e.preventDefault();
         setSidebarOpen((v) => !v);
-      } else if (mod && e.key.toLowerCase() === "t") {
+      } else if (mod && (e.key.toLowerCase() === "t" || e.key.toLowerCase() === "n")) {
+        // ⌘T / ⌘N — new terminal
         e.preventDefault();
         addShell();
       } else if (mod && e.key.toLowerCase() === "r") {
