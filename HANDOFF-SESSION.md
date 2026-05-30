@@ -1,54 +1,53 @@
-# AIOS shell — live session handoff
-2026-05-31 ~02:30 MYT
+# AIOS shell — session handoff
+2026-05-31 · focus: multi-engine chat + making ChatPane the best daily driver
 
-> **Next session: read THIS, then `git -C ~/Repo/firaz/aios/shell log --oneline -12` + TaskList.**
-> Repo `~/Repo/firaz/aios/shell`, branch `master`, head `ed7d18b`, **15 commits ahead of origin, NOT pushed** (don't push unprompted).
+> **Next session: read THIS, then `git -C ~/Repo/firaz/aios/shell log --oneline -16`.**
+> Repo `~/Repo/firaz/aios/shell`, branch `master`, head `287f261`, ~40 commits
+> ahead of origin, **NOT pushed** (don't push unprompted).
 
-## SHIPPED after the doc was first written (newest)
-- `ed7d18b` **oracles: exclude `aios-term-*` from the roster** — `list_oracles` (oracles.rs ~line 214) was listing the shell's own persistent terminal panes as oracles → cryptic "oracle: term-k3-…". Now filters them like `list_tmux_sessions` does.
-- `1535481` **pane labels auto-distinguishable + inline rename** — `spawn()` (App.tsx ~line 279) suffixes a shell/claude pane's cwd basename + de-dupes (`terminal`, `terminal 2`). OPEN-rail rows (`OpenPanesList`) get double-click / pencil inline rename via new `renamePane` (App.tsx).
-- `dfa916b` **/handoff slash item** — `TerminalComposer.tsx`: `/handoff` in the slash menu fires the handoff skill in claude's TUI, then arms a two-tap banner ("clear + start fresh" → `/clear` + seeds "read HANDOFF-SESSION.md and continue"). `handoffArmed` state + `finishHandoff`.
-- `a666dc7` **mission-control overview redesign** — `PaneOverview` (App.tsx): centered gallery, big window-thumbnail cards (chrome + per-type glyph via `PANE_GLYPH`), adaptive width, ←/→/⏎ keyboard. Replaced the cramped top-left grid.
-- (still pending UI: none of these have a Settings toggle yet.)
+## WORKING RULES (firaz, load-bearing)
+- **Build loop (NO `cd` — triggers prompts):** `pnpm --dir ~/Repo/firaz/aios/shell tauri build` → `pkill -9 -f "AIOS.app/Contents/MacOS"; rm -rf /Applications/AIOS.app; cp -R <repo>/src-tauri/target/release/bundle/macos/AIOS.app /Applications/AIOS.app; open /Applications/AIOS.app`. ALWAYS `npx tsc --noEmit` == 0 first.
+- The DMG bundle step sometimes fails (leftover mount) — **the `.app` is built before it, so ignore the dmg error**; install the `.app`.
+- **Edit freely → only build/install when at a checkpoint or handoff.** Commit per logical win.
+- **TerminalComposer.tsx is DONE — do NOT touch it.** firaz: "it's amazing already." It's the reference; port FROM it, never edit it.
+- **ChatPane history (↑ recall) — leave as is**, firaz loves it.
+- No WhatsApp sends. Keep replies in-pane.
+- **Multiple oracle sessions edit this same repo concurrently** (aios-shell-3152 etc.). Re-check `git status` / file state before big edits; converge, don't clobber.
 
-## Working rules (firaz, this session — LOAD-BEARING)
-- **Build cadence:** edit freely → only `commit → tauri build → install → launch` when the session is bloated or at handoff. Do NOT build per-change.
-- **Build/install loop (NO `cd` — triggers permission prompts):**
-  `pnpm --dir ~/Repo/firaz/aios/shell tauri build` → `pkill -9 -f "AIOS.app/Contents/MacOS"; rm -rf /Applications/AIOS.app; cp -R ~/Repo/firaz/aios/shell/src-tauri/target/release/bundle/macos/AIOS.app /Applications/AIOS.app; open /Applications/AIOS.app`
-- **ALWAYS `npx tsc --noEmit` (must be 0 errors) BEFORE a tauri build** — `pnpm build` runs tsc and a single TS error wastes a full ~60s build.
-- **No WhatsApp** unless firaz says — keep replies in-pane.
-- App currently installed + running (the flashy-composer build).
+## SHIPPED this session (all build-verified, tsc-green, on master)
+Multi-engine chat:
+- `06d23d6` **multi-engine chat pane** — `chat.rs` now engine-agnostic. claude = persistent stream-json process (unchanged); codex (ChatGPT sub) + opencode = spawn-per-turn (`codex exec --json`+resume / `opencode run --format json -s`), output normalized into claude's event shape via `adapt_codex_line`/`adapt_opencode_line`. `ChatStartOpts.engine`, `ChatModel.engine`.
+- `5e7c0b3` **one free model** — `opencode/nemotron-3-super-free` (NVIDIA, US, not Chinese) as the sole free fallback. Dropped model sprawl.
+- `43c202b` **render whole-message text blocks** (codex/opencode emit whole msgs, not deltas — the assistant handler now renders a text block when no streaming bubble exists) + codex `-c mcp_servers={}` for speed.
 
-## SHIPPED this session (all on master, build-verified, 0 TS errors)
-- `dbdbdd1` **notes pane** — apple-notes scratch pane. `src/components/NotesPane.tsx` + `src/lib/notes.ts`. One `.md`/note in `~/.aios/notes/`, title=first line, list + autosave (600ms), search, 5s cross-process poll. Backend `files::delete_path` (file-only, dir-guarded) in `src-tauri/src/files.rs` + `lib.rs`. `notes` app in `src/lib/apps.ts`.
-- **/notes skill** — `~/.claude/skills/notes/SKILL.md` (+ in `aios-firaz/.claude/skills/_INDEX.md`). Oracle reads/writes the SAME `~/.aios/notes/*.md`. firaz's one-shot idea inbox.
-- `c1f6363` **send-to-AI** — notes "send" routes to `settings.defaultAi` (claude-code|terminal|chat, default claude-code), reuses an alive pane via `paneSubmitters` (`src/lib/paneBus.ts`), spawns only if none, pastes AND submits. + **open-panes "OPEN" rail** (`OpenPanesList` in App.tsx) replacing the floating overlay. + youtube fullscreen rAF sequencing.
-- `a3df0fb` **pane navigation** — ⌘F fullscreen selected pane (any type), ⌘W close focused, ⌘`/Ctrl+↑/3-finger-swipe-up → `PaneOverview` mission-control, ⌘1-9 jump, ⌘M minimize / ⇧⌘M restore-all, Esc exit fullscreen. **Startup reopens last layout** (`loadLayout`/`saveLayout`, gated on `reopenLastLayout`; X drops a pane from the set).
-- `b65da55` **flashy composer** — `TerminalComposer.tsx`: gradient send (hover lift+glow, active spring), mic accent-glow, box accent halo + top-edge sheen on focus.
+Composer daily-driver work (ChatPane.tsx):
+- `c29b353`,`681b0c4` ↑-recall last msg + running context chip; live mode/model/ctx pills in TerminalComposer (parsed from claude-code's PTY in TerminalPane — see `claudeStatus` parser ~line 297).
+- `cbbeda4` scroll-aware autoscroll + jump-to-latest pill; draft persistence per pane (`localStorage[aios-chat-draft:${paneKey}]`).
+- `981f9b8` **image paste/attach** (⌘V screenshot, attach button, drag) → temp file → quoted path prepended to message; **wrap-aware composer** (flex-wrap + ml-auto action cluster, reflows like TUI).
+- `14b7d57` **voice dictation** (ported from TerminalComposer — mic → waveform → transcript, Esc cancels); flash treatment on the box; **/handoff** in slash menu; model pill nowrap; **context readout moved OUT of composer** to a line above it, model-aware window (**opus 4.8 = 1M**, sonnet/haiku 200K, codex 272K, opencode 256K).
+- `cd7cbd3` **sleek composer** — plan/goal pills removed from the bar → `/plan` `/goal` slash commands. Row is now: `+ full access · medium · model · attach · mic · send`.
+- `9683f76` **fix:** removed `overflow-hidden` from composer box (flash had added it; it clipped the permission/effort/model dropdown menus — "overlay broken").
+- `287f261` **slash menu = compact left-anchored dropdown** (OverlayPanel `compact` prop) instead of full-width overlay; @-mention picker keeps full-width.
 
 ## DECISIONS locked (firaz)
-- Default AI for "send" = **claude-code** (claude in a terminal), configurable via `settings.defaultAi`.
-- Notes = plain `.md` on disk so the oracle shares the files — that's the moat, don't regress to a DB/localStorage.
-- Flutter companion app = **parked** (seed note in `~/.aios/notes`), revisit after custom-panes + OSS readiness.
-- Send-to-AI must reuse an EXISTING alive pane; spawn only when none active.
+- ChatPane is the daily driver to perfect; TerminalComposer is untouchable/done.
+- ChatGPT sub via **Codex native** (not opencode's ChatGPT auth); opencode = the "everything else / free fallback" engine. ONE free model only, no Chinese models.
+- Docker→Colima idea: **PARKED** ("nvm the docker"). Don't action.
+- Codex/opencode replies land whole (no token streaming) — accepted; the "Working… m:ss" timer covers it.
+- Free-model latency is backend-bound (3–25s, variable) — NOT our wrapper; can't fix locally. codex ~9s floor (17.5K base prompt).
 
-## PENDING (firaz asked, NOT started — next session picks one)
-1. **Default-AI picker in Settings UI** — data layer done; add toggle in `src/components/Settings.tsx` general section (~line 919, mirror the `defaultPaneType` Row): claude-code / terminal / chat.
-2. **Send ALL notes at once** — NotesPane button concatenating every note → same `onSend`.
-3. **Per-note todo/done status** — auto-detected (regex `- [ ]` or oracle), shown in the list.
-4. **Purge old duplicate AIOS apps** (causes duplicate macOS permission entries). Keep ONLY `/Applications/AIOS.app` (`com.adletic.aios`). Delete after confirming bundle ids: `~/Desktop/AIOS.app`, `~/aios-terminal-prod-snapshot-2026-05-04/applications/AIOS.app`, `~/Repo/firaz/adletic/aios-terminal/release/{mac,mac-arm64}/AIOS.app`, `~/Repo/firaz/terminal/extra/osx/AIOS.app`.
-5. **Custom panes** ("make panes as customisable as possible") — user-created/edited panes (command/url/html) + in-app builder + ai-generated. Big, unscoped.
-6. **Notes best-in-class** — research done (below).
+## PENDING (next session)
+1. **VERIFY drag files→chat works.** Mechanism is wired (FilesPane rows draggable w/ `AIOS_PATH_MIME`; `PaneDropZone` wraps ChatPane, auto-arms via window dragover in `lib/paneBus.ts`; `extractPath`→`insertPath`). firaz reported it not working but that may have been the now-fixed clipped-overlay. If still broken: chase z-index / event-capture between FilesPane and ChatPane (PaneDropZone overlay is `z-30 absolute inset-0`). FilesPane onDragStart at `FilesPane.tsx:266`.
+2. **Confirm slash-dropdown direction.** firaz said "reuse down instead of overlay" — I made it a compact left-anchored dropdown (still opens upward since composer is bottom-docked). Confirm that's what he meant; he may want it to open downward (only fits in the empty hero state where the composer is centered).
+3. **Backlog (PLAN-chatpane-daily-driver.md)** still open: edit-a-prior-message→resend, cumulative cost HUD, retry-with-different-model without nuking the thread (route via `resumeId` — model change is a session-restart effect dep, the sharp edge), ⌘F transcript find, codex-style approval scope-tiers, recursive @ mentions, markdown tables/blockquotes/syntax-highlight.
 
-## Notes research — build-next shortlist (plain-md on disk)
-1. **Markdown live preview + code highlight** (L) — swap the raw `<textarea>` for CodeMirror 6 (md + Shiki). Biggest gap vs competitors; foundation for slash/checkboxes.
-2. **Ask-AI-across-all-notes w/ citations** (M) — oracle greps `~/.aios/notes`, answers, links source. THE differentiator (fs access + send channel already exist).
-3. **Global quick-capture hotkey** (M) — Tauri global shortcut → mini window → save+close. Kills capture-latency, the #1 universal complaint.
-4. **Tags `#tag` + daily notes + pin** (S each).
-5. **AI auto-tag + auto-status on save** (M).
-Don't out-Obsidian Obsidian on plugins — win on "the oracle IS in the notes." Defer backlinks/graph, slash, templates.
+## Key files / anchors
+- `src/components/ChatPane.tsx` (~3200 lines) — the daily driver. composer is a `useMemo` (~line 1640+); slashCommands ~1354; handleEvent ~574; session-restart effect deps include model/permission/effort/cwd (changing any restarts the engine — route mid-convo switches via `resumeId`).
+- `src-tauri/src/chat.rs` — engines: `start_per_turn`, `run_per_turn`, `adapt_codex_line`, `adapt_opencode_line`.
+- `src/components/TerminalPane.tsx` — `claudeStatus` PTY parser (~297) feeding the terminal composer pills. DON'T edit TerminalComposer.
+- `src/lib/paneBus.ts` — `AIOS_PATH_MIME`, `onAiosDrag` (drop-overlay arm signal).
+- `PLAN-chatpane-daily-driver.md` + `PLAN-chat-engines.md` — the design/backlog (untracked; both deep-dive reports synthesized here).
 
-## Gotchas
-- **Tooling flaked hard** this session: large-file Reads + `cd`-chained Bash intermittently returned "internal error". Use `git -C`/`pnpm --dir`, read ≤120-line windows, python heredocs over sed/awk for big files. A python in-place delete once OVERSHOT and removed `PaneCard`+`Splash` from App.tsx — recovered by splicing from `c1f6363`. Always `npx tsc --noEmit` == 0 before build.
-- Untracked in repo root: `PLAN-control-plane.md`, `PLAN-customizable-sidebar.md` (pre-existing, leave).
-- Detailed copy also at `~/.aios/state/handoffs/2026-05-31-0200-shell-notes-pane-nav.md`.
+## Live context
+- Verified on this machine: codex-cli 0.135.0 (logged in via ChatGPT Plus), opencode 1.15.12 (`~/.opencode/bin`). `timeout` is NOT installed on this mac (use bg + file).
+- Untracked PLAN docs in repo root (leave): PLAN-control-plane, PLAN-customizable-sidebar, PLAN-model-agnostic, PLAN-chat-engines, PLAN-chatpane-daily-driver.
