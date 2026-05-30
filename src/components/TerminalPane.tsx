@@ -128,6 +128,10 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // global ⌘J dictation (App's single VoiceButton) lands in the box, exactly
   // like ChatPane. null = no composer mounted → fall back to the PTY writer.
   const composerAppendRef = useRef<((text: string) => void) | null>(null);
+  // Live xterm handle so composerSend can snap the viewport to the prompt before
+  // writing — the common "wrong spot" is a scrolled-up terminal (reading backlog
+  // / tmux copy-mode) that would eat the sent line.
+  const termRef = useRef<Xterm | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -151,6 +155,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       scrollback: 10000,
       theme: THEME,
     });
+    termRef.current = term;
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.loadAddon(new WebLinksAddon());
@@ -392,6 +397,12 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   const composerSend = (text: string) => {
     const id = sessionIdRef.current;
     if (id == null) return;
+    // auto-correct the "wrong spot": if the terminal is scrolled up (reading
+    // backlog / tmux copy-mode), the prompt isn't in view and the sent line gets
+    // lost. Snap to the live bottom + refocus first, then write. No-op when
+    // already at the bottom, so normal sends are unaffected.
+    termRef.current?.scrollToBottom();
+    termRef.current?.focus();
     ptyWrite(id, text).catch(() => {});
     setTimeout(() => ptyWrite(id, "\r").catch(() => {}), 40);
   };
