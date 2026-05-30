@@ -39,3 +39,6 @@ src-tauri/target/
 # Local env
 .env
 .env.*
+
+# agent worktrees + local session state
+.claude/

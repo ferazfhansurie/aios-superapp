@@ -76,6 +76,10 @@ export async function readChatTranscript(id: string): Promise<ChatTurnInfo[]> {
 export interface EffortOption {
   id: string;
   label: string;
+  /** Secondary line shown in the menu (e.g. ultracode's "xhigh + workflows"). */
+  sub?: string;
+  /** The flashy top tier — rendered with the animated purple gradient. */
+  ultra?: boolean;
 }
 export const EFFORTS: EffortOption[] = [
   { id: "low", label: "low" },
@@ -83,6 +87,7 @@ export const EFFORTS: EffortOption[] = [
   { id: "high", label: "high" },
   { id: "xhigh", label: "xhigh" },
   { id: "max", label: "max" },
+  { id: "ultracode", label: "ultracode", sub: "xhigh + workflows", ultra: true },
 ];
 
 /**

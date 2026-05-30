@@ -9,6 +9,7 @@ import {
   MessageCircle,
   MessageSquare,
   PanelLeft,
+  Play,
   Radio,
   Search,
   Settings as SettingsIcon,
@@ -31,9 +32,11 @@ import { DatabasePane } from "./components/DatabasePane";
 import { MotionPane } from "./components/MotionPane";
 import { OracleRoster } from "./components/OracleRoster";
 import { PluginsPane } from "./components/PluginsPane";
+import { PulsePane } from "./components/PulsePane";
 import { ResizableGrid } from "./components/ResizableGrid";
 import { Settings } from "./components/Settings";
 import { TerminalPane, type PaneKind } from "./components/TerminalPane";
+import { EditorPane } from "./components/EditorPane";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { VoiceButton } from "./components/VoiceButton";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -44,6 +47,8 @@ import { listCustomers, type Customer } from "./lib/inbox";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import { chatHandles, paneWriters } from "./lib/paneBus";
+import { homeDir } from "./lib/fs";
+import { detectProject } from "./lib/run";
 
 /** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
 type PaneContent =
@@ -54,10 +59,12 @@ type PaneContent =
   | { type: "automations" }
   | { type: "bridges" }
   | { type: "plugins" }
+  | { type: "pulse" }
   | { type: "chat"; seed?: string; resume?: { id: string; title: string }; reattach?: number }
   | { type: "customers" }
   | { type: "motion" }
-  | { type: "file"; path: string; name: string };
+  | { type: "file"; path: string; name: string }
+  | { type: "editor"; path: string; name: string };
 interface Pane {
   key: string;
   label: string;
@@ -66,6 +73,24 @@ interface Pane {
 
 const isTerminal = (k: PaneContent): k is PaneKind =>
   k.type === "shell" || k.type === "oracle" || k.type === "tmux";
+
+// Files that render in the viewer (images / pdf / office / binary); everything
+// else opens in the Monaco editor pane (the editor itself falls back to "open
+// externally" if the file turns out to be binary).
+const VIEWER_EXT = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico",
+  "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "key", "numbers", "pages",
+  "zip", "gz", "tar", "dmg", "app", "mp4", "mov", "mp3", "wav", "woff", "woff2", "ttf",
+]);
+
+/** Pick the pane kind for opening a file: viewer for media/binaries, else the
+ *  code editor. */
+function paneForFile(path: string, name: string): PaneContent {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return VIEWER_EXT.has(ext)
+    ? { type: "file", path, name }
+    : { type: "editor", path, name };
+}
 
 let seq = 0;
 const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
@@ -112,6 +137,35 @@ function App() {
   const spawn = useCallback((kind: PaneContent, label: string) => {
     setPanes((p) => [...p, { key: nextKey(), kind, label }]);
   }, []);
+
+  // remember the last file opened in the editor so F5 knows which project to run
+  const lastOpenPath = useRef<string | null>(null);
+  const openFile = useCallback(
+    (path: string, name: string) => {
+      lastOpenPath.current = path;
+      spawn(paneForFile(path, name), name);
+    },
+    [spawn],
+  );
+
+  // F5 / Run — detect the project around the last-opened file (or $HOME) and
+  // spawn a terminal running its default command in the project dir (logs +
+  // flutter's own `r` hot-reload work right in that terminal, like VS Code).
+  const runF5 = useCallback(async () => {
+    try {
+      const base = lastOpenPath.current ?? (await homeDir());
+      const proj = await detectProject(base);
+      if (!proj.root || !proj.commands.length) {
+        flash("no runnable project found near the open file");
+        return;
+      }
+      const c = proj.commands[0];
+      spawn({ type: "shell", cmd: c.cmd, cwd: proj.root }, `▶ ${c.label}`);
+      flash(`▶ ${c.cmd}`);
+    } catch (e) {
+      flash(`run failed: ${e}`);
+    }
+  }, [spawn, flash]);
   const addShell = useCallback(() => spawn({ type: "shell" }, "terminal"), [spawn]);
   const addOracle = useCallback(
     (identity: string) => spawn({ type: "oracle", identity }, identity),
@@ -242,6 +296,10 @@ function App() {
       } else if (mod && e.key === ",") {
         e.preventDefault();
         setSettingsOpen(true);
+      } else if (e.key === "F5") {
+        // F5 — run the current project (VS Code's start-debugging muscle memory)
+        e.preventDefault();
+        runF5();
       }
       if (e.key === "Meta") {
         const now = e.timeStamp || performance.now();
@@ -255,7 +313,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addShell, fireAppshot]);
+  }, [addShell, fireAppshot, runF5]);
 
   // Native OS drag-drop (Finder files/folders) → insert paths into the terminal
   // pane under the cursor. Tauri gives real filesystem paths the webview can't.
@@ -335,10 +393,11 @@ function App() {
         run: () => spawn({ type: "customers" }, "customers"),
       })),
       { id: "sidebar", title: "toggle sidebar", subtitle: "⌘B", group: "view", icon: <PanelLeft size={14} />, keywords: "rail hide show", actionLabel: "toggle", run: () => setSidebarOpen((v) => !v) },
+      { id: "run", title: "run project", subtitle: "F5", group: "actions", icon: <Play size={14} />, keywords: "f5 run debug start flutter npm dev build terminal", actionLabel: "run", run: () => runF5() },
       { id: "appshot", title: "appshot — screenshot to oracle", subtitle: "⌘⌘", group: "actions", icon: <Camera size={14} />, keywords: "screenshot capture", actionLabel: "run", run: fireAppshot },
       { id: "settings", title: "settings", subtitle: "⌘,", group: "app", icon: <SettingsIcon size={14} />, keywords: "preferences theme appearance", actionLabel: "open", run: () => setSettingsOpen(true) },
     ],
-    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle],
+    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5],
   );
 
   return (
@@ -426,7 +485,7 @@ function App() {
                   onClose={() => requestClose(pane.key)}
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
-                  onOpenFile={(path, name) => spawn({ type: "file", path, name }, name)}
+                  onOpenFile={openFile}
                 />
               ))}
             </ResizableGrid>
@@ -572,6 +631,7 @@ const DOT: Record<string, string> = {
   automations: "status-dot--cold",
   bridges: "status-dot--cold",
   plugins: "status-dot--cold",
+  pulse: "status-dot--active",
   chat: "status-dot--active",
   customers: "status-dot--active",
   motion: "status-dot--cold",
@@ -662,12 +722,16 @@ function PaneCard({
           <BridgesPane />
         ) : pane.kind.type === "plugins" ? (
           <PluginsPane />
+        ) : pane.kind.type === "pulse" ? (
+          <PulsePane />
         ) : pane.kind.type === "customers" ? (
           <CrmPane />
         ) : pane.kind.type === "motion" ? (
           <MotionPane />
         ) : pane.kind.type === "file" ? (
           <FileViewerPane path={pane.kind.path} />
+        ) : pane.kind.type === "editor" ? (
+          <EditorPane path={pane.kind.path} name={pane.kind.name} />
         ) : (
           <ChatPane
             paneKey={pane.key}

@@ -14,6 +14,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 
 import { ptyKill, ptyResize, ptyWrite, spawnOracle, spawnShell, spawnTmux } from "../lib/pty";
 import { paneWriters } from "../lib/paneBus";
+import { PaneDropZone } from "./PaneDropZone";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
 const THEME = {
@@ -44,14 +45,13 @@ const FONT_FAMILY =
   '"SF Mono", "Menlo", "Monaco", "JetBrains Mono", "Consolas", ui-monospace, monospace';
 
 export type PaneKind =
-  | { type: "shell"; cmd?: string }
+  | { type: "shell"; cmd?: string; cwd?: string }
   | { type: "oracle"; identity: string }
   | { type: "tmux"; socket: string; session: string };
 
 export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: string }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<number | null>(null);
-  const [dragOver, setDragOver] = useState(false);
   // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
   const [buttons, setButtons] = useState<string[] | null>(null);
   const bufRef = useRef("");
@@ -130,7 +130,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
             ? await spawnOracle(onData, kind.identity, cols, rows)
             : kind.type === "tmux"
               ? await spawnTmux(onData, kind.socket, kind.session, cols, rows)
-              : await spawnShell(onData, null, cols, rows);
+              : await spawnShell(onData, kind.type === "shell" ? kind.cwd ?? null : null, cols, rows);
       } catch (e) {
         term.write(`\r\n\x1b[31m[aios] spawn failed: ${e}\x1b[0m\r\n`);
         return;
@@ -189,11 +189,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
 
   // Drop a file/folder (dragged from the Files pane) → insert its path into
   // this session's PTY, shell-quoted, with a trailing space.
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragOver(false);
-    const path =
-      e.dataTransfer.getData("application/x-aios-path") || e.dataTransfer.getData("text/plain");
+  const onPath = (path: string) => {
     const id = sessionIdRef.current;
     if (!path || id == null) return;
     const quoted = /[\s'"\\]/.test(path) ? `'${path.replace(/'/g, "'\\''")}' ` : `${path} `;
@@ -201,18 +197,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   };
 
   return (
-    <div
-      className="relative h-full min-h-0 w-full"
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = "copy";
-        if (!dragOver) setDragOver(true);
-      }}
-      onDragLeave={(e) => {
-        if (e.currentTarget === e.target) setDragOver(false);
-      }}
-      onDrop={onDrop}
-    >
+    <PaneDropZone onPath={onPath}>
       <div ref={hostRef} className="h-full min-h-0 w-full" />
       {buttons && (
         <div className="absolute inset-x-0 bottom-0 z-20 flex flex-wrap items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-panel)]/95 p-2 backdrop-blur">
@@ -234,13 +219,6 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
           </button>
         </div>
       )}
-      {dragOver && (
-        <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center border-2 border-dashed border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10">
-          <span className="rounded-md bg-[var(--color-panel)]/90 px-3 py-1.5 text-[12px] text-[var(--color-text)]">
-            drop to insert path
-          </span>
-        </div>
-      )}
-    </div>
+    </PaneDropZone>
   );
 }
