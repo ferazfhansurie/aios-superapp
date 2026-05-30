@@ -52,12 +52,313 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
+/// Like `read_dir` but for the VS Code-style explorer tree: shows dotfiles
+/// (`.claude`, `.vercel`, …) the way VS Code does, hiding only `.git` and
+/// `.DS_Store`. Same sort (dirs first, alphabetical).
+#[tauri::command]
+pub fn read_dir_tree(path: String) -> Result<Vec<DirEntry>, String> {
+    let p = if path.is_empty() {
+        home_dir()
+    } else {
+        path
+    };
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for e in std::fs::read_dir(&p).map_err(|e| e.to_string())? {
+        let e = match e {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == ".git" || name == ".DS_Store" {
+            continue;
+        }
+        let meta = e.metadata().ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let mtime = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        entries.push(DirEntry {
+            name,
+            path: e.path().to_string_lossy().to_string(),
+            is_dir,
+            mtime,
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+#[derive(Serialize)]
+pub struct GitEntry {
+    /// Absolute path of the changed file.
+    path: String,
+    /// Single-letter status: M(odified) A(dded) D(eleted) R(enamed) U(ntracked).
+    status: String,
+}
+
+#[derive(Serialize)]
+pub struct GitStatus {
+    /// Repo toplevel, or null if `path` isn't inside a git repo.
+    root: Option<String>,
+    entries: Vec<GitEntry>,
+}
+
+/// Git status for the repo containing `path`, as absolute-path → status-letter,
+/// so the Files tree can decorate changed files + their parent folders. Returns
+/// `{ root: null, entries: [] }` (never errors) when not in a repo.
+#[tauri::command]
+pub fn git_status(path: String) -> Result<GitStatus, String> {
+    let root = match std::process::Command::new("git")
+        .args(["-C", &path, "rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => return Ok(GitStatus { root: None, entries: Vec::new() }),
+    };
+    let out = std::process::Command::new("git")
+        .args(["-C", &root, "status", "--porcelain", "--ignored=no"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let xy = &line[..2];
+        let mut rest = line[3..].to_string();
+        // renames come as "old -> new" — decorate the new path
+        if let Some(idx) = rest.find(" -> ") {
+            rest = rest[idx + 4..].to_string();
+        }
+        let rel = rest.trim().trim_matches('"');
+        let abs = std::path::Path::new(&root)
+            .join(rel)
+            .to_string_lossy()
+            .to_string();
+        let status = simplify_status(xy).to_string();
+        entries.push(GitEntry { path: abs, status });
+    }
+    Ok(GitStatus { root: Some(root), entries })
+}
+
+/// Collapse a 2-char porcelain XY code to one display letter.
+fn simplify_status(xy: &str) -> &'static str {
+    if xy == "??" {
+        return "U";
+    }
+    if xy.contains('D') {
+        "D"
+    } else if xy.contains('A') {
+        "A"
+    } else if xy.contains('R') {
+        "R"
+    } else if xy.contains('M') {
+        "M"
+    } else {
+        "M"
+    }
+}
+
+#[derive(Serialize)]
+pub struct RunCommand {
+    label: String,
+    cmd: String,
+}
+
+#[derive(Serialize)]
+pub struct ProjectRun {
+    /// "flutter" | "node" | "rust" | "go" | "python" | "make" | "unknown"
+    kind: String,
+    /// Directory the project marker was found in (where the command should run).
+    root: Option<String>,
+    /// Candidate run commands; the first is the default for F5.
+    commands: Vec<RunCommand>,
+}
+
+/// Detects the runnable project containing `path` (walks up to find a marker)
+/// and returns the F5-style run commands. Used by the Run pane / F5 to spawn a
+/// terminal running the right thing in the right directory.
+#[tauri::command]
+pub fn detect_project(path: String) -> ProjectRun {
+    let mut dir = std::path::PathBuf::from(&path);
+    if dir.is_file() {
+        if let Some(p) = dir.parent() {
+            dir = p.to_path_buf();
+        }
+    }
+    for _ in 0..12 {
+        let here = dir.to_string_lossy().to_string();
+        let has = |f: &str| dir.join(f).is_file();
+
+        if has("pubspec.yaml") {
+            return ProjectRun {
+                kind: "flutter".into(),
+                root: Some(here),
+                commands: vec![
+                    RunCommand { label: "flutter run".into(), cmd: "flutter run".into() },
+                    RunCommand { label: "flutter run --release".into(), cmd: "flutter run --release".into() },
+                    RunCommand { label: "flutter test".into(), cmd: "flutter test".into() },
+                ],
+            };
+        }
+        if has("package.json") {
+            return ProjectRun {
+                kind: "node".into(),
+                root: Some(here.clone()),
+                commands: node_scripts(&dir),
+            };
+        }
+        if has("Cargo.toml") {
+            return ProjectRun {
+                kind: "rust".into(),
+                root: Some(here),
+                commands: vec![
+                    RunCommand { label: "cargo run".into(), cmd: "cargo run".into() },
+                    RunCommand { label: "cargo test".into(), cmd: "cargo test".into() },
+                    RunCommand { label: "cargo build".into(), cmd: "cargo build".into() },
+                ],
+            };
+        }
+        if has("go.mod") {
+            return ProjectRun {
+                kind: "go".into(),
+                root: Some(here),
+                commands: vec![
+                    RunCommand { label: "go run .".into(), cmd: "go run .".into() },
+                    RunCommand { label: "go test ./...".into(), cmd: "go test ./...".into() },
+                ],
+            };
+        }
+        if has("pyproject.toml") || has("requirements.txt") || has("manage.py") {
+            let cmd = if has("manage.py") {
+                "python manage.py runserver"
+            } else {
+                "python main.py"
+            };
+            return ProjectRun {
+                kind: "python".into(),
+                root: Some(here),
+                commands: vec![RunCommand { label: cmd.into(), cmd: cmd.into() }],
+            };
+        }
+        if has("Makefile") {
+            return ProjectRun {
+                kind: "make".into(),
+                root: Some(here),
+                commands: vec![RunCommand { label: "make".into(), cmd: "make".into() }],
+            };
+        }
+
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => break,
+        }
+    }
+    ProjectRun { kind: "unknown".into(), root: None, commands: Vec::new() }
+}
+
+/// Reads package.json `scripts` and turns them into `<pm> run <name>` commands,
+/// dev/start/serve first. Picks the package manager from the lockfile present.
+fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
+    let pm = if dir.join("pnpm-lock.yaml").is_file() {
+        "pnpm"
+    } else if dir.join("yarn.lock").is_file() {
+        "yarn"
+    } else if dir.join("bun.lockb").is_file() {
+        "bun"
+    } else {
+        "npm"
+    };
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(dir.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
+                let mut names: Vec<&String> = scripts.keys().collect();
+                // priority order first, then the rest alphabetically
+                let prio = ["dev", "start", "serve", "build", "test"];
+                names.sort_by_key(|n| {
+                    prio.iter().position(|p| *p == n.as_str()).unwrap_or(prio.len() + 1)
+                });
+                for name in names {
+                    let run = if pm == "npm" {
+                        format!("npm run {name}")
+                    } else {
+                        format!("{pm} {name}")
+                    };
+                    out.push(RunCommand { label: run.clone(), cmd: run });
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(RunCommand {
+            label: format!("{pm} start"),
+            cmd: format!("{pm} start"),
+        });
+    }
+    out
+}
+
 /// Returns the user's home directory (HOME, then USERPROFILE on Windows).
 #[tauri::command]
 pub fn home_dir() -> String {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| if cfg!(windows) { "C:\\".into() } else { "/".into() })
+}
+
+/// Builds a `file://` URL from an absolute path, cross-platform. On Windows
+/// `C:\Users\…` → `file:///C:/Users/…`; on unix `/tmp/…` → `file:///tmp/…`.
+fn url_from_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
+    }
+}
+
+/// Cap on editable text files: 8 MB. Larger files are refused (the editor isn't
+/// meant for huge blobs — guards against loading a gigabyte into the webview).
+const EDIT_TEXT_CAP: u64 = 8 * 1024 * 1024;
+
+/// Reads a file's full UTF-8 contents for the editor pane. Refuses files over
+/// the cap or that aren't valid UTF-8 (binary). Errors are returned as strings.
+#[tauri::command]
+pub fn read_text_file(path: String) -> Result<String, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| format!("{e}"))?;
+    if meta.len() > EDIT_TEXT_CAP {
+        return Err(format!(
+            "file too large to edit ({} MB > 8 MB)",
+            meta.len() / (1024 * 1024)
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("{e}"))?;
+    String::from_utf8(bytes).map_err(|_| "not a UTF-8 text file".to_string())
+}
+
+/// Writes UTF-8 contents back to a file (editor save). Writes to a temp file in
+/// the same dir then renames, so a crash mid-write can't truncate the original.
+#[tauri::command]
+pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    let dir = p.parent().ok_or_else(|| "invalid path".to_string())?;
+    let tmp = dir.join(format!(
+        ".{}.aios-tmp",
+        p.file_name().and_then(|s| s.to_str()).unwrap_or("file")
+    ));
+    std::fs::write(&tmp, content.as_bytes()).map_err(|e| format!("{e}"))?;
+    std::fs::rename(&tmp, p).map_err(|e| format!("{e}"))?;
+    Ok(())
 }
 
 /// Cap on inline text payloads: ~256 KB.
@@ -192,21 +493,16 @@ fn is_office_ext(ext: &str) -> bool {
 fn soffice_bin() -> Option<String> {
     #[cfg(windows)]
     {
-        let mut candidates: Vec<String> = Vec::new();
         for var in ["ProgramFiles", "ProgramFiles(x86)"] {
             if let Ok(pf) = std::env::var(var) {
-                candidates.push(format!(r"{pf}\LibreOffice\program\soffice.exe"));
+                let p = format!(r"{pf}\LibreOffice\program\soffice.exe");
+                if std::path::Path::new(&p).exists() {
+                    return Some(p);
+                }
             }
         }
-        for c in &candidates {
-            if std::path::Path::new(c).exists() {
-                return Some(c.clone());
-            }
-        }
-        // Last resort: PATH resolution (Rust appends .exe).
         return Some("soffice.exe".to_string());
     }
-
     #[cfg(not(windows))]
     {
         let candidates = [
@@ -223,19 +519,6 @@ fn soffice_bin() -> Option<String> {
         }
         // Last resort: rely on PATH resolution.
         Some("soffice".to_string())
-    }
-}
-
-/// Builds a `file://` URL from an absolute path, cross-platform. On Windows a
-/// path like `C:\Users\…` becomes `file:///C:/Users/…`; on unix `/tmp/…` becomes
-/// `file:///tmp/…`. Sufficient for LibreOffice's `-env:UserInstallation` (paths
-/// here are app-generated temp dirs, so no exotic chars to percent-encode).
-fn url_from_path(p: &std::path::Path) -> String {
-    let s = p.to_string_lossy().replace('\\', "/");
-    if s.starts_with('/') {
-        format!("file://{s}")
-    } else {
-        format!("file:///{s}")
     }
 }
 
@@ -288,10 +571,8 @@ pub fn convert_office_to_pdf(path: String) -> Result<String, String> {
 
     let bin = soffice_bin().ok_or("LibreOffice (soffice) not found")?;
     // Isolated profile so we don't clash with a running LibreOffice instance.
-    // LibreOffice wants a file:// URL; build it from the platform temp dir so it's
-    // valid on Windows (file:///C:/...) as well as unix.
-    let profile_path = preview_root.join(format!(".profile-{key:x}"));
-    let profile_url = url_from_path(&profile_path);
+    // Build the file:// URL from the platform temp dir (valid on Windows too).
+    let profile_url = url_from_path(&preview_root.join(format!(".profile-{key:x}")));
     let profile = format!("-env:UserInstallation={profile_url}");
 
     let output = std::process::Command::new(&bin)
@@ -326,4 +607,65 @@ pub fn convert_office_to_pdf(path: String) -> Result<String, String> {
     }
 
     Err("conversion produced no PDF".into())
+}
+
+/// Decodes standard base64 (no whitespace/newlines tolerated beyond what we
+/// strip) into bytes. Dependency-free so we don't pull a crate just for paste.
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for c in input.bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' || c == b' ' || c == b'\t' {
+            continue;
+        }
+        let v = val(c).ok_or("invalid base64 character")?;
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Persists a clipboard / dropped image to a temp file and returns its path, so
+/// the terminal can hand the path to a CLI AI (claude code) for vision.
+///
+/// `data` is the raw base64 of the image bytes (NOT a data-URL — the frontend
+/// strips the `data:image/png;base64,` prefix). `ext` is the desired file
+/// extension (e.g. "png", "jpg"). The file lands under `/tmp/aios-paste/` with
+/// a content-hashed name so repeated pastes of the same image dedupe.
+#[tauri::command]
+pub fn save_image_temp(data: String, ext: String) -> Result<String, String> {
+    let bytes = base64_decode(&data)?;
+    if bytes.is_empty() {
+        return Err("empty image data".into());
+    }
+    let safe_ext: String = ext
+        .trim_start_matches('.')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let safe_ext = if safe_ext.is_empty() { "png".into() } else { safe_ext };
+
+    let dir = std::env::temp_dir().join("aios-paste");
+    let dir = dir.as_path();
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let key = fnv1a(&format!("{}|{}", bytes.len(), bytes.iter().take(4096).fold(0u64, |a, &b| a.wrapping_add(b as u64))));
+    let path = dir.join(format!("paste-{key:x}.{safe_ext}"));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
 }

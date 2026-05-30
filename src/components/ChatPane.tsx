@@ -84,6 +84,7 @@ import {
 } from "../lib/chat";
 import { readDir, type DirEntry } from "../lib/fs";
 import { chatHandles, paneWriters } from "../lib/paneBus";
+import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
 
@@ -145,6 +146,11 @@ const PLAN_PREFIX =
   "Plan first: lay out a concise step-by-step plan and wait for my go-ahead before writing any code or running mutating commands.\n\n";
 const GOAL_PREFIX = (goal: string) =>
   `Ongoing goal (keep pursuing this across turns until I say it's done): ${goal}\n\n`;
+// ultracode = xhigh effort + workflows. Headless `claude -p` has no ultracode
+// flag, so we run xhigh and replicate the "workflows" half with this directive:
+// orchestrate, fan out, verify — be maximally thorough.
+const ULTRA_PREFIX =
+  "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel sub-agents (Task tool) to cover it, then adversarially verify findings before concluding. Prefer orchestrated multi-agent execution over a single pass; only handle trivially small tasks inline.\n\n";
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -519,6 +525,12 @@ export function ChatPane({
     };
   }, [paneKey]);
 
+  // A path dragged from another pane (Files) → append it to the composer.
+  const insertPath = useCallback((path: string) => {
+    setInput((v) => (v ? v.trimEnd() + " " + path + " " : path + " "));
+    taRef.current?.focus();
+  }, []);
+
   // ── event ingestion ───────────────────────────────────────────────────────
 
   const handleEvent = useCallback((ev: ChatEvent) => {
@@ -790,7 +802,9 @@ export function ChatPane({
             cwd: cwd ?? null,
             model: model.disabled ? null : model.id,
             permissionMode: permission.id,
-            effort: effort.id,
+            // ultracode isn't a real --effort value; run it as xhigh (the
+            // "+ workflows" half is applied per-message via ULTRA_PREFIX).
+            effort: effort.ultra ? "xhigh" : effort.id,
             resume: resumeId,
           });
 
@@ -898,6 +912,7 @@ export function ChatPane({
       let wire = display;
       if (goal.trim()) wire = GOAL_PREFIX(goal.trim()) + wire;
       if (planMode) wire = PLAN_PREFIX + wire;
+      if (effort.ultra) wire = ULTRA_PREFIX + wire;
       lastSentRef.current = display;
       if (!opts?.skipUserBubble) {
         setTurns((prev) => [...prev, { kind: "user", id: uid(), text: display }]);
@@ -920,7 +935,7 @@ export function ChatPane({
         setStreaming(false);
       });
     },
-    [goal, planMode],
+    [goal, planMode, effort.ultra],
   );
 
   const send = useCallback(() => {
@@ -1448,25 +1463,58 @@ export function ChatPane({
             <Dropdown
               open={openMenu === "effort"}
               onToggle={() => setOpenMenu(openMenu === "effort" ? null : "effort")}
+              triggerClassName={
+                effort.ultra
+                  ? "aios-ultra flex items-center gap-1.5 rounded-full px-2.5 py-1 font-sans text-[11.5px] font-semibold"
+                  : undefined
+              }
               trigger={
                 <>
+                  {effort.ultra && <Sparkles size={12} className="shrink-0" />}
                   <span>{effort.label}</span>
-                  <ChevronDown size={12} className="text-[var(--color-faint)]" />
+                  <ChevronDown
+                    size={12}
+                    className={effort.ultra ? "text-white/80" : "text-[var(--color-faint)]"}
+                  />
                 </>
               }
             >
-              {EFFORTS.map((ef) => (
-                <MenuItem
-                  key={ef.id}
-                  active={ef.id === effort.id}
-                  onClick={() => {
-                    setEffort(ef);
-                    setOpenMenu(null);
-                  }}
-                >
-                  {ef.label}
-                </MenuItem>
-              ))}
+              {EFFORTS.map((ef) =>
+                ef.ultra ? (
+                  <button
+                    key={ef.id}
+                    type="button"
+                    onClick={() => {
+                      setEffort(ef);
+                      setOpenMenu(null);
+                    }}
+                    className={`group/ultra flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors ${
+                      ef.id === effort.id ? "bg-[var(--color-panel)]" : "hover:bg-[var(--color-panel)]"
+                    }`}
+                  >
+                    <Sparkles size={13} className="shrink-0 text-[#a855f7]" />
+                    <span className="flex min-w-0 flex-col">
+                      <span className="aios-ultra-text font-sans text-[12px] font-semibold">
+                        {ef.label}
+                      </span>
+                      {ef.sub && (
+                        <span className="font-mono text-[9.5px] text-[var(--color-faint)]">{ef.sub}</span>
+                      )}
+                    </span>
+                  </button>
+                ) : (
+                  <MenuItem
+                    key={ef.id}
+                    active={ef.id === effort.id}
+                    onClick={() => {
+                      setEffort(ef);
+                      setOpenMenu(null);
+                    }}
+                  >
+                    {ef.label}
+                  </MenuItem>
+                ),
+              )}
             </Dropdown>
 
             {/* plan toggle */}
@@ -1673,6 +1721,7 @@ export function ChatPane({
 
   if (empty) {
     return (
+      <PaneDropZone onPath={insertPath} label="drop to add to message">
       <div className="flex h-full min-h-0 w-full flex-col items-center justify-center bg-[var(--color-bg)] px-6">
         <div className="w-full max-w-2xl">
           <h1 className="mb-7 text-center font-sans text-3xl font-medium tracking-tight text-[var(--color-text)]">
@@ -1696,10 +1745,12 @@ export function ChatPane({
           </div>
         </div>
       </div>
+      </PaneDropZone>
     );
   }
 
   return (
+    <PaneDropZone onPath={insertPath} label="drop to add to message">
     <div className="flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-2xl flex-col gap-5 px-6 py-8">
@@ -1764,6 +1815,7 @@ export function ChatPane({
         <div className="mx-auto max-w-2xl">{composer}</div>
       </div>
     </div>
+    </PaneDropZone>
   );
 }
 
@@ -2715,19 +2767,25 @@ function Dropdown({
   trigger,
   children,
   align = "left",
+  triggerClassName,
 }: {
   open: boolean;
   onToggle: () => void;
   trigger: React.ReactNode;
   children: React.ReactNode;
   align?: "left" | "right";
+  /** Override the trigger pill styling (e.g. the ultracode gradient). */
+  triggerClassName?: string;
 }) {
   return (
     <div className="relative">
       <button
         type="button"
         onClick={onToggle}
-        className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+        className={
+          triggerClassName ??
+          "flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+        }
       >
         {trigger}
       </button>

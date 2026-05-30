@@ -123,14 +123,15 @@ export function IdleDashboard({
 
       {/* ── bento grid ───────────────────────────────────────────────────── */}
       <div className="relative grid min-h-0 flex-1 grid-cols-6 grid-rows-3 gap-3">
-        {/* PULSE — hero (c1-3, r1-2) */}
+        {/* PULSE — hero (c1-3, r1-2) — click opens the full pulse detail pane */}
         <Tile
           className="col-span-3 row-span-2"
           delay={40}
           icon={<Zap size={12} className="text-[var(--color-highlight)]" />}
           label="pulse"
+          onClick={() => onSpawn({ type: "pulse" }, "pulse")}
         >
-          <Pulse extras={extras} rate={rate} />
+          <Pulse extras={extras} rate={rate} focus={focus} />
         </Tile>
 
         {/* CONTINUE — hero (c4-6, r1) */}
@@ -487,6 +488,34 @@ function fmtNum(n: number): string {
   return String(n);
 }
 
+/** Short label for a model id: "claude-sonnet-4-5-20250101" → "sonnet 4.5". */
+function shortModel(model: string): string {
+  return model
+    .replace(/^claude-/, "")
+    .replace(/-\d{6,}$/, "")
+    .replace(/-(\d)-(\d)$/, " $1.$2")
+    .replace(/-/g, " ");
+}
+
+/** Compact "since" date: an ISO/date string → "may '25". */
+function shortDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const mon = d.toLocaleDateString(undefined, { month: "short" }).toLowerCase();
+  return `${mon} '${String(d.getFullYear()).slice(-2)}`;
+}
+
+/** A small stacked value+label cell for the pulse secondary-stat strip — mirrors
+ *  the muted-label / text-2-value rhythm of the existing stat row. */
+function MetaStat({ value, label }: { value: string; label: string }) {
+  return (
+    <div className="flex flex-col leading-tight">
+      <span className="font-mono text-[13px] text-[var(--color-text-2)]">{value}</span>
+      <span className="text-[9px] uppercase tracking-[0.12em] text-[var(--color-muted)]">{label}</span>
+    </div>
+  );
+}
+
 function heatColor(count: number, max: number): string {
   if (count <= 0) return "var(--color-panel-2)";
   const t = max > 0 ? count / max : 0;
@@ -495,7 +524,15 @@ function heatColor(count: number, max: number): string {
   return `color-mix(in srgb, var(--color-accent) ${pct}%, transparent)`;
 }
 
-function Pulse({ extras, rate }: { extras: UsageExtras | null; rate: IdleRate | null }) {
+function Pulse({
+  extras,
+  rate,
+  focus,
+}: {
+  extras: UsageExtras | null;
+  rate: IdleRate | null;
+  focus: MemoryFocus | null;
+}) {
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
@@ -566,11 +603,43 @@ function Pulse({ extras, rate }: { extras: UsageExtras | null; rate: IdleRate | 
           )}
         </div>
 
-        {/* rate rings — large, labeled */}
+        {/* rate rings — large, labeled (+ context fill as a third ring) */}
         {hasRate && (
           <div className="mt-1 flex gap-6">
             <Ring label="5h" pct={rate!.fiveHour.pct} resetsAt={rate!.fiveHour.resetsAt} size={66} />
             <Ring label="7d" pct={rate!.sevenDay.pct} resetsAt={rate!.sevenDay.resetsAt} size={66} />
+            {rate!.contextPct != null && (
+              <Ring label="ctx" pct={rate!.contextPct} resetsAt={null} size={66} />
+            )}
+          </div>
+        )}
+
+        {/* secondary stats — fills the previously dead lower-left space with the
+            UsageExtras fields the tile didn't surface (sessions / messages /
+            top model / active-since) + the freshest memory focus line. */}
+        {extras && (
+          <div className="mt-1 flex flex-wrap gap-x-5 gap-y-2">
+            {extras.totalSessions != null && (
+              <MetaStat value={fmtNum(extras.totalSessions)} label="sessions" />
+            )}
+            {extras.totalMessages != null && (
+              <MetaStat value={fmtNum(extras.totalMessages)} label="messages" />
+            )}
+            {extras.favoriteModel && (
+              <MetaStat value={shortModel(extras.favoriteModel)} label="top model" />
+            )}
+            {extras.firstSessionDate && (
+              <MetaStat value={shortDate(extras.firstSessionDate)} label="since" />
+            )}
+          </div>
+        )}
+
+        {focus?.title && (
+          <div className="flex items-baseline gap-1.5 font-mono text-[10px] leading-tight text-[var(--color-faint)]">
+            <span className="uppercase tracking-[0.14em] text-[var(--color-muted)]">focus</span>
+            <span className="min-w-0 truncate text-[var(--color-text-2)]" title={focus.title}>
+              {focus.title}
+            </span>
           </div>
         )}
       </div>
@@ -690,3 +759,7 @@ function Empty({ children }: { children: ReactNode }) {
     </div>
   );
 }
+
+// Shared with PulsePane (the click-to-detail view) so the rich pane reuses the
+// exact same ring + heatmap + formatting the tile uses — no duplication.
+export { Ring, heatColor, fmtNum, shortModel, shortDate };

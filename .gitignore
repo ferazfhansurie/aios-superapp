@@ -44,3 +44,6 @@ src-tauri/target/
 windows-*.png
 *.key
 src-tauri/.motion.key
+
+# agent worktrees + local session state
+.claude/

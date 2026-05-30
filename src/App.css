@@ -259,6 +259,30 @@ html, body, #root {
 .aios-drift-a { animation: aios-drift-a 34s ease-in-out infinite; top: 8%; left: 22%; }
 .aios-drift-b { animation: aios-drift-b 41s ease-in-out infinite; bottom: 6%; right: 18%; }
 
+/* ultracode — the flashy top effort tier (mirrors Anthropic's terminal gradient).
+   An animated purple band that pans across the chip + a soft glow. */
+@keyframes aios-ultra-pan { 0% { background-position: 0% 50%; } 100% { background-position: 200% 50%; } }
+@keyframes aios-ultra-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(168, 85, 247, 0); }
+  50% { box-shadow: 0 0 14px 1px rgba(168, 85, 247, 0.55); }
+}
+.aios-ultra {
+  background-image: linear-gradient(90deg, #6d28d9, #a855f7, #d8b4fe, #7c3aed, #a855f7, #6d28d9);
+  background-size: 220% 100%;
+  animation: aios-ultra-pan 2.8s linear infinite, aios-ultra-glow 2.8s ease-in-out infinite;
+  color: #fff !important;
+  border-color: transparent !important;
+  text-shadow: 0 0 6px rgba(255, 255, 255, 0.35);
+}
+.aios-ultra-text {
+  background-image: linear-gradient(90deg, #a855f7, #d8b4fe, #7c3aed, #a855f7);
+  background-size: 220% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: aios-ultra-pan 2.8s linear infinite;
+}
+
 /* reduce-motion: Settings sets data-reduce-motion on :root — kill the ambient
    loops + intro sweeps so the idle page (and brand motion) sit still. */
 [data-reduce-motion="true"] .brand-logo,
