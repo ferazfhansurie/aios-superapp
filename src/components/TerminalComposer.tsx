@@ -827,7 +827,9 @@ export function TerminalComposer({
         </OverlayPanel>
       )}
 
-      <div className="relative rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
+      <div className="group/composer relative overflow-hidden rounded-2xl border border-[var(--color-border-strong)] bg-gradient-to-b from-[var(--color-panel-2)]/80 to-[var(--color-panel-2)]/55 shadow-2xl shadow-black/40 backdrop-blur transition-all duration-300 focus-within:border-[var(--color-accent)]/60 focus-within:shadow-[0_0_0_1px_color-mix(in_srgb,var(--color-accent)_50%,transparent),0_18px_50px_-12px_color-mix(in_srgb,var(--color-accent)_45%,transparent)]">
+        {/* accent sheen sweeping the top edge when focused */}
+        <span className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px bg-gradient-to-r from-transparent via-[var(--color-accent)] to-transparent opacity-0 transition-opacity duration-500 group-focus-within/composer:opacity-80" />
         {/* hidden file input driving the "+" → Add photos & files */}
         <input
           ref={fileInputRef}
@@ -1034,7 +1036,7 @@ export function TerminalComposer({
               type="button"
               onClick={() => void micStart()}
               title="dictate (⌘J)"
-              className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+              className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-all duration-200 hover:scale-110 hover:bg-[var(--color-accent-soft)] hover:text-[var(--color-accent)] hover:shadow-[0_0_14px_-3px_var(--color-accent)]"
             >
               <Mic size={16} />
             </button>
@@ -1048,9 +1050,9 @@ export function TerminalComposer({
               onClick={submit}
               disabled={!hasContent}
               title="send to terminal (↵)"
-              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
+              className="group/send grid h-8 w-8 place-items-center rounded-full bg-gradient-to-br from-[var(--color-accent)] to-[color-mix(in_srgb,var(--color-accent)_62%,#000)] text-[var(--color-bg)] shadow-[0_2px_12px_-2px_color-mix(in_srgb,var(--color-accent)_70%,transparent)] transition-all duration-200 enabled:hover:scale-110 enabled:hover:shadow-[0_4px_22px_-2px_var(--color-accent)] enabled:active:scale-90 disabled:cursor-not-allowed disabled:bg-none disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)] disabled:shadow-none"
             >
-              <ArrowUp size={16} />
+              <ArrowUp size={16} className="transition-transform duration-200 group-hover/send:-translate-y-0.5" />
             </button>
           )}
           </div>
