@@ -15,10 +15,13 @@ import {
   MessageSquarePlus,
   MoreVertical,
   Pin,
+  Check,
+  Plus,
   RotateCw,
   Smartphone,
   SquareDashedMousePointer,
   Trash2,
+  Users,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -44,6 +47,7 @@ import {
   type Rect,
 } from "../lib/browser";
 import { addLink } from "../lib/sidebar";
+import { DEFAULT_PROFILE, addProfile, loadProfiles } from "../lib/profiles";
 
 const ANNOT_SENTINEL = "AIOS_ANNOT:";
 const ANNOT_POLL_MS = 700;
@@ -66,21 +70,35 @@ export function BrowserPane({
   label,
   active = true,
   initialUrl,
+  initialProfile,
   onAnnotate,
+  onProfileChange,
 }: {
   label: string;
   active?: boolean;
   /** Optional starting url (e.g. a pinned-site sidebar item deep-links here). */
   initialUrl?: string;
+  /** Cookie-partition profile this pane opens in (lets a second/third Google
+   *  account stay logged in alongside the first). Defaults to the shared store. */
+  initialProfile?: string;
   /** Fired when an annotation or page-selection is captured (clipboard-bridge),
    *  with a formatted, chat-ready string. App wires this to the active chat. */
   onAnnotate?: (text: string) => void;
+  /** Fired when the user switches this pane's profile, so App persists it on the
+   *  pane model (the login sticks if the pane is reopened). */
+  onProfileChange?: (profile: string) => void;
 }) {
   const slotRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const profileMenuRef = useRef<HTMLDivElement>(null);
   const start = initialUrl ? normalizeUrl(initialUrl) : DEFAULT_URL;
   const [input, setInput] = useState(start);
   const [current, setCurrent] = useState(start);
+  const [profile, setProfile] = useState(initialProfile || DEFAULT_PROFILE);
+  const [profiles, setProfiles] = useState<string[]>(() => loadProfiles());
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [addingProfile, setAddingProfile] = useState(false);
+  const [newProfile, setNewProfile] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [zoom, setZoom] = useState(100);
   const [deviceMode, setDeviceMode] = useState(false);
@@ -114,7 +132,7 @@ export function BrowserPane({
       if (!r) return;
       if (!shownRef.current) {
         shownRef.current = true;
-        browserShow(label, current, r).catch(() => {});
+        browserShow(label, current, r, profile).catch(() => {});
       } else {
         browserSetBounds(label, r).catch(() => {});
       }
@@ -130,7 +148,47 @@ export function BrowserPane({
       window.removeEventListener("resize", sync);
       clearInterval(poll);
     };
-  }, [active, current, label, rect]);
+  }, [active, current, label, profile, rect]);
+
+  // Switch the pane to another cookie partition. The data store is fixed at
+  // webview creation, so switching = destroy the current webview + let the show
+  // effect recreate it in the new profile's jar (profile is in its deps).
+  const switchProfile = useCallback(
+    (next: string) => {
+      setProfileMenuOpen(false);
+      setAddingProfile(false);
+      if (next === profile) return;
+      browserClose(label).catch(() => {});
+      shownRef.current = false;
+      setProfile(next);
+      onProfileChange?.(next);
+    },
+    [label, profile, onProfileChange],
+  );
+
+  const commitNewProfile = useCallback(() => {
+    const name = addProfile(newProfile);
+    setNewProfile("");
+    if (!name) {
+      setAddingProfile(false);
+      return;
+    }
+    setProfiles(loadProfiles());
+    switchProfile(name);
+  }, [newProfile, switchProfile]);
+
+  // Close the profile menu on outside click.
+  useEffect(() => {
+    if (!profileMenuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (profileMenuRef.current && !profileMenuRef.current.contains(e.target as Node)) {
+        setProfileMenuOpen(false);
+        setAddingProfile(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [profileMenuOpen]);
 
   useEffect(() => {
     return () => {
@@ -370,6 +428,75 @@ export function BrowserPane({
             <SquareDashedMousePointer size={14} />
           )}
         </button>
+        <div ref={profileMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => setProfileMenuOpen((o) => !o)}
+            title="Account profile (separate logins)"
+            className={
+              profile === DEFAULT_PROFILE
+                ? "flex items-center gap-1 rounded p-1.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                : "flex items-center gap-1 rounded px-1.5 py-1 bg-[var(--color-accent)]/15 text-[var(--color-accent)] transition-colors"
+            }
+          >
+            <Users size={14} />
+            {profile !== DEFAULT_PROFILE && (
+              <span className="max-w-[72px] truncate text-[11px] font-medium">{profile}</span>
+            )}
+          </button>
+          {profileMenuOpen && (
+            <div className="absolute right-0 top-full z-50 mt-1 w-48 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
+              <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-[var(--color-faint)]">
+                account profile
+              </div>
+              {profiles.map((p) => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => switchProfile(p)}
+                  className="flex w-full items-center justify-between px-3 py-1.5 text-left hover:bg-[var(--color-panel)]"
+                >
+                  <span className="truncate">{p === DEFAULT_PROFILE ? "default" : p}</span>
+                  {p === profile && <Check size={13} className="text-[var(--color-accent)]" />}
+                </button>
+              ))}
+              <div className="my-1 border-t border-[var(--color-border)]" />
+              {addingProfile ? (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    commitNewProfile();
+                  }}
+                  className="px-2 py-1"
+                >
+                  <input
+                    autoFocus
+                    value={newProfile}
+                    onChange={(e) => setNewProfile(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") {
+                        setAddingProfile(false);
+                        setNewProfile("");
+                      }
+                    }}
+                    placeholder="name e.g. work"
+                    spellCheck={false}
+                    className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/50"
+                  />
+                </form>
+              ) : (
+                <MenuItem
+                  icon={<Plus size={13} />}
+                  label="New account…"
+                  onClick={() => {
+                    setAddingProfile(true);
+                    setNewProfile("");
+                  }}
+                />
+              )}
+            </div>
+          )}
+        </div>
         <div ref={menuRef} className="relative">
           <NavBtn title="Options" onClick={() => setMenuOpen((o) => !o)}>
             <MoreVertical size={14} />

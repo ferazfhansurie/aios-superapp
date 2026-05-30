@@ -570,6 +570,15 @@ function App() {
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
                   onOpenFile={openFile}
+                  onProfileChange={(profile) =>
+                    setPanes((ps) =>
+                      ps.map((p) =>
+                        p.key === pane.key && p.kind.type === "browser"
+                          ? { ...p, kind: { ...p.kind, profile } }
+                          : p,
+                      ),
+                    )
+                  }
                 />
               ))}
             </ResizableGrid>
@@ -1069,6 +1078,7 @@ function PaneCard({
   onFocus,
   onAnnotate,
   onOpenFile,
+  onProfileChange,
 }: {
   pane: Pane;
   active: boolean;
@@ -1077,6 +1087,7 @@ function PaneCard({
   onFocus: () => void;
   onAnnotate: (text: string) => void;
   onOpenFile: (path: string, name: string) => void;
+  onProfileChange: (profile: string) => void;
 }) {
   const t = pane.kind.type;
   const label =
@@ -1142,7 +1153,14 @@ function PaneCard({
         ) : pane.kind.type === "files" ? (
           <FilesPane onOpenFile={onOpenFile} />
         ) : pane.kind.type === "browser" ? (
-          <BrowserPane label={pane.key} active={active} initialUrl={pane.kind.url} onAnnotate={onAnnotate} />
+          <BrowserPane
+            label={pane.key}
+            active={active}
+            initialUrl={pane.kind.url}
+            initialProfile={pane.kind.profile}
+            onAnnotate={onAnnotate}
+            onProfileChange={onProfileChange}
+          />
         ) : pane.kind.type === "memory" ? (
           <DatabasePane />
         ) : pane.kind.type === "automations" ? (

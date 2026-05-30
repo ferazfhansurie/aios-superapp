@@ -18,6 +18,28 @@ fn parse(url: &str) -> Result<Url, String> {
     Url::parse(url).map_err(|e| format!("bad url: {e}"))
 }
 
+/// Derive a stable 16-byte WKWebsiteDataStore identifier from a profile name.
+/// Each distinct profile gets its OWN persistent cookie jar — so two Google
+/// accounts can be logged in simultaneously (each is a *fresh first login* in
+/// its own partition, sidestepping Google's stricter "add account" webview
+/// check that throws "this browser or app may not be secure"). Deterministic
+/// (FNV-1a, two salted passes) so a profile's login persists across restarts.
+fn profile_store_id(profile: &str) -> [u8; 16] {
+    fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        hash
+    }
+    let lo = fnv1a(profile.as_bytes(), 0xcbf2_9ce4_8422_2325);
+    let hi = fnv1a(profile.as_bytes(), 0x9e37_79b9_7f4a_7c15);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&lo.to_le_bytes());
+    id[8..].copy_from_slice(&hi.to_le_bytes());
+    id
+}
+
 /// Shows the browser `label` at the given rect, creating it (loading `url`) on
 /// first call or just repositioning an existing one.
 #[tauri::command]
@@ -29,6 +51,7 @@ pub fn browser_show(
     y: f64,
     width: f64,
     height: f64,
+    profile: Option<String>,
 ) -> Result<(), String> {
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.set_position(LogicalPosition::new(x, y));
@@ -37,8 +60,15 @@ pub fn browser_show(
     }
     let parsed = parse(&url)?;
     let window = app.get_window("main").ok_or("no main window")?;
-    let builder =
+    let mut builder =
         tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed)).user_agent(UA);
+    // A named profile gets its own persistent cookie partition so multiple
+    // accounts (personal / noobx29 / fathopes work) stay logged in at once.
+    // The unnamed/"default" profile keeps the shared default store (preserves
+    // any existing login). macOS 14+ only — the only platform this app ships on.
+    if let Some(name) = profile.as_deref().filter(|p| !p.is_empty() && *p != "default") {
+        builder = builder.data_store_identifier(profile_store_id(name));
+    }
     window
         .add_child(
             builder,

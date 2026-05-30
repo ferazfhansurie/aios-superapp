@@ -21,7 +21,7 @@ import type { PaneKind } from "../components/TerminalPane";
 export type PaneContent =
   | PaneKind
   | { type: "files" }
-  | { type: "browser"; url?: string }
+  | { type: "browser"; url?: string; profile?: string }
   | { type: "memory" }
   | { type: "automations" }
   | { type: "bridges" }
