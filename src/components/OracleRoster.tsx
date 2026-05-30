@@ -354,7 +354,14 @@ function OracleRow({
           onBlur={() => setEditing(false)}
           className="min-w-0 flex-1 bg-transparent font-mono text-[12px] text-[var(--color-text)] outline-none"
         />
-        <button type="submit" className="text-[var(--color-success)]" title="save">
+        <button
+          type="submit"
+          // Commit BEFORE the input's onBlur fires — otherwise clicking save
+          // blurs the input, cancels edit-mode, and the rename never submits.
+          onMouseDown={(e) => e.preventDefault()}
+          className="text-[var(--color-success)]"
+          title="save"
+        >
           <Check size={13} />
         </button>
       </form>
