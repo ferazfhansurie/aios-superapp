@@ -650,6 +650,7 @@ function App() {
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
                   onOpenFile={openFile}
+                  onOpenUrl={(url) => spawn({ type: "browser", url }, "browser")}
                   onProfileChange={(profile) =>
                     setPanes((ps) =>
                       ps.map((p) =>
@@ -1361,6 +1362,7 @@ function PaneCard({
   onFocus,
   onAnnotate,
   onOpenFile,
+  onOpenUrl,
   onProfileChange,
   onVideoFullscreen,
 }: {
@@ -1375,6 +1377,7 @@ function PaneCard({
   onFocus: () => void;
   onAnnotate: (text: string) => void;
   onOpenFile: (path: string, name: string) => void;
+  onOpenUrl?: (url: string) => void;
   onProfileChange: (profile: string) => void;
   onVideoFullscreen?: (on: boolean) => void;
 }) {
@@ -1479,7 +1482,7 @@ function PaneCard({
             onVideoFullscreen={onVideoFullscreen}
           />
         ) : pane.kind.type === "memory" ? (
-          <DatabasePane />
+          <DatabasePane onOpenUrl={onOpenUrl} />
         ) : pane.kind.type === "automations" ? (
           <AutomationsPane />
         ) : pane.kind.type === "bridges" ? (
@@ -1502,6 +1505,7 @@ function PaneCard({
             seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
             resume={pane.kind.type === "chat" ? pane.kind.resume : undefined}
             reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}
+            onOpenUrl={onOpenUrl}
           />
         )}
       </div>

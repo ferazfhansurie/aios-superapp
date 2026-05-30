@@ -419,6 +419,7 @@ export function ChatPane({
   seed,
   resume,
   reattach,
+  onOpenUrl,
 }: {
   cwd?: string;
   paneKey?: string;
@@ -428,6 +429,8 @@ export function ChatPane({
   /** Reattach to a still-live backgrounded session by its backend id (from the
    *  "running" tray) — replays its buffer and continues live instead of spawning. */
   reattach?: number;
+  /** Open an http(s) link from rendered markdown in an in-app browser pane. */
+  onOpenUrl?: (url: string) => void;
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState(seed ?? "");
@@ -1785,6 +1788,7 @@ export function ChatPane({
                   if (!streaming && sessionIdRef.current != null) dispatch(label);
                 }}
                 disabled={streaming}
+                onOpenUrl={onOpenUrl}
               />
             ) : b.kind === "thinking" ? (
               <ThinkingBlock key={b.id} turn={b.turn} />
@@ -2342,10 +2346,12 @@ function AssistantBubble({
   turn,
   onButton,
   disabled,
+  onOpenUrl,
 }: {
   turn: Extract<Turn, { kind: "assistant" }>;
   onButton: (label: string) => void;
   disabled: boolean;
+  onOpenUrl?: (url: string) => void;
 }) {
   // Don't render the sentinel as a half-baked pill while still streaming in —
   // wait for the full message so we don't flicker partial `[[btn:` text.
@@ -2355,7 +2361,7 @@ function AssistantBubble({
   return (
     <div className="group flex flex-col items-start gap-1">
       <div className="max-w-[92%] font-sans text-[14.5px] leading-relaxed text-[var(--color-text-2)]">
-        <Markdown text={body} />
+        <Markdown text={body} onOpenUrl={onOpenUrl} />
         {turn.streaming && (
           <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-pulse bg-[var(--color-accent)]" />
         )}
@@ -2523,7 +2529,13 @@ function splitFences(
   return out;
 }
 
-function Markdown({ text }: { text: string }) {
+function Markdown({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   const segments = useMemo(() => splitFences(text), [text]);
   return (
     <div className="flex flex-col gap-2">
@@ -2531,7 +2543,7 @@ function Markdown({ text }: { text: string }) {
         seg.code ? (
           <CodeBlock key={i} lang={seg.lang} body={seg.body} />
         ) : (
-          <MarkdownBlocks key={i} text={seg.body} />
+          <MarkdownBlocks key={i} text={seg.body} onOpenUrl={onOpenUrl} />
         ),
       )}
     </div>
@@ -2558,7 +2570,13 @@ function CodeBlock({ lang, body }: { lang: string; body: string }) {
 
 /** Render the non-code body: split into block-level lines (headings / lists /
  *  paragraphs), each with inline formatting. */
-function MarkdownBlocks({ text }: { text: string }) {
+function MarkdownBlocks({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   if (!text.trim()) return null;
   const lines = text.split("\n");
   const out: React.ReactNode[] = [];
@@ -2578,7 +2596,7 @@ function MarkdownBlocks({ text }: { text: string }) {
             <li key={j} className="flex gap-2">
               <span className="select-none text-[var(--color-faint)]">{j + 1}.</span>
               <span className="flex-1">
-                <Inline text={it} />
+                <Inline text={it} onOpenUrl={onOpenUrl} />
               </span>
             </li>
           ))}
@@ -2589,7 +2607,7 @@ function MarkdownBlocks({ text }: { text: string }) {
             <li key={j} className="flex gap-2">
               <span className="select-none text-[var(--color-accent)]">•</span>
               <span className="flex-1">
-                <Inline text={it} />
+                <Inline text={it} onOpenUrl={onOpenUrl} />
               </span>
             </li>
           ))}
@@ -2617,7 +2635,7 @@ function MarkdownBlocks({ text }: { text: string }) {
           key={`h${key++}`}
           className={`mt-1 font-sans font-semibold text-[var(--color-text)] ${size}`}
         >
-          <Inline text={h[2]} />
+          <Inline text={h[2]} onOpenUrl={onOpenUrl} />
         </div>,
       );
       continue;
@@ -2651,7 +2669,7 @@ function MarkdownBlocks({ text }: { text: string }) {
     flushList();
     out.push(
       <p key={`p${key++}`} className="whitespace-pre-wrap break-words">
-        <Inline text={line} />
+        <Inline text={line} onOpenUrl={onOpenUrl} />
       </p>,
     );
   }
@@ -2662,7 +2680,13 @@ function MarkdownBlocks({ text }: { text: string }) {
 /** Inline span formatting: `code`, **bold**, *italic* / _italic_, [text](url).
  *  Single-pass tokenizer — partial markers (e.g. a lone trailing `**` during
  *  streaming) just render literally, never throw. */
-function Inline({ text }: { text: string }) {
+function Inline({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   const nodes: React.ReactNode[] = [];
   let i = 0;
   let k = 0;
@@ -2702,7 +2726,7 @@ function Inline({ text }: { text: string }) {
         flush();
         nodes.push(
           <strong key={`b${k++}`} className="font-semibold text-[var(--color-text)]">
-            <Inline text={text.slice(i + 2, end)} />
+            <Inline text={text.slice(i + 2, end)} onOpenUrl={onOpenUrl} />
           </strong>,
         );
         i = end + 2;
@@ -2719,12 +2743,19 @@ function Inline({ text }: { text: string }) {
           flush();
           const label = text.slice(i + 1, close);
           const url = text.slice(close + 2, paren);
+          const http = /^https?:\/\//i.test(url);
           nodes.push(
             <a
               key={`a${k++}`}
               href={url}
               target="_blank"
               rel="noreferrer"
+              onClick={(e) => {
+                if (http && onOpenUrl) {
+                  e.preventDefault();
+                  onOpenUrl(url);
+                }
+              }}
               className="text-[var(--color-accent)] underline decoration-[var(--color-accent)]/40 underline-offset-2 hover:decoration-[var(--color-accent)]"
             >
               {label}

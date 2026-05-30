@@ -42,7 +42,7 @@ import { MemoryView } from "./MemoryPane";
 
 const MEMORY_ID = "__memory__";
 
-export function DatabasePane() {
+export function DatabasePane({ onOpenUrl }: { onOpenUrl?: (url: string) => void } = {}) {
   const [conns, setConns] = useState<ConnMeta[]>([]);
   const [activeId, setActiveId] = useState<string>(MEMORY_ID);
   const [adding, setAdding] = useState(false);
@@ -112,7 +112,7 @@ export function DatabasePane() {
 
       {/* active source */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {activeId === MEMORY_ID ? <MemoryView /> : active ? <SqlView conn={active} /> : null}
+        {activeId === MEMORY_ID ? <MemoryView onOpenUrl={onOpenUrl} /> : active ? <SqlView conn={active} /> : null}
       </div>
 
       {adding && (
