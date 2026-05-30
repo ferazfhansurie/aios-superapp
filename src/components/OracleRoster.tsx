@@ -30,6 +30,7 @@ import {
   type OracleInfo,
   type TmuxSession,
 } from "../lib/pty";
+import { SidebarUsage } from "./SidebarUsage";
 
 interface Props {
   onAttachOracle: (identity: string) => void;
@@ -263,6 +264,9 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
               ))}
           </div>
         )}
+
+        {/* ---- live usage (5h / 7d rate windows) ---- */}
+        {!collapsed && <SidebarUsage />}
       </div>
 
       {/* ---- all tmux sessions ---- */}
