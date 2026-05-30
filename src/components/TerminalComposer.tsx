@@ -1,53 +1,83 @@
 /**
  * Compose box docked at the bottom of a terminal pane.
  *
- * Gives the terminal the affordances the GUI chat composer (ChatPane) has, so
- * driving a CLI AI (claude code, codex) in a real PTY isn't a poorer experience
- * than the chat surface. It is built to be visually + behaviourally
- * indistinguishable from ChatPane's composer — and tuned to OpenAI Codex's
- * desktop composer for premium calm:
- *   - a multi-line auto-growing textarea (Shift+Enter = newline; Enter or the
- *     send button writes the whole text to the PTY + a trailing CR)
- *   - a "+" button on the LEFT opening a small menu — "Add photos & files" —
- *     which reuses the image-chip + saveImageTemp flow (images) and inserts a
- *     shell-quoted path for any other file. Paste / drag-drop still work.
- *   - voice dictation lands cleanly in the box — both the in-composer mic AND
- *     the global ⌘J (which App routes here via the `register` writer bridge,
- *     exactly like ChatPane). The composer owns NO global hotkey of its own, so
- *     ⌘J fires exactly once (App's single VoiceButton) — no double-fire jank.
- *     While recording, the input row shows an inline animated waveform spanning
- *     the width + an m:ss timer + a square stop button (Codex-style).
- *   - image paste / drag-drop → shown as a removable THUMBNAIL chip; on send the
- *     shell-quoted temp path(s) are written to the PTY (so claude code can read
- *     them for vision), but the user SEES the image first.
- *   - a round send button (ArrowUp) and a "stop" affordance that sends Ctrl-C.
- *   - a bottom context bar: subtle read-only chips for the session's cwd / repo
- *     name (branch is shown when cheaply available, else skipped).
+ * Built to look + behave like the AIOS **chat pane composer** (ChatPane) — the
+ * same `/` slash menu, the same `@` file-mention picker, the same bottom pill
+ * row, the same tokens/spacing — so driving a CLI AI (claude code, codex) in a
+ * real PTY isn't a poorer experience than the headless chat surface.
  *
- * Focus robustness (P0): while the composer is open, a capture-phase window
- * keydown guard re-routes *typing* into the textarea even when focus drifted to
- * the xterm (e.g. after scrolling the terminal, which moves keyboard focus to
- * the terminal / copy-mode). Only bare printable keys are redirected — never
- * modifier combos (terminal/app control keys) and never when another input or a
- * modal is focused — so deliberate terminal interaction is untouched.
+ * CRITICAL difference from ChatPane: this composer drives a RAW PTY (claude
+ * code's TUI), NOT the chat's headless `claude -p`. So we MATCH the chat
+ * composer's look exactly, but every control routes to claude code's PTY
+ * equivalent — slash commands are TYPED INTO claude code's own TUI, pills send
+ * the keystrokes claude code understands. Each control's real effect is spelled
+ * out honestly in the code below; chat-only concepts with no TUI equivalent
+ * (effort / persistent goal) are OMITTED rather than faked.
  *
- * Pure presentation + local state: all PTY effects flow through the `onSend` /
- * `onInterrupt` callbacks the pane passes down (which wrap ptyWrite).
+ * What's matched from ChatPane's composer:
+ *   - `/` slash menu (OverlayPanel/OverlayRow style): /clear /plan /resume
+ *     /model /help — type `/` at the start, arrow/enter to pick, filters as you
+ *     type. Each ROUTES to claude code's PTY (see SLASH mapping below).
+ *   - `@` file-mention picker sourced from the pane's cwd (readDir), inserts the
+ *     quoted path into the box — mirrors ChatPane's @ picker.
+ *   - bottom pill row: `+` add files, a "full access" permission pill, a "plan"
+ *     pill, a model pill ("opus 4.8" ▾). permission + plan + model all send the
+ *     keystrokes claude code uses; effort + persistent-goal pills are omitted
+ *     (no TUI equivalent — see note on the pill row).
+ *
+ * QoL kept / added:
+ *   - ↑ history recall: arrow-up through previously SENT prompts, edit + resend.
+ *   - the capture-phase focus guard (printable keys re-target the composer after
+ *     a terminal scroll moves keyboard focus to xterm).
+ *   - image thumbnail chips + saveImageTemp (paste / drag-drop / picker).
+ *   - voice: in-composer mic (click-to-record → inline waveform + timer →
+ *     transcript lands in the box) AND the global ⌘J bridge via `register`.
+ *   - `+` attach menu, auto-grow, Enter=send, Shift+Enter=newline, Esc→onEscape.
+ *
+ * claude code PTY mapping (raw bytes via `onRaw`, which writes straight to the
+ * PTY with NO auto-CR):
+ *   /clear  → ^U (\x15, clear claude's input line) then "/clear\r"
+ *   /model  → "/model\r"  (opens claude code's own model picker in the TUI)
+ *   /resume → "/resume\r"
+ *   /help   → "/help\r"
+ *   /plan   → \x1b[Z (Shift+Tab — claude code cycles its mode, incl. plan mode).
+ *             claude code has no literal "/plan" command; Shift+Tab is the real
+ *             plan-mode toggle, so that's what the menu item + pill send.
+ *   model pill       → "/model\r"
+ *   permission pill  → \x1b[Z (Shift+Tab — claude code cycles permission/mode).
+ *                      claude code's permission state is driven by Shift+Tab, not
+ *                      a stable command, so the pill cycles it; the label is
+ *                      generic ("permissions") since we can't read claude's
+ *                      current mode back from the raw PTY.
+ *   plan pill        → \x1b[Z (same Shift+Tab cycle as the /plan item).
+ *
+ * Pure presentation + local state: all PTY effects flow through the
+ * `onSend` / `onRaw` / `onInterrupt` / `onEscape` callbacks the pane passes down
+ * (which wrap ptyWrite).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ArrowUp,
+  ChevronDown,
+  CornerDownLeft,
   FileText,
+  Folder,
+  HelpCircle,
+  History,
   Image as ImageIcon,
+  ListChecks,
   Loader2,
   Mic,
   Plus,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles,
   Square,
   X,
 } from "lucide-react";
 
-import { gitStatus, saveImageTemp } from "../lib/fs";
+import { gitStatus, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
 
 /** Shell-quote a path (single-quote wrap) when it has whitespace/quotes. */
@@ -73,7 +103,7 @@ function fmtElapsed(sec: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-/** basename of a path, for the context chip. */
+/** basename of a path, for the context chip + @-mention labels. */
 function baseName(p: string): string {
   const cleaned = p.replace(/\/+$/, "");
   const i = cleaned.lastIndexOf("/");
@@ -91,8 +121,20 @@ interface ImageChip {
   path: string | null;
 }
 
+// ── slash menu (matches ChatPane's `/` overlay) ──────────────────────────────
+// Each command ROUTES to claude code's own TUI via raw PTY bytes — these are not
+// AIOS-side actions like in ChatPane, they're the keystrokes you'd type in
+// claude code. The `effect` strings below are the literal byte sequences.
+interface SlashCommand {
+  id: string;
+  label: string;
+  desc: string;
+  icon: React.ReactNode;
+}
+
 export function TerminalComposer({
   onSend,
+  onRaw,
   onInterrupt,
   onEscape,
   onClose,
@@ -101,6 +143,12 @@ export function TerminalComposer({
 }: {
   /** Write the composed text to the PTY (the pane appends the CR). */
   onSend: (text: string) => void;
+  /**
+   * Write RAW bytes straight to the PTY — NO auto-CR, NO quoting. Drives claude
+   * code's own TUI controls (slash commands, ^U line-clear, Shift+Tab cycle).
+   * Optional so the composer degrades gracefully if a pane doesn't wire it.
+   */
+  onRaw?: (bytes: string) => void;
   /** Send Ctrl-C (^C) to the PTY. */
   onInterrupt: () => void;
   /** Send ESC to the PTY — claude code: stop / double-Esc = edit previous. */
@@ -113,7 +161,7 @@ export function TerminalComposer({
    * VoiceButton) lands in THIS box — never in the PTY, never double-fired.
    */
   register?: (append: (text: string) => void) => void;
-  /** Working directory for this pane — drives the bottom context bar (repo/cwd). */
+  /** Working directory for this pane — drives the context bar + @-mention picker. */
   cwd?: string;
 }) {
   const [value, setValue] = useState("");
@@ -161,6 +209,27 @@ export function TerminalComposer({
   useEffect(() => {
     register?.(append);
   }, [register, append]);
+
+  // ── slash + @ overlay state (mirrors ChatPane) ─────────────────────────────
+  const [overlay, setOverlay] = useState<null | "slash" | "mention">(null);
+  const [overlayIdx, setOverlayIdx] = useState(0);
+  const [mentionItems, setMentionItems] = useState<DirEntry[]>([]);
+  const [mentionQuery, setMentionQuery] = useState("");
+
+  // ── sent-prompt history (↑ recall) ─────────────────────────────────────────
+  // Every SENT prompt is pushed here (newest last). ArrowUp on an empty/at-start
+  // caret walks back through them so you can edit + resend; ArrowDown walks
+  // forward, and past the newest restores the draft you were typing.
+  const [history, setHistory] = useState<string[]>([]);
+  // -1 = not browsing history (live draft). 0..n-1 indexes from newest.
+  const histIdxRef = useRef(-1);
+  // the in-progress draft stashed when you first arrow up into history.
+  const histDraftRef = useRef("");
+
+  const resetHistoryNav = useCallback(() => {
+    histIdxRef.current = -1;
+    histDraftRef.current = "";
+  }, []);
 
   // ── type-to-focus guard (P0) ───────────────────────────────────────────────
   // Scrolling the xterm (or entering tmux copy-mode) moves keyboard focus to the
@@ -305,8 +374,7 @@ export function TerminalComposer({
         if (f.type.startsWith("image/")) {
           void addImage(f, f.type);
         } else {
-          const p =
-            (f as File & { path?: string }).path ?? f.name;
+          const p = (f as File & { path?: string }).path ?? f.name;
           append(quotePath(p));
         }
       }
@@ -335,10 +403,16 @@ export function TerminalComposer({
     // claude code prompt ("<path> describe this").
     const out = [...paths, text].filter(Boolean).join(" ");
     onSend(out);
+    // remember this prompt for ↑ recall (skip empty / exact-dup of the last one)
+    if (text) {
+      setHistory((h) => (h[h.length - 1] === text ? h : [...h, text]));
+    }
+    resetHistoryNav();
     setValue("");
+    setOverlay(null);
     for (const im of images) URL.revokeObjectURL(im.url);
     setImages([]);
-  }, [value, images, onSend]);
+  }, [value, images, onSend, resetHistoryNav]);
 
   // ── in-composer voice (click-to-record). NO global hotkey here — that's
   //    App's single VoiceButton (⌘J), which routes into this box via `register`.
@@ -392,16 +466,225 @@ export function TerminalComposer({
     }
   }, []);
 
+  // ── slash commands + @ mentions ────────────────────────────────────────────
+
+  const slashCommands = useMemo<SlashCommand[]>(
+    () => [
+      {
+        id: "clear",
+        label: "/clear",
+        desc: "clear claude's context (sends /clear)",
+        icon: <RefreshCw size={14} />,
+      },
+      {
+        id: "plan",
+        label: "/plan",
+        desc: "toggle plan mode (Shift+Tab)",
+        icon: <ListChecks size={14} />,
+      },
+      {
+        id: "resume",
+        label: "/resume",
+        desc: "reopen a past conversation (sends /resume)",
+        icon: <History size={14} />,
+      },
+      {
+        id: "model",
+        label: "/model",
+        desc: "switch the model (opens claude's picker)",
+        icon: <Sparkles size={14} />,
+      },
+      {
+        id: "help",
+        label: "/help",
+        desc: "claude code help (sends /help)",
+        icon: <HelpCircle size={14} />,
+      },
+    ],
+    [],
+  );
+
+  // Route a slash command to claude code's PTY. These are TYPED INTO claude
+  // code's own TUI — not AIOS-side actions. ^U (\x15) first clears whatever
+  // claude has on its input line so the command lands clean.
+  const runSlash = useCallback(
+    (id: string) => {
+      const raw = onRaw;
+      switch (id) {
+        case "clear":
+          // clear claude's input line, then send /clear, then clear OUR box too
+          raw?.("\x15");
+          raw?.("/clear\r");
+          break;
+        case "model":
+          raw?.("\x15");
+          raw?.("/model\r");
+          break;
+        case "resume":
+          raw?.("\x15");
+          raw?.("/resume\r");
+          break;
+        case "help":
+          raw?.("\x15");
+          raw?.("/help\r");
+          break;
+        case "plan":
+          // claude code has no literal "/plan" command — Shift+Tab cycles its
+          // mode (incl. plan mode). Send that escape sequence.
+          raw?.("\x1b[Z");
+          break;
+      }
+      setValue("");
+      setOverlay(null);
+      taRef.current?.focus();
+    },
+    [onRaw],
+  );
+
+  // load dir entries for the @-mention picker (lazy, on first open). Mirrors
+  // ChatPane: dirs first, capped, filtered by the typed token.
+  const loadMentions = useCallback(async () => {
+    const root = cwd;
+    if (!root) {
+      setMentionItems([]);
+      return;
+    }
+    try {
+      const entries = await readDir(root);
+      entries.sort((a, b) =>
+        a.is_dir === b.is_dir
+          ? a.name.localeCompare(b.name)
+          : a.is_dir
+            ? -1
+            : 1,
+      );
+      setMentionItems(entries.slice(0, 200));
+    } catch {
+      setMentionItems([]);
+    }
+  }, [cwd]);
+
+  // detect `/word` at the very start, or an `@token` under the caret → overlay.
+  const syncOverlay = useCallback(
+    (next: string) => {
+      if (/^\/[a-z]*$/i.test(next)) {
+        setOverlay("slash");
+        setOverlayIdx(0);
+        return;
+      }
+      const m = next.match(/(?:^|\s)@([^\s]*)$/);
+      if (m) {
+        setMentionQuery(m[1] ?? "");
+        if (overlay !== "mention") {
+          setOverlay("mention");
+          setOverlayIdx(0);
+          void loadMentions();
+        }
+        return;
+      }
+      if (overlay) setOverlay(null);
+    },
+    [overlay, loadMentions],
+  );
+
+  const onChangeValue = (next: string) => {
+    setValue(next);
+    // any manual edit drops you out of history navigation
+    if (histIdxRef.current !== -1) resetHistoryNav();
+    syncOverlay(next);
+  };
+
+  const slashFiltered = useMemo(() => {
+    const q = value.replace(/^\//, "").toLowerCase();
+    return slashCommands.filter((c) => c.id.startsWith(q) || q === "");
+  }, [value, slashCommands]);
+
+  const mentionFiltered = useMemo(() => {
+    const q = mentionQuery.toLowerCase();
+    if (!q) return mentionItems;
+    return mentionItems.filter((e) => e.name.toLowerCase().includes(q));
+  }, [mentionItems, mentionQuery]);
+
+  const pickMention = useCallback((entry: DirEntry) => {
+    // insert the QUOTED absolute path (claude code reads it as a real file ref),
+    // replacing the @token the user was typing.
+    const quoted = quotePath(entry.path) + (entry.is_dir ? "/" : "") + " ";
+    setValue((v) => v.replace(/(^|\s)@([^\s]*)$/, `$1${quoted}`));
+    setOverlay(null);
+    taRef.current?.focus();
+  }, []);
+
+  // ── keyboard ───────────────────────────────────────────────────────────────
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Enter → send (start generating now). Shift+Enter → newline for multi-line
-    // prompts. ⌘/Ctrl+Enter also sends (they carry no shift).
+    // overlay navigation takes priority (slash + @ menus).
+    if (overlay) {
+      const list = overlay === "slash" ? slashFiltered : mentionFiltered;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setOverlayIdx((i) => (list.length ? (i + 1) % list.length : 0));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setOverlayIdx((i) =>
+          list.length ? (i - 1 + list.length) % list.length : 0,
+        );
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOverlay(null);
+        return;
+      }
+      if ((e.key === "Enter" || e.key === "Tab") && list.length) {
+        e.preventDefault();
+        if (overlay === "slash") runSlash(slashFiltered[overlayIdx].id);
+        else pickMention(mentionFiltered[overlayIdx]);
+        return;
+      }
+    }
+
+    // ↑ history recall: only when no overlay is open and the caret is at the
+    // very start of the box (so ↑ still moves the caret within multi-line text).
+    if (e.key === "ArrowUp" && !e.shiftKey && history.length > 0) {
+      const ta = taRef.current;
+      const atStart = ta != null && ta.selectionStart === 0 && ta.selectionEnd === 0;
+      if (atStart) {
+        e.preventDefault();
+        if (histIdxRef.current === -1) histDraftRef.current = value;
+        const ni = Math.min(histIdxRef.current + 1, history.length - 1);
+        histIdxRef.current = ni;
+        setValue(history[history.length - 1 - ni]);
+        setOverlay(null);
+        return;
+      }
+    }
+    if (e.key === "ArrowDown" && !e.shiftKey && histIdxRef.current !== -1) {
+      const ta = taRef.current;
+      const atEnd = ta != null && ta.selectionStart === value.length;
+      if (atEnd) {
+        e.preventDefault();
+        const ni = histIdxRef.current - 1;
+        if (ni < 0) {
+          histIdxRef.current = -1;
+          setValue(histDraftRef.current);
+        } else {
+          histIdxRef.current = ni;
+          setValue(history[history.length - 1 - ni]);
+        }
+        return;
+      }
+    }
+
+    // Enter → send. Shift+Enter → newline. ⌘/Ctrl+Enter also sends.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
       return;
     }
-    // Escape → if dictating, cancel that; else forward ESC to the PTY (claude
-    // code: stop generating; press twice to edit the previous message).
+    // Escape → if dictating, cancel; else forward ESC to the PTY (claude code:
+    // stop generating; twice = edit the previous message).
     if (e.key === "Escape") {
       e.preventDefault();
       if (phaseRef.current === "recording") void micCancel();
@@ -475,6 +758,56 @@ export function TerminalComposer({
       {/* keyframe for the inline recording waveform — kept local so the composer
           stays self-contained (no global stylesheet edit). */}
       <style>{WAVE_KEYFRAMES}</style>
+
+      {/* slash / @-mention overlay — sits just above the box, ChatPane styling */}
+      {overlay === "slash" && slashFiltered.length > 0 && (
+        <OverlayPanel>
+          {slashFiltered.map((c, i) => (
+            <OverlayRow
+              key={c.id}
+              active={i === overlayIdx}
+              onMouseEnter={() => setOverlayIdx(i)}
+              onClick={() => runSlash(c.id)}
+              icon={c.icon}
+              label={c.label}
+              desc={c.desc}
+            />
+          ))}
+        </OverlayPanel>
+      )}
+      {overlay === "mention" && (
+        <OverlayPanel>
+          {!cwd ? (
+            <div className="px-3 py-2 font-mono text-[11.5px] text-[var(--color-faint)]">
+              no working directory for this pane
+            </div>
+          ) : mentionFiltered.length === 0 ? (
+            <div className="px-3 py-2 font-mono text-[11.5px] text-[var(--color-faint)]">
+              no matches in {baseName(cwd)}
+            </div>
+          ) : (
+            mentionFiltered.slice(0, 50).map((e, i) => (
+              <OverlayRow
+                key={e.path}
+                active={i === overlayIdx}
+                onMouseEnter={() => setOverlayIdx(i)}
+                onClick={() => pickMention(e)}
+                icon={
+                  e.is_dir ? (
+                    <Folder size={14} className="text-[var(--color-accent)]" />
+                  ) : (
+                    <FileText size={14} className="text-[var(--color-muted)]" />
+                  )
+                }
+                label={e.name}
+                desc={e.is_dir ? "dir" : ""}
+                mono
+              />
+            ))
+          )}
+        </OverlayPanel>
+      )}
+
       <div className="relative rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
         {/* hidden file input driving the "+" → Add photos & files */}
         <input
@@ -553,7 +886,7 @@ export function TerminalComposer({
           <textarea
             ref={taRef}
             value={value}
-            onChange={(e) => setValue(e.target.value)}
+            onChange={(e) => onChangeValue(e.target.value)}
             onKeyDown={onKeyDown}
             onPaste={onPaste}
             rows={1}
@@ -564,7 +897,7 @@ export function TerminalComposer({
         )}
 
         <div className="flex items-center gap-1.5 px-3 pb-2.5 pt-1">
-          {/* "+" → add photos & files (Codex's left affordance) */}
+          {/* "+" → add photos & files */}
           <div ref={plusWrapRef} className="relative">
             <button
               type="button"
@@ -595,7 +928,51 @@ export function TerminalComposer({
             )}
           </div>
 
-          {/* interrupt the running CLI (^C) without knowing the keystroke */}
+          {/* permission pill — claude code's permission/mode state is driven by
+              Shift+Tab (no stable command to read it back from a raw PTY), so
+              this CYCLES it. Label is generic since we can't reflect the live
+              mode. */}
+          <button
+            type="button"
+            onClick={() => onRaw?.("\x1b[Z")}
+            title="cycle claude permission mode (Shift+Tab)"
+            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+          >
+            <ShieldCheck size={13} className="text-[var(--color-muted)]" />
+            <span>permissions</span>
+            <ChevronDown size={12} className="text-[var(--color-faint)]" />
+          </button>
+
+          {/* plan pill — same Shift+Tab cycle (claude code's plan mode lives on
+              that cycle; there's no literal /plan command). */}
+          <button
+            type="button"
+            onClick={() => onRaw?.("\x1b[Z")}
+            title="toggle plan mode (Shift+Tab)"
+            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+          >
+            <ListChecks size={13} />
+            <span>plan</span>
+          </button>
+
+          {/* model pill — opens claude code's own model picker (/model). We can't
+              read claude's current model back from the raw PTY, so the label is
+              generic rather than a faked "opus 4.8". */}
+          <button
+            type="button"
+            onClick={() => {
+              onRaw?.("\x15");
+              onRaw?.("/model\r");
+            }}
+            title="switch model (opens claude's picker)"
+            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+          >
+            <Sparkles size={13} className="text-[var(--color-muted)]" />
+            <span>model</span>
+            <ChevronDown size={12} className="text-[var(--color-faint)]" />
+          </button>
+
+          {/* interrupt the running CLI (^C) */}
           <button
             type="button"
             onClick={onInterrupt}
@@ -666,9 +1043,8 @@ export function TerminalComposer({
         )}
       </div>
 
-      {/* bottom context bar: subtle read-only cwd / repo chip (Codex's muted
-          context row). Branch is skipped — backend exposes the repo root, not
-          the branch — per the design's "show basename rather than block" rule. */}
+      {/* bottom context bar: subtle read-only cwd / repo chip. Branch is skipped
+          — backend exposes the repo root, not the branch. */}
       {repoLabel && (
         <div className="mt-1.5 flex items-center gap-2 px-2">
           <span className="inline-flex max-w-[60%] items-center gap-1.5 rounded-md px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--color-faint)]">
@@ -681,10 +1057,70 @@ export function TerminalComposer({
   );
 }
 
+// ── slash / @ overlay primitives (mirror ChatPane's OverlayPanel/OverlayRow) ──
+
+/** The floating panel that sits just above the composer for `/` and `@`. */
+function OverlayPanel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="absolute bottom-full left-3 right-3 z-40 mb-2 max-h-64 overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50">
+      {children}
+    </div>
+  );
+}
+
+function OverlayRow({
+  active,
+  onClick,
+  onMouseEnter,
+  icon,
+  label,
+  desc,
+  mono,
+}: {
+  active: boolean;
+  onClick: () => void;
+  onMouseEnter: () => void;
+  icon: React.ReactNode;
+  label: string;
+  desc?: string;
+  mono?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={onMouseEnter}
+      className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
+        active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
+      }`}
+    >
+      <span className="grid h-5 w-5 shrink-0 place-items-center">{icon}</span>
+      <span
+        className={`shrink-0 text-[12.5px] text-[var(--color-text)] ${
+          mono ? "font-mono" : "font-sans"
+        }`}
+      >
+        {label}
+      </span>
+      {desc && (
+        <span className="truncate font-sans text-[11px] text-[var(--color-faint)]">
+          {desc}
+        </span>
+      )}
+      {active && (
+        <>
+          <span className="flex-1" />
+          <CornerDownLeft size={12} className="shrink-0 text-[var(--color-faint)]" />
+        </>
+      )}
+    </button>
+  );
+}
+
 // Precomputed waveform bar heights + stagger delays for the inline recording
-// visualization. Each bar runs the shared `aios-wave-bar` keyframe (defined in
-// the global stylesheet) on a staggered delay so the row reads as a living
-// equalizer — purely time-keyed, no audio analysis.
+// visualization. Each bar runs the shared `aios-wave` keyframe (defined below)
+// on a staggered delay so the row reads as a living equalizer — purely
+// time-keyed, no audio analysis.
 const WAVEFORM_BARS: { h: number; delay: number }[] = Array.from(
   { length: 40 },
   (_, i) => ({

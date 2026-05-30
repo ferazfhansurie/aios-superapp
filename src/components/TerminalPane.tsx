@@ -401,6 +401,15 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     if (id != null) ptyWrite(id, "\x03").catch(() => {});
   };
 
+  // Write RAW bytes straight to the PTY (no auto-CR, no quoting). The compose
+  // box uses this to drive claude code's own TUI controls — slash commands
+  // (e.g. "/model\r"), line-clear (^U = \x15), and the Shift+Tab mode-cycle
+  // (\x1b[Z) — exactly as if the user typed them in the terminal.
+  const sendRaw = (bytes: string) => {
+    const id = sessionIdRef.current;
+    if (id != null) ptyWrite(id, bytes).catch(() => {});
+  };
+
   // Fall back to the home dir for the composer's context chip when this pane has
   // no explicit cwd (oracle / tmux / plain shell). Best-effort, label-only.
   useEffect(() => {
@@ -530,6 +539,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       {composerOpen && (
         <TerminalComposer
           onSend={composerSend}
+          onRaw={sendRaw}
           onInterrupt={interrupt}
           onEscape={sendEscape}
           onClose={() => {
