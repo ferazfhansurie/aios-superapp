@@ -68,7 +68,7 @@ import { listCustomers, type Customer } from "./lib/inbox";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import { chatHandles, paneWriters, paneSubmitters } from "./lib/paneBus";
-import { loadSettings } from "./lib/settings";
+import { loadSettings, applyFlashLevel } from "./lib/settings";
 import { homeDir } from "./lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
@@ -262,7 +262,11 @@ function App() {
     return () => clearTimeout(t);
   }, []);
 
-  useEffect(() => initTheme(), []);
+  useEffect(() => {
+    const teardown = initTheme();
+    applyFlashLevel(); // reflect stored composer flash level on <html>
+    return teardown;
+  }, []);
 
   // Persist the open-pane layout whenever it changes, so the next launch reopens
   // exactly what's up now (X-ing a pane drops it from the saved set).

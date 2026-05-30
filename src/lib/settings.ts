@@ -18,6 +18,12 @@ export interface AppSettings {
   terminalFontSize: number; // 10..18
   splashOnLaunch: boolean;
   reduceMotion: boolean;
+  // composer "flash" level — how much ambient motion/wow the prompt box has.
+  //   "calm" → minimal (current baseline, respects reduce-motion)
+  //   "lush" → + rotating conic-gradient rim + idle breathing glow
+  //   "max"  → + aurora mesh-gradient behind the box
+  // Drives `data-flash` on <html>; gated entirely in App.css (zero JS cost).
+  flashLevel: FlashLevel;
 
   // oracles
   defaultSocketName: string;
@@ -43,6 +49,16 @@ export interface AppSettings {
 /** Routing target for "send to AI" actions. */
 export type DefaultAi = "claude-code" | "terminal" | "chat";
 
+/** Composer flash intensity. */
+export type FlashLevel = "calm" | "lush" | "max";
+
+/** Reflect the flash level as `data-flash` on <html> so App.css can gate the
+ *  ambient composer effects. Mirrors how theme/accent drive `data-theme`. */
+export function applyFlashLevel(level: FlashLevel = loadSettings().flashLevel): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.dataset.flash = level;
+}
+
 export const DEFAULT_SETTINGS: AppSettings = {
   reopenLastLayout: true,
   confirmCloseOraclePane: true,
@@ -52,6 +68,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   terminalFontSize: 13,
   splashOnLaunch: true,
   reduceMotion: false,
+  flashLevel: "lush",
 
   defaultSocketName: "adletic",
   autoRefreshSeconds: 15,

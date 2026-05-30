@@ -51,8 +51,10 @@ import { PluginsPane } from "./PluginsPane";
 import {
   type AppSettings,
   type PaneType,
+  type FlashLevel,
   loadSettings,
   saveSettings,
+  applyFlashLevel,
   MEMORY_VAULT_PATH,
 } from "../lib/settings";
 
@@ -819,6 +821,7 @@ export function Settings({
     const init = loadSettings();
     applyFontScale(init.terminalFontSize);
     applyReduceMotion(init.reduceMotion);
+    applyFlashLevel(init.flashLevel);
     applyDensity(getDensity());
   }, []);
 
@@ -1022,6 +1025,23 @@ export function Settings({
                     <Toggle
                       checked={s.splashOnLaunch}
                       onChange={(v) => patch({ splashOnLaunch: v })}
+                    />
+                  </Row>
+                  <Row
+                    label="composer flash"
+                    sub="ambient motion on the prompt box — calm is minimal, max adds a rotating rim + aurora"
+                  >
+                    <Segmented<FlashLevel>
+                      value={s.flashLevel}
+                      onChange={(v) => {
+                        patch({ flashLevel: v });
+                        applyFlashLevel(v);
+                      }}
+                      options={[
+                        { value: "calm", label: "calm" },
+                        { value: "lush", label: "lush" },
+                        { value: "max", label: "max" },
+                      ]}
                     />
                   </Row>
                   <Row label="reduce motion" sub="cut animations + transitions">

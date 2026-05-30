@@ -525,3 +525,123 @@ html, body, #root {
 .focus-accent:focus-within {
   border-color: color-mix(in srgb, var(--color-accent) 50%, transparent);
 }
+
+/* --- composer flash levels ---------------------------------------
+   Ambient "wow" on the prompt box, gated by <html data-flash>. The
+   composer (.flash-composer) has backdrop-filter → it's its own
+   stacking context, so a z-index:-1 ::before paints ABOVE the box's
+   own gradient bg but BELOW the in-flow content (textarea/toolbar) —
+   exactly where an aurora belongs, with zero markup risk. All effects
+   are additive; "calm" leaves the baseline composer untouched. */
+
+@property --flash-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+/* lush + max: a slow conic-gradient rim rotating around the border.
+   The padding + mask-composite trick paints only the 1px ring; it sits
+   above content (z 2) but is pointer-events:none, so it's just a glow. */
+[data-flash="lush"] .flash-composer::after,
+[data-flash="max"] .flash-composer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  padding: 1px;
+  pointer-events: none;
+  opacity: 0.6;
+  background: conic-gradient(
+    from var(--flash-angle),
+    transparent 0deg,
+    var(--color-accent) 70deg,
+    color-mix(in srgb, var(--color-accent) 30%, transparent) 150deg,
+    transparent 230deg,
+    var(--color-accent) 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: flash-rim-spin 7s linear infinite;
+}
+@keyframes flash-rim-spin {
+  to {
+    --flash-angle: 360deg;
+  }
+}
+
+/* lush + max: idle breathing glow when the box is empty + unfocused. */
+[data-flash="lush"] .flash-composer:not(:focus-within),
+[data-flash="max"] .flash-composer:not(:focus-within) {
+  animation: flash-breathe 4.5s ease-in-out infinite;
+}
+@keyframes flash-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent) 0%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 22px -6px color-mix(in srgb, var(--color-accent) 40%, transparent);
+  }
+}
+
+/* max only: an aurora mesh-gradient drifting behind the content. */
+[data-flash="max"] .flash-composer::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0.55;
+  filter: blur(24px);
+  background:
+    radial-gradient(
+      42% 55% at 18% 28%,
+      color-mix(in srgb, var(--color-accent) 45%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      38% 48% at 82% 62%,
+      color-mix(in srgb, var(--color-accent-hover) 35%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      46% 42% at 60% 18%,
+      color-mix(in srgb, var(--color-accent) 28%, transparent),
+      transparent 72%
+    );
+  animation: flash-aurora 13s ease-in-out infinite alternate;
+}
+@keyframes flash-aurora {
+  0% {
+    transform: translate3d(-6%, -4%, 0) scale(1.08);
+  }
+  50% {
+    transform: translate3d(5%, 4%, 0) scale(1.18);
+  }
+  100% {
+    transform: translate3d(-3%, 6%, 0) scale(1.1);
+  }
+}
+
+/* respect reduce-motion: kill the moving parts, keep a static accent rim. */
+[data-reduce-motion="true"] .flash-composer::after,
+[data-reduce-motion="true"] .flash-composer::before,
+[data-reduce-motion="true"] .flash-composer:not(:focus-within) {
+  animation: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .flash-composer::after,
+  .flash-composer::before,
+  .flash-composer:not(:focus-within) {
+    animation: none;
+  }
+}
