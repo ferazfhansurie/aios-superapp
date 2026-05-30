@@ -1,8 +1,15 @@
 # AIOS shell — live session handoff
-2026-05-31 ~02:00 MYT
+2026-05-31 ~02:30 MYT
 
 > **Next session: read THIS, then `git -C ~/Repo/firaz/aios/shell log --oneline -12` + TaskList.**
-> Repo `~/Repo/firaz/aios/shell`, branch `master`, head `b65da55`, **10 commits ahead of origin, NOT pushed** (don't push unprompted).
+> Repo `~/Repo/firaz/aios/shell`, branch `master`, head `ed7d18b`, **15 commits ahead of origin, NOT pushed** (don't push unprompted).
+
+## SHIPPED after the doc was first written (newest)
+- `ed7d18b` **oracles: exclude `aios-term-*` from the roster** — `list_oracles` (oracles.rs ~line 214) was listing the shell's own persistent terminal panes as oracles → cryptic "oracle: term-k3-…". Now filters them like `list_tmux_sessions` does.
+- `1535481` **pane labels auto-distinguishable + inline rename** — `spawn()` (App.tsx ~line 279) suffixes a shell/claude pane's cwd basename + de-dupes (`terminal`, `terminal 2`). OPEN-rail rows (`OpenPanesList`) get double-click / pencil inline rename via new `renamePane` (App.tsx).
+- `dfa916b` **/handoff slash item** — `TerminalComposer.tsx`: `/handoff` in the slash menu fires the handoff skill in claude's TUI, then arms a two-tap banner ("clear + start fresh" → `/clear` + seeds "read HANDOFF-SESSION.md and continue"). `handoffArmed` state + `finishHandoff`.
+- `a666dc7` **mission-control overview redesign** — `PaneOverview` (App.tsx): centered gallery, big window-thumbnail cards (chrome + per-type glyph via `PANE_GLYPH`), adaptive width, ←/→/⏎ keyboard. Replaced the cramped top-left grid.
+- (still pending UI: none of these have a Settings toggle yet.)
 
 ## Working rules (firaz, this session — LOAD-BEARING)
 - **Build cadence:** edit freely → only `commit → tauri build → install → launch` when the session is bloated or at handoff. Do NOT build per-change.
