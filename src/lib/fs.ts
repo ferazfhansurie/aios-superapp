@@ -74,3 +74,10 @@ export async function writeTextFile(path: string, content: string): Promise<void
 export async function convertOfficeToPdf(path: string): Promise<string> {
   return invoke<string>("convert_office_to_pdf", { path });
 }
+
+/** Persists a pasted/dropped image (raw base64, no data-URL prefix) to a temp
+ *  file and returns its path — so a terminal can hand the path to a CLI AI
+ *  (claude code) for vision. `ext` is the file extension, e.g. "png". */
+export async function saveImageTemp(data: string, ext: string): Promise<string> {
+  return invoke<string>("save_image_temp", { data, ext });
+}

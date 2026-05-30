@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import {
   Database,
+  Bot,
   Camera,
   Clock,
   Folder,
@@ -99,6 +100,7 @@ export type AppDef = { kind: PaneContent; icon: typeof Folder; label: string };
 const SPAWN: AppDef[] = [
   { kind: { type: "chat" }, icon: MessageSquare, label: "chat" },
   { kind: { type: "shell" }, icon: TerminalSquare, label: "terminal" },
+  { kind: { type: "shell", cmd: "claude" }, icon: Bot, label: "claude code" },
   { kind: { type: "files" }, icon: Folder, label: "files" },
   { kind: { type: "browser" }, icon: Globe, label: "browser" },
   { kind: { type: "memory" }, icon: Database, label: "database" },

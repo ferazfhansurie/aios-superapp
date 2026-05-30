@@ -5,7 +5,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 
-import { X } from "lucide-react";
+import { MessageSquarePlus, X } from "lucide-react";
 import { Channel } from "@tauri-apps/api/core";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -21,8 +21,9 @@ import {
   spawnTerminal,
   spawnTmux,
 } from "../lib/pty";
+import { saveImageTemp } from "../lib/fs";
 import { paneWriters } from "../lib/paneBus";
-import { PaneDropZone } from "./PaneDropZone";
+import { TerminalComposer } from "./TerminalComposer";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
 const THEME = {
@@ -52,6 +53,33 @@ const THEME = {
 const FONT_FAMILY =
   '"SF Mono", "Menlo", "Monaco", "JetBrains Mono", "Consolas", ui-monospace, monospace';
 
+/** Shell-quote a path (single-quote wrap) only when it needs it. */
+function quotePath(path: string): string {
+  return /[\s'"\\]/.test(path) ? `'${path.replace(/'/g, "'\\''")}'` : path;
+}
+
+/** Extension for a clipboard/file image mime, defaulting to png. */
+function imageExt(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("svg")) return "svg";
+  if (m.includes("bmp")) return "bmp";
+  return "png";
+}
+
+/** Base64-encode a Blob (chunked, avoids call-stack blowups on big images). */
+async function blobToBase64(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
 export type PaneKind =
   | { type: "shell"; cmd?: string; cwd?: string }
   | { type: "oracle"; identity: string }
@@ -75,6 +103,13 @@ function termSessionName(paneKey?: string): string {
 export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: string }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<number | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  // Compose box (multi-line prompt affordance). Default-open for the dedicated
+  // "claude code" pane so the chat-grade surface is there from the first frame.
+  const [composerOpen, setComposerOpen] = useState(
+    kind.type === "shell" && kind.cmd === "claude",
+  );
+  const [savingImg, setSavingImg] = useState(false);
   // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
   const [buttons, setButtons] = useState<string[] | null>(null);
   const bufRef = useRef("");
@@ -107,6 +142,48 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     term.loadAddon(new WebLinksAddon());
     term.open(host);
 
+    // Save an image blob to a temp file and write its shell-quoted path (+space)
+    // into the live PTY — so a CLI AI (claude code) can read it for vision.
+    const insertImageBlob = async (blob: Blob, mime: string, sid: number | null) => {
+      if (sid == null) return;
+      setSavingImg(true);
+      try {
+        const b64 = await blobToBase64(blob);
+        const path = await saveImageTemp(b64, imageExt(mime));
+        ptyWrite(sid, `${quotePath(path)} `).catch(() => {});
+      } catch {
+        /* best-effort */
+      } finally {
+        setSavingImg(false);
+      }
+    };
+
+    // Cmd+V paste: prefer an image on the clipboard (→ temp path), else text.
+    const pasteClipboard = async (sid: number | null) => {
+      // Try the async clipboard API for image data first.
+      try {
+        if (navigator.clipboard?.read) {
+          const items = await navigator.clipboard.read();
+          for (const it of items) {
+            const imgType = it.types.find((t) => t.startsWith("image/"));
+            if (imgType) {
+              const blob = await it.getType(imgType);
+              await insertImageBlob(blob, imgType, sid);
+              return;
+            }
+          }
+        }
+      } catch {
+        /* clipboard.read unsupported/denied → fall through to text */
+      }
+      try {
+        const t = await navigator.clipboard.readText();
+        if (t && sid != null) ptyWrite(sid, t).catch(() => {});
+      } catch {
+        /* nothing pasteable */
+      }
+    };
+
     // Key interception (runs before xterm's default handling). Returning false
     // suppresses xterm's built-in behaviour for that key. We read sessionId from
     // the ref so the handler always targets the live session (mirrors onData).
@@ -120,14 +197,11 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         return false;
       }
       // Cmd+V → paste from the system clipboard into the PTY (Ctrl+V stays
-      // literal-quote in the shell, matching Alacritty on macOS).
+      // literal-quote in the shell, matching Alacritty on macOS). If the
+      // clipboard holds an IMAGE (not text), save it to a temp file and insert
+      // its shell-quoted path instead — so claude code can read it for vision.
       if (e.key === "v" && e.metaKey && !e.ctrlKey && !e.altKey) {
-        navigator.clipboard
-          .readText()
-          .then((t) => {
-            if (t && sid != null) ptyWrite(sid, t).catch(() => {});
-          })
-          .catch(() => {});
+        void pasteClipboard(sid);
         return false;
       }
       // Cmd+C → copy the selection. We never intercept Ctrl+C, so it always
@@ -288,38 +362,122 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     bufRef.current = "";
   };
 
-  // Drop a file/folder (dragged from the Files pane) → insert its path into
-  // this session's PTY, shell-quoted, with a trailing space.
-  const onPath = (path: string) => {
+  // Compose box → write the full text to the PTY followed by CR (submit).
+  const composerSend = (text: string) => {
     const id = sessionIdRef.current;
-    if (!path || id == null) return;
-    const quoted = /[\s'"\\]/.test(path) ? `'${path.replace(/'/g, "'\\''")}' ` : `${path} `;
-    ptyWrite(id, quoted).catch(() => {});
+    if (id != null) ptyWrite(id, `${text}\r`).catch(() => {});
+  };
+
+  // Interrupt the running CLI (^C) — visible "stop" affordance.
+  const interrupt = () => {
+    const id = sessionIdRef.current;
+    if (id != null) ptyWrite(id, "\x03").catch(() => {});
+  };
+
+  // Save a dropped image → temp file → insert its quoted path into the PTY.
+  const insertImagePath = async (blob: Blob, mime: string) => {
+    const id = sessionIdRef.current;
+    if (id == null) return;
+    setSavingImg(true);
+    try {
+      const b64 = await blobToBase64(blob);
+      const path = await saveImageTemp(b64, imageExt(mime));
+      ptyWrite(id, `${quotePath(path)} `).catch(() => {});
+    } catch {
+      /* best-effort */
+    } finally {
+      setSavingImg(false);
+    }
+  };
+
+  // Drop onto the terminal body: an image file → temp path; a file/folder
+  // dragged from the Files pane → its shell-quoted path, trailing space.
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const id = sessionIdRef.current;
+    if (id == null) return;
+    const files = e.dataTransfer?.files;
+    if (files && files.length) {
+      for (const f of files) {
+        if (f.type.startsWith("image/")) {
+          void insertImagePath(f, f.type);
+          return;
+        }
+      }
+    }
+    const path =
+      e.dataTransfer.getData("application/x-aios-path") || e.dataTransfer.getData("text/plain");
+    if (!path) return;
+    ptyWrite(id, `${quotePath(path)} `).catch(() => {});
   };
 
   return (
-    <PaneDropZone onPath={onPath}>
-      <div ref={hostRef} className="h-full min-h-0 w-full" />
-      {buttons && (
-        <div className="absolute inset-x-0 bottom-0 z-20 flex flex-wrap items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-panel)]/95 p-2 backdrop-blur">
-          {buttons.map((b, i) => (
-            <button
-              key={i}
-              onClick={() => sendChoice(b)}
-              className="rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)]"
-            >
-              {b}
-            </button>
-          ))}
+    <div
+      className="relative flex h-full min-h-0 w-full flex-col"
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+        if (!dragOver) setDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setDragOver(false);
+      }}
+      onDrop={onDrop}
+    >
+      <div className="relative min-h-0 flex-1">
+        <div ref={hostRef} className="h-full min-h-0 w-full" />
+        {/* toggle the compose box (chat-grade prompt surface for CLI AIs) */}
+        {!composerOpen && (
           <button
-            onClick={() => setButtons(null)}
-            className="ml-auto rounded p-1 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-            title="dismiss"
+            onClick={() => setComposerOpen(true)}
+            title="open compose box"
+            className="absolute right-2 top-2 z-20 flex items-center gap-1 rounded-md border border-[var(--color-border-strong)] bg-[var(--color-panel)]/90 px-2 py-1 text-[11px] text-[var(--color-text-2)] backdrop-blur transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
           >
-            <X size={13} />
+            <MessageSquarePlus size={13} />
+            <span>compose</span>
           </button>
-        </div>
+        )}
+        {savingImg && (
+          <div className="absolute left-2 top-2 z-20 rounded-md bg-[var(--color-panel)]/90 px-2 py-1 text-[11px] text-[var(--color-faint)] backdrop-blur">
+            saving image…
+          </div>
+        )}
+        {buttons && (
+          <div className="absolute inset-x-0 bottom-0 z-20 flex flex-wrap items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-panel)]/95 p-2 backdrop-blur">
+            {buttons.map((b, i) => (
+              <button
+                key={i}
+                onClick={() => sendChoice(b)}
+                className="rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)]"
+              >
+                {b}
+              </button>
+            ))}
+            <button
+              onClick={() => setButtons(null)}
+              className="ml-auto rounded p-1 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+              title="dismiss"
+            >
+              <X size={13} />
+            </button>
+          </div>
+        )}
+        {dragOver && (
+          <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center border-2 border-dashed border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10">
+            <span className="rounded-md bg-[var(--color-panel)]/90 px-3 py-1.5 text-[12px] text-[var(--color-text)]">
+              drop to insert path
+            </span>
+          </div>
+        )}
+      </div>
+      {composerOpen && (
+        <TerminalComposer
+          onSend={composerSend}
+          onInterrupt={interrupt}
+          onClose={() => setComposerOpen(false)}
+        />
       )}
-    </PaneDropZone>
+    </div>
   );
 }

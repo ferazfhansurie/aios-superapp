@@ -579,3 +579,63 @@ pub fn convert_office_to_pdf(path: String) -> Result<String, String> {
 
     Err("conversion produced no PDF".into())
 }
+
+/// Decodes standard base64 (no whitespace/newlines tolerated beyond what we
+/// strip) into bytes. Dependency-free so we don't pull a crate just for paste.
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for c in input.bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' || c == b' ' || c == b'\t' {
+            continue;
+        }
+        let v = val(c).ok_or("invalid base64 character")?;
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Persists a clipboard / dropped image to a temp file and returns its path, so
+/// the terminal can hand the path to a CLI AI (claude code) for vision.
+///
+/// `data` is the raw base64 of the image bytes (NOT a data-URL — the frontend
+/// strips the `data:image/png;base64,` prefix). `ext` is the desired file
+/// extension (e.g. "png", "jpg"). The file lands under `/tmp/aios-paste/` with
+/// a content-hashed name so repeated pastes of the same image dedupe.
+#[tauri::command]
+pub fn save_image_temp(data: String, ext: String) -> Result<String, String> {
+    let bytes = base64_decode(&data)?;
+    if bytes.is_empty() {
+        return Err("empty image data".into());
+    }
+    let safe_ext: String = ext
+        .trim_start_matches('.')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let safe_ext = if safe_ext.is_empty() { "png".into() } else { safe_ext };
+
+    let dir = std::path::Path::new("/tmp/aios-paste");
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let key = fnv1a(&format!("{}|{}", bytes.len(), bytes.iter().take(4096).fold(0u64, |a, &b| a.wrapping_add(b as u64))));
+    let path = dir.join(format!("paste-{key:x}.{safe_ext}"));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}

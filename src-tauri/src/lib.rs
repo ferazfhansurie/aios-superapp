@@ -65,6 +65,7 @@ pub fn run() {
             files::read_text_file,
             files::write_text_file,
             files::convert_office_to_pdf,
+            files::save_image_temp,
             plugins::list_plugins,
             browser::browser_zoom,
             browser::browser_clear_cookies,
