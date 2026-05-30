@@ -69,8 +69,10 @@ import {
   ListChecks,
   Loader2,
   Mic,
+  PackageOpen,
   Plus,
   RefreshCw,
+  Rocket,
   ShieldCheck,
   Sparkles,
   Square,
@@ -168,6 +170,23 @@ export function TerminalComposer({
   const [images, setImages] = useState<ImageChip[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [plusOpen, setPlusOpen] = useState(false);
+  // armed after /handoff fires — shows the one-tap "clear + start fresh" banner.
+  const [handoffArmed, setHandoffArmed] = useState(false);
+
+  // Tap-2 of the handoff flow: clear claude's context, then seed it to read the
+  // freshly-written handoff doc and continue — a clean fresh session in-place.
+  const finishHandoff = useCallback(() => {
+    const raw = onRaw;
+    raw?.("\x15");
+    raw?.("/clear\r");
+    // after /clear settles, drop in the resume prompt + send it.
+    setTimeout(() => {
+      raw?.(
+        "read HANDOFF-SESSION.md (this repo, else ~/.aios/state/handoffs/ newest) and continue exactly where the last session left off\r",
+      );
+    }, 600);
+    setHandoffArmed(false);
+  }, [onRaw]);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const plusWrapRef = useRef<HTMLDivElement>(null);
@@ -514,6 +533,12 @@ export function TerminalComposer({
         icon: <Sparkles size={14} />,
       },
       {
+        id: "handoff",
+        label: "/handoff",
+        desc: "package session → then one tap to clear + start fresh",
+        icon: <PackageOpen size={14} />,
+      },
+      {
         id: "help",
         label: "/help",
         desc: "claude code help (sends /help)",
@@ -551,6 +576,14 @@ export function TerminalComposer({
           // claude code has no literal "/plan" command — Shift+Tab cycles its
           // mode (incl. plan mode). Send that escape sequence.
           raw?.("\x1b[Z");
+          break;
+        case "handoff":
+          // fire the AIOS /handoff skill in claude code's TUI to package the
+          // session, then ARM the two-tap "clear + start fresh" affordance (we
+          // can't detect when handoff finishes, so the user taps once it's done).
+          raw?.("\x15");
+          raw?.("/handoff\r");
+          setHandoffArmed(true);
           break;
       }
       setValue("");
@@ -777,6 +810,33 @@ export function TerminalComposer({
       {/* keyframe for the inline recording waveform — kept local so the composer
           stays self-contained (no global stylesheet edit). */}
       <style>{WAVE_KEYFRAMES}</style>
+
+      {/* handoff two-tap banner: appears after /handoff fires; one tap clears +
+          starts the fresh session in-place (reads the new handoff doc). */}
+      {handoffArmed && (
+        <div className="mb-2 flex items-center gap-2 rounded-xl border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-2">
+          <PackageOpen size={15} className="shrink-0 text-[var(--color-accent)]" />
+          <span className="min-w-0 flex-1 text-[12px] text-[var(--color-text-2)]">
+            handoff packaged? clear context + start the fresh session
+          </span>
+          <button
+            type="button"
+            onClick={finishHandoff}
+            className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:brightness-110 active:scale-95"
+          >
+            <Rocket size={13} />
+            clear + start fresh
+          </button>
+          <button
+            type="button"
+            onClick={() => setHandoffArmed(false)}
+            title="dismiss"
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       {/* slash / @-mention overlay — sits just above the box, ChatPane styling */}
       {overlay === "slash" && slashFiltered.length > 0 && (
