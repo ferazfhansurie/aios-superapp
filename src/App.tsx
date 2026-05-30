@@ -662,28 +662,40 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [addShell, fireAppshot, runF5, toggleFullscreenSelected, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
 
-  // ---- trackpad three-finger swipe-UP → open the pane overview (mac Mission
-  // Control muscle memory). macOS reserves the literal 3-finger swipe for system
-  // Mission Control, but a swipe over the webview surfaces as a fast wheel
-  // gesture; we detect a decisive upward fling (large negative deltaY, not a
-  // gentle scroll) on the pane area and open the overview. Swipe-DOWN while the
-  // overview is open closes it. Guarded so ordinary scrolling never triggers it.
+  // ---- trackpad swipe-UP → open the pane overview (mac Mission Control muscle
+  // memory). macOS reserves the LITERAL 3-finger swipe for its own Mission
+  // Control, so a true 3-finger gesture never reaches the webview — all we get
+  // is wheel events from a 2-finger scroll. To keep ordinary scrolling (reading
+  // terminal backlog, a webpage, notes) from popping the overview, we require a
+  // genuine HARD FLICK: a long burst of travel (FLING) that ALSO contains at
+  // least one high-velocity event (FLICK_VEL). Slow/precise reading-scroll never
+  // hits the velocity floor, so it can't trigger no matter how far it travels.
+  // Swipe-DOWN with the same force while open closes it.
   const wheelAccum = useRef(0);
+  const wheelPeak = useRef(0); // strongest single-event |deltaY| this gesture
   const wheelLast = useRef(0);
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       // ignore pinch-zoom (ctrl) and horizontal-dominant gestures
       if (e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
       const now = e.timeStamp || performance.now();
-      if (now - wheelLast.current > 200) wheelAccum.current = 0; // new gesture
+      if (now - wheelLast.current > 150) {
+        wheelAccum.current = 0; // new gesture
+        wheelPeak.current = 0;
+      }
       wheelLast.current = now;
       wheelAccum.current += e.deltaY;
-      const FLING = 180; // px of accumulated travel = a decisive swipe
+      wheelPeak.current = Math.max(wheelPeak.current, Math.abs(e.deltaY));
+      const FLING = 600; // px of accumulated travel — a long, decisive throw
+      const FLICK_VEL = 80; // a single fast event must be in the burst (a flick)
+      if (wheelPeak.current < FLICK_VEL) return; // slow scroll → never a gesture
       if (!overviewOpen && wheelAccum.current < -FLING && panes.length > 0) {
         wheelAccum.current = 0;
+        wheelPeak.current = 0;
         setOverviewOpen(true);
       } else if (overviewOpen && wheelAccum.current > FLING) {
         wheelAccum.current = 0;
+        wheelPeak.current = 0;
         setOverviewOpen(false);
       }
     };
