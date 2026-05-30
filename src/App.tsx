@@ -11,6 +11,7 @@ import {
   GripVertical,
   MessageSquare,
   MessageCircle,
+  Minus,
   MoveRight,
   PanelLeft,
   Pencil,
@@ -85,6 +86,10 @@ interface Pane {
   key: string;
   label: string;
   kind: PaneContent;
+  /** Backgrounded: stays React-MOUNTED (so a browser pane keeps its login + a
+   *  terminal keeps its process) but is hidden from the grid and parked in the
+   *  minimized tray. Restored by clearing this flag. */
+  minimized?: boolean;
 }
 
 const isTerminal = (k: PaneContent): k is PaneKind =>
@@ -208,6 +213,14 @@ function App() {
   );
   const closePane = useCallback((key: string) => {
     setPanes((p) => p.filter((x) => x.key !== key));
+  }, []);
+  // Minimize = background the pane WITHOUT unmounting it (keeps a browser login /
+  // a running terminal alive). Restore = bring it back to the grid.
+  const minimizePane = useCallback((key: string) => {
+    setPanes((p) => p.map((x) => (x.key === key ? { ...x, minimized: true } : x)));
+  }, []);
+  const restorePane = useCallback((key: string) => {
+    setPanes((p) => p.map((x) => (x.key === key ? { ...x, minimized: false } : x)));
   }, []);
   // Closing a chat pane whose claude is mid-task → prompt to keep it running in
   // the background (with optional done-notification) instead of killing it.
@@ -431,11 +444,15 @@ function App() {
     };
   }, [flash]);
 
+  // Grid shape is driven only by VISIBLE (non-minimized) panes — minimized ones
+  // stay mounted but display:none, so they don't take a grid cell.
+  const visibleCount = useMemo(() => panes.filter((p) => !p.minimized).length, [panes]);
+  const minimizedPanes = useMemo(() => panes.filter((p) => p.minimized), [panes]);
   const { cols, rows } = useMemo(() => {
-    const n = panes.length || 1;
+    const n = visibleCount || 1;
     const c = Math.ceil(Math.sqrt(n));
     return { cols: c, rows: Math.ceil(n / c) };
-  }, [panes.length]);
+  }, [visibleCount]);
 
   const commands: Command[] = useMemo(
     () => [
@@ -564,7 +581,7 @@ function App() {
         )}
 
         <main className="min-h-0 flex-1">
-          {panes.length === 0 ? (
+          {visibleCount === 0 && (
             <IdleDashboard
               apps={SPAWN}
               oracles={oracles}
@@ -575,15 +592,23 @@ function App() {
               onResumeChat={resumeChat}
               onOpenPalette={() => setPaletteOpen(true)}
             />
-          ) : (
+          )}
+          {/* ALL panes render here always (so minimized ones stay mounted and a
+              browser keeps its login). Minimized panes are display:none, parked
+              outside the grid; the grid auto-flows only the visible ones. When
+              none are visible the grid collapses (h-0) and the idle dashboard
+              above shows instead. */}
+          <div className={visibleCount === 0 ? "h-0 overflow-hidden" : "h-full"}>
             <ResizableGrid cols={cols} rows={rows} gap={8}>
               {panes.map((pane) => (
                 <PaneCard
                   key={pane.key}
                   pane={pane}
-                  active={!overlayOpen}
+                  active={!overlayOpen && !pane.minimized}
+                  minimized={!!pane.minimized}
                   dropTarget={dropTargetKey === pane.key}
                   onClose={() => requestClose(pane.key)}
+                  onMinimize={() => minimizePane(pane.key)}
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
                   onOpenFile={openFile}
@@ -599,13 +624,46 @@ function App() {
                 />
               ))}
             </ResizableGrid>
-          )}
+          </div>
         </main>
       </div>
 
       {toast && (
         <div className="modal-in glass absolute bottom-4 left-1/2 z-40 -translate-x-1/2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/90 px-3 py-2 text-[12px] text-[var(--color-text)] shadow-2xl">
           {toast}
+        </div>
+      )}
+
+      {/* minimized panes — backgrounded but alive (browser keeps its login, a
+          terminal keeps running). Click a chip to restore it to the grid; the ×
+          truly closes it. Bottom-left so it doesn't collide with the live-chats
+          tray (bottom-right). */}
+      {minimizedPanes.length > 0 && (
+        <div className="absolute bottom-4 left-4 z-40 flex max-w-[60vw] flex-wrap items-center gap-1.5">
+          {minimizedPanes.map((mp) => (
+            <div
+              key={mp.key}
+              className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/95 py-1 pl-2.5 pr-1 shadow-lg backdrop-blur"
+            >
+              <button
+                onClick={() => restorePane(mp.key)}
+                className="flex items-center gap-1.5 text-left"
+                title="restore"
+              >
+                <span className={`status-dot shrink-0 ${DOT[mp.kind.type] ?? "status-dot--cold"}`} />
+                <span className="max-w-[160px] truncate text-[12px] text-[var(--color-text-2)]">
+                  {mp.label}
+                </span>
+              </button>
+              <button
+                onClick={() => requestClose(mp.key)}
+                title="close for good"
+                className="grid h-4 w-4 place-items-center rounded-full text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              >
+                <X size={11} />
+              </button>
+            </div>
+          ))}
         </div>
       )}
 
@@ -1263,8 +1321,10 @@ const DOT: Record<string, string> = {
 function PaneCard({
   pane,
   active,
+  minimized,
   dropTarget,
   onClose,
+  onMinimize,
   onFocus,
   onAnnotate,
   onOpenFile,
@@ -1272,8 +1332,10 @@ function PaneCard({
 }: {
   pane: Pane;
   active: boolean;
+  minimized?: boolean;
   dropTarget?: boolean;
   onClose: () => void;
+  onMinimize: () => void;
   onFocus: () => void;
   onAnnotate: (text: string) => void;
   onOpenFile: (path: string, name: string) => void;
@@ -1301,6 +1363,11 @@ function PaneCard({
     <div
       data-pane-key={pane.key}
       onMouseDownCapture={onFocus}
+      // Minimized: hidden but STILL MOUNTED (style display:none, not unmounted),
+      // so the native webview / terminal process survives — that's what keeps a
+      // browser pane logged in. It also leaves the CSS grid, so visible panes
+      // reflow without it.
+      style={minimized ? { display: "none" } : undefined}
       className={`relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-[var(--color-pane)] transition-colors ${
         dropTarget
           ? "border-[var(--color-accent)]"
@@ -1327,6 +1394,14 @@ function PaneCard({
               <Radio size={12} className={mon ? "animate-pulse" : ""} />
             </button>
           )}
+          <button
+            type="button"
+            onClick={onMinimize}
+            className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+            title="Minimize (keep running in background)"
+          >
+            <Minus size={12} />
+          </button>
           <button
             type="button"
             onClick={onClose}
