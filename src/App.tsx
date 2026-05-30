@@ -571,6 +571,11 @@ function App() {
                 onSpawn={spawnSidebarItem}
                 onPinSite={(spaceId) => setPinSiteSpace(spaceId)}
               />
+              <MinimizedTabs
+                panes={minimizedPanes}
+                onRestore={restorePane}
+                onClose={requestClose}
+              />
               <OracleRoster onAttachOracle={addOracle} onAttachTmux={addTmux} />
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
@@ -634,38 +639,6 @@ function App() {
         </div>
       )}
 
-      {/* minimized panes — backgrounded but alive (browser keeps its login, a
-          terminal keeps running). Click a chip to restore it to the grid; the ×
-          truly closes it. Bottom-left so it doesn't collide with the live-chats
-          tray (bottom-right). */}
-      {minimizedPanes.length > 0 && (
-        <div className="absolute bottom-4 left-4 z-40 flex max-w-[60vw] flex-wrap items-center gap-1.5">
-          {minimizedPanes.map((mp) => (
-            <div
-              key={mp.key}
-              className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/95 py-1 pl-2.5 pr-1 shadow-lg backdrop-blur"
-            >
-              <button
-                onClick={() => restorePane(mp.key)}
-                className="flex items-center gap-1.5 text-left"
-                title="restore"
-              >
-                <span className={`status-dot shrink-0 ${DOT[mp.kind.type] ?? "status-dot--cold"}`} />
-                <span className="max-w-[160px] truncate text-[12px] text-[var(--color-text-2)]">
-                  {mp.label}
-                </span>
-              </button>
-              <button
-                onClick={() => requestClose(mp.key)}
-                title="close for good"
-                className="grid h-4 w-4 place-items-center rounded-full text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-              >
-                <X size={11} />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
 
       {/* background chat sessions — still running after their pane closed */}
       {liveChats.length > 0 && (
@@ -883,6 +856,56 @@ function SpaceHeader({ space, count }: { space: SidebarSpace; count: number }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** OPEN TABS — minimized panes, listed in the sidebar (NOT a floating bottom bar,
+ *  which the native browser webview paints over on Windows). Each row restores
+ *  its pane on click; the × closes it for good. Styled to match the rail's other
+ *  sections (uppercase header, dot + label rows). Hidden when nothing's minimized. */
+function MinimizedTabs({
+  panes,
+  onRestore,
+  onClose,
+}: {
+  panes: Pane[];
+  onRestore: (key: string) => void;
+  onClose: (key: string) => void;
+}) {
+  if (panes.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] pt-1.5">
+      <div className="flex items-center gap-1.5 px-2.5 py-1">
+        <span className="text-[10px] font-medium uppercase tracking-[0.16em] text-[var(--color-muted)]">
+          open tabs
+        </span>
+        <span className="font-mono text-[10px] text-[var(--color-faint)]">{panes.length}</span>
+      </div>
+      {panes.map((mp) => (
+        <div
+          key={mp.key}
+          className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-[var(--color-panel-2)]"
+        >
+          <button
+            onClick={() => onRestore(mp.key)}
+            className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+            title="restore tab"
+          >
+            <span className={`status-dot shrink-0 ${DOT[mp.kind.type] ?? "status-dot--cold"}`} />
+            <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+              {mp.label}
+            </span>
+          </button>
+          <button
+            onClick={() => onClose(mp.key)}
+            title="close tab"
+            className="grid h-4 w-4 shrink-0 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:text-[var(--color-text)] group-hover:opacity-100"
+          >
+            <X size={11} />
+          </button>
+        </div>
+      ))}
     </div>
   );
 }
