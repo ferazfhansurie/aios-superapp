@@ -810,6 +810,7 @@ export function ChatPane({
       reattach != null
         ? chatReattach(reattach, chan).then(() => reattach)
         : chatStart(chan, {
+            engine: model.engine ?? "claude",
             cwd: cwd ?? null,
             model: model.disabled ? null : model.id,
             permissionMode: permission.id,
