@@ -8,11 +8,16 @@
 
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl};
 
-/// Present as desktop Chrome so sites don't flag the WKWebView UA as a bot
-/// (cuts captcha walls). Cookies persist on-disk per app, so a one-time login
-/// sticks across restarts.
+/// Present as desktop **Safari**, NOT Chrome. We're a WKWebView — Safari's own
+/// engine — so a Safari UA is the honest, consistent fingerprint and Google
+/// fully supports Safari sign-in. A Chrome UA gets flagged on Google's OAuth
+/// pages ("this browser or app may not be secure"): real Chrome sends `Sec-CH-UA`
+/// client-hint headers that a WKWebView can't, so "claims Chrome + no client
+/// hints" reads as a fake/embedded browser. The `Version/… Safari/…` suffix is
+/// also what separates real Safari from a bare embedded webview (whose default
+/// UA omits it). Cookies persist on-disk per profile, so logins stick.
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15";
 
 fn parse(url: &str) -> Result<Url, String> {
     Url::parse(url).map_err(|e| format!("bad url: {e}"))
