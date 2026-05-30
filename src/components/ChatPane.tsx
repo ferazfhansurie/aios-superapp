@@ -443,6 +443,8 @@ export function ChatPane({
   const [model, setModel] = useState<ChatModel>(CHAT_MODELS[0]);
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(EFFORTS[1]);
+  // running context size (prompt tokens of the latest turn) → composer indicator
+  const [ctxTokens, setCtxTokens] = useState<number | null>(null);
 
   // mode chips
   const [planMode, setPlanMode] = useState(false);
@@ -759,6 +761,18 @@ export function ChatPane({
         const tokens = tokensFromUsage(ev.usage);
         const tokStr =
           tokens != null ? `${tokens.toLocaleString()} tok` : "";
+        // context size = the prompt the model saw this turn (input + cached
+        // input). Drives the composer's running "Nk ctx" indicator, TUI-style.
+        const u = (ev.usage ?? {}) as Record<string, unknown>;
+        const ctx =
+          (typeof u.input_tokens === "number" ? u.input_tokens : 0) +
+          (typeof u.cache_read_input_tokens === "number"
+            ? u.cache_read_input_tokens
+            : 0) +
+          (typeof u.cache_creation_input_tokens === "number"
+            ? u.cache_creation_input_tokens
+            : 0);
+        if (ctx > 0) setCtxTokens(ctx);
         const foot = [dur, tokStr, cost].filter(Boolean).join(" · ");
         // always emit a result turn (carries durationMs for the activity line),
         // even if the human-readable footer would be empty.
@@ -806,6 +820,7 @@ export function ChatPane({
     let disposed = false;
     setStarted(false);
     setClaudeReady(false);
+    setCtxTokens(null);
     const chan = new Channel<string>();
     chan.onmessage = (line) => {
       if (disposed) return;
@@ -1346,6 +1361,26 @@ export function ChatPane({
         }
       }
     }
+    // ↑ on an EMPTY composer recalls the last sent message for quick edit/resend
+    // (TUI staple). Empty-only so it never fights normal cursor movement.
+    if (
+      e.key === "ArrowUp" &&
+      !overlay &&
+      input.trim() === "" &&
+      lastSentRef.current
+    ) {
+      e.preventDefault();
+      const recalled = lastSentRef.current;
+      setInput(recalled);
+      requestAnimationFrame(() => {
+        const ta = taRef.current;
+        if (ta) {
+          ta.focus();
+          ta.setSelectionRange(recalled.length, recalled.length);
+        }
+      });
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
@@ -1629,6 +1664,21 @@ export function ChatPane({
               ))}
             </Dropdown>
 
+            {/* running context indicator (TUI-style "18.6K · 9%") */}
+            {ctxTokens != null && (
+              <span
+                title={`${ctxTokens.toLocaleString()} tokens of context this turn`}
+                className="hidden items-center px-1 font-mono text-[10.5px] tabular-nums text-[var(--color-faint)] sm:flex"
+              >
+                {(ctxTokens / 1000).toFixed(1)}K
+                {(() => {
+                  const win = model.engine === "codex" ? 272_000 : 200_000;
+                  const pct = Math.round((ctxTokens / win) * 100);
+                  return pct > 0 ? ` · ${pct}%` : "";
+                })()}
+              </span>
+            )}
+
             {/* mic */}
             <button
               type="button"
@@ -1670,6 +1720,7 @@ export function ChatPane({
       permission,
       effort,
       model,
+      ctxTokens,
       streaming,
       canSend,
       send,
