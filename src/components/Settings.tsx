@@ -5,6 +5,7 @@ import {
   type ComponentType,
   type ReactNode,
   useEffect,
+  useRef,
   useState,
 } from "react";
 
@@ -56,10 +57,14 @@ import { SPAWN_BY_ID } from "../lib/apps";
 import {
   type Accent,
   type Theme,
-  ACCENTS,
+  ACCENT_PRESETS,
   ACCENT_ORDER,
+  accentToHex,
   getAccent,
+  getAccentRecents,
   getTheme,
+  isCustomAccent,
+  normalizeHex,
   setAccent,
   setTheme,
   subscribe as subscribeTheme,
@@ -217,7 +222,7 @@ function Segmented<T extends string>({
             className="rounded-md px-2.5 py-1 text-[12px] transition-colors"
             style={{
               background: active ? "var(--color-accent)" : "transparent",
-              color: active ? "#fff" : "var(--color-text-2)",
+              color: active ? "var(--color-accent-fg)" : "var(--color-text-2)",
             }}
           >
             {o.label}
@@ -357,7 +362,40 @@ function ThemePicker({
   );
 }
 
-/** Accent swatch row — click to re-tint the whole app live. Active = ringed. */
+/** A single round accent dot. Active = ringed + check. */
+function AccentDot({
+  hex,
+  active,
+  label,
+  onClick,
+}: {
+  hex: string;
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-pressed={active}
+      title={label}
+      onClick={onClick}
+      className="relative grid h-7 w-7 place-items-center rounded-full transition-transform hover:scale-110"
+      style={{
+        background: hex,
+        boxShadow: active
+          ? "0 0 0 2px var(--color-panel), 0 0 0 4px var(--color-text)"
+          : "0 0 0 1px rgba(0,0,0,0.25) inset",
+      }}
+    >
+      {active && <Check size={14} strokeWidth={3} color="#fff" />}
+    </button>
+  );
+}
+
+/** Accent swatch row — 6 presets + recent customs + a "custom" picker.
+ *  Click any swatch (or pick/type a hex) to re-tint the whole app live. */
 function AccentSwatches({
   value,
   onChange,
@@ -365,31 +403,108 @@ function AccentSwatches({
   value: Accent;
   onChange: (a: Accent) => void;
 }) {
+  const colorInputRef = useRef<HTMLInputElement>(null);
+  const custom = isCustomAccent(value);
+  // current base hex (preset or custom) — drives the picker + hex field.
+  const currentHex = accentToHex(value);
+  const [hexDraft, setHexDraft] = useState(currentHex);
+  const [recents, setRecents] = useState<string[]>(getAccentRecents);
+
+  // keep the draft + recents in sync when the accent changes elsewhere.
+  useEffect(() => {
+    setHexDraft(currentHex);
+    setRecents(getAccentRecents());
+  }, [currentHex]);
+
+  const commitHex = (raw: string) => {
+    const norm = normalizeHex(raw);
+    if (norm) onChange(norm);
+  };
+
   return (
-    <div className="flex items-center gap-2.5">
-      {ACCENT_ORDER.map((a) => {
-        const def = ACCENTS[a];
-        const active = a === value;
-        return (
-          <button
+    <div className="flex flex-col items-end gap-2.5">
+      <div className="flex items-center gap-2.5">
+        {ACCENT_ORDER.map((a) => (
+          <AccentDot
             key={a}
-            type="button"
-            aria-label={a}
-            aria-pressed={active}
-            title={a}
+            hex={ACCENT_PRESETS[a]}
+            active={value === a}
+            label={a}
             onClick={() => onChange(a)}
-            className="relative grid h-7 w-7 place-items-center rounded-full transition-transform hover:scale-110"
-            style={{
-              background: def.swatch,
-              boxShadow: active
-                ? "0 0 0 2px var(--color-panel), 0 0 0 4px var(--color-text)"
-                : "0 0 0 1px rgba(0,0,0,0.25) inset",
-            }}
-          >
-            {active && <Check size={14} strokeWidth={3} color="#fff" />}
-          </button>
-        );
-      })}
+          />
+        ))}
+
+        {/* recent custom colors */}
+        {recents.map((hex) => (
+          <AccentDot
+            key={hex}
+            hex={hex}
+            active={custom && currentHex === hex}
+            label={hex}
+            onClick={() => onChange(hex)}
+          />
+        ))}
+
+        {/* custom — rainbow + opens native color picker */}
+        <button
+          type="button"
+          aria-label="custom color"
+          title="custom color"
+          aria-pressed={custom}
+          onClick={() => colorInputRef.current?.click()}
+          className="relative grid h-7 w-7 place-items-center rounded-full transition-transform hover:scale-110"
+          style={{
+            background:
+              "conic-gradient(from 0deg, #ff5f57, #febc2e, #28c840, #339cff, #924ff7, #fb5b86, #ff5f57)",
+            boxShadow: custom
+              ? "0 0 0 2px var(--color-panel), 0 0 0 4px var(--color-text)"
+              : "0 0 0 1px rgba(0,0,0,0.25) inset",
+          }}
+        >
+          <Plus size={13} strokeWidth={3} color="#fff" />
+          {/* the actual color input lives here, visually hidden but anchored
+              under the swatch so the OS picker pops near it. */}
+          <input
+            ref={colorInputRef}
+            type="color"
+            value={currentHex}
+            onChange={(e) => onChange(e.target.value)}
+            className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+            aria-hidden
+            tabIndex={-1}
+          />
+        </button>
+      </div>
+
+      {/* editable hex field — type or paste any color. */}
+      <div className="flex items-center gap-2">
+        <span
+          className="h-4 w-4 shrink-0 rounded-[5px]"
+          style={{
+            background: currentHex,
+            boxShadow: "0 0 0 1px rgba(0,0,0,0.25) inset",
+          }}
+        />
+        <span className="font-mono text-[12px] text-[var(--color-muted)]">#</span>
+        <input
+          value={hexDraft.replace(/^#/, "")}
+          onChange={(e) => setHexDraft(e.target.value)}
+          onBlur={() => {
+            commitHex(hexDraft);
+            setHexDraft(currentHex);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              commitHex(hexDraft);
+              (e.target as HTMLInputElement).blur();
+            }
+          }}
+          spellCheck={false}
+          maxLength={6}
+          placeholder="f26522"
+          className="w-[72px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2 py-1 font-mono text-[12px] uppercase tracking-wide text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+        />
+      </div>
     </div>
   );
 }
@@ -456,8 +571,11 @@ function AppearancePreview({ fontPx }: { fontPx: number }) {
             looks like this.
           </p>
           <button
-            className="mt-2.5 rounded-md px-2.5 py-1 text-[11px] font-medium text-white"
-            style={{ background: "var(--color-accent)" }}
+            className="mt-2.5 rounded-md px-2.5 py-1 text-[11px] font-medium"
+            style={{
+              background: "var(--color-accent)",
+              color: "var(--color-accent-fg)",
+            }}
           >
             primary action
           </button>
@@ -695,7 +813,10 @@ export function Settings({
 
                   {/* accent */}
                   <div className="py-3">
-                    <Row label="accent" sub="re-tints the whole cockpit instantly">
+                    <Row
+                      label="accent"
+                      sub="pick a preset or any custom color — re-tints the whole cockpit instantly"
+                    >
                       <AccentSwatches
                         value={accent}
                         onChange={(a) => {

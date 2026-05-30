@@ -53,6 +53,7 @@
   --color-accent-soft: oklch(0.72 0.18 50 / 16%); /* wash — active pill bg, user bubble, nav-active */
   --color-cursor: #f97316;                   /* terminal caret (runtime-overridden) */
   --color-selection: rgba(249, 115, 22, 0.30); /* text selection (runtime-overridden) */
+  --color-accent-fg: #ffffff;                /* readable text/icon on an accent fill — black or white, picked by accent luminance at runtime (lib/theme.ts) */
   --color-highlight: #fbbf24;
 
   /* ---- status — semantic, used sparingly ---------------------- */
