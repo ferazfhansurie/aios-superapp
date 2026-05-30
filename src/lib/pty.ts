@@ -73,6 +73,23 @@ export async function spawnShell(
   return invoke<number>("pty_spawn", { onData, cwd, cols, rows });
 }
 
+/**
+ * Spawns a pane attached to a PERSISTENT terminal tmux session `aios-term-<name>`
+ * (created on first use). Closing the pane / quitting the app only detaches the
+ * tmux client — the session (and `cmd`, e.g. `claude`) keeps running and is
+ * reattachable. Unix-only: on Windows the backend command is absent, so callers
+ * must fall back to `spawnShell` (the raw, non-persistent PTY).
+ */
+export async function spawnTerminal(
+  onData: Channel<string>,
+  name: string,
+  cmd: string | null,
+  cols: number,
+  rows: number,
+): Promise<number> {
+  return invoke<number>("pty_spawn_terminal", { onData, name, cmd: cmd ?? null, cols, rows });
+}
+
 /** Spawns a pane attached to the oracle tmux session `aios-<identity>`. */
 export async function spawnOracle(
   onData: Channel<string>,

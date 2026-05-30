@@ -28,6 +28,11 @@ fn read_telemetry() -> telemetry::Telemetry {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // INVARIANT: this app must NEVER tear down the `-L adletic` tmux socket /
+    // server on exit. Persistent terminal panes (`aios-term-*`) and oracle panes
+    // (`aios-*`) live on that daemon and are meant to outlive the cockpit — there
+    // is deliberately no window-close / ExitRequested handler that kills tmux.
+    // If you ever add an exit hook, do NOT `kill-server` the adletic socket.
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -35,6 +40,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_telemetry,
             pty::pty_spawn,
+            // pty_spawn_terminal is Unix-only (tmux); on Windows it's compiled
+            // out and the frontend falls back to pty_spawn (no persistence).
+            #[cfg(unix)]
+            pty::pty_spawn_terminal,
             pty::pty_spawn_oracle,
             pty::pty_spawn_tmux,
             pty::pty_write,

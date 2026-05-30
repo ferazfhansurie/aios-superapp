@@ -12,7 +12,15 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 
-import { ptyKill, ptyResize, ptyWrite, spawnOracle, spawnShell, spawnTmux } from "../lib/pty";
+import {
+  ptyKill,
+  ptyResize,
+  ptyWrite,
+  spawnOracle,
+  spawnShell,
+  spawnTerminal,
+  spawnTmux,
+} from "../lib/pty";
 import { paneWriters } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
 
@@ -48,6 +56,21 @@ export type PaneKind =
   | { type: "shell"; cmd?: string; cwd?: string }
   | { type: "oracle"; identity: string }
   | { type: "tmux"; socket: string; session: string };
+
+/**
+ * Derives a stable, tmux-safe session name (`[a-z0-9_-]`) from a pane key so the
+ * SAME pane reattaches to the SAME persistent `aios-term-<name>` session across
+ * remounts/relaunches. Falls back to a per-mount id when no key is available
+ * (that pane just won't persist across full app restarts — acceptable).
+ */
+let termFallbackSeq = 0;
+function termSessionName(paneKey?: string): string {
+  const base = (paneKey ?? `pane-${++termFallbackSeq}`)
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return base || `pane-${++termFallbackSeq}`;
+}
 
 export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: string }) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -124,13 +147,28 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       const cols = Math.max(1, term.cols);
       const rows = Math.max(1, term.rows);
 
+      // Default ("shell") panes route through a PERSISTENT tmux session
+      // `aios-term-<name>` so they survive pane-close + app-quit (detach, not
+      // kill). The name is derived from the stable pane key; cmd (e.g. "claude")
+      // becomes the session's startup command. tmux is Unix-only, so on Windows
+      // (or any box without tmux) pty_spawn_terminal is absent/fails — fall back
+      // to the raw, non-persistent login shell.
+      let persisted = false;
       try {
-        sessionId =
-          kind.type === "oracle"
-            ? await spawnOracle(onData, kind.identity, cols, rows)
-            : kind.type === "tmux"
-              ? await spawnTmux(onData, kind.socket, kind.session, cols, rows)
-              : await spawnShell(onData, kind.type === "shell" ? kind.cwd ?? null : null, cols, rows);
+        if (kind.type === "oracle") {
+          sessionId = await spawnOracle(onData, kind.identity, cols, rows);
+        } else if (kind.type === "tmux") {
+          sessionId = await spawnTmux(onData, kind.socket, kind.session, cols, rows);
+        } else {
+          const name = termSessionName(paneKey);
+          try {
+            sessionId = await spawnTerminal(onData, name, kind.cmd ?? null, cols, rows);
+            persisted = true;
+          } catch {
+            // no tmux (Windows / non-AIOS box) → ephemeral shell fallback.
+            sessionId = await spawnShell(onData, null, cols, rows);
+          }
+        }
       } catch (e) {
         term.write(`\r\n\x1b[31m[aios] spawn failed: ${e}\x1b[0m\r\n`);
         return;
@@ -146,8 +184,10 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       inputDisposer = term.onData((d) => {
         if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
       });
-      // auto-run an init command (e.g. `aios`) once the shell is ready
-      if (kind.type === "shell" && kind.cmd) {
+      // auto-run an init command (e.g. `aios`) once the shell is ready.
+      // Skip for persistent panes — there `cmd` is the tmux session's startup
+      // command, so typing it again would double-launch (and re-launch on reattach).
+      if (kind.type === "shell" && kind.cmd && !persisted) {
         const c = kind.cmd;
         const sid = sessionId;
         setTimeout(() => {

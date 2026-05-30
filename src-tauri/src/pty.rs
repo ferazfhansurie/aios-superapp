@@ -171,6 +171,63 @@ pub fn pty_spawn_oracle(
     spawn_internal(app, &state, on_data, cmd, cols, rows)
 }
 
+/// Attaches a pane to a PERSISTENT terminal tmux session (`aios-term-<name>` on
+/// socket `adletic`), creating it on first use. Unlike `pty_spawn`'s ephemeral
+/// login shell, this session lives on the tmux daemon — so closing the pane (or
+/// quitting the whole app) only detaches the `tmux attach` client; the shell (or
+/// whatever `cmd` ran, e.g. `claude`) keeps running and is reattachable later.
+///
+/// `cmd` is the session's startup command — passed to `new-session` so a "claude
+/// code" pane boots claude inside the persistent session. `None` → a login shell.
+///
+/// tmux is Unix-only; on Windows this command is compiled out and the frontend
+/// must fall back to the raw `pty_spawn` (no persistence there).
+#[cfg(unix)]
+#[tauri::command]
+pub fn pty_spawn_terminal(
+    app: AppHandle,
+    state: State<PtyState>,
+    on_data: Channel<String>,
+    name: String,
+    cmd: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<u32, String> {
+    // Guard against shell-injection via the pane-derived session name.
+    let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    if name.is_empty() || !safe(&name) {
+        return Err("invalid terminal name".into());
+    }
+    let tmux = tmux_bin();
+    let session = format!("aios-term-{name}");
+    // Build the optional startup command for `new-session`. tmux runs it via its
+    // own default-shell, so a bare string like `claude` is fine; empty → login shell.
+    let startup = cmd
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_default();
+    let new_session = if startup.is_empty() {
+        format!("{tmux} -L adletic new-session -d -s {session}")
+    } else {
+        // Single-quote the command so spaces/args survive the outer `sh -c`.
+        let quoted = format!("'{}'", startup.replace('\'', "'\\''"));
+        format!("{tmux} -L adletic new-session -d -s {session} {quoted}")
+    };
+    let mut cmdb = CommandBuilder::new("/bin/sh");
+    cmdb.arg("-c");
+    // Create the session if absent, enable mouse so the wheel scrolls inside tmux
+    // (it owns the alt-screen, bypassing xterm's scrollback), then attach. `exec`
+    // replaces the shell so closing the pane detaches the client — see pty_kill.
+    cmdb.arg(format!(
+        "{tmux} -L adletic has-session -t {session} 2>/dev/null || {new_session}; \
+         {tmux} -L adletic set -g mouse on 2>/dev/null; \
+         exec {tmux} -L adletic attach -t {session}"
+    ));
+    cmdb.env("TERM", "xterm-256color");
+    cmdb.env("COLORTERM", "truecolor");
+    spawn_internal(app, &state, on_data, cmdb, cols, rows)
+}
+
 /// Attaches a pane to ANY tmux session on a given socket — the all-tmux attach
 /// surface (oracles, the bridge, even the session you're typing in now). `exec`
 /// replaces the shell so closing the pane detaches the client without killing
@@ -232,8 +289,13 @@ pub fn pty_resize(state: State<PtyState>, id: u32, cols: u16, rows: u16) -> Resu
 }
 
 /// Kills a session: removes it from the registry and terminates the child.
-/// For an oracle pane this kills only the `tmux attach` client (the oracle
-/// session keeps running under the bridge).
+///
+/// For any tmux-backed pane (oracle, all-tmux, OR a persistent terminal spawned
+/// via `pty_spawn_terminal`) the child PTY runs the `tmux attach` process, not
+/// the tmux session itself — so killing it merely DETACHES the client. Closing
+/// the pane = detach; the `aios-term-*` (or `aios-*`) session keeps running on
+/// the tmux daemon and is reattachable later. The session only dies when its own
+/// process exits or someone explicitly `kill-session`s it.
 #[tauri::command]
 pub fn pty_kill(state: State<PtyState>, id: u32) -> Result<(), String> {
     let removed = state.sessions.lock().remove(&id);
