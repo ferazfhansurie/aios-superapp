@@ -60,8 +60,16 @@ fn profile_store_id(profile: &str) -> [u8; 16] {
 
 /// Shows the browser `label` at the given rect, creating it (loading `url`) on
 /// first call or just repositioning an existing one.
+///
+/// MUST be `async`: on Windows, `Window::add_child` (below) DEADLOCKS when called
+/// from a synchronous Tauri command — the call blocks waiting on the main-thread
+/// event loop that a sync command is itself occupying, so the webview never
+/// attaches and the pane hangs on "loading...". An async command runs on the
+/// async runtime (off the main thread), so `add_child`'s internal main-thread
+/// dispatch completes. (tauri-apps/tauri #9798, #11452.) No behavior change on
+/// macOS, where sync worked fine.
 #[tauri::command]
-pub fn browser_show(
+pub async fn browser_show(
     app: AppHandle,
     label: String,
     url: String,
@@ -77,7 +85,23 @@ pub fn browser_show(
         return Ok(());
     }
     let parsed = parse(&url)?;
-    let window = app.get_window("main").ok_or("no main window")?;
+    let window = match app.get_window("main") {
+        Some(w) => w,
+        None => {
+            // Fall back to the first window if it isn't labelled "main".
+            let alt = app.windows().into_values().next();
+            match alt {
+                Some(w) => {
+                    eprintln!("[aios browser] no 'main' window; using '{}'", w.label());
+                    w
+                }
+                None => {
+                    eprintln!("[aios browser] FAIL: no windows at all");
+                    return Err("no main window".into());
+                }
+            }
+        }
+    };
     #[allow(unused_mut)]
     let mut builder =
         tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed)).user_agent(UA);
@@ -93,13 +117,20 @@ pub fn browser_show(
     }
     #[cfg(not(target_os = "macos"))]
     let _ = &profile;
+    eprintln!(
+        "[aios browser] add_child label='{label}' at ({x},{y}) {width}x{height} url-ok",
+    );
     window
         .add_child(
             builder,
             LogicalPosition::new(x, y),
             LogicalSize::new(width.max(1.0), height.max(1.0)),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            eprintln!("[aios browser] add_child FAILED: {e}");
+            e.to_string()
+        })?;
+    eprintln!("[aios browser] add_child OK for '{label}'");
     Ok(())
 }
 

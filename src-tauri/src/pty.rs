@@ -225,19 +225,35 @@ pub fn pty_spawn_terminal(
     rows: u16,
 ) -> Result<u32, String> {
     let _ = name; // no tmux session name on Windows (no persistence)
-    let mut cmdb = CommandBuilder::new(windows_shell());
+    let shell = windows_shell();
+    let mut cmdb = CommandBuilder::new(&shell);
+    let startup = cmd.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    // Boot the startup command (e.g. `claude --dangerously-skip-permissions`) as
+    // the shell's OWN launch argument rather than typing it into the PTY after
+    // spawn. Injecting keystrokes races PowerShell's PSReadLine init — early
+    // bytes get swallowed and `claude` never starts (the "claude code pane does
+    // nothing" bug). `-NoExit` keeps the shell alive after claude exits so the
+    // pane stays usable; on a bare PowerShell shell the binary resolves `claude`
+    // (a `claude.cmd`/`claude.exe` shim) from PATH.
+    if let Some(c) = &startup {
+        let is_powershell = shell.to_lowercase().contains("powershell")
+            || shell.to_lowercase().ends_with("pwsh.exe");
+        if is_powershell {
+            cmdb.arg("-NoExit");
+            cmdb.arg("-Command");
+            cmdb.arg(c);
+        } else {
+            // cmd.exe or another shell: /k keeps it open after the command.
+            cmdb.arg("/k");
+            cmdb.arg(c);
+        }
+    }
     cmdb.env("TERM", "xterm-256color");
     cmdb.env("COLORTERM", "truecolor");
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         cmdb.cwd(home);
     }
-    let id = spawn_internal(app, &state, on_data, cmdb, cols, rows)?;
-    // If a startup command was requested (e.g. `claude`), type it into the fresh
-    // shell once it's up — same UX as the tmux path booting a command.
-    if let Some(c) = cmd.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) {
-        let _ = pty_write(state, id, format!("{c}\r"));
-    }
-    Ok(id)
+    spawn_internal(app, &state, on_data, cmdb, cols, rows)
 }
 
 #[cfg(unix)]

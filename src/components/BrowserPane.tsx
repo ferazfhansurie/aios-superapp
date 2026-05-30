@@ -110,6 +110,9 @@ export function BrowserPane({
   const [deviceMode, setDeviceMode] = useState(false);
   const [annotating, setAnnotating] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  // Surfaces a browser_show failure instead of silently showing "loading…"
+  // forever (the native child-webview can fail to attach on some platforms).
+  const [showError, setShowError] = useState<string | null>(null);
   const shownRef = useRef(false);
   const inputFocusedRef = useRef(false);
   // last url we observed from the live webview — dedupes the poll so we only
@@ -142,7 +145,12 @@ export function BrowserPane({
       if (!r) return;
       if (!shownRef.current) {
         shownRef.current = true;
-        browserShow(label, current, r, profile).catch(() => {});
+        browserShow(label, current, r, profile)
+          .then(() => setShowError(null))
+          .catch((e) => {
+            shownRef.current = false; // allow a retry on the next sync tick
+            setShowError(typeof e === "string" ? e : String(e));
+          });
       } else {
         browserSetBounds(label, r).catch(() => {});
       }
@@ -609,8 +617,14 @@ export function BrowserPane({
       </div>
 
       <div ref={slotRef} className="relative min-h-0 flex-1">
-        <div className="pointer-events-none absolute inset-0 grid place-items-center text-[11px] text-[var(--color-faint)]">
-          loading native browser…
+        <div className="pointer-events-none absolute inset-0 grid place-items-center px-6 text-center text-[11px] text-[var(--color-faint)]">
+          {showError ? (
+            <span className="max-w-md text-[var(--color-danger)]">
+              native browser failed to load: {showError}
+            </span>
+          ) : (
+            "loading native browser…"
+          )}
         </div>
         {annotating && (
           <div className="pointer-events-none absolute left-1/2 top-2 z-50 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-panel-2)] px-3 py-1 text-[11px] text-[var(--color-accent)] shadow-lg">
