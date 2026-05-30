@@ -16,11 +16,16 @@ import {
   Info,
   Keyboard,
   Minus,
+  Eye,
+  EyeOff,
   Monitor,
   Moon,
+  PanelLeft,
   Palette,
   Plus,
   Radio,
+  RotateCcw,
+  Trash2,
   Settings as SettingsIcon,
   Sun,
   Type,
@@ -37,6 +42,16 @@ import {
   saveSettings,
   MEMORY_VAULT_PATH,
 } from "../lib/settings";
+
+import {
+  type SidebarState,
+  loadSidebar,
+  toggleHidden,
+  removeItem,
+  resetSidebar,
+  subscribe as subscribeSidebar,
+} from "../lib/sidebar";
+import { SPAWN_BY_ID } from "../lib/apps";
 
 import {
   type Accent,
@@ -466,6 +481,7 @@ function GroupLabel({ children }: { children: ReactNode }) {
 type SectionId =
   | "general"
   | "appearance"
+  | "sidebar"
   | "oracles"
   | "channels"
   | "plugins"
@@ -476,6 +492,7 @@ type SectionId =
 const NAV: { id: SectionId; label: string; icon: ComponentType<{ size?: number }> }[] = [
   { id: "general", label: "general", icon: SettingsIcon },
   { id: "appearance", label: "appearance", icon: Palette },
+  { id: "sidebar", label: "sidebar", icon: PanelLeft },
   { id: "oracles", label: "oracles", icon: Cpu },
   { id: "channels", label: "channels", icon: Radio },
   { id: "plugins", label: "plugins", icon: Blocks },
@@ -513,6 +530,8 @@ export function Settings({
 }) {
   const [section, setSection] = useState<SectionId>("general");
   const [s, setS] = useState<AppSettings>(loadSettings);
+  const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
+  useEffect(() => subscribeSidebar(setSidebar), []);
   const [theme, setLocalTheme] = useState<Theme>(getTheme);
   const [accent, setLocalAccent] = useState<Accent>(getAccent);
   const [density, setLocalDensity] = useState<Density>(getDensity);
@@ -755,6 +774,73 @@ export function Settings({
                       }}
                     />
                   </Row>
+                </div>
+              )}
+
+              {section === "sidebar" && (
+                <div className="-mt-1">
+                  <p className="pb-3 pt-1 text-[12px] leading-snug text-[var(--color-muted)]">
+                    show or hide rail items. drag to reorder them right in the
+                    sidebar. pinned sites can be unpinned here or via their ⋯ menu.
+                  </p>
+                  {sidebar.items.map((it) => {
+                    const isLink = it.kind.type === "link";
+                    const app = it.kind.type === "app" ? SPAWN_BY_ID[it.kind.appId] : undefined;
+                    const Icon = app?.icon ?? PanelLeft;
+                    return (
+                      <div
+                        key={it.id}
+                        className="flex items-center justify-between gap-3 border-b border-[var(--color-border)] py-2 last:border-0"
+                      >
+                        <div className="flex min-w-0 items-center gap-2.5">
+                          {isLink && it.faviconUrl ? (
+                            <img src={it.faviconUrl} alt="" className="h-4 w-4 shrink-0 rounded-sm" />
+                          ) : (
+                            <Icon size={14} className="shrink-0 text-[var(--color-muted)]" />
+                          )}
+                          <span
+                            className="truncate text-[13px]"
+                            style={{
+                              color: it.hidden ? "var(--color-faint)" : "var(--color-text-2)",
+                            }}
+                          >
+                            {it.label}
+                          </span>
+                          <span className="shrink-0 text-[10px] uppercase tracking-wide text-[var(--color-faint)]">
+                            {it.group}
+                          </span>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1">
+                          {isLink ? (
+                            <button
+                              onClick={() => removeItem(it.id)}
+                              title="unpin"
+                              className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-danger)]"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => toggleHidden(it.id, !it.hidden)}
+                              title={it.hidden ? "show" : "hide"}
+                              className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                            >
+                              {it.hidden ? <EyeOff size={14} /> : <Eye size={14} />}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div className="flex justify-end pt-3">
+                    <button
+                      onClick={() => resetSidebar()}
+                      className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-3 py-1.5 text-[12px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+                    >
+                      <RotateCcw size={13} />
+                      reset sidebar to default
+                    </button>
+                  </div>
                 </div>
               )}
 

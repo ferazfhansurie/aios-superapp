@@ -14,6 +14,7 @@ import {
   ExternalLink,
   MessageSquarePlus,
   MoreVertical,
+  Pin,
   RotateCw,
   Smartphone,
   SquareDashedMousePointer,
@@ -42,6 +43,7 @@ import {
   type BrowserAnnotation,
   type Rect,
 } from "../lib/browser";
+import { addLink } from "../lib/sidebar";
 
 const ANNOT_SENTINEL = "AIOS_ANNOT:";
 const ANNOT_POLL_MS = 700;
@@ -58,21 +60,27 @@ function normalizeUrl(input: string): string {
   return `https://www.google.com/search?q=${encodeURIComponent(t)}`;
 }
 
+const DEFAULT_URL = "https://google.com";
+
 export function BrowserPane({
   label,
   active = true,
+  initialUrl,
   onAnnotate,
 }: {
   label: string;
   active?: boolean;
+  /** Optional starting url (e.g. a pinned-site sidebar item deep-links here). */
+  initialUrl?: string;
   /** Fired when an annotation or page-selection is captured (clipboard-bridge),
    *  with a formatted, chat-ready string. App wires this to the active chat. */
   onAnnotate?: (text: string) => void;
 }) {
   const slotRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const [input, setInput] = useState("https://google.com");
-  const [current, setCurrent] = useState("https://google.com");
+  const start = initialUrl ? normalizeUrl(initialUrl) : DEFAULT_URL;
+  const [input, setInput] = useState(start);
+  const [current, setCurrent] = useState(start);
   const [menuOpen, setMenuOpen] = useState(false);
   const [zoom, setZoom] = useState(100);
   const [deviceMode, setDeviceMode] = useState(false);
@@ -138,6 +146,23 @@ export function BrowserPane({
     setInput(url);
     if (shownRef.current) browserNavigate(label, url).catch(() => {});
   }, [input, label]);
+
+  // Pin the current site to the sidebar (favicon resolved by the store from the
+  // host). Label defaults to the hostname; the user can rename it in the rail.
+  const pinSite = useCallback(() => {
+    const url = current || normalizeUrl(input);
+    if (!url) return;
+    addLink(url);
+    let host = url;
+    try {
+      host = new URL(url).hostname.replace(/^www\./, "");
+    } catch {
+      /* keep raw */
+    }
+    setToast(`pinned ${host} to sidebar`);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2500);
+  }, [current, input]);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -316,6 +341,9 @@ export function BrowserPane({
             placeholder="search or enter url"
           />
         </form>
+        <NavBtn title="Pin this site to the sidebar" onClick={pinSite}>
+          <Pin size={13} />
+        </NavBtn>
         <NavBtn title="Open in system browser" onClick={() => openUrl(current).catch(() => {})}>
           <ExternalLink size={13} />
         </NavBtn>
