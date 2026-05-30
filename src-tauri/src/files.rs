@@ -184,6 +184,65 @@ pub struct ProjectRun {
     commands: Vec<RunCommand>,
 }
 
+/// If `dir` is itself a runnable project root (has a known marker), returns its
+/// `(kind, commands)`. This is the single source of truth for marker detection +
+/// command derivation, shared by `detect_project` (walks up) and `list_projects`
+/// (scans down). Returns `None` when `dir` has no recognized marker.
+fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
+    let has = |f: &str| dir.join(f).is_file();
+
+    if has("pubspec.yaml") {
+        return Some((
+            "flutter".into(),
+            vec![
+                RunCommand { label: "flutter run".into(), cmd: "flutter run".into() },
+                RunCommand { label: "flutter run --release".into(), cmd: "flutter run --release".into() },
+                RunCommand { label: "flutter test".into(), cmd: "flutter test".into() },
+            ],
+        ));
+    }
+    if has("package.json") {
+        return Some(("node".into(), node_scripts(dir)));
+    }
+    if has("Cargo.toml") {
+        return Some((
+            "rust".into(),
+            vec![
+                RunCommand { label: "cargo run".into(), cmd: "cargo run".into() },
+                RunCommand { label: "cargo test".into(), cmd: "cargo test".into() },
+                RunCommand { label: "cargo build".into(), cmd: "cargo build".into() },
+            ],
+        ));
+    }
+    if has("go.mod") {
+        return Some((
+            "go".into(),
+            vec![
+                RunCommand { label: "go run .".into(), cmd: "go run .".into() },
+                RunCommand { label: "go test ./...".into(), cmd: "go test ./...".into() },
+            ],
+        ));
+    }
+    if has("pyproject.toml") || has("requirements.txt") || has("manage.py") {
+        let cmd = if has("manage.py") {
+            "python manage.py runserver"
+        } else {
+            "python main.py"
+        };
+        return Some((
+            "python".into(),
+            vec![RunCommand { label: cmd.into(), cmd: cmd.into() }],
+        ));
+    }
+    if has("Makefile") {
+        return Some((
+            "make".into(),
+            vec![RunCommand { label: "make".into(), cmd: "make".into() }],
+        ));
+    }
+    None
+}
+
 /// Detects the runnable project containing `path` (walks up to find a marker)
 /// and returns the F5-style run commands. Used by the Run pane / F5 to spawn a
 /// terminal running the right thing in the right directory.
@@ -196,74 +255,116 @@ pub fn detect_project(path: String) -> ProjectRun {
         }
     }
     for _ in 0..12 {
-        let here = dir.to_string_lossy().to_string();
-        let has = |f: &str| dir.join(f).is_file();
-
-        if has("pubspec.yaml") {
+        if let Some((kind, commands)) = project_at(&dir) {
             return ProjectRun {
-                kind: "flutter".into(),
-                root: Some(here),
-                commands: vec![
-                    RunCommand { label: "flutter run".into(), cmd: "flutter run".into() },
-                    RunCommand { label: "flutter run --release".into(), cmd: "flutter run --release".into() },
-                    RunCommand { label: "flutter test".into(), cmd: "flutter test".into() },
-                ],
+                kind,
+                root: Some(dir.to_string_lossy().to_string()),
+                commands,
             };
         }
-        if has("package.json") {
-            return ProjectRun {
-                kind: "node".into(),
-                root: Some(here.clone()),
-                commands: node_scripts(&dir),
-            };
-        }
-        if has("Cargo.toml") {
-            return ProjectRun {
-                kind: "rust".into(),
-                root: Some(here),
-                commands: vec![
-                    RunCommand { label: "cargo run".into(), cmd: "cargo run".into() },
-                    RunCommand { label: "cargo test".into(), cmd: "cargo test".into() },
-                    RunCommand { label: "cargo build".into(), cmd: "cargo build".into() },
-                ],
-            };
-        }
-        if has("go.mod") {
-            return ProjectRun {
-                kind: "go".into(),
-                root: Some(here),
-                commands: vec![
-                    RunCommand { label: "go run .".into(), cmd: "go run .".into() },
-                    RunCommand { label: "go test ./...".into(), cmd: "go test ./...".into() },
-                ],
-            };
-        }
-        if has("pyproject.toml") || has("requirements.txt") || has("manage.py") {
-            let cmd = if has("manage.py") {
-                "python manage.py runserver"
-            } else {
-                "python main.py"
-            };
-            return ProjectRun {
-                kind: "python".into(),
-                root: Some(here),
-                commands: vec![RunCommand { label: cmd.into(), cmd: cmd.into() }],
-            };
-        }
-        if has("Makefile") {
-            return ProjectRun {
-                kind: "make".into(),
-                root: Some(here),
-                commands: vec![RunCommand { label: "make".into(), cmd: "make".into() }],
-            };
-        }
-
         match dir.parent() {
             Some(p) => dir = p.to_path_buf(),
             None => break,
         }
     }
     ProjectRun { kind: "unknown".into(), root: None, commands: Vec::new() }
+}
+
+#[derive(Serialize)]
+pub struct ProjectInfo {
+    /// Directory name of the project root (display title).
+    name: String,
+    /// Absolute path of the project root.
+    root: String,
+    /// "flutter" | "node" | "rust" | "go" | "python" | "make"
+    kind: String,
+    /// Candidate run commands; the first is the primary (default for the palette).
+    commands: Vec<RunCommand>,
+}
+
+/// Directory names we never descend into — heavy build/dep/vcs dirs that would
+/// blow up the scan and never contain a project root worth running on its own.
+fn is_pruned_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules"
+            | ".git"
+            | "build"
+            | "target"
+            | "dist"
+            | ".next"
+            | "Pods"
+            | ".dart_tool"
+            | "vendor"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".turbo"
+            | ".cache"
+    )
+}
+
+/// Scans `~/Repo` (bounded depth ~4) for runnable project roots. A directory is
+/// a project if `project_at` recognizes a marker in it; once found we record it
+/// and STOP descending (the marker dir is the project — nested sub-packages are
+/// not surfaced as separate run targets here). Heavy dirs (node_modules, target,
+/// .git, …) are pruned. Results are capped, deduped by root, and sorted by name.
+/// Reuses `project_at` so command derivation is identical to F5 / `detect_project`.
+#[tauri::command]
+pub fn list_projects() -> Vec<ProjectInfo> {
+    const MAX_DEPTH: usize = 4;
+    const CAP: usize = 200;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let repo_root = std::path::Path::new(&home).join("Repo");
+
+    let mut out: Vec<ProjectInfo> = Vec::new();
+    // (dir, depth) stack — iterative to bound recursion + allow early cap.
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(repo_root, 0)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if out.len() >= CAP {
+            break;
+        }
+        // If this dir is a project root, record it and don't descend further.
+        if let Some((kind, commands)) = project_at(&dir) {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| dir.to_string_lossy().to_string());
+            out.push(ProjectInfo {
+                name,
+                root: dir.to_string_lossy().to_string(),
+                kind,
+                commands,
+            });
+            continue;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || is_pruned_dir(&name) {
+                continue;
+            }
+            let is_dir = e
+                .file_type()
+                .map(|t| t.is_dir())
+                .unwrap_or_else(|_| e.path().is_dir());
+            if is_dir {
+                stack.push((e.path(), depth + 1));
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.truncate(CAP);
+    out
 }
 
 /// Reads package.json `scripts` and turns them into `<pm> run <name>` commands,

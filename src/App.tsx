@@ -49,7 +49,7 @@ import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import { chatHandles, paneWriters } from "./lib/paneBus";
 import { homeDir } from "./lib/fs";
-import { detectProject } from "./lib/run";
+import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 
 /** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
 type PaneContent =
@@ -207,6 +207,9 @@ function App() {
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [chats, setChats] = useState<ChatSessionInfo[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  // every runnable project under ~/Repo, for the per-project ⌘K run entries.
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [home, setHome] = useState<string>("");
   useEffect(() => {
     let alive = true;
     const load = () => {
@@ -222,6 +225,32 @@ function App() {
       clearInterval(t);
     };
   }, []);
+
+  // Discover every runnable project under ~/Repo once on mount so each one gets
+  // its own ⌘K "run <name>" entry. Cheap (bounded scan), so no polling — a stale
+  // list just misses a brand-new repo until next launch.
+  const loadProjects = useCallback(() => {
+    listProjects().then(setProjects).catch(() => {});
+  }, []);
+  useEffect(() => {
+    homeDir().then(setHome).catch(() => {});
+    loadProjects();
+  }, [loadProjects]);
+
+  // spawn a run terminal for a discovered project, exactly like F5 (logs stream
+  // + flutter `r` hot-reload work in-pane). Uses the project's primary command.
+  const runProject = useCallback(
+    (p: ProjectInfo) => {
+      const c = p.commands[0];
+      if (!c) {
+        flash(`no run command for ${p.name}`);
+        return;
+      }
+      spawn({ type: "shell", cmd: c.cmd, cwd: p.root }, `▶ ${p.name}`);
+      flash(`▶ ${c.cmd}`);
+    },
+    [spawn, flash],
+  );
 
   // background chat tray refreshes faster so a finished/closed task shows up
   // (and drops off on reattach) without waiting on the 30s data loop.
@@ -426,12 +455,29 @@ function App() {
         actionLabel: "open inbox",
         run: () => spawn({ type: "customers" }, "customers"),
       })),
+      // one "run <name>" per discovered ~/Repo project — type a repo name in ⌘K
+      // and ⏎ launches its primary command in a fresh run terminal.
+      ...projects.map((p) => {
+        const rel = home && p.root.startsWith(home)
+          ? p.root.slice(home.length).replace(/^\//, "")
+          : p.root;
+        return {
+          id: `run-project-${p.root}`,
+          title: `run ${p.name}`,
+          subtitle: `${p.kind} · ${rel}`,
+          group: "run",
+          icon: <Play size={14} />,
+          keywords: `run start launch project ${p.name} ${p.kind} ${rel}`,
+          actionLabel: "run",
+          run: () => runProject(p),
+        };
+      }),
       { id: "sidebar", title: "toggle sidebar", subtitle: "⌘B", group: "view", icon: <PanelLeft size={14} />, keywords: "rail hide show", actionLabel: "toggle", run: () => setSidebarOpen((v) => !v) },
-      { id: "run", title: "run project", subtitle: "F5", group: "actions", icon: <Play size={14} />, keywords: "f5 run debug start flutter npm dev build terminal", actionLabel: "run", run: () => runF5() },
+      { id: "run", title: "run focused project", subtitle: "F5", group: "actions", icon: <Play size={14} />, keywords: "f5 run debug start flutter npm dev build terminal focused open file — type a repo name for a specific project", actionLabel: "run", run: () => runF5() },
       { id: "appshot", title: "appshot — screenshot to oracle", subtitle: "⌘⌘", group: "actions", icon: <Camera size={14} />, keywords: "screenshot capture", actionLabel: "run", run: fireAppshot },
       { id: "settings", title: "settings", subtitle: "⌘,", group: "app", icon: <SettingsIcon size={14} />, keywords: "preferences theme appearance", actionLabel: "open", run: () => setSettingsOpen(true) },
     ],
-    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5],
+    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, projects, home, runProject],
   );
 
   return (

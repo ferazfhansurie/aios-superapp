@@ -30,6 +30,21 @@ export async function detectProject(path: string): Promise<ProjectRun> {
   return invoke<ProjectRun>("detect_project", { path });
 }
 
+/** A discovered project under `~/Repo` — name + root + kind + run commands.
+ *  Same command derivation as {@link detectProject}; `commands[0]` is primary. */
+export interface ProjectInfo {
+  name: string;
+  root: string;
+  kind: ProjectKind;
+  commands: RunCommand[];
+}
+
+/** Scan `~/Repo` (bounded depth, heavy dirs pruned) for every runnable project
+ *  root. Powers the per-project ⌘K run entries. Sorted by name, capped at 200. */
+export async function listProjects(): Promise<ProjectInfo[]> {
+  return invoke<ProjectInfo[]>("list_projects");
+}
+
 /** A short ▶ label for the run button, e.g. "▶ flutter run". */
 export function runLabel(p: ProjectRun): string {
   return p.commands.length ? `▶ ${p.commands[0].label}` : "▶ run";
