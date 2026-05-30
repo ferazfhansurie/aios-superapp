@@ -28,6 +28,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import {
   ArrowUp,
   ArrowDown,
+  PackageOpen,
   AtSign,
   Check,
   CheckCheck,
@@ -84,6 +85,7 @@ import {
   type ChatTurnInfo,
 } from "../lib/chat";
 import { readDir, saveImageTemp, type DirEntry } from "../lib/fs";
+import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
 import { chatHandles, paneWriters, paneSubmitters } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
 
@@ -153,6 +155,22 @@ let _imgSeq = 0;
 function quotePath(path: string): string {
   return `'${path.replace(/'/g, "'\\''")}'`;
 }
+/** "0:05" from elapsed seconds (dictation timer). */
+function fmtElapsed(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+/** Precomputed equalizer bars for the inline dictation waveform (time-keyed). */
+const WAVEFORM_BARS: { h: number; delay: number }[] = Array.from(
+  { length: 40 },
+  (_, i) => ({ h: 28 + ((i * 37) % 60), delay: (i * 70) % 900 }),
+);
+const WAVE_KEYFRAMES = `@keyframes aios-wave {
+  0%, 100% { transform: scaleY(0.32); opacity: 0.55; }
+  50% { transform: scaleY(1); opacity: 1; }
+}`;
+
 /** File extension for a clipboard/file image mime. */
 function extFromMime(mime: string): string {
   const m = mime.toLowerCase();
@@ -641,6 +659,73 @@ export function ChatPane({
     [addImage],
   );
   const savingImg = images.some((im) => im.path == null);
+
+  // ── voice dictation: click mic → inline waveform + timer → transcript ───────
+  // Ported from TerminalComposer (the polished one). Records via lib/voice, swaps
+  // the textarea for a live equalizer while recording, drops the transcript into
+  // the box on stop. Esc cancels.
+  type VoicePhase = "idle" | "recording" | "transcribing";
+  const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
+  const [voiceElapsed, setVoiceElapsed] = useState(0);
+  const voicePhaseRef = useRef<VoicePhase>("idle");
+  voicePhaseRef.current = voicePhase;
+  useEffect(() => {
+    if (voicePhase !== "recording") return;
+    setVoiceElapsed(0);
+    const base = Date.now();
+    const t = setInterval(
+      () => setVoiceElapsed(Math.floor((Date.now() - base) / 1000)),
+      250,
+    );
+    return () => clearInterval(t);
+  }, [voicePhase]);
+  const micStart = useCallback(async () => {
+    if (voicePhaseRef.current !== "idle") return;
+    try {
+      await dictateStart();
+      setVoicePhase("recording");
+    } catch {
+      setVoicePhase("idle");
+    }
+  }, []);
+  const micStop = useCallback(async () => {
+    if (voicePhaseRef.current !== "recording") return;
+    setVoicePhase("transcribing");
+    try {
+      const text = await dictateStop();
+      if (text) {
+        setInput((v) => (v ? v.trimEnd() + " " + text : text));
+      }
+    } catch {
+      /* best-effort dictation */
+    } finally {
+      setVoicePhase("idle");
+      taRef.current?.focus();
+    }
+  }, []);
+  const micCancel = useCallback(async () => {
+    if (voicePhaseRef.current !== "recording") return;
+    setVoicePhase("idle");
+    try {
+      await dictateCancel();
+    } catch {
+      /* best-effort */
+    }
+  }, []);
+  const recording = voicePhase === "recording";
+  // Esc cancels an in-progress recording (the textarea is swapped out then, so a
+  // window listener catches it).
+  useEffect(() => {
+    if (!recording) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        void micCancel();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [recording, micCancel]);
 
   // ── event ingestion ───────────────────────────────────────────────────────
 
@@ -1316,6 +1401,17 @@ export function ChatPane({
         },
       },
       {
+        id: "handoff",
+        label: "/handoff",
+        desc: "package this session for a fresh one",
+        icon: <PackageOpen size={14} />,
+        run: () => {
+          setInput("");
+          setOverlay(null);
+          sendText("/handoff");
+        },
+      },
+      {
         id: "help",
         label: "/help",
         desc: "what can this do",
@@ -1335,7 +1431,7 @@ export function ChatPane({
         },
       },
     ],
-    [clearSession, loadResumeSessions],
+    [clearSession, loadResumeSessions, sendText],
   );
 
   // load dir entries for the @-mention picker (lazy, on first open)
@@ -1672,17 +1768,47 @@ export function ChatPane({
               e.target.value = "";
             }}
           />
-          <textarea
-            ref={taRef}
-            value={input}
-            onChange={(e) => onChangeInput(e.target.value)}
-            onKeyDown={onKeyDown}
-            onPaste={onPasteImage}
-            rows={1}
-            placeholder={planMode ? "describe the task to plan…" : "do anything"}
-            spellCheck={false}
-            className="block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
-          />
+          <style>{WAVE_KEYFRAMES}</style>
+          {recording ? (
+            <div className="flex items-center gap-3 px-4 pt-4 pb-2">
+              <div className="flex h-7 flex-1 items-center gap-[3px] overflow-hidden">
+                {WAVEFORM_BARS.map((b, i) => (
+                  <span
+                    key={i}
+                    className="w-[3px] shrink-0 origin-center rounded-full bg-[var(--color-accent)]"
+                    style={{
+                      height: `${b.h}%`,
+                      animation: "aios-wave 0.9s ease-in-out infinite",
+                      animationDelay: `${b.delay}ms`,
+                    }}
+                  />
+                ))}
+              </div>
+              <span className="font-mono text-[12px] tabular-nums text-[var(--color-text)]">
+                {fmtElapsed(voiceElapsed)}
+              </span>
+              <button
+                type="button"
+                onClick={() => void micStop()}
+                title="stop dictation (esc to cancel)"
+                className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
+              >
+                <Square size={14} className="fill-current" />
+              </button>
+            </div>
+          ) : (
+            <textarea
+              ref={taRef}
+              value={input}
+              onChange={(e) => onChangeInput(e.target.value)}
+              onKeyDown={onKeyDown}
+              onPaste={onPasteImage}
+              rows={1}
+              placeholder={planMode ? "describe the task to plan…" : "do anything"}
+              spellCheck={false}
+              className="block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
+            />
+          )}
           <div className="flex flex-wrap items-center gap-1.5 px-3 pb-3 pt-1">
             {/* permission chip */}
             <Dropdown
@@ -1814,7 +1940,7 @@ export function ChatPane({
               align="right"
               trigger={
                 <>
-                  <span>{model.label}</span>
+                  <span className="whitespace-nowrap">{model.label}</span>
                   <ChevronDown size={12} className="text-[var(--color-faint)]" />
                 </>
               }
@@ -1843,21 +1969,6 @@ export function ChatPane({
               ))}
             </Dropdown>
 
-            {/* running context indicator (TUI-style "18.6K · 9%") */}
-            {ctxTokens != null && (
-              <span
-                title={`${ctxTokens.toLocaleString()} tokens of context this turn`}
-                className="hidden items-center px-1 font-mono text-[10.5px] tabular-nums text-[var(--color-faint)] sm:flex"
-              >
-                {(ctxTokens / 1000).toFixed(1)}K
-                {(() => {
-                  const win = model.engine === "codex" ? 272_000 : 200_000;
-                  const pct = Math.round((ctxTokens / win) * 100);
-                  return pct > 0 ? ` · ${pct}%` : "";
-                })()}
-              </span>
-            )}
-
             {/* attach image (or paste a screenshot / drag a file in) */}
             <button
               type="button"
@@ -1870,14 +1981,22 @@ export function ChatPane({
               <ImageIcon size={16} />
             </button>
 
-            {/* mic */}
-            <button
-              type="button"
-              className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-              title="dictate (⌘J)"
-            >
-              <Mic size={16} />
-            </button>
+            {/* mic — click to dictate (waveform takes over the input row while
+                recording; this shows idle / transcribing) */}
+            {voicePhase === "transcribing" ? (
+              <div className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-accent)]">
+                <Loader2 size={16} className="animate-spin" />
+              </div>
+            ) : !recording ? (
+              <button
+                type="button"
+                onClick={() => void micStart()}
+                className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-all duration-200 hover:scale-110 hover:bg-[var(--color-accent-soft)] hover:text-[var(--color-accent)] hover:shadow-[0_0_14px_-3px_var(--color-accent)]"
+                title="dictate (⌘J)"
+              >
+                <Mic size={16} />
+              </button>
+            ) : null}
 
             {/* send / stop */}
             {streaming ? (
@@ -1915,6 +2034,8 @@ export function ChatPane({
       model,
       ctxTokens,
       images,
+      voicePhase,
+      voiceElapsed,
       streaming,
       canSend,
       send,
@@ -2108,7 +2229,29 @@ export function ChatPane({
         </button>
       )}
       <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg)]/80 px-6 pb-5 pt-3 backdrop-blur">
-        <div className="mx-auto max-w-2xl">{composer}</div>
+        <div className="mx-auto max-w-2xl">
+          {/* context readout — out of the cramped composer, model-aware window
+              (opus 4.8 = 1M, sonnet/haiku = 200K, codex = 272K) */}
+          {ctxTokens != null && (
+            <div
+              title={`${ctxTokens.toLocaleString()} tokens of context`}
+              className="mb-1.5 flex justify-end px-1 font-mono text-[10.5px] tabular-nums text-[var(--color-faint)]"
+            >
+              {(() => {
+                const win = model.id.startsWith("claude-opus")
+                  ? 1_000_000
+                  : model.engine === "codex"
+                    ? 272_000
+                    : model.engine === "opencode"
+                      ? 256_000
+                      : 200_000;
+                const pct = Math.round((ctxTokens / win) * 100);
+                return `${(ctxTokens / 1000).toFixed(1)}K${pct > 0 ? ` · ${pct}%` : ""} ctx`;
+              })()}
+            </div>
+          )}
+          {composer}
+        </div>
       </div>
     </div>
     </PaneDropZone>
