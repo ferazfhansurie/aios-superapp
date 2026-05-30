@@ -3,7 +3,7 @@
  * per-session Channel. Mounts once, spawns its session, and cleans up (kills
  * the session) on unmount.
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { MessageSquarePlus, X } from "lucide-react";
 import { Channel } from "@tauri-apps/api/core";
@@ -119,6 +119,10 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   const [buttons, setButtons] = useState<string[] | null>(null);
   const bufRef = useRef("");
   const lastBtnRef = useRef("");
+  // When the compose box is open, an "append to box" writer it registers — so
+  // global ⌘J dictation (App's single VoiceButton) lands in the box, exactly
+  // like ChatPane. null = no composer mounted → fall back to the PTY writer.
+  const composerAppendRef = useRef<((text: string) => void) | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -319,7 +323,15 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       }
 
       sessionIdRef.current = sessionId;
-      if (paneKey) paneWriters.set(paneKey, (t) => ptyWrite(sessionId!, t).catch(() => {}));
+      // Pane writer for cross-cutting features (voice dictation, file drops).
+      // Prefer the compose box when it's open (so dictation lands in the box and
+      // is editable before send, like ChatPane); else write straight to the PTY.
+      if (paneKey)
+        paneWriters.set(paneKey, (t) => {
+          const toBox = composerAppendRef.current;
+          if (toBox) toBox(t);
+          else ptyWrite(sessionId!, t).catch(() => {});
+        });
       inputDisposer = term.onData((d) => {
         if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
       });
@@ -383,6 +395,13 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const id = sessionIdRef.current;
     if (id != null) ptyWrite(id, "\x03").catch(() => {});
   };
+
+  // Stable register callback for the compose box: it hands us its append-to-box
+  // writer so global ⌘J dictation routes into the box. Stable identity keeps the
+  // composer's effect from re-firing every render.
+  const registerComposer = useCallback((append: (text: string) => void) => {
+    composerAppendRef.current = append;
+  }, []);
 
   // ESC → PTY. Claude code: stop generating; press again to edit the previous
   // message. Lets you drive claude's Esc behaviour from the compose box.
@@ -493,7 +512,11 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
           onSend={composerSend}
           onInterrupt={interrupt}
           onEscape={sendEscape}
-          onClose={() => setComposerOpen(false)}
+          onClose={() => {
+            composerAppendRef.current = null;
+            setComposerOpen(false);
+          }}
+          register={registerComposer}
         />
       )}
     </div>
