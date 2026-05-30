@@ -1375,6 +1375,21 @@ export function ChatPane({
         },
       },
       {
+        id: "goal",
+        label: "/goal",
+        desc: "set an ongoing goal (prepended each turn)",
+        icon: <Target size={14} />,
+        run: () => {
+          setOverlay(null);
+          setInput("");
+          const next = window.prompt(
+            "pursue goal — prepended as context each turn until cleared:",
+            goal,
+          );
+          if (next != null) setGoal(next.trim());
+        },
+      },
+      {
         id: "resume",
         label: "/resume",
         desc: "reopen a past conversation",
@@ -1431,7 +1446,7 @@ export function ChatPane({
         },
       },
     ],
-    [clearSession, loadResumeSessions, sendText],
+    [clearSession, loadResumeSessions, sendText, goal],
   );
 
   // load dir entries for the @-mention picker (lazy, on first open)
@@ -1894,41 +1909,8 @@ export function ChatPane({
               )}
             </Dropdown>
 
-            {/* plan toggle */}
-            <button
-              type="button"
-              onClick={() => setPlanMode((p) => !p)}
-              title="plan first on the next message"
-              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
-                planMode
-                  ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                  : "border-[var(--color-border)] bg-[var(--color-panel)]/50 text-[var(--color-text-2)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
-              }`}
-            >
-              <ListChecks size={13} />
-              <span>plan</span>
-            </button>
-
-            {/* pursue-goal pill: set / focus */}
-            <button
-              type="button"
-              onClick={() => {
-                const next = window.prompt(
-                  "pursue goal — prepended as context each turn until cleared:",
-                  goal,
-                );
-                if (next != null) setGoal(next.trim());
-              }}
-              title="set an ongoing goal"
-              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
-                goal
-                  ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                  : "border-[var(--color-border)] bg-[var(--color-panel)]/50 text-[var(--color-text-2)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
-              }`}
-            >
-              <Target size={13} />
-              <span>goal</span>
-            </button>
+            {/* plan + goal moved off the bar (use /plan, /goal) to keep it sleek;
+                their active state still shows as a chip above the composer. */}
 
             {/* right action cluster — pinned right (ml-auto), stays together and
                 wraps to its own line on a narrow pane so send is never clipped */}
