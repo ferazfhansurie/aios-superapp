@@ -7,9 +7,27 @@
 import { SPAWN } from "./apps";
 
 const STORAGE_KEY = "aios.sidebar";
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
-export type SidebarGroup = "sessions" | "tools" | "pinned";
+/** A space = a named, collapsible section of the rail. The three built-ins
+ *  (sessions / tools / pinned) are `system` — they can be renamed + collapsed +
+ *  reordered, but not deleted. The user can create their own spaces and sort
+ *  apps + pinned sites into them. An item's `group` is the id of its space. */
+export type SidebarGroup = string;
+
+export const SYSTEM_SPACES = ["sessions", "tools", "pinned"] as const;
+const SYSTEM_SPACE_NAMES: Record<string, string> = {
+  sessions: "sessions",
+  tools: "tools",
+  pinned: "pinned",
+};
+
+export interface SidebarSpace {
+  id: string; // stable id ("sessions" etc for system, uuid for custom)
+  name: string; // user-editable display name
+  collapsed?: boolean; // section folded shut
+  system?: boolean; // built-in (cannot be deleted)
+}
 
 export type SidebarItemKind =
   | { type: "app"; appId: string } // references a built-in SPAWN entry by stable id
@@ -21,13 +39,19 @@ export interface SidebarItem {
   iconName: string; // lucide icon name OR "favicon" for links
   faviconUrl?: string; // for link items: cached favicon url
   kind: SidebarItemKind;
-  group: SidebarGroup; // which section it lives in
+  group: SidebarGroup; // id of the space it lives in
   hidden?: boolean; // user hid a default app
 }
 
 export interface SidebarState {
   items: SidebarItem[]; // ORDER in this array == render order
+  spaces: SidebarSpace[]; // ORDER == section render order
   version: number; // schema version for migrations
+}
+
+/** The three built-in spaces, in their canonical order. */
+function defaultSpaces(): SidebarSpace[] {
+  return SYSTEM_SPACES.map((id) => ({ id, name: SYSTEM_SPACE_NAMES[id], system: true }));
 }
 
 /** A small, stable id generator (crypto.randomUUID with a fallback). */
@@ -44,6 +68,7 @@ function uid(): string {
 export function seedDefault(): SidebarState {
   return {
     version: SCHEMA_VERSION,
+    spaces: defaultSpaces(),
     items: SPAWN.map((a) => ({
       id: `app:${a.id}`,
       label: a.id === "chat" ? "new chat" : a.label,
@@ -86,7 +111,36 @@ export function loadSidebar(): SidebarState {
     const additions = seeded.items.filter(
       (it) => it.kind.type === "app" && !present.has((it.kind as { appId: string }).appId),
     );
-    cache = { version: SCHEMA_VERSION, items: [...kept, ...additions] };
+    const items = [...kept, ...additions];
+
+    // Spaces: use stored ones if present (v2+); otherwise synthesize (v1 → v2
+    // migration) from the built-in three plus any custom group ids items
+    // reference. Then guarantee every item points at an existing space.
+    const storedSpaces = Array.isArray(stored.spaces) ? (stored.spaces as SidebarSpace[]) : null;
+    let spaces: SidebarSpace[];
+    if (storedSpaces && storedSpaces.length) {
+      // re-assert system flags + ensure the three built-ins always exist.
+      const byId = new Map(storedSpaces.map((s) => [s.id, { ...s }]));
+      for (const id of SYSTEM_SPACES) {
+        const ex = byId.get(id);
+        if (ex) ex.system = true;
+        else byId.set(id, { id, name: SYSTEM_SPACE_NAMES[id], system: true });
+      }
+      // keep stored order, appending any missing system space at the end.
+      const ordered = storedSpaces.map((s) => byId.get(s.id)!).filter(Boolean);
+      for (const id of SYSTEM_SPACES) {
+        if (!ordered.some((s) => s.id === id)) ordered.push(byId.get(id)!);
+      }
+      spaces = ordered;
+    } else {
+      const custom = Array.from(new Set(items.map((it) => it.group))).filter(
+        (g) => !SYSTEM_SPACES.includes(g as (typeof SYSTEM_SPACES)[number]),
+      );
+      spaces = [...defaultSpaces(), ...custom.map((id) => ({ id, name: id }))];
+    }
+    const knownSpaces = new Set(spaces.map((s) => s.id));
+    const fixed = items.map((it) => (knownSpaces.has(it.group) ? it : { ...it, group: "pinned" }));
+    cache = { version: SCHEMA_VERSION, spaces, items: fixed };
   } catch {
     cache = seeded;
   }
@@ -124,8 +178,13 @@ export function reorder(fromIndex: number, toIndex: number): SidebarState {
   return saveSidebar({ ...loadSidebar(), items });
 }
 
-/** Pin a website → a link item in the "pinned" group. */
-export function addLink(url: string, label?: string, faviconUrl?: string): SidebarState {
+/** Pin a website → a link item in a space (default "pinned"). */
+export function addLink(
+  url: string,
+  label?: string,
+  faviconUrl?: string,
+  spaceId: string = "pinned",
+): SidebarState {
   const norm = /^https?:\/\//i.test(url) ? url : `https://${url}`;
   let host = "";
   try {
@@ -141,10 +200,11 @@ export function addLink(url: string, label?: string, faviconUrl?: string): Sideb
     iconName: "favicon",
     faviconUrl: favicon,
     kind: { type: "link", url: norm },
-    group: "pinned",
+    group: spaceId,
   };
   const cur = loadSidebar();
-  return saveSidebar({ ...cur, items: [...cur.items, item] });
+  const group = cur.spaces.some((s) => s.id === spaceId) ? spaceId : "pinned";
+  return saveSidebar({ ...cur, items: [...cur.items, { ...item, group }] });
 }
 
 /** Remove an item entirely (used for unpinning links). */
@@ -183,7 +243,70 @@ export function setGroup(id: string, group: SidebarGroup): SidebarState {
   });
 }
 
-/** Restore the default sidebar (drops all links + un-hides built-ins). */
+/* ── spaces ────────────────────────────────────────────────────────────── */
+
+/** Create a new (custom) space at the end of the rail. Returns its id. */
+export function addSpace(name: string): { state: SidebarState; id: string } {
+  const cur = loadSidebar();
+  const clean = name.trim().slice(0, 32) || "new space";
+  const space: SidebarSpace = { id: uid(), name: clean };
+  return { state: saveSidebar({ ...cur, spaces: [...cur.spaces, space] }), id: space.id };
+}
+
+/** Rename a space (system or custom). */
+export function renameSpace(id: string, name: string): SidebarState {
+  const cur = loadSidebar();
+  const clean = name.trim().slice(0, 32);
+  if (!clean) return cur;
+  return saveSidebar({
+    ...cur,
+    spaces: cur.spaces.map((s) => (s.id === id ? { ...s, name: clean } : s)),
+  });
+}
+
+/** Delete a custom space; its items fall back to the "pinned" space so nothing
+ *  is lost. System spaces are protected (no-op). */
+export function removeSpace(id: string): SidebarState {
+  const cur = loadSidebar();
+  const target = cur.spaces.find((s) => s.id === id);
+  if (!target || target.system) return cur;
+  return saveSidebar({
+    ...cur,
+    spaces: cur.spaces.filter((s) => s.id !== id),
+    items: cur.items.map((it) => (it.group === id ? { ...it, group: "pinned" } : it)),
+  });
+}
+
+/** Collapse / expand a space (or set explicitly). */
+export function toggleSpaceCollapsed(id: string, collapsed?: boolean): SidebarState {
+  const cur = loadSidebar();
+  return saveSidebar({
+    ...cur,
+    spaces: cur.spaces.map((s) =>
+      s.id === id ? { ...s, collapsed: collapsed ?? !s.collapsed } : s,
+    ),
+  });
+}
+
+/** Reorder spaces (absolute indices into the spaces array). */
+export function moveSpace(fromIndex: number, toIndex: number): SidebarState {
+  const cur = loadSidebar();
+  const spaces = [...cur.spaces];
+  if (
+    fromIndex < 0 ||
+    fromIndex >= spaces.length ||
+    toIndex < 0 ||
+    toIndex >= spaces.length ||
+    fromIndex === toIndex
+  ) {
+    return cur;
+  }
+  const [moved] = spaces.splice(fromIndex, 1);
+  spaces.splice(toIndex, 0, moved);
+  return saveSidebar({ ...cur, spaces });
+}
+
+/** Restore the default sidebar (drops all links + custom spaces + un-hides). */
 export function resetSidebar(): SidebarState {
   return saveSidebar(seedDefault());
 }

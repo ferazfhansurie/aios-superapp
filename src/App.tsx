@@ -2,12 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import {
   Camera,
+  ChevronDown,
+  ChevronRight,
   EllipsisVertical,
   Folder,
+  FolderPlus,
   Globe,
   GripVertical,
   MessageSquare,
   MessageCircle,
+  MoveRight,
   PanelLeft,
   Pencil,
   Pin,
@@ -21,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 
+import { recallUrl } from "./lib/browser-mem";
 import { AccountMenu } from "./components/AccountMenu";
 import { AutomationsPane } from "./components/AutomationsPane";
 import { BridgesPane } from "./components/BridgesPane";
@@ -61,8 +66,14 @@ import {
   removeItem,
   renameItem,
   toggleHidden,
+  setGroup,
+  addSpace,
+  renameSpace,
+  removeSpace,
+  toggleSpaceCollapsed,
   subscribe as subscribeSidebar,
   type SidebarItem,
+  type SidebarSpace,
   type SidebarState,
 } from "./lib/sidebar";
 
@@ -117,10 +128,11 @@ function App() {
   const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
   useEffect(() => subscribeSidebar(setSidebar), []);
   // "pin a site" inline prompt.
-  const [pinSiteOpen, setPinSiteOpen] = useState(false);
+  // which space the pin-a-site modal targets (null = closed).
+  const [pinSiteSpace, setPinSiteSpace] = useState<string | null>(null);
   // Native browser webviews paint ABOVE html, so any floating overlay (modals,
   // palette) must hide them or it gets occluded.
-  const overlayOpen = settingsOpen || paletteOpen || pinSiteOpen;
+  const overlayOpen = settingsOpen || paletteOpen || pinSiteSpace != null;
 
   useEffect(() => {
     const t = setTimeout(() => setSplash(false), 850);
@@ -143,7 +155,12 @@ function App() {
   const spawnSidebarItem = useCallback(
     (item: SidebarItem) => {
       if (item.kind.type === "link") {
-        spawn({ type: "browser", url: item.kind.url }, item.label);
+        // resume at the last place this pinned site was left, falling back to its
+        // pinned url; memKey = the stable item id so the memory survives restarts.
+        spawn(
+          { type: "browser", url: recallUrl(item.id) ?? item.kind.url, memKey: item.id },
+          item.label,
+        );
         return;
       }
       const app = SPAWN_BY_ID[item.kind.appId];
@@ -535,7 +552,7 @@ function App() {
               <SidebarRail
                 state={sidebar}
                 onSpawn={spawnSidebarItem}
-                onPinSite={() => setPinSiteOpen(true)}
+                onPinSite={(spaceId) => setPinSiteSpace(spaceId)}
               />
               <OracleRoster onAttachOracle={addOracle} onAttachTmux={addTmux} />
             </div>
@@ -663,7 +680,7 @@ function App() {
 
       <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} commands={commands} />
-      <PinSiteModal open={pinSiteOpen} onClose={() => setPinSiteOpen(false)} />
+      <PinSiteModal spaceId={pinSiteSpace} onClose={() => setPinSiteSpace(null)} />
     </div>
   );
 }
@@ -717,10 +734,105 @@ function NavRow({
 
 /* ── personalizable sidebar rail ─────────────────────────────────────────── */
 
-const GROUP_ORDER = ["sessions", "tools", "pinned"] as const;
+/** A collapsible space header: click the title to fold/unfold; hover reveals a
+ *  ⋯ menu (rename always; delete only for custom spaces — the three built-ins
+ *  are protected). Inline rename mirrors the row rename UX. */
+function SpaceHeader({ space, count }: { space: SidebarSpace; count: number }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(space.name);
+  const menuRef = useRef<HTMLDivElement>(null);
 
-/** The store-driven rail: built-in apps + pinned sites, grouped, drag-to-reorder
- *  (native HTML5 DnD), with per-row rename / hide / unpin actions. */
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
+
+  const commit = () => {
+    const v = draft.trim();
+    if (v && v !== space.name) renameSpace(space.id, v);
+    setRenaming(false);
+  };
+
+  if (renaming) {
+    return (
+      <div className="px-2.5 py-1">
+        <input
+          autoFocus
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+            else if (e.key === "Escape") {
+              setDraft(space.name);
+              setRenaming(false);
+            }
+          }}
+          spellCheck={false}
+          className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-0.5 text-[11px] uppercase tracking-wide text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="group/sh relative flex items-center pl-1.5 pr-1">
+      <button
+        onClick={() => toggleSpaceCollapsed(space.id)}
+        className="flex min-w-0 flex-1 items-center gap-1 py-1 text-left text-[10px] font-medium uppercase tracking-wide text-[var(--color-faint)] transition-colors hover:text-[var(--color-muted)]"
+        title={space.collapsed ? "expand" : "collapse"}
+      >
+        {space.collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+        <span className="truncate">{space.name}</span>
+        {space.collapsed && count > 0 && (
+          <span className="text-[var(--color-faint)]">({count})</span>
+        )}
+      </button>
+      <div ref={menuRef} className="relative shrink-0">
+        <button
+          onClick={() => setMenuOpen((o) => !o)}
+          className="grid h-5 w-5 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-text)] group-hover/sh:opacity-100"
+          title="space options"
+        >
+          <EllipsisVertical size={12} />
+        </button>
+        {menuOpen && (
+          <div className="absolute right-0 top-full z-50 mt-1 w-36 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
+            <RowMenuItem
+              icon={<Pencil size={13} />}
+              label="rename"
+              onClick={() => {
+                setDraft(space.name);
+                setRenaming(true);
+                setMenuOpen(false);
+              }}
+            />
+            {!space.system && (
+              <RowMenuItem
+                icon={<Trash2 size={13} />}
+                label="delete space"
+                onClick={() => {
+                  removeSpace(space.id);
+                  setMenuOpen(false);
+                }}
+              />
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** The store-driven rail: built-in apps + pinned sites organized into SPACES
+ *  (collapsible, user-creatable sections). Drag-to-reorder rows within/across
+ *  spaces (native HTML5 DnD); per-row rename / hide / unpin / move-to-space;
+ *  per-space rename / collapse / delete; "+ new space" at the foot. */
 function SidebarRail({
   state,
   onSpawn,
@@ -728,7 +840,7 @@ function SidebarRail({
 }: {
   state: SidebarState;
   onSpawn: (item: SidebarItem) => void;
-  onPinSite: () => void;
+  onPinSite: (spaceId: string) => void;
 }) {
   // index of the row being dragged + the row currently hovered (drop target),
   // both into the FULL ordered items array (reorder() takes absolute indices).
@@ -736,75 +848,108 @@ function SidebarRail({
   const [overIdx, setOverIdx] = useState<number | null>(null);
 
   const items = state.items;
+  const spaces = state.spaces;
   const indexOf = useCallback(
     (id: string) => items.findIndex((it) => it.id === id),
     [items],
   );
 
+  // Drop onto a row: if it came from another space, reassign it to the target's
+  // space first (that's how you sort an item into a space by dragging), then
+  // reorder to the drop position.
   const onDrop = useCallback(
-    (toId: string) => {
+    (toId: string, toGroup: string) => {
       const from = dragIdx;
-      const to = indexOf(toId);
+      const dragged = from != null ? items[from] : null;
       setDragIdx(null);
       setOverIdx(null);
-      if (from == null || to < 0 || from === to) return;
-      reorder(from, to);
+      const to = indexOf(toId);
+      if (from == null || to < 0 || !dragged) return;
+      if (dragged.group !== toGroup) setGroup(dragged.id, toGroup);
+      if (from !== to) reorder(from, to);
     },
-    [dragIdx, indexOf],
+    [dragIdx, items, indexOf],
   );
 
-  const renderGroup = (group: (typeof GROUP_ORDER)[number], withBorder: boolean) => {
-    const rows = items.filter((it) => it.group === group && !it.hidden);
-    const isPinned = group === "pinned";
-    if (!rows.length && !isPinned) return null;
-    return (
-      <div
-        key={group}
-        className={`flex flex-col gap-0.5 ${withBorder ? "border-t border-[var(--color-border)] pt-2" : ""}`}
-      >
-        {rows.map((it) => {
-          const idx = indexOf(it.id);
-          return (
-            <SidebarRow
-              key={it.id}
-              item={it}
-              dragging={dragIdx === idx}
-              over={overIdx === idx && dragIdx !== idx}
-              onSpawn={() => onSpawn(it)}
-              onDragStart={() => setDragIdx(idx)}
-              onDragEnter={() => setOverIdx(idx)}
-              onDragEnd={() => {
-                setDragIdx(null);
-                setOverIdx(null);
-              }}
-              onDrop={() => onDrop(it.id)}
-            />
-          );
-        })}
-        {isPinned && (
-          <button
-            onClick={onPinSite}
-            className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[12px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-            title="pin a website to the sidebar"
-          >
-            <Plus size={14} className="shrink-0" />
-            pin a site
-          </button>
-        )}
-      </div>
-    );
-  };
+  // Drop onto an (empty area of a) space: just reassign space, keep order.
+  const onDropToSpace = useCallback(
+    (group: string) => {
+      const from = dragIdx;
+      const dragged = from != null ? items[from] : null;
+      setDragIdx(null);
+      setOverIdx(null);
+      if (!dragged) return;
+      if (dragged.group !== group) setGroup(dragged.id, group);
+    },
+    [dragIdx, items],
+  );
 
-  // border-top only once a prior group has actually rendered (so an empty
-  // sessions group doesn't leave a stray divider above tools).
-  let rendered = 0;
+  const spaceNames = spaces.map((s) => ({ id: s.id, name: s.name }));
+
   return (
     <>
-      {GROUP_ORDER.map((g) => {
-        const node = renderGroup(g, rendered > 0);
-        if (node) rendered += 1;
-        return node;
+      {spaces.map((space, si) => {
+        const rows = items.filter((it) => it.group === space.id && !it.hidden);
+        const isPinned = space.id === "pinned";
+        return (
+          <div
+            key={space.id}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={() => onDropToSpace(space.id)}
+            className={`flex flex-col gap-0.5 ${si > 0 ? "border-t border-[var(--color-border)] pt-1.5" : ""}`}
+          >
+            <SpaceHeader space={space} count={rows.length} />
+            {!space.collapsed && (
+              <>
+                {rows.map((it) => {
+                  const idx = indexOf(it.id);
+                  return (
+                    <SidebarRow
+                      key={it.id}
+                      item={it}
+                      spaces={spaceNames}
+                      dragging={dragIdx === idx}
+                      over={overIdx === idx && dragIdx !== idx}
+                      onSpawn={() => onSpawn(it)}
+                      onSetSpace={(g) => setGroup(it.id, g)}
+                      onDragStart={() => setDragIdx(idx)}
+                      onDragEnter={() => setOverIdx(idx)}
+                      onDragEnd={() => {
+                        setDragIdx(null);
+                        setOverIdx(null);
+                      }}
+                      onDrop={() => onDrop(it.id, space.id)}
+                    />
+                  );
+                })}
+                {isPinned && (
+                  <button
+                    onClick={() => onPinSite(space.id)}
+                    className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[12px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                    title="pin a website to the sidebar"
+                  >
+                    <Plus size={14} className="shrink-0" />
+                    pin a site
+                  </button>
+                )}
+                {!isPinned && rows.length === 0 && (
+                  <div className="px-2.5 py-1.5 text-[11px] italic text-[var(--color-faint)]">
+                    drag items here
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        );
       })}
+      <button
+        onClick={() => addSpace("new space")}
+        className="group mt-1.5 flex w-full items-center gap-2.5 rounded-md border-t border-[var(--color-border)] px-2.5 pt-2.5 pb-1.5 text-left text-[12px] text-[var(--color-faint)] transition-colors hover:text-[var(--color-text)]"
+        title="create a new space"
+      >
+        <FolderPlus size={14} className="shrink-0" />
+        new space
+      </button>
     </>
   );
 }
@@ -813,24 +958,29 @@ function SidebarRail({
  *  favicon (links), with a hover ⋯ menu (rename / hide / unpin). */
 function SidebarRow({
   item,
+  spaces,
   dragging,
   over,
   onSpawn,
+  onSetSpace,
   onDragStart,
   onDragEnter,
   onDragEnd,
   onDrop,
 }: {
   item: SidebarItem;
+  spaces: { id: string; name: string }[];
   dragging: boolean;
   over: boolean;
   onSpawn: () => void;
+  onSetSpace: (spaceId: string) => void;
   onDragStart: () => void;
   onDragEnter: () => void;
   onDragEnd: () => void;
   onDrop: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [moveOpen, setMoveOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(item.label);
   const [favBroken, setFavBroken] = useState(false);
@@ -847,6 +997,11 @@ function SidebarRow({
     };
     window.addEventListener("mousedown", onDown);
     return () => window.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
+
+  // close the nested move-to submenu whenever the parent menu closes.
+  useEffect(() => {
+    if (!menuOpen) setMoveOpen(false);
   }, [menuOpen]);
 
   const commitRename = () => {
@@ -925,7 +1080,7 @@ function SidebarRow({
           <EllipsisVertical size={13} />
         </button>
         {menuOpen && (
-          <div className="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
+          <div className="absolute right-0 top-full z-50 mt-1 w-44 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
             <RowMenuItem
               icon={<Pencil size={13} />}
               label="rename"
@@ -935,6 +1090,40 @@ function SidebarRow({
                 setMenuOpen(false);
               }}
             />
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setMoveOpen((o) => !o)}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--color-panel)]"
+              >
+                <MoveRight size={13} className="shrink-0 text-[var(--color-muted)]" />
+                <span className="flex-1">move to space</span>
+                <ChevronRight size={12} className="text-[var(--color-faint)]" />
+              </button>
+              {moveOpen && (
+                <div className="mb-1 ml-5 flex flex-col border-l border-[var(--color-border)] pl-1">
+                  {spaces.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      disabled={s.id === item.group}
+                      onClick={() => {
+                        onSetSpace(s.id);
+                        setMenuOpen(false);
+                      }}
+                      className={`truncate px-3 py-1 text-left ${
+                        s.id === item.group
+                          ? "text-[var(--color-accent)]"
+                          : "text-[var(--color-text-2)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+                      }`}
+                    >
+                      {s.id === item.group ? "• " : ""}
+                      {s.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             {isLink ? (
               <RowMenuItem
                 icon={<Trash2 size={13} />}
@@ -982,7 +1171,8 @@ function RowMenuItem({
 }
 
 /** Inline modal to pin a website by url (favicon resolved by the store). */
-function PinSiteModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+function PinSiteModal({ spaceId, onClose }: { spaceId: string | null; onClose: () => void }) {
+  const open = spaceId != null;
   const [url, setUrl] = useState("");
   const [label, setLabel] = useState("");
   useEffect(() => {
@@ -995,7 +1185,7 @@ function PinSiteModal({ open, onClose }: { open: boolean; onClose: () => void })
   const submit = () => {
     const u = url.trim();
     if (!u) return;
-    addLink(u, label.trim() || undefined);
+    addLink(u, label.trim() || undefined, undefined, spaceId ?? "pinned");
     onClose();
   };
   return (
@@ -1158,6 +1348,7 @@ function PaneCard({
             active={active}
             initialUrl={pane.kind.url}
             initialProfile={pane.kind.profile}
+            memKey={pane.kind.memKey}
             onAnnotate={onAnnotate}
             onProfileChange={onProfileChange}
           />

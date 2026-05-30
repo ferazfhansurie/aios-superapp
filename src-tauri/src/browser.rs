@@ -100,6 +100,15 @@ pub fn browser_set_bounds(
     Ok(())
 }
 
+/// Returns the webview's CURRENT url (reflects in-page navigation the address
+/// bar never saw). The frontend polls this to (a) keep the address bar live and
+/// (b) remember a pinned site's last location so reopening returns there.
+#[tauri::command]
+pub fn browser_current_url(app: AppHandle, label: String) -> Option<String> {
+    app.get_webview(&label)
+        .and_then(|wv| wv.url().ok().map(|u| u.to_string()))
+}
+
 #[tauri::command]
 pub fn browser_navigate(app: AppHandle, label: String, url: String) -> Result<(), String> {
     let parsed = parse(&url)?;

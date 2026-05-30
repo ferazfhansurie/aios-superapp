@@ -133,6 +133,7 @@ pub fn run() {
             chat::read_chat_transcript,
             browser::browser_show,
             browser::browser_set_bounds,
+            browser::browser_current_url,
             browser::browser_navigate,
             browser::browser_back,
             browser::browser_forward,
