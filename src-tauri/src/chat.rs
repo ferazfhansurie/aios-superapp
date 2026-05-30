@@ -529,6 +529,10 @@ fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<
                 }
             }
             cmd.arg("--json").arg("--skip-git-repo-check");
+            // Chat is conversational — skip MCP servers so each turn doesn't
+            // re-attempt (and time out on) figma/vercel auth, which adds seconds
+            // of tail latency per message. Pure speed win for the chat path.
+            cmd.arg("-c").arg("mcp_servers={}");
             if let Some(m) = model.as_deref().filter(|s| !s.is_empty()) {
                 cmd.arg("-m").arg(m);
             }

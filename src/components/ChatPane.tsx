@@ -657,6 +657,19 @@ export function ChatPane({
           );
         }
         for (const b of blocks) {
+          // text fallback: claude streams text via content_block_delta tokens, so
+          // the bubble is already built by the time this final message lands. But
+          // engines without token-streaming (codex/opencode) emit ONLY the whole
+          // message — so when no streaming bubble exists, render the text here.
+          if (b.type === "text") {
+            const full = (b.text ?? "").trim();
+            if (full && streamingTurnId.current == null) {
+              setTurns((prev) => [
+                ...prev,
+                { kind: "assistant", id: uid(), text: full, streaming: false },
+              ]);
+            }
+          }
           // thinking fallback: if partial-message deltas didn't build a block
           // (e.g. replay or thinking arriving whole), synthesize one from text.
           if (b.type === "thinking") {
