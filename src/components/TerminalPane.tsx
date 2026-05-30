@@ -21,7 +21,7 @@ import {
   spawnTerminal,
   spawnTmux,
 } from "../lib/pty";
-import { saveImageTemp } from "../lib/fs";
+import { homeDir, saveImageTemp } from "../lib/fs";
 import { paneWriters } from "../lib/paneBus";
 import { TerminalComposer } from "./TerminalComposer";
 
@@ -115,6 +115,11 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       (kind.type === "shell" && kind.cmd === "claude"),
   );
   const [savingImg, setSavingImg] = useState(false);
+  // Best-effort cwd for the composer's context bar: a shell pane's explicit cwd,
+  // else the home dir (oracle/tmux panes don't carry one). Read-only label only.
+  const [paneCwd, setPaneCwd] = useState<string | undefined>(
+    kind.type === "shell" ? kind.cwd : undefined,
+  );
   // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
   const [buttons, setButtons] = useState<string[] | null>(null);
   const bufRef = useRef("");
@@ -396,6 +401,21 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     if (id != null) ptyWrite(id, "\x03").catch(() => {});
   };
 
+  // Fall back to the home dir for the composer's context chip when this pane has
+  // no explicit cwd (oracle / tmux / plain shell). Best-effort, label-only.
+  useEffect(() => {
+    if (paneCwd) return;
+    let alive = true;
+    homeDir()
+      .then((h) => {
+        if (alive) setPaneCwd(h);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [paneCwd]);
+
   // Stable register callback for the compose box: it hands us its append-to-box
   // writer so global ⌘J dictation routes into the box. Stable identity keeps the
   // composer's effect from re-firing every render.
@@ -517,6 +537,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
             setComposerOpen(false);
           }}
           register={registerComposer}
+          cwd={paneCwd}
         />
       )}
     </div>
