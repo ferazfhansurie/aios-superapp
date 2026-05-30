@@ -31,6 +31,7 @@ import {
   browserClearCookies,
   browserClose,
   browserCopySelection,
+  browserCurrentUrl,
   browserDeviceMode,
   browserEnterAnnotate,
   browserExitAnnotate,
@@ -48,6 +49,7 @@ import {
 } from "../lib/browser";
 import { addLink } from "../lib/sidebar";
 import { DEFAULT_PROFILE, addProfile, loadProfiles } from "../lib/profiles";
+import { rememberUrl } from "../lib/browser-mem";
 
 const ANNOT_SENTINEL = "AIOS_ANNOT:";
 const ANNOT_POLL_MS = 700;
@@ -71,6 +73,7 @@ export function BrowserPane({
   active = true,
   initialUrl,
   initialProfile,
+  memKey,
   onAnnotate,
   onProfileChange,
 }: {
@@ -78,6 +81,9 @@ export function BrowserPane({
   active?: boolean;
   /** Optional starting url (e.g. a pinned-site sidebar item deep-links here). */
   initialUrl?: string;
+  /** Stable id (pinned-site sidebar id) under which to remember this pane's last
+   *  location, so reopening returns where it left off. Omit = no memory. */
+  memKey?: string;
   /** Cookie-partition profile this pane opens in (lets a second/third Google
    *  account stay logged in alongside the first). Defaults to the shared store. */
   initialProfile?: string;
@@ -105,6 +111,10 @@ export function BrowserPane({
   const [annotating, setAnnotating] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const shownRef = useRef(false);
+  const inputFocusedRef = useRef(false);
+  // last url we observed from the live webview — dedupes the poll so we only
+  // persist + update the address bar on a real navigation.
+  const lastUrlRef = useRef(start);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Last clipboard payload we already consumed — so the poll only fires
   // `onAnnotate` once per fresh annotation, never re-emitting stale text.
@@ -149,6 +159,29 @@ export function BrowserPane({
       clearInterval(poll);
     };
   }, [active, current, label, profile, rect]);
+
+  // Poll the webview's REAL url (catches in-page navigation the address bar never
+  // sees). On a real change: remember it (pinned sites resume here) and sync the
+  // address bar — unless the user is mid-edit in it.
+  useEffect(() => {
+    if (!active) return;
+    const tick = () => {
+      if (!shownRef.current) return;
+      browserCurrentUrl(label)
+        .then((u) => {
+          if (!u || u === "about:blank" || u === lastUrlRef.current) return;
+          lastUrlRef.current = u;
+          rememberUrl(memKey, u);
+          if (!inputFocusedRef.current) {
+            setCurrent(u);
+            setInput(u);
+          }
+        })
+        .catch(() => {});
+    };
+    const poll = setInterval(tick, 1500);
+    return () => clearInterval(poll);
+  }, [active, label, memKey]);
 
   // Switch the pane to another cookie partition. The data store is fixed at
   // webview creation, so switching = destroy the current webview + let the show
@@ -394,6 +427,8 @@ export function BrowserPane({
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onFocus={() => (inputFocusedRef.current = true)}
+            onBlur={() => (inputFocusedRef.current = false)}
             spellCheck={false}
             className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1 font-mono text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/50"
             placeholder="search or enter url"

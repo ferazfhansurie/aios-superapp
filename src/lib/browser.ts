@@ -15,6 +15,8 @@ export const browserSetBounds = (label: string, r: Rect) =>
   invoke("browser_set_bounds", { label, ...r });
 export const browserNavigate = (label: string, url: string) =>
   invoke("browser_navigate", { label, url });
+export const browserCurrentUrl = (label: string) =>
+  invoke<string | null>("browser_current_url", { label });
 export const browserBack = (label: string) => invoke("browser_back", { label });
 export const browserForward = (label: string) => invoke("browser_forward", { label });
 export const browserReload = (label: string) => invoke("browser_reload", { label });
