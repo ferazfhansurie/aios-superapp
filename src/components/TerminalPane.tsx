@@ -123,6 +123,18 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
   const [buttons, setButtons] = useState<string[] | null>(null);
   const bufRef = useRef("");
+  // claude-code's live state, parsed best-effort from its TUI output (the raw
+  // PTY has no API to query it). Drives the composer's mode + model pills so they
+  // reflect REALITY instead of generic labels. Kept in a ref + state so the
+  // per-chunk parse only re-renders when something actually changes.
+  const [claudeStatus, setClaudeStatus] = useState<{
+    mode?: string;
+    model?: string;
+    ctxPct?: number;
+  }>({});
+  const claudeStatusRef = useRef<{ mode?: string; model?: string; ctxPct?: number }>(
+    {},
+  );
   const lastBtnRef = useRef("");
   // When the compose box is open, an "append to box" writer it registers — so
   // global ⌘J dictation (App's single VoiceButton) lands in the box, exactly
@@ -276,6 +288,43 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       const clean = raw
         .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
         .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+      // parse claude-code's live status out of the same cleaned window:
+      //   mode  — the footer hint "⏵⏵ bypass permissions on / plan mode on / …"
+      //   model — "Opus 4.8" / "Sonnet 4.6" / "Haiku 4.5" wherever it's printed
+      //   ctx%  — claude's "NN% context left" / "context: NN%" readout
+      // Best-effort + sticky: update only on a fresh match, keep last otherwise.
+      {
+        const prev = claudeStatusRef.current;
+        const next = { ...prev };
+        const modeM = clean.match(
+          /(bypass permissions|accept edits|plan mode|normal mode)\b/i,
+        );
+        if (modeM) {
+          const m = modeM[1].toLowerCase();
+          next.mode = m.startsWith("bypass")
+            ? "full access"
+            : m.startsWith("accept")
+              ? "accept edits"
+              : m.startsWith("plan")
+                ? "plan"
+                : "ask each time";
+        }
+        const modelM = clean.match(/\b(opus|sonnet|haiku)\s+(\d+(?:\.\d+)?)/i);
+        if (modelM) {
+          next.model = `${modelM[1][0].toUpperCase()}${modelM[1].slice(1).toLowerCase()} ${modelM[2]}`;
+        }
+        const ctxM = clean.match(/(\d+)%\s*context\s*(?:left|remaining)/i);
+        if (ctxM) next.ctxPct = Number(ctxM[1]);
+        if (
+          next.mode !== prev.mode ||
+          next.model !== prev.model ||
+          next.ctxPct !== prev.ctxPct
+        ) {
+          claudeStatusRef.current = next;
+          setClaudeStatus(next);
+        }
+      }
+
       const matches = [...clean.matchAll(/\[\[btn:\s*([^\]]+?)\]\]/gi)];
       const last = matches[matches.length - 1];
       if (last && last[1] !== lastBtnRef.current) {
@@ -572,6 +621,9 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
           }}
           register={registerComposer}
           cwd={paneCwd}
+          liveMode={claudeStatus.mode}
+          liveModel={claudeStatus.model}
+          liveCtxPct={claudeStatus.ctxPct}
         />
       )}
     </div>

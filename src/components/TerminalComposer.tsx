@@ -142,6 +142,9 @@ export function TerminalComposer({
   onClose,
   register,
   cwd,
+  liveMode,
+  liveModel,
+  liveCtxPct,
 }: {
   /** Write the composed text to the PTY (the pane appends the CR). */
   onSend: (text: string) => void;
@@ -165,6 +168,14 @@ export function TerminalComposer({
   register?: (append: (text: string) => void) => void;
   /** Working directory for this pane — drives the context bar + @-mention picker. */
   cwd?: string;
+  /** claude-code's live mode, parsed from its TUI by TerminalPane (e.g. "full
+   *  access" / "plan" / "accept edits"). Reflects the pill instead of a generic
+   *  label; undefined until first parsed. */
+  liveMode?: string;
+  /** claude-code's live model, parsed from its TUI (e.g. "Opus 4.8"). */
+  liveModel?: string;
+  /** claude-code's "% context left", parsed from its TUI (0–100). */
+  liveCtxPct?: number;
 }) {
   const [value, setValue] = useState("");
   const [images, setImages] = useState<ImageChip[]>([]);
@@ -1023,10 +1034,21 @@ export function TerminalComposer({
             type="button"
             onClick={() => onRaw?.("\x1b[Z")}
             title="cycle claude permission mode (Shift+Tab)"
-            className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
+              liveMode && liveMode !== "ask each time"
+                ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
+                : "border-[var(--color-border)] bg-[var(--color-panel)]/50 text-[var(--color-text-2)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            }`}
           >
-            <ShieldCheck size={13} className="text-[var(--color-muted)]" />
-            <span>permissions</span>
+            <ShieldCheck
+              size={13}
+              className={
+                liveMode && liveMode !== "ask each time"
+                  ? "text-[var(--color-accent)]"
+                  : "text-[var(--color-muted)]"
+              }
+            />
+            <span>{liveMode ?? "permissions"}</span>
             <ChevronDown size={12} className="text-[var(--color-faint)]" />
           </button>
 
@@ -1055,9 +1077,23 @@ export function TerminalComposer({
             className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
           >
             <Sparkles size={13} className="text-[var(--color-muted)]" />
-            <span>model</span>
+            <span>{liveModel ?? "model"}</span>
             <ChevronDown size={12} className="text-[var(--color-faint)]" />
           </button>
+
+          {/* live context-left meter, parsed from claude code's TUI */}
+          {liveCtxPct != null && (
+            <span
+              title="context remaining (from claude code)"
+              className={`hidden shrink-0 items-center gap-1 font-mono text-[10.5px] tabular-nums sm:flex ${
+                liveCtxPct <= 15
+                  ? "text-[var(--color-danger)]"
+                  : "text-[var(--color-faint)]"
+              }`}
+            >
+              {liveCtxPct}% ctx
+            </span>
+          )}
 
           {/* interrupt the running CLI (^C) */}
           <button
