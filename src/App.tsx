@@ -119,12 +119,57 @@ function paneForFile(path: string, name: string): PaneContent {
 let seq = 0;
 const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
 
+// ── session layout persistence ───────────────────────────────────────────────
+// Reopen whatever panes were open last time (mac-app muscle memory) — closing a
+// pane with its X removes it from the saved set, so the layout reflects what you
+// left up. Only kinds that can be cleanly re-spawned are persisted; transient
+// one-shot fields (chat seed/resume/reattach) are stripped so a restored chat
+// doesn't re-fire its launcher prompt or try to reattach a dead backend id.
+const LAYOUT_KEY = "aios.layout";
+
+/** Strip a pane kind down to its restorable shape (drop one-shot fields). */
+function persistableKind(kind: PaneContent): PaneContent | null {
+  if (kind.type === "chat") return { type: "chat" }; // fresh chat, no seed/resume/reattach
+  // file/editor restore by path; everything else is self-describing.
+  return kind;
+}
+
+function loadLayout(): Pane[] {
+  try {
+    const raw = localStorage.getItem(LAYOUT_KEY);
+    if (!raw) return [];
+    const saved = JSON.parse(raw) as { label: string; kind: PaneContent }[];
+    if (!Array.isArray(saved)) return [];
+    return saved.map((p) => ({ key: nextKey(), label: p.label, kind: p.kind }));
+  } catch {
+    return [];
+  }
+}
+
+function saveLayout(panes: Pane[]) {
+  try {
+    const out = panes
+      .map((p) => {
+        const kind = persistableKind(p.kind);
+        return kind ? { label: p.label, kind } : null;
+      })
+      .filter(Boolean);
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify(out));
+  } catch {
+    /* quota / unavailable — skip */
+  }
+}
+
 function App() {
-  const [panes, setPanes] = useState<Pane[]>([]);
+  const [panes, setPanes] = useState<Pane[]>(() =>
+    loadSettings().reopenLastLayout ? loadLayout() : [],
+  );
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [splash, setSplash] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // mission-control-style pane overview: fan out every open pane to switch.
+  const [overviewOpen, setOverviewOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   // pane key pending a close-confirm (busy chat: keep-running vs kill).
   const [closePrompt, setClosePrompt] = useState<string | null>(null);
@@ -178,6 +223,21 @@ function App() {
       );
     }
   }, []);
+
+  // ⌘F → fullscreen the SELECTED pane (any type — not just video). Uses the same
+  // pane-maximize + OS-fullscreen path, so a browser pane goes true screen-fill
+  // and a terminal/editor goes edge-to-edge. Target = the selected/focused pane,
+  // else the single pane if there's only one. Toggle: a second ⌘F restores.
+  const toggleFullscreenSelected = useCallback((): boolean => {
+    if (panes.length === 0) return false;
+    const sel = activeKey ?? focusedPane.current;
+    const target =
+      panes.find((p) => p.key === sel) ?? (panes.length === 1 ? panes[0] : null);
+    if (!target) return false; // no clear target → let ⌘F fall through to find
+    const isOn = maximizedKey === target.key;
+    onVideoFullscreen(target.key, !isOn);
+    return true;
+  }, [panes, activeKey, maximizedKey, onVideoFullscreen]);
   // backgrounded chat sessions still running after their pane closed.
   const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
   // personalizable sidebar — items + order live in lib/sidebar (localStorage).
@@ -188,7 +248,7 @@ function App() {
   const [pinSiteSpace, setPinSiteSpace] = useState<string | null>(null);
   // Native browser webviews paint ABOVE html, so any floating overlay (modals,
   // palette) must hide them or it gets occluded.
-  const overlayOpen = settingsOpen || paletteOpen || pinSiteSpace != null;
+  const overlayOpen = settingsOpen || paletteOpen || pinSiteSpace != null || overviewOpen;
 
   useEffect(() => {
     const t = setTimeout(() => setSplash(false), 850);
@@ -196,6 +256,12 @@ function App() {
   }, []);
 
   useEffect(() => initTheme(), []);
+
+  // Persist the open-pane layout whenever it changes, so the next launch reopens
+  // exactly what's up now (X-ing a pane drops it from the saved set).
+  useEffect(() => {
+    saveLayout(panes);
+  }, [panes]);
 
   const flash = useCallback((msg: string) => {
     setToast(msg);
@@ -508,6 +574,37 @@ function App() {
         // ⌘R — reload the cockpit fresh (re-init theme, re-poll all live data).
         e.preventDefault();
         window.location.reload();
+      } else if (mod && e.key.toLowerCase() === "w") {
+        // ⌘W — close the focused pane (mac muscle memory). Falls back to the
+        // active pane; no-op when nothing's focused.
+        e.preventDefault();
+        const k = focusedPane.current ?? activeKey;
+        if (k) requestClose(k);
+      } else if ((mod && e.key === "`") || (e.ctrlKey && e.key === "ArrowUp")) {
+        // ⌘` / Ctrl+↑ — toggle the mission-control pane overview (switch panes).
+        // Ctrl+↑ mirrors macOS Mission Control; ⌘` mirrors window-cycle.
+        e.preventDefault();
+        if (panes.length > 0) setOverviewOpen((v) => !v);
+      } else if (mod && e.key.toLowerCase() === "f") {
+        // ⌘F — fullscreen the SELECTED pane (true screen-fill, any type). Only
+        // intercept when panes exist; otherwise let ⌘F pass (in-page find etc).
+        if (toggleFullscreenSelected()) e.preventDefault();
+      } else if (mod && e.key.toLowerCase() === "m") {
+        // ⌘M — minimize (hide) the selected pane to the OPEN rail. ⇧ restores all.
+        e.preventDefault();
+        if (e.shiftKey) {
+          setHiddenKeys([]);
+          setMaximizedKey(null);
+        } else {
+          const k = activeKey ?? focusedPane.current;
+          if (k) toggleHide(k);
+        }
+      } else if (mod && /^[1-9]$/.test(e.key)) {
+        // ⌘1..9 — jump to the Nth open pane (restore + select it).
+        e.preventDefault();
+        const idx = Number(e.key) - 1;
+        const p = panes[idx];
+        if (p) focusPane(p.key);
       } else if (mod && e.key === ",") {
         e.preventDefault();
         setSettingsOpen(true);
@@ -515,6 +612,10 @@ function App() {
         // F5 — run the current project (VS Code's start-debugging muscle memory)
         e.preventDefault();
         runF5();
+      } else if (e.key === "Escape" && maximizedKey) {
+        // Esc — exit a maximized/fullscreen pane.
+        setWindowFullscreen(false).catch(() => {});
+        setMaximizedKey(null);
       }
       if (e.key === "Meta") {
         const now = e.timeStamp || performance.now();
@@ -528,7 +629,36 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addShell, fireAppshot, runF5]);
+  }, [addShell, fireAppshot, runF5, toggleFullscreenSelected, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
+
+  // ---- trackpad three-finger swipe-UP → open the pane overview (mac Mission
+  // Control muscle memory). macOS reserves the literal 3-finger swipe for system
+  // Mission Control, but a swipe over the webview surfaces as a fast wheel
+  // gesture; we detect a decisive upward fling (large negative deltaY, not a
+  // gentle scroll) on the pane area and open the overview. Swipe-DOWN while the
+  // overview is open closes it. Guarded so ordinary scrolling never triggers it.
+  const wheelAccum = useRef(0);
+  const wheelLast = useRef(0);
+  useEffect(() => {
+    const onWheel = (e: WheelEvent) => {
+      // ignore pinch-zoom (ctrl) and horizontal-dominant gestures
+      if (e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+      const now = e.timeStamp || performance.now();
+      if (now - wheelLast.current > 200) wheelAccum.current = 0; // new gesture
+      wheelLast.current = now;
+      wheelAccum.current += e.deltaY;
+      const FLING = 180; // px of accumulated travel = a decisive swipe
+      if (!overviewOpen && wheelAccum.current < -FLING && panes.length > 0) {
+        wheelAccum.current = 0;
+        setOverviewOpen(true);
+      } else if (overviewOpen && wheelAccum.current > FLING) {
+        wheelAccum.current = 0;
+        setOverviewOpen(false);
+      }
+    };
+    window.addEventListener("wheel", onWheel, { passive: true });
+    return () => window.removeEventListener("wheel", onWheel);
+  }, [overviewOpen, panes.length]);
 
   // Native OS drag-drop (Finder files/folders, e.g. a screenshot) → insert paths
   // into the targeted terminal pane. Because `dragDropEnabled` is true, macOS
@@ -657,11 +787,13 @@ function App() {
         };
       }),
       { id: "sidebar", title: "toggle sidebar", subtitle: "⌘B", group: "view", icon: <PanelLeft size={14} />, keywords: "rail hide show", actionLabel: "toggle", run: () => setSidebarOpen((v) => !v) },
+      { id: "overview", title: "show all panes", subtitle: "⌘`", group: "view", icon: <Layers size={14} />, keywords: "overview mission control switch panes windows fan out swipe", actionLabel: "open", run: () => { if (panes.length > 0) setOverviewOpen(true); } },
+      { id: "show-all-panes", title: "tile all panes", subtitle: "", group: "view", icon: <Maximize2 size={14} />, keywords: "show all restore unminimize tile grid every pane visible", actionLabel: "tile", run: () => { setHiddenKeys([]); setMaximizedKey(null); } },
       { id: "run", title: "run focused project", subtitle: "F5", group: "actions", icon: <Play size={14} />, keywords: "f5 run debug start flutter npm dev build terminal focused open file — type a repo name for a specific project", actionLabel: "run", run: () => runF5() },
       { id: "appshot", title: "appshot — screenshot to oracle", subtitle: "⌘⌘", group: "actions", icon: <Camera size={14} />, keywords: "screenshot capture", actionLabel: "run", run: fireAppshot },
       { id: "settings", title: "settings", subtitle: "⌘,", group: "app", icon: <SettingsIcon size={14} />, keywords: "preferences theme appearance", actionLabel: "open", run: () => setSettingsOpen(true) },
     ],
-    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, projects, home, runProject],
+    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, projects, home, runProject, panes.length],
   );
 
   return (
@@ -878,6 +1010,25 @@ function App() {
       <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} commands={commands} />
       <PinSiteModal spaceId={pinSiteSpace} onClose={() => setPinSiteSpace(null)} />
+      <PaneOverview
+        open={overviewOpen}
+        panes={panes}
+        hiddenKeys={hiddenKeys}
+        activeKey={activeKey}
+        onClose={() => setOverviewOpen(false)}
+        onPick={(key) => {
+          focusPane(key);
+          setMaximizedKey(null);
+          setOverviewOpen(false);
+        }}
+        onClosePane={requestClose}
+        onShowAll={() => {
+          // un-minimize + un-maximize everything (tile all panes into the grid).
+          setHiddenKeys([]);
+          setMaximizedKey(null);
+          setOverviewOpen(false);
+        }}
+      />
     </div>
   );
 }
@@ -1435,6 +1586,135 @@ function PinSiteModal({ spaceId, onClose }: { spaceId: string | null; onClose: (
             </button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+/** Mission-control-style pane overview: a full-screen scrim that fans out every
+ *  open pane as a clickable card so you can SEE them all and switch. Opened by
+ *  three-finger swipe-up (wheel-fling), ⌘` / Ctrl+↑, or the command palette.
+ *  Pick a card → focus that pane; "show all" → tile every pane back into the
+ *  grid (un-minimize + un-maximize). Esc / click-scrim closes. Cards are static
+ *  previews (label + type dot) — cheap, no live webview duplication. */
+function PaneOverview({
+  open,
+  panes,
+  hiddenKeys,
+  activeKey,
+  onClose,
+  onPick,
+  onClosePane,
+  onShowAll,
+}: {
+  open: boolean;
+  panes: Pane[];
+  hiddenKeys: string[];
+  activeKey: string | null;
+  onClose: () => void;
+  onPick: (key: string) => void;
+  onClosePane: (key: string) => void;
+  onShowAll: () => void;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, onClose]);
+
+  if (!open) return null;
+  const cols = Math.min(4, Math.ceil(Math.sqrt(panes.length || 1)));
+
+  return (
+    <div
+      className="modal-in fixed inset-0 z-[60] flex flex-col bg-[var(--color-bg)]/80 backdrop-blur-xl"
+      onMouseDown={onClose}
+    >
+      <div className="flex shrink-0 items-center justify-between px-6 pt-5 pb-3">
+        <div className="flex items-center gap-2 text-[13px] font-medium text-[var(--color-text)]">
+          <Layers size={15} className="text-[var(--color-accent)]" />
+          open panes
+          <span className="text-[var(--color-faint)]">({panes.length})</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              onShowAll();
+            }}
+            className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-1.5 text-[12px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-accent)]"
+            title="tile every pane back into the grid"
+          >
+            show all
+          </button>
+          <button
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              onClose();
+            }}
+            className="grid h-8 w-8 place-items-center rounded-lg text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+            title="close (Esc)"
+          >
+            <X size={16} />
+          </button>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6">
+        <div
+          className="grid gap-4"
+          style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
+        >
+          {panes.map((p) => {
+            const hidden = hiddenKeys.includes(p.key);
+            const isActive = activeKey === p.key && !hidden;
+            return (
+              <button
+                key={p.key}
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                  onPick(p.key);
+                }}
+                className={`group relative flex aspect-[16/10] flex-col overflow-hidden rounded-xl border text-left transition-all hover:scale-[1.02] ${
+                  isActive
+                    ? "border-[var(--color-accent)] ring-2 ring-[var(--color-accent)]/40"
+                    : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]"
+                } ${hidden ? "opacity-50" : ""}`}
+              >
+                <div className="flex h-8 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-panel)] px-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className={`status-dot shrink-0 ${DOT[p.kind.type] ?? "status-dot--cold"}`} />
+                    <span className="truncate font-mono text-[11px] text-[var(--color-text-2)]">
+                      {p.label}
+                    </span>
+                  </div>
+                  <span
+                    onMouseDown={(e) => {
+                      e.stopPropagation();
+                      onClosePane(p.key);
+                    }}
+                    className="grid h-5 w-5 shrink-0 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:bg-[var(--color-panel-2)] hover:text-[var(--color-danger)] group-hover:opacity-100"
+                    title="close pane"
+                  >
+                    <X size={12} />
+                  </span>
+                </div>
+                <div className="flex min-h-0 flex-1 items-center justify-center bg-[var(--color-pane)] p-3">
+                  <span className="text-[10px] uppercase tracking-widest text-[var(--color-faint)]">
+                    {p.kind.type}
+                    {hidden ? " · minimized" : ""}
+                  </span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
