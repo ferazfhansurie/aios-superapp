@@ -16,7 +16,7 @@ pub struct DirEntry {
 #[tauri::command]
 pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let p = if path.is_empty() {
-        std::env::var("HOME").unwrap_or_else(|_| "/".into())
+        home_dir()
     } else {
         path
     };
@@ -52,10 +52,12 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
-/// Returns the user's home directory.
+/// Returns the user's home directory (HOME, then USERPROFILE on Windows).
 #[tauri::command]
 pub fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| if cfg!(windows) { "C:\\".into() } else { "/".into() })
 }
 
 /// Cap on inline text payloads: ~256 KB.
@@ -188,20 +190,53 @@ fn is_office_ext(ext: &str) -> bool {
 
 /// Locates the LibreOffice headless binary across the common install spots.
 fn soffice_bin() -> Option<String> {
-    let candidates = [
-        "/opt/homebrew/bin/soffice",
-        "/usr/local/bin/soffice",
-        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-        "/usr/bin/soffice",
-        "/usr/bin/libreoffice",
-    ];
-    for c in candidates {
-        if std::path::Path::new(c).exists() {
-            return Some(c.to_string());
+    #[cfg(windows)]
+    {
+        let mut candidates: Vec<String> = Vec::new();
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(pf) = std::env::var(var) {
+                candidates.push(format!(r"{pf}\LibreOffice\program\soffice.exe"));
+            }
         }
+        for c in &candidates {
+            if std::path::Path::new(c).exists() {
+                return Some(c.clone());
+            }
+        }
+        // Last resort: PATH resolution (Rust appends .exe).
+        return Some("soffice.exe".to_string());
     }
-    // Last resort: rely on PATH resolution.
-    Some("soffice".to_string())
+
+    #[cfg(not(windows))]
+    {
+        let candidates = [
+            "/opt/homebrew/bin/soffice",
+            "/usr/local/bin/soffice",
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            "/usr/bin/soffice",
+            "/usr/bin/libreoffice",
+        ];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                return Some(c.to_string());
+            }
+        }
+        // Last resort: rely on PATH resolution.
+        Some("soffice".to_string())
+    }
+}
+
+/// Builds a `file://` URL from an absolute path, cross-platform. On Windows a
+/// path like `C:\Users\…` becomes `file:///C:/Users/…`; on unix `/tmp/…` becomes
+/// `file:///tmp/…`. Sufficient for LibreOffice's `-env:UserInstallation` (paths
+/// here are app-generated temp dirs, so no exotic chars to percent-encode).
+fn url_from_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
+    }
 }
 
 /// FNV-1a — small, dependency-free hash for cache-key derivation.
@@ -236,7 +271,8 @@ pub fn convert_office_to_pdf(path: String) -> Result<String, String> {
         .unwrap_or(0);
     let key = fnv1a(&format!("{}|{}|{}", path, mtime, meta.len()));
 
-    let out_dir = std::path::Path::new("/tmp/aios-office-preview").join(format!("{key:x}"));
+    let preview_root = std::env::temp_dir().join("aios-office-preview");
+    let out_dir = preview_root.join(format!("{key:x}"));
     let stem = src
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -252,9 +288,11 @@ pub fn convert_office_to_pdf(path: String) -> Result<String, String> {
 
     let bin = soffice_bin().ok_or("LibreOffice (soffice) not found")?;
     // Isolated profile so we don't clash with a running LibreOffice instance.
-    let profile = format!(
-        "-env:UserInstallation=file:///tmp/aios-office-preview/.profile-{key:x}"
-    );
+    // LibreOffice wants a file:// URL; build it from the platform temp dir so it's
+    // valid on Windows (file:///C:/...) as well as unix.
+    let profile_path = preview_root.join(format!(".profile-{key:x}"));
+    let profile_url = url_from_path(&profile_path);
+    let profile = format!("-env:UserInstallation={profile_url}");
 
     let output = std::process::Command::new(&bin)
         .arg("--headless")

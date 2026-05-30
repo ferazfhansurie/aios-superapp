@@ -51,6 +51,7 @@ export type PaneKind =
 export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: string }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<number | null>(null);
+  const termRef = useRef<Xterm | null>(null);
   const [dragOver, setDragOver] = useState(false);
   // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
   const [buttons, setButtons] = useState<string[] | null>(null);
@@ -76,9 +77,15 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     term.loadAddon(fit);
     term.loadAddon(new WebLinksAddon());
     term.open(host);
+    termRef.current = term;
+    term.focus();
     // WebGL renderer for speed; silently fall back to the default if unavailable.
+    // On WebView2 (Windows) the GL context can be lost — dispose the addon if so,
+    // which drops xterm back to its canvas/DOM renderer instead of freezing.
     try {
-      term.loadAddon(new WebglAddon());
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      term.loadAddon(webgl);
     } catch {
       /* canvas/dom fallback */
     }
@@ -146,6 +153,8 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       inputDisposer = term.onData((d) => {
         if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
       });
+      // Take keyboard focus now that the PTY is live and accepting input.
+      term.focus();
       // auto-run an init command (e.g. `aios`) once the shell is ready
       if (kind.type === "shell" && kind.cmd) {
         const c = kind.cmd;
@@ -173,6 +182,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       ro.disconnect();
       inputDisposer?.dispose();
       if (sessionId != null) ptyKill(sessionId).catch(() => {});
+      termRef.current = null;
       term.dispose();
     };
     // Mount once: each pane has a stable React key and fixed kind.
@@ -203,6 +213,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   return (
     <div
       className="relative h-full min-h-0 w-full"
+      onMouseDown={() => termRef.current?.focus()}
       onDragOver={(e) => {
         e.preventDefault();
         e.dataTransfer.dropEffect = "copy";

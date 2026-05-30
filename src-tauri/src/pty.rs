@@ -120,6 +120,27 @@ fn spawn_internal(
     Ok(id)
 }
 
+/// Resolves the shell to launch on Windows. Honors `$SHELL` if the user set one,
+/// otherwise prefers PowerShell 7 (`pwsh.exe`) and falls back to the built-in
+/// Windows PowerShell — always an ABSOLUTE path so the PTY layer never depends on
+/// PATH resolution (a common cause of a terminal that opens but can't be typed
+/// into because the shell never actually spawned).
+#[allow(dead_code)]
+fn windows_shell() -> String {
+    if let Ok(s) = std::env::var("SHELL") {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    let pwsh = format!(r"{program_files}\PowerShell\7\pwsh.exe");
+    if std::path::Path::new(&pwsh).exists() {
+        return pwsh;
+    }
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    format!(r"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
 /// Spawns the user's login shell in a new PTY pane.
 #[tauri::command]
 pub fn pty_spawn(
@@ -130,15 +151,22 @@ pub fn pty_spawn(
     cols: u16,
     rows: u16,
 ) -> Result<u32, String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let mut cmd = CommandBuilder::new(shell);
-    cmd.arg("-l");
+    let mut cmd = if cfg!(windows) {
+        // On Windows there's no SHELL/login-shell convention; launch PowerShell by
+        // absolute path and skip the `-l` login flag.
+        CommandBuilder::new(windows_shell())
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let mut c = CommandBuilder::new(shell);
+        c.arg("-l");
+        c
+    };
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     match cwd {
         Some(dir) if !dir.is_empty() => cmd.cwd(dir),
         _ => {
-            if let Ok(home) = std::env::var("HOME") {
+            if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
                 cmd.cwd(home);
             }
         }

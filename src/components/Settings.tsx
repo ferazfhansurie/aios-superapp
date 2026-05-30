@@ -624,6 +624,18 @@ export function Settings({
               {section === "general" && (
                 <>
                   <Row
+                    label="your name"
+                    sub="shown in the homescreen greeting + account row"
+                  >
+                    <input
+                      value={s.userName}
+                      onChange={(e) => patch({ userName: e.target.value })}
+                      placeholder="your name"
+                      spellCheck={false}
+                      className="w-[160px] rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+                    />
+                  </Row>
+                  <Row
                     label="reopen last layout"
                     sub="restore your panes + sizes on startup"
                   >

@@ -8,9 +8,14 @@
 
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl};
 
-/// Present as desktop Chrome so sites don't flag the WKWebView UA as a bot
+/// Present as desktop Chrome so sites don't flag the webview UA as a bot
 /// (cuts captcha walls). Cookies persist on-disk per app, so a one-time login
-/// sticks across restarts.
+/// sticks across restarts. Platform-matched so the claimed OS isn't obviously
+/// wrong for the host (Windows vs macOS).
+#[cfg(windows)]
+const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+#[cfg(not(windows))]
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -202,27 +207,65 @@ pub fn browser_screenshot(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_millis();
-    let path = format!("/tmp/cockpit-shot-{epoch}.png");
-    let region = format!(
-        "{},{},{},{}",
+    let (xi, yi, wi, hi) = (
         x.round() as i64,
         y.round() as i64,
         width.round().max(1.0) as i64,
         height.round().max(1.0) as i64,
     );
-    let status = std::process::Command::new("/usr/sbin/screencapture")
-        .arg("-x")
-        .arg(format!("-R{region}"))
-        .arg(&path)
-        .status()
-        .map_err(|e| format!("screencapture failed to launch: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "screencapture exited with {} (check Screen Recording permission)",
-            status.code().unwrap_or(-1)
-        ));
+
+    // macOS: screencapture region grab. Windows: a tiny PowerShell .NET capture
+    // of the same on-screen rect to a temp PNG (no extra crates).
+    #[cfg(not(windows))]
+    {
+        let path = format!("/tmp/cockpit-shot-{epoch}.png");
+        let status = std::process::Command::new("/usr/sbin/screencapture")
+            .arg("-x")
+            .arg(format!("-R{xi},{yi},{wi},{hi}"))
+            .arg(&path)
+            .status()
+            .map_err(|e| format!("screencapture failed to launch: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "screencapture exited with {} (check Screen Recording permission)",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        Ok(path)
     }
-    Ok(path)
+
+    #[cfg(windows)]
+    {
+        let path = std::env::temp_dir()
+            .join(format!("cockpit-shot-{epoch}.png"))
+            .to_string_lossy()
+            .into_owned();
+        let script = format!(
+            "Add-Type -AssemblyName System.Drawing,System.Windows.Forms; \
+             $b=New-Object System.Drawing.Bitmap {wi},{hi}; \
+             $g=[System.Drawing.Graphics]::FromImage($b); \
+             $g.CopyFromScreen({xi},{yi},0,0,(New-Object System.Drawing.Size({wi},{hi}))); \
+             $b.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose()",
+            path.replace('\\', "\\\\")
+        );
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| format!("screen capture failed to launch: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "screen capture exited with {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        Ok(path)
+    }
 }
 
 // ─── Annotate mode (Codex-style "select-on-page → send to chat") ──────────────
@@ -398,14 +441,38 @@ pub fn browser_copy_selection(app: AppHandle, label: String) -> Result<(), Strin
 /// Linux fallback: `xclip -selection clipboard -o` (or `wl-paste`).
 #[tauri::command]
 pub fn read_clipboard() -> Result<String, String> {
-    let out = std::process::Command::new("/usr/bin/pbpaste")
-        .output()
-        .map_err(|e| format!("pbpaste failed to launch: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "pbpaste exited with {}",
-            out.status.code().unwrap_or(-1)
-        ));
+    #[cfg(not(windows))]
+    {
+        let out = std::process::Command::new("/usr/bin/pbpaste")
+            .output()
+            .map_err(|e| format!("pbpaste failed to launch: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("pbpaste exited with {}", out.status.code().unwrap_or(-1)));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+
+    #[cfg(windows)]
+    {
+        // `Get-Clipboard -Raw` returns the clipboard text verbatim. PowerShell
+        // appends a trailing CRLF; strip one so the `AIOS_ANNOT:` sentinel match
+        // (and any exact comparisons) behave like pbpaste.
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Clipboard -Raw",
+        ]);
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let out = cmd
+            .output()
+            .map_err(|e| format!("Get-Clipboard failed to launch: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("Get-Clipboard exited with {}", out.status.code().unwrap_or(-1)));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(&text).to_string())
+    }
 }

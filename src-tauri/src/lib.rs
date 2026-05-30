@@ -28,6 +28,18 @@ fn read_telemetry() -> telemetry::Telemetry {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Windows has no $HOME, but nearly every data source here keys off it (usage
+    // stats, the memory vault, the file browser, JSONL telemetry). Alias it to
+    // %USERPROFILE% once at startup so every `std::env::var("HOME")` across the
+    // backend resolves correctly — this is what makes the homescreen show the
+    // current user's real data on Windows.
+    #[cfg(windows)]
+    if std::env::var_os("HOME").is_none() {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            std::env::set_var("HOME", profile);
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -65,6 +77,7 @@ pub fn run() {
             memory::memory_file,
             memory::memory_save,
             memory::memory_delete,
+            memory::memory_focus,
             db::db_list_connections,
             db::db_add_connection,
             db::db_remove_connection,

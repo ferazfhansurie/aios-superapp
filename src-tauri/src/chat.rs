@@ -99,28 +99,61 @@ fn claude_bin() -> String {
             return p;
         }
     }
-    let candidates = [
-        "/opt/homebrew/bin/claude",
-        "/usr/local/bin/claude",
-    ];
-    for c in candidates {
-        if std::path::Path::new(c).exists() {
-            return c.to_string();
+    // Windows: the binary is `claude.exe` (native installer drops it under
+    // %USERPROFILE%\.local\bin). Check the explicit paths first, then a PATH
+    // probe, then fall back to a bare name (Rust appends .exe for PATH search).
+    #[cfg(windows)]
+    {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            for rel in [r".local\bin\claude.exe", r".claude\local\claude.exe"] {
+                let p = std::path::Path::new(&home).join(rel);
+                if p.exists() {
+                    return p.to_string_lossy().into_owned();
+                }
+            }
+        }
+        if let Some(p) = which_on_path("claude.exe").or_else(|| which_on_path("claude.cmd")) {
+            return p;
+        }
+        return "claude.exe".to_string();
+    }
+
+    #[cfg(not(windows))]
+    {
+        let candidates = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
+        }
+        // Try the user's HOME-based installs (native installer / nvm current).
+        if let Ok(home) = std::env::var("HOME") {
+            let native = format!("{home}/.local/bin/claude");
+            if std::path::Path::new(&native).exists() {
+                return native;
+            }
+            let claude_local = format!("{home}/.claude/local/claude");
+            if std::path::Path::new(&claude_local).exists() {
+                return claude_local;
+            }
+        }
+        // Default: let the OS resolve it from PATH.
+        "claude".to_string()
+    }
+}
+
+/// Resolves an executable by scanning the `PATH` dirs. Windows-only helper for
+/// finding `claude.exe`/`claude.cmd` when it isn't in a known install dir.
+#[cfg(windows)]
+fn which_on_path(exe: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(exe);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
-    // Try the user's HOME-based installs (native installer / nvm current).
-    if let Ok(home) = std::env::var("HOME") {
-        let native = format!("{home}/.local/bin/claude");
-        if std::path::Path::new(&native).exists() {
-            return native;
-        }
-        let claude_local = format!("{home}/.claude/local/claude");
-        if std::path::Path::new(&claude_local).exists() {
-            return claude_local;
-        }
-    }
-    // Default: let the OS resolve it from PATH.
-    "claude".to_string()
+    None
 }
 
 /// JSON-escapes a string for embedding in the stream-json user line. We build
@@ -241,6 +274,14 @@ pub fn chat_start(
         // Merge nothing from stderr into the event stream — surface it on its
         // own so a missing-binary / auth error doesn't masquerade as JSON.
         .stderr(Stdio::piped());
+
+    // Windows: don't pop a console window for the headless `claude` child.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     let mut child = cmd
         .spawn()

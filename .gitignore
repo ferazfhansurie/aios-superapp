@@ -39,3 +39,8 @@ src-tauri/target/
 # Local env
 .env
 .env.*
+
+# Windows port: local screenshots + secrets (never commit)
+windows-*.png
+*.key
+src-tauri/.motion.key

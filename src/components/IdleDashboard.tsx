@@ -48,6 +48,7 @@ import type { ChatSessionInfo } from "../lib/chat";
 import type { Customer } from "../lib/inbox";
 import { deviceStats, type DeviceStats } from "../lib/device";
 import { usageExtras, type UsageExtras } from "../lib/stats";
+import { getSetting } from "../lib/settings";
 import {
   idleRate,
   memoryFocus,
@@ -248,9 +249,10 @@ function Greeting() {
   }, []);
   const h = now.getHours();
   const part = h < 5 ? "still up" : h < 12 ? "good morning" : h < 18 ? "good afternoon" : "good evening";
+  const name = (getSetting("userName") || "").trim() || "there";
   return (
     <div className="aios-fade-in flex shrink-0 flex-col">
-      <span className="text-[18px] font-medium leading-tight tracking-tight text-[var(--color-text)]">{part}, firaz</span>
+      <span className="text-[18px] font-medium leading-tight tracking-tight text-[var(--color-text)]">{part}, {name}</span>
       <span className="font-mono text-[11px] text-[var(--color-muted)]">
         {now.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }).toLowerCase()}
       </span>

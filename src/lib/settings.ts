@@ -9,6 +9,7 @@ export type PaneType = "terminal" | "files" | "browser";
 
 export interface AppSettings {
   // general
+  userName: string;
   reopenLastLayout: boolean;
   confirmCloseOraclePane: boolean;
   defaultPaneType: PaneType;
@@ -29,6 +30,7 @@ export interface AppSettings {
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
+  userName: "faeez",
   reopenLastLayout: true,
   confirmCloseOraclePane: true,
   defaultPaneType: "terminal",
@@ -45,9 +47,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   graphPhysicsStrength: 50,
 };
 
-/** Read-only display value — the memory vault lives here on this machine. */
+/** Read-only display value — the vault is auto-resolved from your home dir. */
 export const MEMORY_VAULT_PATH =
-  "~/.claude/projects/-Users-firazfhansurie/memory";
+  "~/.claude/projects/<your-home>/memory (auto-resolved)";
 
 type Listener = (s: AppSettings) => void;
 const listeners = new Set<Listener>();

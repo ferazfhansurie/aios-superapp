@@ -17,7 +17,7 @@
  *
  * Design per DESIGN.md — brand --color-* tokens, restrained accent, lucide.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   AlertCircle,
@@ -92,9 +92,21 @@ export function MotionPane() {
   const [pan, setPan] = useState({ x: 80, y: 80 });
   const [zoom, setZoom] = useState(0.6);
   const viewportRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
+  // The board-space layer we pan/zoom. We mutate its transform DIRECTLY during a
+  // drag (imperative) so a pan doesn't trigger a React re-render every frame —
+  // the big canvas-lag win, alongside memoizing the items below.
+  const layerRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ x: number; y: number; px: number; py: number; nx: number; ny: number } | null>(null);
+  // Fit the viewport to the board's items once, on first load — without this the
+  // default pan/zoom leaves items (which live at large board-space coords) off
+  // screen, so the canvas looks empty / "stuck loading".
+  const didFitRef = useRef(false);
 
   const [lightbox, setLightbox] = useState<LiveItem | null>(null);
+  // Stable so memoized CanvasItems don't re-render when pan/zoom changes.
+  const openLightbox = useCallback((it: LiveItem) => {
+    if (it.outputUrl || it.src) setLightbox(it);
+  }, []);
 
   // ── loaders ───────────────────────────────────────────────────────────────
 
@@ -184,16 +196,24 @@ export function MotionPane() {
   const onPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
     if ((e.target as HTMLElement).closest("[data-board-item]")) return; // let items handle clicks
-    dragRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y };
+    dragRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y, nx: pan.x, ny: pan.y };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   };
   const onPointerMove = (e: React.PointerEvent) => {
     const d = dragRef.current;
     if (!d) return;
-    setPan({ x: d.px + (e.clientX - d.x), y: d.py + (e.clientY - d.y) });
+    d.nx = d.px + (e.clientX - d.x);
+    d.ny = d.py + (e.clientY - d.y);
+    // Write the transform straight to the DOM — no setState, no re-render of the
+    // (potentially dozens of) items while dragging. We commit to state on release.
+    if (layerRef.current) {
+      layerRef.current.style.transform = `translate(${d.nx}px, ${d.ny}px) scale(${zoom})`;
+    }
   };
   const onPointerUp = () => {
+    const d = dragRef.current;
     dragRef.current = null;
+    if (d) setPan({ x: d.nx, y: d.ny }); // single commit at end of drag
   };
   const onWheel = (e: React.WheelEvent) => {
     if (e.ctrlKey || e.metaKey) {
@@ -209,10 +229,45 @@ export function MotionPane() {
       setPan((p) => ({ x: p.x - e.deltaX, y: p.y - e.deltaY }));
     }
   };
-  const fit = () => {
-    setPan({ x: 80, y: 80 });
-    setZoom(0.6);
-  };
+  /** Fit the viewport to the bounding box of all items (or reset when empty). */
+  const fit = useCallback(() => {
+    const active = board?.boards?.find((b) => b.id === board.activeBoardId) ?? board?.boards?.[0];
+    const all = [...(active?.items ?? []), ...locals] as LiveItem[];
+    const vp = viewportRef.current?.getBoundingClientRect();
+    if (!all.length || !vp) {
+      setPan({ x: 80, y: 80 });
+      setZoom(0.6);
+      return;
+    }
+    const minX = Math.min(...all.map((i) => i.x));
+    const minY = Math.min(...all.map((i) => i.y));
+    const maxX = Math.max(...all.map((i) => i.x + (i.width || 280)));
+    const maxY = Math.max(...all.map((i) => i.y + (i.height || 280)));
+    const pad = 60;
+    const z = Math.min(
+      ZOOM_MAX,
+      Math.max(
+        ZOOM_MIN,
+        Math.min((vp.width - pad * 2) / Math.max(1, maxX - minX), (vp.height - pad * 2) / Math.max(1, maxY - minY)),
+      ),
+    );
+    // centre the content in the viewport at the fitted zoom.
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    setZoom(z);
+    setPan({ x: vp.width / 2 - cx * z, y: vp.height / 2 - cy * z });
+  }, [board, locals]);
+
+  // Auto-fit once, as soon as the first board with items arrives.
+  useEffect(() => {
+    if (didFitRef.current) return;
+    const active = board?.boards?.find((b) => b.id === board.activeBoardId) ?? board?.boards?.[0];
+    if (active?.items?.length) {
+      didFitRef.current = true;
+      // next frame so the viewport has measured.
+      requestAnimationFrame(() => fit());
+    }
+  }, [board, fit]);
 
   // ── generate ──────────────────────────────────────────────────────────────
 
@@ -390,11 +445,12 @@ export function MotionPane() {
           >
             {/* board-space layer */}
             <div
+              ref={layerRef}
               className="absolute left-0 top-0 origin-top-left"
               style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
             >
               {items.map((it) => (
-                <CanvasItem key={it.id} item={it} onOpen={() => (it.outputUrl || it.src) && setLightbox(it)} />
+                <CanvasItem key={it.id} item={it} onOpen={openLightbox} />
               ))}
             </div>
 
@@ -473,7 +529,7 @@ export function MotionPane() {
 
 // ── one canvas item ───────────────────────────────────────────────────────────
 
-function CanvasItem({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
+const CanvasItem = memo(function CanvasItem({ item, onOpen }: { item: LiveItem; onOpen: (it: LiveItem) => void }) {
   const url = item.outputUrl || item.src || "";
   const isVideo = item.type === "video" || item.outputType === "video" || (item.kind === "video") || (url ? looksLikeVideo(url) : false);
   const processing = item.status === "processing";
@@ -501,9 +557,11 @@ function CanvasItem({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
         </div>
       ) : url ? (
         isVideo ? (
-          <video src={url} controls playsInline className="h-full w-full object-contain" />
+          // preload="none" so a board of many videos doesn't buffer them all at
+          // once (a major source of canvas lag in WebView2).
+          <video src={url} controls playsInline preload="none" className="h-full w-full object-contain" />
         ) : (
-          <img src={url} alt={item.prompt || ""} loading="lazy" className="h-full w-full cursor-zoom-in object-cover" onClick={onOpen} />
+          <img src={url} alt={item.prompt || ""} loading="lazy" decoding="async" className="h-full w-full cursor-zoom-in object-cover" onClick={() => onOpen(item)} />
         )
       ) : (
         <div className="flex h-full w-full items-center justify-center text-[var(--color-faint)]"><ImageIcon size={20} /></div>
@@ -512,7 +570,7 @@ function CanvasItem({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
       {/* hover actions on finished media */}
       {url && !processing && !failed && (
         <div className="pointer-events-none absolute right-1.5 top-1.5 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-          <TileAction title="Enlarge" onClick={onOpen} icon={<Maximize2 size={11} />} />
+          <TileAction title="Enlarge" onClick={() => onOpen(item)} icon={<Maximize2 size={11} />} />
           <TileAction title="Open externally" href={url} icon={<ExternalLink size={11} />} />
         </div>
       )}
@@ -526,7 +584,7 @@ function CanvasItem({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
       )}
     </div>
   );
-}
+});
 
 function TileAction({ title, onClick, href, icon }: { title: string; onClick?: () => void; href?: string; icon: React.ReactNode }) {
   const cls = "pointer-events-auto flex h-5 w-5 items-center justify-center rounded bg-black/55 text-white backdrop-blur-sm hover:bg-black/75";

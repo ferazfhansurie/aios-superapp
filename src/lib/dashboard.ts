@@ -77,28 +77,11 @@ export interface MemoryFocus {
 export async function memoryFocus(): Promise<MemoryFocus> {
   const empty: MemoryFocus = { tag: null, title: null };
   try {
-    const home = await invoke<string>("home_dir");
-    // claude encodes the cwd into the projects dir name (/ → -); firaz's global
-    // memory lives under the home-encoded project.
-    const enc = home.replace(/\//g, "-");
-    const dir = `${home}/.claude/projects/${enc}/memory`;
-    const entries = await invoke<{ name: string; path: string; mtime: number }[]>("read_dir", { path: dir });
-    const notes = entries
-      .filter((e) => e.name.startsWith("project_") && e.name.endsWith(".md"))
-      .sort((a, b) => b.mtime - a.mtime);
-    if (!notes.length) return empty;
-
-    const res = await invoke<{ text: string | null }>("read_file_preview", { path: notes[0].path });
-    if (!res?.text) return empty;
-
-    const nameLine = res.text.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? notes[0].name;
-    const tag = nameLine.replace(/^project_/, "").replace(/_/g, " ").trim();
-
-    // frontmatter description — may be quoted; strip wrapping quotes + unescape.
-    let desc = res.text.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? "";
-    desc = desc.replace(/^["']|["']$/g, "").replace(/\\"/g, '"').trim();
-
-    return { tag: tag || null, title: desc || null };
+    // Backend resolves the vault portably (home-encoded path, then fallbacks) and
+    // picks the freshest note — correct across macOS/Windows without path-encoding
+    // logic living in the frontend.
+    const res = await invoke<MemoryFocus>("memory_focus");
+    return res ?? empty;
   } catch {
     return empty;
   }

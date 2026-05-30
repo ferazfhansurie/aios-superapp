@@ -15,9 +15,55 @@
 //! the cache being missing/invalid yields nulls/empties, never a panic.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use serde_json::{json, Value};
+
+/// Cached JSONL-telemetry fallback for activity/tokens/favorite-model, used when
+/// neither ccusage nor `stats-cache.json` is available (the typical Windows
+/// case). Walking every `~/.claude/projects/**/*.jsonl` is expensive, so the
+/// result is memoised for 5 minutes — plenty fresh for an idle dashboard.
+/// Returns `(date → activity-count, total-tokens, favorite-model)`.
+fn telemetry_fallback() -> (HashMap<String, f64>, Option<f64>, Option<String>) {
+    struct Cached {
+        at: Instant,
+        activity: HashMap<String, f64>,
+        tokens: Option<f64>,
+        favorite: Option<String>,
+    }
+    static CACHE: OnceLock<Mutex<Option<Cached>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+
+    if let Ok(guard) = cell.lock() {
+        if let Some(c) = guard.as_ref() {
+            if c.at.elapsed() < Duration::from_secs(300) {
+                return (c.activity.clone(), c.tokens, c.favorite.clone());
+            }
+        }
+    }
+
+    let t = crate::telemetry::collect();
+    let activity: HashMap<String, f64> = t
+        .heatmap
+        .iter()
+        .filter(|c| c.count > 0)
+        .map(|c| (c.date.clone(), c.count as f64))
+        .collect();
+    let tokens = (t.totals.tokens > 0).then_some(t.totals.tokens as f64);
+    let favorite = (!t.streak.favorite_model.is_empty()).then_some(t.streak.favorite_model.clone());
+
+    if let Ok(mut guard) = cell.lock() {
+        *guard = Some(Cached {
+            at: Instant::now(),
+            activity: activity.clone(),
+            tokens,
+            favorite: favorite.clone(),
+        });
+    }
+    (activity, tokens, favorite)
+}
 
 /// Number of trailing days the heatmap covers (10 weeks).
 const HEATMAP_DAYS: i64 = 70;
@@ -334,13 +380,30 @@ pub fn usage_extras() -> Value {
     let live = read_live_usage();
     let today = today_day_number();
 
-    // --- Activity source: LIVE ccusage when available, else the on-disk cache.
-    // Streaks/heatmap/active-windows/tokens all key off this map so the numbers
-    // match the terminal HUD rather than the stale cache. ---
-    let activity: Option<&HashMap<String, f64>> = live
+    // --- Activity source priority: LIVE ccusage → on-disk cache → JSONL
+    // telemetry. Streaks/heatmap/active-windows/tokens all key off this map. The
+    // telemetry fallback is what lights up the homescreen on Windows, where
+    // ccusage isn't installed and stats-cache.json doesn't exist. ---
+    let mut activity_owned: Option<HashMap<String, f64>> = live
         .as_ref()
-        .map(|l| &l.daily_activity)
-        .or_else(|| cache.as_ref().map(|c| &c.daily_activity));
+        .map(|l| l.daily_activity.clone())
+        .or_else(|| {
+            cache
+                .as_ref()
+                .map(|c| c.daily_activity.clone())
+                .filter(|m| !m.is_empty())
+        });
+    let mut tele_tokens: Option<f64> = None;
+    let mut tele_favorite: Option<String> = None;
+    if activity_owned.is_none() {
+        let (act, tok, fav) = telemetry_fallback();
+        if !act.is_empty() {
+            activity_owned = Some(act);
+        }
+        tele_tokens = tok;
+        tele_favorite = fav;
+    }
+    let activity: Option<&HashMap<String, f64>> = activity_owned.as_ref();
 
     // --- Heatmap: last HEATMAP_DAYS days ascending, missing filled with 0. ---
     let mut heatmap = Vec::with_capacity(HEATMAP_DAYS as usize);
@@ -436,13 +499,15 @@ pub fn usage_extras() -> Value {
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(id, _)| pretty_model(id))
             })
-        });
+        })
+        .or_else(|| tele_favorite.as_deref().map(pretty_model));
 
     // Token total: prefer LIVE ccusage grand total, fall back to the cache.
     let tokens_total: Option<i64> = live
         .as_ref()
         .and_then(|l| l.tokens_total)
         .or_else(|| cache.as_ref().and_then(|c| c.tokens_total))
+        .or(tele_tokens)
         .map(|t| t.round() as i64);
 
     json!({

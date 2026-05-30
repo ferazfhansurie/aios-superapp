@@ -64,9 +64,12 @@ fn vault_dir() -> std::path::PathBuf {
     //    encodes a cwd by swapping every `/` (and `.`) for `-`; for `$HOME` this
     //    yields e.g. `-Users-alice`. Resolves to the author's existing path too.
     if let Some(home_str) = home.to_str() {
+        // Claude Code encodes a cwd by replacing path-ish chars with '-'. On unix
+        // that's '/' and '.'; on Windows the drive colon and backslashes too, so
+        // `C:\Users\user` → `C--Users-user` (matching the real on-disk dir name).
         let encoded: String = home_str
             .chars()
-            .map(|c| if c == '/' || c == '.' { '-' } else { c })
+            .map(|c| if matches!(c, '/' | '\\' | ':' | '.') { '-' } else { c })
             .collect();
         let p = projects.join(&encoded).join("memory");
         if p.is_dir() {
@@ -289,6 +292,63 @@ pub fn memory_file(path: String) -> Result<String, String> {
         return Err("not a markdown file".into());
     }
     std::fs::read_to_string(&canon_target).map_err(|e| e.to_string())
+}
+
+/// The idle homescreen's FOCUS tile: the freshest curated note in the vault,
+/// surfaced as `{ tag, title }`. Prefers the newest `project_*.md` (the user's
+/// current focus); if there are none, falls back to the newest note overall.
+/// Always returns a valid object — an empty/absent vault yields nulls.
+#[tauri::command]
+pub fn memory_focus() -> Value {
+    use std::time::SystemTime;
+    let dir = vault_dir();
+    let mut newest_project: Option<(SystemTime, std::path::PathBuf)> = None;
+    let mut newest_any: Option<(SystemTime, std::path::PathBuf)> = None;
+
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                continue;
+            }
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if fname.eq_ignore_ascii_case("MEMORY.md") {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if fname.starts_with("project_")
+                && newest_project.as_ref().map_or(true, |(t, _)| mtime > *t)
+            {
+                newest_project = Some((mtime, path.clone()));
+            }
+            if newest_any.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                newest_any = Some((mtime, path));
+            }
+        }
+    }
+
+    let Some((_, path)) = newest_project.or(newest_any) else {
+        return json!({ "tag": Value::Null, "title": Value::Null });
+    };
+
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let (fm, _body) = split_frontmatter(&text);
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let name = frontmatter_field(fm, "name").unwrap_or(id);
+    let tag = name.trim_start_matches("project_").replace('_', " ");
+    let title = frontmatter_field(fm, "description").unwrap_or_default();
+
+    json!({
+        "tag": if tag.trim().is_empty() { Value::Null } else { json!(tag.trim()) },
+        "title": if title.trim().is_empty() { Value::Null } else { json!(title.trim()) },
+    })
 }
 
 /// A slug is safe if it's a bare filename — letters, digits, `-`, `_` only.
