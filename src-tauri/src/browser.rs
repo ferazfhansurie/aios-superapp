@@ -81,6 +81,24 @@ pub fn browser_show(
             LogicalSize::new(width.max(1.0), height.max(1.0)),
         )
         .map_err(|e| e.to_string())?;
+    // WKWebView ships with element (HTML) fullscreen DISABLED, so YouTube etc.
+    // show "your browser doesn't support full screen". Flip the preference on the
+    // freshly-created native webview. macOS-only; best-effort.
+    #[cfg(target_os = "macos")]
+    if let Some(wv) = app.get_webview(&label) {
+        let _ = wv.with_webview(|pw| {
+            // PlatformWebview::inner() is the raw WKWebView pointer — cast to the
+            // objc2-web-kit type (same crate version tauri uses) and flip the pref.
+            let ptr = pw.inner() as *mut objc2_web_kit::WKWebView;
+            unsafe {
+                if let Some(wk) = ptr.as_ref() {
+                    wk.configuration()
+                        .preferences()
+                        .setElementFullscreenEnabled(true);
+                }
+            }
+        });
+    }
     Ok(())
 }
 

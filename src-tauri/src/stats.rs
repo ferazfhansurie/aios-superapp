@@ -84,12 +84,25 @@ fn read_live_usage() -> Option<LiveUsage> {
         .chain(std::iter::once("ccusage"))
         .collect();
 
+    // ccusage is a `#!/usr/bin/env node` script. GUI apps launched from Finder/
+    // dock inherit a minimal PATH with no `node`, so spawning the script directly
+    // fails (non-zero exit) and we'd silently fall back to the stale on-disk cache
+    // — which is exactly how the streak/active counts collapsed to 0 while best +
+    // tok (computed from the frozen cache) still showed. Resolve `node` explicitly
+    // (same probe monitor.rs uses) and run `node <ccusage-cli> …` instead.
+    let node = crate::monitor::node_bin();
     let mut output = None;
     for bin in candidates {
-        if let Ok(out) = std::process::Command::new(bin)
-            .args(["daily", "--json", "--offline"])
-            .output()
-        {
+        let spawned = match &node {
+            Some(n) => std::process::Command::new(n)
+                .arg(bin)
+                .args(["daily", "--json", "--offline"])
+                .output(),
+            None => std::process::Command::new(bin)
+                .args(["daily", "--json", "--offline"])
+                .output(),
+        };
+        if let Ok(out) = spawned {
             if out.status.success() {
                 output = Some(out.stdout);
                 break;

@@ -112,7 +112,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   const [composerOpen, setComposerOpen] = useState(
     kind.type === "oracle" ||
       kind.type === "tmux" ||
-      (kind.type === "shell" && kind.cmd === "claude"),
+      (kind.type === "shell" && !!kind.cmd && kind.cmd.startsWith("claude")),
   );
   const [savingImg, setSavingImg] = useState(false);
   // Best-effort cwd for the composer's context bar: a shell pane's explicit cwd,
@@ -309,8 +309,9 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
           sessionId = await spawnTmux(onData, kind.socket, kind.session, cols, rows);
         } else {
           const name = termSessionName(paneKey);
+          const cwd = kind.type === "shell" ? kind.cwd ?? null : null;
           try {
-            sessionId = await spawnTerminal(onData, name, kind.cmd ?? null, cols, rows);
+            sessionId = await spawnTerminal(onData, name, kind.cmd ?? null, cwd, cols, rows);
             persisted = true;
           } catch {
             // no tmux (Windows / non-AIOS box) → ephemeral shell fallback.

@@ -59,6 +59,7 @@ pub fn run() {
             files::read_dir,
             files::read_dir_tree,
             files::git_status,
+            files::git_pulse,
             files::detect_project,
             files::list_projects,
             files::home_dir,

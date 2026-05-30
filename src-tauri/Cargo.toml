@@ -39,3 +39,9 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
+# macOS-only: flip the WKWebView element-fullscreen preference (off by default)
+# so YouTube/video fullscreen works inside browser panes. Pinned to the same
+# objc2-web-kit version tauri 2.11 uses so the WKWebView types unify.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKWebViewConfiguration", "WKPreferences"] }
+

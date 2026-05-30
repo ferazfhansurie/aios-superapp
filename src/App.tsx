@@ -9,6 +9,8 @@ import {
   FolderPlus,
   Globe,
   GripVertical,
+  Maximize2,
+  Minimize2,
   MessageSquare,
   MessageCircle,
   MoveRight,
@@ -57,6 +59,7 @@ import { monitorStart, monitorStop } from "./lib/monitor";
 import { chatHandles, paneWriters } from "./lib/paneBus";
 import { homeDir } from "./lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
+import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
 
 import { SPAWN, SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
 import {
@@ -122,6 +125,21 @@ function App() {
   const [closePrompt, setClosePrompt] = useState<string | null>(null);
   // pane currently under a native OS file drag (for the drop highlight).
   const [dropTargetKey, setDropTargetKey] = useState<string | null>(null);
+  // per-pane window controls. The maximized pane escapes the CSS grid to fill
+  // the viewport (`fixed inset-2 z-30`); every OTHER pane must deactivate
+  // (active=false) because native webviews paint ABOVE html and would overpaint
+  // it. Hidden panes stay MOUNTED (out of layout via display:none) so their
+  // terminal/webview state survives — restored from the dock bar.
+  const [maximizedKey, setMaximizedKey] = useState<string | null>(null);
+  const [hiddenKeys, setHiddenKeys] = useState<string[]>([]);
+  const toggleMax = useCallback(
+    (key: string) => setMaximizedKey((cur) => (cur === key ? null : key)),
+    [],
+  );
+  const toggleHide = useCallback((key: string) => {
+    setHiddenKeys((cur) => (cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]));
+    setMaximizedKey((cur) => (cur === key ? null : cur));
+  }, []);
   // backgrounded chat sessions still running after their pane closed.
   const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
   // personalizable sidebar — items + order live in lib/sidebar (localStorage).
@@ -208,6 +226,8 @@ function App() {
   );
   const closePane = useCallback((key: string) => {
     setPanes((p) => p.filter((x) => x.key !== key));
+    setHiddenKeys((h) => h.filter((k) => k !== key));
+    setMaximizedKey((m) => (m === key ? null : m));
   }, []);
   // Closing a chat pane whose claude is mid-task → prompt to keep it running in
   // the background (with optional done-notification) instead of killing it.
@@ -234,8 +254,12 @@ function App() {
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [chats, setChats] = useState<ChatSessionInfo[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
-  // every runnable project under ~/Repo, for the per-project ⌘K run entries.
-  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  // every runnable project under ~/Repo (auto-scanned), merged with the user's
+  // project store (custom adds / hides / name+cmd overrides — CRUD from Settings).
+  const [scanned, setScanned] = useState<ProjectInfo[]>([]);
+  const [projStore, setProjStore] = useState(loadProjectsStore);
+  useEffect(() => subscribeProjects(() => setProjStore(loadProjectsStore())), []);
+  const projects = useMemo(() => mergeProjects(scanned, projStore), [scanned, projStore]);
   const [home, setHome] = useState<string>("");
   useEffect(() => {
     let alive = true;
@@ -257,7 +281,7 @@ function App() {
   // its own ⌘K "run <name>" entry. Cheap (bounded scan), so no polling — a stale
   // list just misses a brand-new repo until next launch.
   const loadProjects = useCallback(() => {
-    listProjects().then(setProjects).catch(() => {});
+    listProjects().then(setScanned).catch(() => {});
   }, []);
   useEffect(() => {
     homeDir().then(setHome).catch(() => {});
@@ -431,11 +455,14 @@ function App() {
     };
   }, [flash]);
 
+  // grid is sized to the VISIBLE panes — hidden ones are display:none (out of
+  // grid flow), so they leave no empty cell behind.
+  const visibleCount = panes.length - hiddenKeys.length;
   const { cols, rows } = useMemo(() => {
-    const n = panes.length || 1;
+    const n = visibleCount || 1;
     const c = Math.ceil(Math.sqrt(n));
     return { cols: c, rows: Math.ceil(n / c) };
-  }, [panes.length]);
+  }, [visibleCount]);
 
   const commands: Command[] = useMemo(
     () => [
@@ -563,27 +590,45 @@ function App() {
           </aside>
         )}
 
-        <main className="min-h-0 flex-1">
-          {panes.length === 0 ? (
-            <IdleDashboard
-              apps={SPAWN}
-              oracles={oracles}
-              chats={chats}
-              customers={customers}
-              onSpawn={spawn}
-              onAttachOracle={addOracle}
-              onResumeChat={resumeChat}
-              onOpenPalette={() => setPaletteOpen(true)}
-            />
-          ) : (
+        <main className="relative min-h-0 flex-1">
+          {(() => {
+            const idleDash = (
+              <IdleDashboard
+                apps={SPAWN}
+                oracles={oracles}
+                projects={projects}
+                sidebar={sidebar}
+                onSpawn={spawn}
+                onAttachOracle={addOracle}
+                onOpenProject={(p) => spawn({ type: "shell", cwd: p.root }, p.name)}
+                onOpenSidebarItem={spawnSidebarItem}
+                onRevealSidebar={() => setSidebarOpen(true)}
+                onOpenPalette={() => setPaletteOpen(true)}
+              />
+            );
+            // No panes at all → idle. If panes exist but ALL are hidden, keep them
+            // mounted (state-preserving) in the grid and overlay idle on top — else
+            // the grid is all-`display:none` and the screen goes blank.
+            if (panes.length === 0) return idleDash;
+            return (
+              <>
+                {visibleCount === 0 && <div className="absolute inset-0 z-10">{idleDash}</div>}
             <ResizableGrid cols={cols} rows={rows} gap={8}>
               {panes.map((pane) => (
                 <PaneCard
                   key={pane.key}
                   pane={pane}
-                  active={!overlayOpen}
+                  active={
+                    !overlayOpen &&
+                    !hiddenKeys.includes(pane.key) &&
+                    (maximizedKey === null || maximizedKey === pane.key)
+                  }
+                  maximized={maximizedKey === pane.key}
+                  hidden={hiddenKeys.includes(pane.key)}
                   dropTarget={dropTargetKey === pane.key}
                   onClose={() => requestClose(pane.key)}
+                  onToggleMax={() => toggleMax(pane.key)}
+                  onToggleHide={() => toggleHide(pane.key)}
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
                   onOpenFile={openFile}
@@ -599,7 +644,9 @@ function App() {
                 />
               ))}
             </ResizableGrid>
-          )}
+              </>
+            );
+          })()}
         </main>
       </div>
 
@@ -629,6 +676,29 @@ function App() {
               <span className="shrink-0 text-[9px] text-[var(--color-faint)]">{lc.busy ? "working" : "done"}</span>
             </button>
           ))}
+        </div>
+      )}
+
+      {/* hidden panes — still mounted + running, click to restore into the grid */}
+      {hiddenKeys.length > 0 && (
+        <div className="absolute bottom-4 left-4 z-40 flex max-w-64 flex-col gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/95 p-2 shadow-2xl backdrop-blur">
+          <div className="px-1 text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
+            hidden
+          </div>
+          {panes
+            .filter((p) => hiddenKeys.includes(p.key))
+            .map((p) => (
+              <button
+                key={p.key}
+                onClick={() => toggleHide(p.key)}
+                className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left hover:border-[var(--color-accent)]/40"
+                title="restore pane"
+              >
+                <span className={`status-dot shrink-0 ${DOT[p.kind.type] ?? "status-dot--cold"}`} />
+                <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--color-text-2)]">{p.label}</span>
+                <Maximize2 size={11} className="shrink-0 text-[var(--color-faint)]" />
+              </button>
+            ))}
         </div>
       )}
 
@@ -1263,8 +1333,12 @@ const DOT: Record<string, string> = {
 function PaneCard({
   pane,
   active,
+  maximized,
+  hidden,
   dropTarget,
   onClose,
+  onToggleMax,
+  onToggleHide,
   onFocus,
   onAnnotate,
   onOpenFile,
@@ -1272,8 +1346,12 @@ function PaneCard({
 }: {
   pane: Pane;
   active: boolean;
+  maximized?: boolean;
+  hidden?: boolean;
   dropTarget?: boolean;
   onClose: () => void;
+  onToggleMax?: () => void;
+  onToggleHide?: () => void;
   onFocus: () => void;
   onAnnotate: (text: string) => void;
   onOpenFile: (path: string, name: string) => void;
@@ -1301,10 +1379,16 @@ function PaneCard({
     <div
       data-pane-key={pane.key}
       onMouseDownCapture={onFocus}
-      className={`relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-[var(--color-pane)] transition-colors ${
-        dropTarget
-          ? "border-[var(--color-accent)]"
-          : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]"
+      style={hidden ? { display: "none" } : undefined}
+      className={`flex min-h-0 min-w-0 flex-col overflow-hidden bg-[var(--color-pane)] transition-colors ${
+        maximized
+          ? // truly fullscreen — edge-to-edge over the top bar + sidebar, no chrome
+            "fixed inset-0 z-40"
+          : `relative rounded-lg border ${
+              dropTarget
+                ? "border-[var(--color-accent)]"
+                : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]"
+            }`
       }`}
     >
       <div className="flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-white/[0.02] px-2.5">
@@ -1325,6 +1409,26 @@ function PaneCard({
               }`}
             >
               <Radio size={12} className={mon ? "animate-pulse" : ""} />
+            </button>
+          )}
+          {onToggleHide && (
+            <button
+              type="button"
+              onClick={(e) => (e.stopPropagation(), onToggleHide())}
+              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              title="Hide pane (keeps running)"
+            >
+              <EyeOff size={12} />
+            </button>
+          )}
+          {onToggleMax && (
+            <button
+              type="button"
+              onClick={(e) => (e.stopPropagation(), onToggleMax())}
+              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              title={maximized ? "Restore pane" : "Maximize pane"}
+            >
+              {maximized ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
             </button>
           )}
           <button

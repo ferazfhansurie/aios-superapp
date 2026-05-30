@@ -45,6 +45,21 @@ export async function gitStatus(path: string): Promise<GitStatus> {
   return invoke<GitStatus>("git_status", { path });
 }
 
+/** Compact per-repo git summary for the homescreen "dev pulse" tile. */
+export interface RepoPulse {
+  root: string;
+  name: string;
+  branch: string;
+  dirty: number;
+  ahead: number;
+  behind: number;
+}
+
+/** Branch + dirty-count + ahead/behind for each repo path (best-effort). */
+export async function gitPulse(paths: string[]): Promise<RepoPulse[]> {
+  return invoke<RepoPulse[]>("git_pulse", { paths });
+}
+
 export async function homeDir(): Promise<string> {
   return invoke<string>("home_dir");
 }
