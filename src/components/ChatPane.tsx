@@ -1744,7 +1744,7 @@ export function ChatPane({
           />
         )}
 
-        <div className="flash-composer relative overflow-hidden rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
+        <div className="flash-composer relative rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
           {/* attached-image thumbnails (paste a screenshot / + attach) */}
           {images.length > 0 && (
             <div className="flex flex-wrap gap-2 px-3 pt-3">
