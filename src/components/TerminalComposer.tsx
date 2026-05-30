@@ -106,9 +106,9 @@ export function TerminalComposer({
   );
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // ⌘/Ctrl+Enter → send the whole box to the PTY. Plain Enter / Shift+Enter
-    // stay as newlines so long structured prompts are easy to write.
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    // Enter → send (start generating now). Shift+Enter → newline for multi-line
+    // prompts. ⌘/Ctrl+Enter also sends (they carry no shift).
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
     }
@@ -172,7 +172,7 @@ export function TerminalComposer({
           onPaste={onPaste}
           rows={1}
           spellCheck={false}
-          placeholder="compose a prompt — ⌘↵ to send · shift+↵ newline · paste/drop an image"
+          placeholder="compose a prompt — ↵ to send · shift+↵ newline · paste/drop an image"
           className="block w-full resize-none bg-transparent px-3 pt-2.5 pb-1.5 font-sans text-[13.5px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
         />
         <div className="flex items-center gap-1.5 px-2 pb-2 pt-0.5">
@@ -213,7 +213,7 @@ export function TerminalComposer({
             type="button"
             onClick={submit}
             disabled={!value.trim()}
-            title="send to terminal (⌘↵)"
+            title="send to terminal (↵)"
             className="flex items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 py-1 font-sans text-[12px] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:opacity-40"
           >
             <span>send</span>

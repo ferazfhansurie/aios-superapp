@@ -367,10 +367,15 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     bufRef.current = "";
   };
 
-  // Compose box → write the full text to the PTY followed by CR (submit).
+  // Compose box → write the text, then send Enter as a SEPARATE keystroke a beat
+  // later. Claude Code / Ink TUIs can swallow a CR glued to a pasted block
+  // (bracketed paste), so the prompt wouldn't actually submit. Splitting them
+  // makes the Enter land as a real submit and generation starts.
   const composerSend = (text: string) => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, `${text}\r`).catch(() => {});
+    if (id == null) return;
+    ptyWrite(id, text).catch(() => {});
+    setTimeout(() => ptyWrite(id, "\r").catch(() => {}), 40);
   };
 
   // Interrupt the running CLI (^C) — visible "stop" affordance.
