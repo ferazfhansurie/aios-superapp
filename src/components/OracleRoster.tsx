@@ -362,7 +362,7 @@ function OracleRow({
   }
 
   return (
-    <div className="group flex flex-col gap-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2.5 py-2 transition-colors hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-panel-2)]">
+    <div className="group flex flex-col gap-1 rounded-md px-2 py-1 transition-colors hover:bg-[var(--color-panel-2)]/60">
       <div className="flex items-center gap-2.5">
       <button onClick={onAttach} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
         <span
@@ -374,10 +374,10 @@ function OracleRow({
                 : "status-dot--cold"
           }`}
         />
-        <div className="flex min-w-0 flex-1 flex-col">
-          <span className="truncate text-[13px] text-[var(--color-text)]">{oracle.display_name}</span>
-          <span className="truncate text-[10px] text-[var(--color-muted)]">
-            {oracle.running ? oracle.session : "not running · click to start"}
+        <div className="flex min-w-0 flex-1 items-baseline gap-1.5">
+          <span className="truncate text-[12px] text-[var(--color-text)]">{oracle.display_name}</span>
+          <span className="truncate text-[9px] text-[var(--color-faint)] opacity-0 transition-opacity group-hover:opacity-100">
+            {oracle.running ? oracle.session : "not running"}
           </span>
         </div>
       </button>
