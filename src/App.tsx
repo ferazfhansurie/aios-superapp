@@ -1,21 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
-  Database,
-  Bot,
   Camera,
-  Clock,
+  EllipsisVertical,
   Folder,
   Globe,
-  MessageCircle,
+  GripVertical,
   MessageSquare,
+  MessageCircle,
   PanelLeft,
+  Pencil,
+  Pin,
   Play,
+  Plus,
   Radio,
   Search,
   Settings as SettingsIcon,
-  TerminalSquare,
-  Wand2,
+  Trash2,
+  EyeOff,
   X,
 } from "lucide-react";
 
@@ -49,23 +51,25 @@ import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import { chatHandles, paneWriters } from "./lib/paneBus";
 import { homeDir } from "./lib/fs";
-import { detectProject } from "./lib/run";
+import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 
-/** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
-type PaneContent =
-  | PaneKind
-  | { type: "files" }
-  | { type: "browser" }
-  | { type: "memory" }
-  | { type: "automations" }
-  | { type: "bridges" }
-  | { type: "plugins" }
-  | { type: "pulse" }
-  | { type: "chat"; seed?: string; resume?: { id: string; title: string }; reattach?: number }
-  | { type: "customers" }
-  | { type: "motion" }
-  | { type: "file"; path: string; name: string }
-  | { type: "editor"; path: string; name: string };
+import { SPAWN, SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
+import {
+  loadSidebar,
+  reorder,
+  addLink,
+  removeItem,
+  renameItem,
+  toggleHidden,
+  subscribe as subscribeSidebar,
+  type SidebarItem,
+  type SidebarState,
+} from "./lib/sidebar";
+
+// re-export the catalog types so existing consumers (IdleDashboard) keep their
+// `import { AppDef } from "../App"` path working without churn.
+export type { AppDef, PaneContent };
+
 interface Pane {
   key: string;
   label: string;
@@ -96,19 +100,6 @@ function paneForFile(path: string, name: string): PaneContent {
 let seq = 0;
 const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
 
-export type AppDef = { kind: PaneContent; icon: typeof Folder; label: string };
-const SPAWN: AppDef[] = [
-  { kind: { type: "chat" }, icon: MessageSquare, label: "chat" },
-  { kind: { type: "shell" }, icon: TerminalSquare, label: "terminal" },
-  { kind: { type: "shell", cmd: "claude --dangerously-skip-permissions" }, icon: Bot, label: "claude code" },
-  { kind: { type: "files" }, icon: Folder, label: "files" },
-  { kind: { type: "browser" }, icon: Globe, label: "browser" },
-  { kind: { type: "memory" }, icon: Database, label: "database" },
-  { kind: { type: "automations" }, icon: Clock, label: "automations" },
-  { kind: { type: "customers" }, icon: MessageCircle, label: "contacts" },
-  { kind: { type: "motion" }, icon: Wand2, label: "studio" },
-];
-
 function App() {
   const [panes, setPanes] = useState<Pane[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -122,9 +113,14 @@ function App() {
   const [dropTargetKey, setDropTargetKey] = useState<string | null>(null);
   // backgrounded chat sessions still running after their pane closed.
   const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
+  // personalizable sidebar — items + order live in lib/sidebar (localStorage).
+  const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
+  useEffect(() => subscribeSidebar(setSidebar), []);
+  // "pin a site" inline prompt.
+  const [pinSiteOpen, setPinSiteOpen] = useState(false);
   // Native browser webviews paint ABOVE html, so any floating overlay (modals,
   // palette) must hide them or it gets occluded.
-  const overlayOpen = settingsOpen || paletteOpen;
+  const overlayOpen = settingsOpen || paletteOpen || pinSiteOpen;
 
   useEffect(() => {
     const t = setTimeout(() => setSplash(false), 850);
@@ -141,6 +137,20 @@ function App() {
   const spawn = useCallback((kind: PaneContent, label: string) => {
     setPanes((p) => [...p, { key: nextKey(), kind, label }]);
   }, []);
+
+  // Resolve a sidebar item to a spawn: built-in apps look up their kind from the
+  // catalog; link items open the embedded browser already at their url.
+  const spawnSidebarItem = useCallback(
+    (item: SidebarItem) => {
+      if (item.kind.type === "link") {
+        spawn({ type: "browser", url: item.kind.url }, item.label);
+        return;
+      }
+      const app = SPAWN_BY_ID[item.kind.appId];
+      if (app) spawn(app.kind, item.label);
+    },
+    [spawn],
+  );
 
   // remember the last file opened in the editor so F5 knows which project to run
   const lastOpenPath = useRef<string | null>(null);
@@ -207,6 +217,9 @@ function App() {
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [chats, setChats] = useState<ChatSessionInfo[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  // every runnable project under ~/Repo, for the per-project ⌘K run entries.
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [home, setHome] = useState<string>("");
   useEffect(() => {
     let alive = true;
     const load = () => {
@@ -222,6 +235,32 @@ function App() {
       clearInterval(t);
     };
   }, []);
+
+  // Discover every runnable project under ~/Repo once on mount so each one gets
+  // its own ⌘K "run <name>" entry. Cheap (bounded scan), so no polling — a stale
+  // list just misses a brand-new repo until next launch.
+  const loadProjects = useCallback(() => {
+    listProjects().then(setProjects).catch(() => {});
+  }, []);
+  useEffect(() => {
+    homeDir().then(setHome).catch(() => {});
+    loadProjects();
+  }, [loadProjects]);
+
+  // spawn a run terminal for a discovered project, exactly like F5 (logs stream
+  // + flutter `r` hot-reload work in-pane). Uses the project's primary command.
+  const runProject = useCallback(
+    (p: ProjectInfo) => {
+      const c = p.commands[0];
+      if (!c) {
+        flash(`no run command for ${p.name}`);
+        return;
+      }
+      spawn({ type: "shell", cmd: c.cmd, cwd: p.root }, `▶ ${p.name}`);
+      flash(`▶ ${c.cmd}`);
+    },
+    [spawn, flash],
+  );
 
   // background chat tray refreshes faster so a finished/closed task shows up
   // (and drops off on reattach) without waiting on the 30s data loop.
@@ -290,7 +329,8 @@ function App() {
       } else if (mod && e.key.toLowerCase() === "b") {
         e.preventDefault();
         setSidebarOpen((v) => !v);
-      } else if (mod && e.key.toLowerCase() === "t") {
+      } else if (mod && (e.key.toLowerCase() === "t" || e.key.toLowerCase() === "n")) {
+        // ⌘T / ⌘N — new terminal
         e.preventDefault();
         addShell();
       } else if (mod && e.key.toLowerCase() === "r") {
@@ -425,12 +465,29 @@ function App() {
         actionLabel: "open inbox",
         run: () => spawn({ type: "customers" }, "customers"),
       })),
+      // one "run <name>" per discovered ~/Repo project — type a repo name in ⌘K
+      // and ⏎ launches its primary command in a fresh run terminal.
+      ...projects.map((p) => {
+        const rel = home && p.root.startsWith(home)
+          ? p.root.slice(home.length).replace(/^\//, "")
+          : p.root;
+        return {
+          id: `run-project-${p.root}`,
+          title: `run ${p.name}`,
+          subtitle: `${p.kind} · ${rel}`,
+          group: "run",
+          icon: <Play size={14} />,
+          keywords: `run start launch project ${p.name} ${p.kind} ${rel}`,
+          actionLabel: "run",
+          run: () => runProject(p),
+        };
+      }),
       { id: "sidebar", title: "toggle sidebar", subtitle: "⌘B", group: "view", icon: <PanelLeft size={14} />, keywords: "rail hide show", actionLabel: "toggle", run: () => setSidebarOpen((v) => !v) },
-      { id: "run", title: "run project", subtitle: "F5", group: "actions", icon: <Play size={14} />, keywords: "f5 run debug start flutter npm dev build terminal", actionLabel: "run", run: () => runF5() },
+      { id: "run", title: "run focused project", subtitle: "F5", group: "actions", icon: <Play size={14} />, keywords: "f5 run debug start flutter npm dev build terminal focused open file — type a repo name for a specific project", actionLabel: "run", run: () => runF5() },
       { id: "appshot", title: "appshot — screenshot to oracle", subtitle: "⌘⌘", group: "actions", icon: <Camera size={14} />, keywords: "screenshot capture", actionLabel: "run", run: fireAppshot },
       { id: "settings", title: "settings", subtitle: "⌘,", group: "app", icon: <SettingsIcon size={14} />, keywords: "preferences theme appearance", actionLabel: "open", run: () => setSettingsOpen(true) },
     ],
-    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5],
+    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, projects, home, runProject],
   );
 
   return (
@@ -475,18 +532,11 @@ function App() {
         {sidebarOpen && (
           <aside className="flex w-60 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
             <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-2">
-              {/* sessions */}
-              <div className="flex flex-col gap-0.5">
-                {SPAWN.filter((s) => s.label === "chat" || s.label === "terminal").map((s) => (
-                  <NavRow key={s.label} icon={s.icon} label={s.label === "chat" ? "new chat" : s.label} onClick={() => spawn(s.kind, s.label)} />
-                ))}
-              </div>
-              {/* tools */}
-              <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] pt-2">
-                {SPAWN.filter((s) => s.label !== "chat" && s.label !== "terminal").map((s) => (
-                  <NavRow key={s.label} icon={s.icon} label={s.label} onClick={() => spawn(s.kind, s.label)} />
-                ))}
-              </div>
+              <SidebarRail
+                state={sidebar}
+                onSpawn={spawnSidebarItem}
+                onPinSite={() => setPinSiteOpen(true)}
+              />
               <OracleRoster onAttachOracle={addOracle} onAttachTmux={addTmux} />
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
@@ -520,6 +570,15 @@ function App() {
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
                   onOpenFile={openFile}
+                  onProfileChange={(profile) =>
+                    setPanes((ps) =>
+                      ps.map((p) =>
+                        p.key === pane.key && p.kind.type === "browser"
+                          ? { ...p, kind: { ...p.kind, profile } }
+                          : p,
+                      ),
+                    )
+                  }
                 />
               ))}
             </ResizableGrid>
@@ -604,6 +663,7 @@ function App() {
 
       <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} commands={commands} />
+      <PinSiteModal open={pinSiteOpen} onClose={() => setPinSiteOpen(false)} />
     </div>
   );
 }
@@ -655,6 +715,344 @@ function NavRow({
   );
 }
 
+/* ── personalizable sidebar rail ─────────────────────────────────────────── */
+
+const GROUP_ORDER = ["sessions", "tools", "pinned"] as const;
+
+/** The store-driven rail: built-in apps + pinned sites, grouped, drag-to-reorder
+ *  (native HTML5 DnD), with per-row rename / hide / unpin actions. */
+function SidebarRail({
+  state,
+  onSpawn,
+  onPinSite,
+}: {
+  state: SidebarState;
+  onSpawn: (item: SidebarItem) => void;
+  onPinSite: () => void;
+}) {
+  // index of the row being dragged + the row currently hovered (drop target),
+  // both into the FULL ordered items array (reorder() takes absolute indices).
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [overIdx, setOverIdx] = useState<number | null>(null);
+
+  const items = state.items;
+  const indexOf = useCallback(
+    (id: string) => items.findIndex((it) => it.id === id),
+    [items],
+  );
+
+  const onDrop = useCallback(
+    (toId: string) => {
+      const from = dragIdx;
+      const to = indexOf(toId);
+      setDragIdx(null);
+      setOverIdx(null);
+      if (from == null || to < 0 || from === to) return;
+      reorder(from, to);
+    },
+    [dragIdx, indexOf],
+  );
+
+  const renderGroup = (group: (typeof GROUP_ORDER)[number], withBorder: boolean) => {
+    const rows = items.filter((it) => it.group === group && !it.hidden);
+    const isPinned = group === "pinned";
+    if (!rows.length && !isPinned) return null;
+    return (
+      <div
+        key={group}
+        className={`flex flex-col gap-0.5 ${withBorder ? "border-t border-[var(--color-border)] pt-2" : ""}`}
+      >
+        {rows.map((it) => {
+          const idx = indexOf(it.id);
+          return (
+            <SidebarRow
+              key={it.id}
+              item={it}
+              dragging={dragIdx === idx}
+              over={overIdx === idx && dragIdx !== idx}
+              onSpawn={() => onSpawn(it)}
+              onDragStart={() => setDragIdx(idx)}
+              onDragEnter={() => setOverIdx(idx)}
+              onDragEnd={() => {
+                setDragIdx(null);
+                setOverIdx(null);
+              }}
+              onDrop={() => onDrop(it.id)}
+            />
+          );
+        })}
+        {isPinned && (
+          <button
+            onClick={onPinSite}
+            className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[12px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+            title="pin a website to the sidebar"
+          >
+            <Plus size={14} className="shrink-0" />
+            pin a site
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  // border-top only once a prior group has actually rendered (so an empty
+  // sessions group doesn't leave a stray divider above tools).
+  let rendered = 0;
+  return (
+    <>
+      {GROUP_ORDER.map((g) => {
+        const node = renderGroup(g, rendered > 0);
+        if (node) rendered += 1;
+        return node;
+      })}
+    </>
+  );
+}
+
+/** One sidebar row — draggable, resolves to a lucide icon (apps) or a cached
+ *  favicon (links), with a hover ⋯ menu (rename / hide / unpin). */
+function SidebarRow({
+  item,
+  dragging,
+  over,
+  onSpawn,
+  onDragStart,
+  onDragEnter,
+  onDragEnd,
+  onDrop,
+}: {
+  item: SidebarItem;
+  dragging: boolean;
+  over: boolean;
+  onSpawn: () => void;
+  onDragStart: () => void;
+  onDragEnter: () => void;
+  onDragEnd: () => void;
+  onDrop: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(item.label);
+  const [favBroken, setFavBroken] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const isLink = item.kind.type === "link";
+  const app = item.kind.type === "app" ? SPAWN_BY_ID[item.kind.appId] : undefined;
+  const Icon = app?.icon ?? Globe;
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
+
+  const commitRename = () => {
+    const v = draft.trim();
+    if (v && v !== item.label) renameItem(item.id, v);
+    setRenaming(false);
+  };
+
+  if (renaming) {
+    return (
+      <div className="flex items-center gap-2 rounded-md px-2.5 py-1">
+        <input
+          autoFocus
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            else if (e.key === "Escape") {
+              setDraft(item.label);
+              setRenaming(false);
+            }
+          }}
+          spellCheck={false}
+          className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-0.5 text-[13px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = "move";
+        // a transparent payload keeps Firefox/Safari happy with HTML5 DnD.
+        e.dataTransfer.setData("text/plain", item.id);
+        onDragStart();
+      }}
+      onDragEnter={onDragEnter}
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => {
+        e.preventDefault();
+        onDrop();
+      }}
+      onDragEnd={onDragEnd}
+      className={`group relative flex items-center rounded-md transition-colors ${
+        dragging ? "opacity-40" : ""
+      } ${over ? "bg-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent)]/40" : "hover:bg-[var(--color-panel-2)]"}`}
+    >
+      <span className="grid w-4 shrink-0 cursor-grab place-items-center text-[var(--color-faint)] opacity-0 transition-opacity group-hover:opacity-100 active:cursor-grabbing">
+        <GripVertical size={12} />
+      </span>
+      <button
+        onClick={onSpawn}
+        className="flex min-w-0 flex-1 items-center gap-2.5 py-1.5 pr-1 text-left text-[13px] text-[var(--color-text-2)] transition-colors group-hover:text-[var(--color-text)]"
+      >
+        {isLink && item.faviconUrl && !favBroken ? (
+          <img
+            src={item.faviconUrl}
+            alt=""
+            onError={() => setFavBroken(true)}
+            className="h-[15px] w-[15px] shrink-0 rounded-sm"
+          />
+        ) : (
+          <Icon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
+        )}
+        <span className="truncate">{item.label}</span>
+      </button>
+      <div ref={menuRef} className="relative shrink-0">
+        <button
+          onClick={() => setMenuOpen((o) => !o)}
+          className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-text)] group-hover:opacity-100"
+          title="options"
+        >
+          <EllipsisVertical size={13} />
+        </button>
+        {menuOpen && (
+          <div className="absolute right-0 top-full z-50 mt-1 w-40 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
+            <RowMenuItem
+              icon={<Pencil size={13} />}
+              label="rename"
+              onClick={() => {
+                setDraft(item.label);
+                setRenaming(true);
+                setMenuOpen(false);
+              }}
+            />
+            {isLink ? (
+              <RowMenuItem
+                icon={<Trash2 size={13} />}
+                label="unpin"
+                onClick={() => {
+                  removeItem(item.id);
+                  setMenuOpen(false);
+                }}
+              />
+            ) : (
+              <RowMenuItem
+                icon={<EyeOff size={13} />}
+                label="hide"
+                onClick={() => {
+                  toggleHidden(item.id, true);
+                  setMenuOpen(false);
+                }}
+              />
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RowMenuItem({
+  icon,
+  label,
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[var(--color-text)] transition-colors hover:bg-[var(--color-panel)]"
+    >
+      <span className="text-[var(--color-muted)]">{icon}</span>
+      {label}
+    </button>
+  );
+}
+
+/** Inline modal to pin a website by url (favicon resolved by the store). */
+function PinSiteModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [url, setUrl] = useState("");
+  const [label, setLabel] = useState("");
+  useEffect(() => {
+    if (open) {
+      setUrl("");
+      setLabel("");
+    }
+  }, [open]);
+  if (!open) return null;
+  const submit = () => {
+    const u = url.trim();
+    if (!u) return;
+    addLink(u, label.trim() || undefined);
+    onClose();
+  };
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/45 p-6 backdrop-blur-sm" onMouseDown={onClose}>
+      <div
+        className="modal-in glass w-[380px] rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel)]/95 p-4 shadow-2xl"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-[var(--color-text)]">
+          <Pin size={14} className="text-[var(--color-accent)]" />
+          pin a site
+        </div>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+          className="flex flex-col gap-2"
+        >
+          <input
+            autoFocus
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            onKeyDown={(e) => e.key === "Escape" && onClose()}
+            placeholder="youtube.com"
+            spellCheck={false}
+            className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+          />
+          <input
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            onKeyDown={(e) => e.key === "Escape" && onClose()}
+            placeholder="label (optional)"
+            spellCheck={false}
+            className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+          />
+          <div className="mt-1 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg border border-[var(--color-border)] px-3 py-1.5 text-[12px] text-[var(--color-text-2)] hover:border-[var(--color-border-strong)]"
+            >
+              cancel
+            </button>
+            <button
+              type="submit"
+              className="rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+            >
+              pin
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 const DOT: Record<string, string> = {
   oracle: "status-dot--active",
   tmux: "status-dot--dormant",
@@ -680,6 +1078,7 @@ function PaneCard({
   onFocus,
   onAnnotate,
   onOpenFile,
+  onProfileChange,
 }: {
   pane: Pane;
   active: boolean;
@@ -688,6 +1087,7 @@ function PaneCard({
   onFocus: () => void;
   onAnnotate: (text: string) => void;
   onOpenFile: (path: string, name: string) => void;
+  onProfileChange: (profile: string) => void;
 }) {
   const t = pane.kind.type;
   const label =
@@ -753,7 +1153,14 @@ function PaneCard({
         ) : pane.kind.type === "files" ? (
           <FilesPane onOpenFile={onOpenFile} />
         ) : pane.kind.type === "browser" ? (
-          <BrowserPane label={pane.key} active={active} onAnnotate={onAnnotate} />
+          <BrowserPane
+            label={pane.key}
+            active={active}
+            initialUrl={pane.kind.url}
+            initialProfile={pane.kind.profile}
+            onAnnotate={onAnnotate}
+            onProfileChange={onProfileChange}
+          />
         ) : pane.kind.type === "memory" ? (
           <DatabasePane />
         ) : pane.kind.type === "automations" ? (

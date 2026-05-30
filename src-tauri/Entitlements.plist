@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Microphone access for in-webview voice dictation.
+
+	  AIOS records audio in the WKWebview via `navigator.mediaDevices.getUserMedia`
+	  (see src/lib/voice.ts). wry 0.55 already installs a WKUIDelegate that GRANTs
+	  the webview-level media-capture request, so the webview is not the blocker.
+
+	  The blocker is macOS TCC: the bundle is signed ad-hoc WITH the hardened
+	  runtime enabled, and under the hardened runtime the kTCCServiceMicrophone
+	  service is refused WITHOUT the audio-input entitlement — silently, with no
+	  system prompt. That is why dictation never recorded. This entitlement, paired
+	  with NSMicrophoneUsageDescription in Info.plist, lets macOS show the mic
+	  prompt once and grant access.
+	-->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+
+	<!-- Camera, for parity with NSCameraUsageDescription / future capture features. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+
+	<!--
+	  This app is NOT sandboxed. It spawns tmux / PTY shells, runs `~/Repo` project
+	  commands, and reads broadly across $HOME (assetProtocol scope $HOME/**). The
+	  App Sandbox would break all of that, so it is explicitly disabled. With the
+	  sandbox off the device entitlements above are technically optional for an
+	  ad-hoc/unsandboxed binary, but the hardened runtime still enforces them, so
+	  they are required here and kept for correctness if signing/notarization is
+	  added later.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>

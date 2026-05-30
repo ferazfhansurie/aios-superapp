@@ -3,7 +3,7 @@
  * per-session Channel. Mounts once, spawns its session, and cleans up (kills
  * the session) on unmount.
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { MessageSquarePlus, X } from "lucide-react";
 import { Channel } from "@tauri-apps/api/core";
@@ -21,7 +21,7 @@ import {
   spawnTerminal,
   spawnTmux,
 } from "../lib/pty";
-import { saveImageTemp } from "../lib/fs";
+import { homeDir, saveImageTemp } from "../lib/fs";
 import { paneWriters } from "../lib/paneBus";
 import { TerminalComposer } from "./TerminalComposer";
 
@@ -115,10 +115,19 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       (kind.type === "shell" && kind.cmd === "claude"),
   );
   const [savingImg, setSavingImg] = useState(false);
+  // Best-effort cwd for the composer's context bar: a shell pane's explicit cwd,
+  // else the home dir (oracle/tmux panes don't carry one). Read-only label only.
+  const [paneCwd, setPaneCwd] = useState<string | undefined>(
+    kind.type === "shell" ? kind.cwd : undefined,
+  );
   // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
   const [buttons, setButtons] = useState<string[] | null>(null);
   const bufRef = useRef("");
   const lastBtnRef = useRef("");
+  // When the compose box is open, an "append to box" writer it registers — so
+  // global ⌘J dictation (App's single VoiceButton) lands in the box, exactly
+  // like ChatPane. null = no composer mounted → fall back to the PTY writer.
+  const composerAppendRef = useRef<((text: string) => void) | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -319,7 +328,15 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       }
 
       sessionIdRef.current = sessionId;
-      if (paneKey) paneWriters.set(paneKey, (t) => ptyWrite(sessionId!, t).catch(() => {}));
+      // Pane writer for cross-cutting features (voice dictation, file drops).
+      // Prefer the compose box when it's open (so dictation lands in the box and
+      // is editable before send, like ChatPane); else write straight to the PTY.
+      if (paneKey)
+        paneWriters.set(paneKey, (t) => {
+          const toBox = composerAppendRef.current;
+          if (toBox) toBox(t);
+          else ptyWrite(sessionId!, t).catch(() => {});
+        });
       inputDisposer = term.onData((d) => {
         if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
       });
@@ -382,6 +399,44 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   const interrupt = () => {
     const id = sessionIdRef.current;
     if (id != null) ptyWrite(id, "\x03").catch(() => {});
+  };
+
+  // Write RAW bytes straight to the PTY (no auto-CR, no quoting). The compose
+  // box uses this to drive claude code's own TUI controls — slash commands
+  // (e.g. "/model\r"), line-clear (^U = \x15), and the Shift+Tab mode-cycle
+  // (\x1b[Z) — exactly as if the user typed them in the terminal.
+  const sendRaw = (bytes: string) => {
+    const id = sessionIdRef.current;
+    if (id != null) ptyWrite(id, bytes).catch(() => {});
+  };
+
+  // Fall back to the home dir for the composer's context chip when this pane has
+  // no explicit cwd (oracle / tmux / plain shell). Best-effort, label-only.
+  useEffect(() => {
+    if (paneCwd) return;
+    let alive = true;
+    homeDir()
+      .then((h) => {
+        if (alive) setPaneCwd(h);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [paneCwd]);
+
+  // Stable register callback for the compose box: it hands us its append-to-box
+  // writer so global ⌘J dictation routes into the box. Stable identity keeps the
+  // composer's effect from re-firing every render.
+  const registerComposer = useCallback((append: (text: string) => void) => {
+    composerAppendRef.current = append;
+  }, []);
+
+  // ESC → PTY. Claude code: stop generating; press again to edit the previous
+  // message. Lets you drive claude's Esc behaviour from the compose box.
+  const sendEscape = () => {
+    const id = sessionIdRef.current;
+    if (id != null) ptyWrite(id, "\x1b").catch(() => {});
   };
 
   // Save a dropped image → temp file → insert its quoted path into the PTY.
@@ -484,8 +539,15 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       {composerOpen && (
         <TerminalComposer
           onSend={composerSend}
+          onRaw={sendRaw}
           onInterrupt={interrupt}
-          onClose={() => setComposerOpen(false)}
+          onEscape={sendEscape}
+          onClose={() => {
+            composerAppendRef.current = null;
+            setComposerOpen(false);
+          }}
+          register={registerComposer}
+          cwd={paneCwd}
         />
       )}
     </div>

@@ -8,19 +8,54 @@
 
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl};
 
-/// Present as desktop Chrome so sites don't flag the webview UA as a bot
-/// (cuts captcha walls). Cookies persist on-disk per app, so a one-time login
-/// sticks across restarts. Platform-matched so the claimed OS isn't obviously
-/// wrong for the host (Windows vs macOS).
+/// The webview UA, matched to the host engine so the fingerprint is honest.
+///
+/// macOS: present as desktop **Safari**, NOT Chrome. We're a WKWebView — Safari's
+/// own engine — so a Safari UA is the consistent fingerprint and Google fully
+/// supports Safari sign-in. A Chrome UA gets flagged on Google's OAuth pages
+/// ("this browser or app may not be secure"): real Chrome sends `Sec-CH-UA`
+/// client-hint headers a WKWebView can't, so "claims Chrome + no client hints"
+/// reads as a fake/embedded browser. The `Version/… Safari/…` suffix separates
+/// real Safari from a bare embedded webview (whose default UA omits it).
+///
+/// Windows: the webview is WebView2 (Chromium), so a Windows-Chrome UA is the
+/// honest match — a Mac-Safari UA on Windows would be the obviously-wrong combo.
+/// Cookies persist on-disk per profile, so logins stick on both.
 #[cfg(windows)]
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 #[cfg(not(windows))]
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15";
 
 fn parse(url: &str) -> Result<Url, String> {
     Url::parse(url).map_err(|e| format!("bad url: {e}"))
+}
+
+/// Derive a stable 16-byte WKWebsiteDataStore identifier from a profile name.
+/// Each distinct profile gets its OWN persistent cookie jar — so two Google
+/// accounts can be logged in simultaneously (each is a *fresh first login* in
+/// its own partition, sidestepping Google's stricter "add account" webview
+/// check that throws "this browser or app may not be secure"). Deterministic
+/// (FNV-1a, two salted passes) so a profile's login persists across restarts.
+///
+/// macOS only: `data_store_identifier` is a WKWebView API. On Windows (WebView2)
+/// this helper is unused — see `browser_show`.
+#[cfg(target_os = "macos")]
+fn profile_store_id(profile: &str) -> [u8; 16] {
+    fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        hash
+    }
+    let lo = fnv1a(profile.as_bytes(), 0xcbf2_9ce4_8422_2325);
+    let hi = fnv1a(profile.as_bytes(), 0x9e37_79b9_7f4a_7c15);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&lo.to_le_bytes());
+    id[8..].copy_from_slice(&hi.to_le_bytes());
+    id
 }
 
 /// Shows the browser `label` at the given rect, creating it (loading `url`) on
@@ -34,6 +69,7 @@ pub fn browser_show(
     y: f64,
     width: f64,
     height: f64,
+    profile: Option<String>,
 ) -> Result<(), String> {
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.set_position(LogicalPosition::new(x, y));
@@ -42,8 +78,21 @@ pub fn browser_show(
     }
     let parsed = parse(&url)?;
     let window = app.get_window("main").ok_or("no main window")?;
-    let builder =
+    #[allow(unused_mut)]
+    let mut builder =
         tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed)).user_agent(UA);
+    // A named profile gets its own persistent cookie partition so multiple
+    // accounts (personal / noobx29 / fathopes work) stay logged in at once.
+    // The unnamed/"default" profile keeps the shared default store (preserves
+    // any existing login). macOS only — `data_store_identifier` is a WKWebView
+    // API; on Windows (WebView2) the browser shares one cookie store, so multiple
+    // simultaneous Google logins aren't partitioned (graceful degradation).
+    #[cfg(target_os = "macos")]
+    if let Some(name) = profile.as_deref().filter(|p| !p.is_empty() && *p != "default") {
+        builder = builder.data_store_identifier(profile_store_id(name));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = &profile;
     window
         .add_child(
             builder,

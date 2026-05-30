@@ -9,8 +9,8 @@ export interface Rect {
   height: number;
 }
 
-export const browserShow = (label: string, url: string, r: Rect) =>
-  invoke("browser_show", { label, url, ...r });
+export const browserShow = (label: string, url: string, r: Rect, profile?: string) =>
+  invoke("browser_show", { label, url, ...r, profile: profile ?? null });
 export const browserSetBounds = (label: string, r: Rect) =>
   invoke("browser_set_bounds", { label, ...r });
 export const browserNavigate = (label: string, url: string) =>

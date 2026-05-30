@@ -5,6 +5,7 @@ import {
   type ComponentType,
   type ReactNode,
   useEffect,
+  useRef,
   useState,
 } from "react";
 
@@ -16,11 +17,16 @@ import {
   Info,
   Keyboard,
   Minus,
+  Eye,
+  EyeOff,
   Monitor,
   Moon,
+  PanelLeft,
   Palette,
   Plus,
   Radio,
+  RotateCcw,
+  Trash2,
   Settings as SettingsIcon,
   Sun,
   Type,
@@ -39,12 +45,26 @@ import {
 } from "../lib/settings";
 
 import {
+  type SidebarState,
+  loadSidebar,
+  toggleHidden,
+  removeItem,
+  resetSidebar,
+  subscribe as subscribeSidebar,
+} from "../lib/sidebar";
+import { SPAWN_BY_ID } from "../lib/apps";
+
+import {
   type Accent,
   type Theme,
-  ACCENTS,
+  ACCENT_PRESETS,
   ACCENT_ORDER,
+  accentToHex,
   getAccent,
+  getAccentRecents,
   getTheme,
+  isCustomAccent,
+  normalizeHex,
   setAccent,
   setTheme,
   subscribe as subscribeTheme,
@@ -202,7 +222,7 @@ function Segmented<T extends string>({
             className="rounded-md px-2.5 py-1 text-[12px] transition-colors"
             style={{
               background: active ? "var(--color-accent)" : "transparent",
-              color: active ? "#fff" : "var(--color-text-2)",
+              color: active ? "var(--color-accent-fg)" : "var(--color-text-2)",
             }}
           >
             {o.label}
@@ -342,7 +362,40 @@ function ThemePicker({
   );
 }
 
-/** Accent swatch row — click to re-tint the whole app live. Active = ringed. */
+/** A single round accent dot. Active = ringed + check. */
+function AccentDot({
+  hex,
+  active,
+  label,
+  onClick,
+}: {
+  hex: string;
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-pressed={active}
+      title={label}
+      onClick={onClick}
+      className="relative grid h-7 w-7 place-items-center rounded-full transition-transform hover:scale-110"
+      style={{
+        background: hex,
+        boxShadow: active
+          ? "0 0 0 2px var(--color-panel), 0 0 0 4px var(--color-text)"
+          : "0 0 0 1px rgba(0,0,0,0.25) inset",
+      }}
+    >
+      {active && <Check size={14} strokeWidth={3} color="#fff" />}
+    </button>
+  );
+}
+
+/** Accent swatch row — 6 presets + recent customs + a "custom" picker.
+ *  Click any swatch (or pick/type a hex) to re-tint the whole app live. */
 function AccentSwatches({
   value,
   onChange,
@@ -350,31 +403,108 @@ function AccentSwatches({
   value: Accent;
   onChange: (a: Accent) => void;
 }) {
+  const colorInputRef = useRef<HTMLInputElement>(null);
+  const custom = isCustomAccent(value);
+  // current base hex (preset or custom) — drives the picker + hex field.
+  const currentHex = accentToHex(value);
+  const [hexDraft, setHexDraft] = useState(currentHex);
+  const [recents, setRecents] = useState<string[]>(getAccentRecents);
+
+  // keep the draft + recents in sync when the accent changes elsewhere.
+  useEffect(() => {
+    setHexDraft(currentHex);
+    setRecents(getAccentRecents());
+  }, [currentHex]);
+
+  const commitHex = (raw: string) => {
+    const norm = normalizeHex(raw);
+    if (norm) onChange(norm);
+  };
+
   return (
-    <div className="flex items-center gap-2.5">
-      {ACCENT_ORDER.map((a) => {
-        const def = ACCENTS[a];
-        const active = a === value;
-        return (
-          <button
+    <div className="flex flex-col items-end gap-2.5">
+      <div className="flex items-center gap-2.5">
+        {ACCENT_ORDER.map((a) => (
+          <AccentDot
             key={a}
-            type="button"
-            aria-label={a}
-            aria-pressed={active}
-            title={a}
+            hex={ACCENT_PRESETS[a]}
+            active={value === a}
+            label={a}
             onClick={() => onChange(a)}
-            className="relative grid h-7 w-7 place-items-center rounded-full transition-transform hover:scale-110"
-            style={{
-              background: def.swatch,
-              boxShadow: active
-                ? "0 0 0 2px var(--color-panel), 0 0 0 4px var(--color-text)"
-                : "0 0 0 1px rgba(0,0,0,0.25) inset",
-            }}
-          >
-            {active && <Check size={14} strokeWidth={3} color="#fff" />}
-          </button>
-        );
-      })}
+          />
+        ))}
+
+        {/* recent custom colors */}
+        {recents.map((hex) => (
+          <AccentDot
+            key={hex}
+            hex={hex}
+            active={custom && currentHex === hex}
+            label={hex}
+            onClick={() => onChange(hex)}
+          />
+        ))}
+
+        {/* custom — rainbow + opens native color picker */}
+        <button
+          type="button"
+          aria-label="custom color"
+          title="custom color"
+          aria-pressed={custom}
+          onClick={() => colorInputRef.current?.click()}
+          className="relative grid h-7 w-7 place-items-center rounded-full transition-transform hover:scale-110"
+          style={{
+            background:
+              "conic-gradient(from 0deg, #ff5f57, #febc2e, #28c840, #339cff, #924ff7, #fb5b86, #ff5f57)",
+            boxShadow: custom
+              ? "0 0 0 2px var(--color-panel), 0 0 0 4px var(--color-text)"
+              : "0 0 0 1px rgba(0,0,0,0.25) inset",
+          }}
+        >
+          <Plus size={13} strokeWidth={3} color="#fff" />
+          {/* the actual color input lives here, visually hidden but anchored
+              under the swatch so the OS picker pops near it. */}
+          <input
+            ref={colorInputRef}
+            type="color"
+            value={currentHex}
+            onChange={(e) => onChange(e.target.value)}
+            className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+            aria-hidden
+            tabIndex={-1}
+          />
+        </button>
+      </div>
+
+      {/* editable hex field — type or paste any color. */}
+      <div className="flex items-center gap-2">
+        <span
+          className="h-4 w-4 shrink-0 rounded-[5px]"
+          style={{
+            background: currentHex,
+            boxShadow: "0 0 0 1px rgba(0,0,0,0.25) inset",
+          }}
+        />
+        <span className="font-mono text-[12px] text-[var(--color-muted)]">#</span>
+        <input
+          value={hexDraft.replace(/^#/, "")}
+          onChange={(e) => setHexDraft(e.target.value)}
+          onBlur={() => {
+            commitHex(hexDraft);
+            setHexDraft(currentHex);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              commitHex(hexDraft);
+              (e.target as HTMLInputElement).blur();
+            }
+          }}
+          spellCheck={false}
+          maxLength={6}
+          placeholder="f26522"
+          className="w-[72px] rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2 py-1 font-mono text-[12px] uppercase tracking-wide text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+        />
+      </div>
     </div>
   );
 }
@@ -441,8 +571,11 @@ function AppearancePreview({ fontPx }: { fontPx: number }) {
             looks like this.
           </p>
           <button
-            className="mt-2.5 rounded-md px-2.5 py-1 text-[11px] font-medium text-white"
-            style={{ background: "var(--color-accent)" }}
+            className="mt-2.5 rounded-md px-2.5 py-1 text-[11px] font-medium"
+            style={{
+              background: "var(--color-accent)",
+              color: "var(--color-accent-fg)",
+            }}
           >
             primary action
           </button>
@@ -466,6 +599,7 @@ function GroupLabel({ children }: { children: ReactNode }) {
 type SectionId =
   | "general"
   | "appearance"
+  | "sidebar"
   | "oracles"
   | "channels"
   | "plugins"
@@ -476,6 +610,7 @@ type SectionId =
 const NAV: { id: SectionId; label: string; icon: ComponentType<{ size?: number }> }[] = [
   { id: "general", label: "general", icon: SettingsIcon },
   { id: "appearance", label: "appearance", icon: Palette },
+  { id: "sidebar", label: "sidebar", icon: PanelLeft },
   { id: "oracles", label: "oracles", icon: Cpu },
   { id: "channels", label: "channels", icon: Radio },
   { id: "plugins", label: "plugins", icon: Blocks },
@@ -513,6 +648,8 @@ export function Settings({
 }) {
   const [section, setSection] = useState<SectionId>("general");
   const [s, setS] = useState<AppSettings>(loadSettings);
+  const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
+  useEffect(() => subscribeSidebar(setSidebar), []);
   const [theme, setLocalTheme] = useState<Theme>(getTheme);
   const [accent, setLocalAccent] = useState<Accent>(getAccent);
   const [density, setLocalDensity] = useState<Density>(getDensity);
@@ -688,7 +825,10 @@ export function Settings({
 
                   {/* accent */}
                   <div className="py-3">
-                    <Row label="accent" sub="re-tints the whole cockpit instantly">
+                    <Row
+                      label="accent"
+                      sub="pick a preset or any custom color — re-tints the whole cockpit instantly"
+                    >
                       <AccentSwatches
                         value={accent}
                         onChange={(a) => {
@@ -767,6 +907,73 @@ export function Settings({
                       }}
                     />
                   </Row>
+                </div>
+              )}
+
+              {section === "sidebar" && (
+                <div className="-mt-1">
+                  <p className="pb-3 pt-1 text-[12px] leading-snug text-[var(--color-muted)]">
+                    show or hide rail items. drag to reorder them right in the
+                    sidebar. pinned sites can be unpinned here or via their ⋯ menu.
+                  </p>
+                  {sidebar.items.map((it) => {
+                    const isLink = it.kind.type === "link";
+                    const app = it.kind.type === "app" ? SPAWN_BY_ID[it.kind.appId] : undefined;
+                    const Icon = app?.icon ?? PanelLeft;
+                    return (
+                      <div
+                        key={it.id}
+                        className="flex items-center justify-between gap-3 border-b border-[var(--color-border)] py-2 last:border-0"
+                      >
+                        <div className="flex min-w-0 items-center gap-2.5">
+                          {isLink && it.faviconUrl ? (
+                            <img src={it.faviconUrl} alt="" className="h-4 w-4 shrink-0 rounded-sm" />
+                          ) : (
+                            <Icon size={14} className="shrink-0 text-[var(--color-muted)]" />
+                          )}
+                          <span
+                            className="truncate text-[13px]"
+                            style={{
+                              color: it.hidden ? "var(--color-faint)" : "var(--color-text-2)",
+                            }}
+                          >
+                            {it.label}
+                          </span>
+                          <span className="shrink-0 text-[10px] uppercase tracking-wide text-[var(--color-faint)]">
+                            {it.group}
+                          </span>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1">
+                          {isLink ? (
+                            <button
+                              onClick={() => removeItem(it.id)}
+                              title="unpin"
+                              className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-danger)]"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => toggleHidden(it.id, !it.hidden)}
+                              title={it.hidden ? "show" : "hide"}
+                              className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                            >
+                              {it.hidden ? <EyeOff size={14} /> : <Eye size={14} />}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div className="flex justify-end pt-3">
+                    <button
+                      onClick={() => resetSidebar()}
+                      className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-3 py-1.5 text-[12px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+                    >
+                      <RotateCcw size={13} />
+                      reset sidebar to default
+                    </button>
+                  </div>
                 </div>
               )}
 

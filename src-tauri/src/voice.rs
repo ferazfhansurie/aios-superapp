@@ -59,11 +59,61 @@ fn curl_bin() -> String {
     resolve_bin(&["/usr/bin/curl", "/opt/homebrew/bin/curl"], "curl")
 }
 
-/// Starts recording the default mic to `WAV_PATH`. Errors if already recording.
+/// Pick a usable avfoundation audio input. macOS frequently makes a Continuity
+/// "iPhone Microphone" the DEFAULT input — and when the phone isn't connected,
+/// ffmpeg's `:default` throws an I/O error and records nothing (silent failure).
+/// So we enumerate the real devices and choose the first that ISN'T an
+/// iPhone/iPad/Continuity device (i.e. the built-in mic), falling back to
+/// `:default` only if enumeration yields nothing.
+#[cfg(unix)]
+fn pick_audio_device() -> String {
+    let out = Command::new(ffmpeg_bin())
+        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    if let Ok(o) = out {
+        let txt = String::from_utf8_lossy(&o.stderr);
+        let mut in_audio = false;
+        for line in txt.lines() {
+            if line.contains("AVFoundation audio devices") {
+                in_audio = true;
+                continue;
+            }
+            if line.contains("AVFoundation video devices") {
+                in_audio = false;
+                continue;
+            }
+            if !in_audio {
+                continue;
+            }
+            // Line looks like: "[AVFoundation indev @ 0x..] [1] MacBook Air Microphone".
+            // The LAST '[' is the device index; the name follows its ']'.
+            if let Some(b) = line.rfind('[') {
+                if let Some(rel) = line[b..].find(']') {
+                    let idx = &line[b + 1..b + rel];
+                    let name = line[b + rel + 1..].trim().to_lowercase();
+                    if !idx.is_empty()
+                        && idx.chars().all(|c| c.is_ascii_digit())
+                        && !name.contains("iphone")
+                        && !name.contains("ipad")
+                        && !name.contains("continuity")
+                    {
+                        return format!(":{idx}");
+                    }
+                }
+            }
+        }
+    }
+    ":default".into()
+}
+
+/// Starts recording the built-in mic to `WAV_PATH`. Errors if already recording.
 ///
-/// avfoundation device string: we use `:default` (the default audio input). The
-/// recorder runs untimed — `dictate_stop`/`dictate_cancel` ends it — and we keep
-/// its stdin piped so we can send `q` for a graceful flush of the WAV trailer.
+/// Picks a real (non-Continuity) avfoundation device — see `pick_audio_device`.
+/// The recorder runs untimed — `dictate_stop`/`dictate_cancel` ends it — and we
+/// keep its stdin piped so we can send `q` for a graceful flush of the WAV trailer.
 #[tauri::command]
 pub fn dictate_start() -> Result<(), String> {
     #[cfg(unix)]
@@ -76,6 +126,7 @@ pub fn dictate_start() -> Result<(), String> {
         // Best-effort: clear any stale clip from a crashed prior session.
         let _ = std::fs::remove_file(WAV_PATH);
 
+        let device = pick_audio_device();
         let child = Command::new(ffmpeg_bin())
             .args([
                 "-hide_banner",
@@ -84,7 +135,7 @@ pub fn dictate_start() -> Result<(), String> {
                 "-f",
                 "avfoundation",
                 "-i",
-                ":default",
+                device.as_str(),
                 "-ar",
                 "16000",
                 "-ac",
@@ -92,10 +143,15 @@ pub fn dictate_start() -> Result<(), String> {
                 "-y",
                 WAV_PATH,
             ])
-            // Piped stdin lets us send 'q' for a clean stop; quiet the rest.
+            // Piped stdin lets us send 'q' for a clean stop.
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Keep ffmpeg's stderr in a log so a failed capture is never silent again.
+            .stderr(
+                std::fs::File::create("/tmp/aios-dictate-ffmpeg.log")
+                    .map(Stdio::from)
+                    .unwrap_or_else(|_| Stdio::null()),
+            )
             .spawn()
             .map_err(|e| format!("failed to start ffmpeg: {e}"))?;
 

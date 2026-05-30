@@ -169,7 +169,7 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
             onCancel={() => setCreating(false)}
             onCreate={async (name, launch) => {
               try {
-                await createOracle(name, launch ? "claude" : undefined);
+                await createOracle(name, launch ? "claude --dangerously-skip-permissions" : undefined);
                 setCreating(false);
                 await refresh();
               } catch (e) {
