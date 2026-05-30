@@ -424,6 +424,11 @@ export function TerminalComposer({
   const phaseRef = useRef<Phase>("idle");
   phaseRef.current = phase;
 
+  // hands-free: when a dictation finishes we set this, then an effect on `value`
+  // fires submit() once the appended transcript has actually landed in state
+  // (can't submit in micStop's tick — `value` is still stale there).
+  const autoSendRef = useRef(false);
+
   useEffect(() => {
     if (phase !== "recording") return;
     setElapsed(0);
@@ -447,7 +452,11 @@ export function TerminalComposer({
     setPhase("transcribing");
     try {
       const text = await dictateStop();
-      if (text) append(text);
+      if (text) {
+        append(text);
+        // hands-free: send as soon as the transcript lands (see autoSendRef).
+        autoSendRef.current = true;
+      }
     } catch {
       /* swallow — best-effort dictation */
     } finally {
@@ -455,6 +464,16 @@ export function TerminalComposer({
       taRef.current?.focus();
     }
   }, [append]);
+
+  // auto-send the dictated transcript once `value` reflects the append. Guarded
+  // by autoSendRef so ordinary typing never triggers it; cleared before submit
+  // so it fires exactly once per dictation.
+  useEffect(() => {
+    if (!autoSendRef.current) return;
+    if (!value.trim()) return;
+    autoSendRef.current = false;
+    submit();
+  }, [value, submit]);
 
   const micCancel = useCallback(async () => {
     if (phaseRef.current !== "recording") return;
