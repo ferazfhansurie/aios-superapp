@@ -100,3 +100,17 @@ export async function bridgeActivity(
 ): Promise<BridgeActivity> {
   return invoke<BridgeActivity>("bridge_activity", { id, limit });
 }
+
+export interface PairResult {
+  ok: boolean;
+  /** 8-digit pairing code "ABCD-EFGH" on success. */
+  code?: string;
+  error?: string;
+}
+
+/** Pairs firaz's PERSONAL WhatsApp (the wwebjs session the "personal" channel
+ *  sends through). Returns the 8-digit pairing code to enter in WhatsApp →
+ *  Linked Devices → Link with phone number. Can take ~30-50s (wwebjs boot). */
+export async function pairPersonalWa(): Promise<PairResult> {
+  return invoke<PairResult>("pair_personal_wa");
+}

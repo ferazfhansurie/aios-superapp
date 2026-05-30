@@ -53,6 +53,28 @@ fn is_aios_label(label: &str) -> bool {
 struct PlistInfo {
     command: String,
     schedule: String,
+    /// Last-run time in unix seconds, inferred from the stdout/stderr log file's
+    /// mtime (0 if no log path or the file doesn't exist). Lets the UI show
+    /// "fired 2h ago" instead of a bare "running" label.
+    last_run: f64,
+}
+
+/// mtime (unix secs) of a launchd log path, expanding a leading `~`. 0 on miss.
+fn log_mtime(path: &str) -> f64 {
+    if path.is_empty() {
+        return 0.0;
+    }
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        format!("{}/{rest}", home())
+    } else {
+        path.to_string()
+    };
+    std::fs::metadata(&expanded)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Reads `~/Library/LaunchAgents/<label>.plist` and extracts the command
@@ -61,12 +83,17 @@ struct PlistInfo {
 fn read_plist(label: &str) -> PlistInfo {
     let path = format!("{}/Library/LaunchAgents/{label}.plist", home());
     let Ok(xml) = std::fs::read_to_string(&path) else {
-        return PlistInfo { command: String::new(), schedule: "unknown".into() };
+        return PlistInfo { command: String::new(), schedule: "unknown".into(), last_run: 0.0 };
     };
 
     let command = parse_program_arguments(&xml);
     let schedule = parse_schedule(&xml);
-    PlistInfo { command, schedule }
+    // Prefer the stdout log's mtime; fall back to stderr's.
+    let mut last_run = log_mtime(&string_for_key(&xml, "StandardOutPath").unwrap_or_default());
+    if last_run == 0.0 {
+        last_run = log_mtime(&string_for_key(&xml, "StandardErrorPath").unwrap_or_default());
+    }
+    PlistInfo { command, schedule, last_run }
 }
 
 /// Pulls the `<string>` values out of the `ProgramArguments` `<array>` and joins
@@ -315,6 +342,7 @@ fn collect_jobs() -> Vec<Value> {
                 "schedule": info.schedule,
                 "running": running,
                 "last_exit": last_exit,
+                "last_run": info.last_run,
             }));
         }
 

@@ -14,6 +14,8 @@ export interface Command {
   group?: string;
   icon?: React.ReactNode;
   keywords?: string;
+  /** Verb shown on the selected row's ⏎ chip ("open" / "resume" / "attach"). */
+  actionLabel?: string;
   run: () => void;
 }
 
@@ -203,21 +205,23 @@ export function CommandPalette({
   // index → row position so hover/selection align across group headers
   let rowPos = -1;
   let lastGroup: string | null = null;
+  const selCmd = results[sel];
+  const selAction = selCmd?.actionLabel ?? "select";
 
   return (
     <div
-      className="fixed inset-0 z-50 flex justify-center bg-black/40 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex justify-center bg-black/50 backdrop-blur-sm"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
-        className="modal-in glass absolute top-[120px] flex max-h-[60vh] w-[560px] flex-col overflow-hidden rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel)]/90 shadow-2xl"
+        className="modal-in glass absolute top-[14vh] flex max-h-[64vh] w-[600px] flex-col overflow-hidden rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel)]/95 shadow-2xl ring-1 ring-black/20"
         onMouseDown={(e) => e.stopPropagation()}
       >
         {/* search row */}
-        <div className="flex items-center gap-2.5 border-b border-[var(--color-border)] px-3.5 py-3">
-          <Search size={15} className="shrink-0 text-[var(--color-muted)]" />
+        <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-4 py-3.5">
+          <Search size={17} className="shrink-0 text-[var(--color-muted)]" />
           <input
             ref={inputRef}
             value={query}
@@ -226,19 +230,22 @@ export function CommandPalette({
               setSel(0);
             }}
             onKeyDown={onKeyDown}
-            placeholder="type a command…"
+            placeholder="launch, ask, or resume anything…"
             spellCheck={false}
             autoComplete="off"
-            className="w-full bg-transparent text-[14px] text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
+            className="w-full bg-transparent text-[15px] text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
           />
+          {results.length > 0 && (
+            <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">{results.length}</span>
+          )}
         </div>
 
         {/* results */}
-        <div ref={listRef} className="flex-1 overflow-y-auto py-1.5">
+        <div ref={listRef} className="flex-1 overflow-y-auto py-2">
           {results.length === 0 ? (
-            <div className="flex flex-col items-center gap-2 px-4 py-10 text-center">
-              <img src="/mascot.png" alt="" className="h-9 w-9 rounded-full object-cover opacity-50" />
-              <div className="text-[12px] text-[var(--color-muted)]">no commands match</div>
+            <div className="flex flex-col items-center gap-2.5 px-4 py-12 text-center">
+              <img src="/mascot.png" alt="" className="h-10 w-10 rounded-full object-cover opacity-40" />
+              <div className="text-[12.5px] text-[var(--color-muted)]">nothing matches “{query}”</div>
             </div>
           ) : (
             results.map((c) => {
@@ -251,42 +258,48 @@ export function CommandPalette({
               return (
                 <div key={c.id}>
                   {showHeader && (
-                    <div className="px-3.5 pb-1 pt-2 text-[10px] font-medium lowercase tracking-wider text-[var(--color-faint)]">
+                    <div className="px-4 pb-1 pt-2.5 text-[10px] font-medium lowercase tracking-[0.14em] text-[var(--color-faint)]">
                       {g}
                     </div>
                   )}
-                  <button
-                    data-row={pos}
-                    onMouseMove={() => setSel(pos)}
-                    onClick={() => {
-                      onClose();
-                      c.run();
-                    }}
-                    className={`relative flex w-full items-center gap-3 px-3.5 py-2 text-left ${
-                      active ? "bg-[var(--color-accent-soft)]" : ""
-                    }`}
-                  >
-                    {active && (
-                      <span className="absolute left-0 top-1/2 h-5 w-[2px] -translate-y-1/2 rounded-r bg-[var(--color-accent)]" />
-                    )}
-                    {c.icon && (
-                      <span
-                        className={`flex h-4 w-4 shrink-0 items-center justify-center ${
-                          active ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]"
-                        }`}
-                      >
-                        {c.icon}
+                  <div className="px-2">
+                    <button
+                      data-row={pos}
+                      onMouseMove={() => setSel(pos)}
+                      onClick={() => {
+                        onClose();
+                        c.run();
+                      }}
+                      className={`relative flex w-full items-center gap-3 rounded-[var(--aios-radius-md)] px-2.5 py-2 text-left transition-colors ${
+                        active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel-2)]/50"
+                      }`}
+                    >
+                      {c.icon && (
+                        <span
+                          className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--aios-radius-sm)] border transition-colors ${
+                            active
+                              ? "border-[var(--color-accent)]/30 bg-[var(--color-accent)]/10 text-[var(--color-accent)]"
+                              : "border-[var(--color-border)] bg-[var(--color-panel-2)]/50 text-[var(--color-muted)]"
+                          }`}
+                        >
+                          {c.icon}
+                        </span>
+                      )}
+                      <span className="min-w-0 flex-1 truncate text-[13.5px] text-[var(--color-text)]">
+                        <Highlight text={c.title} idx={c._idx} />
                       </span>
-                    )}
-                    <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--color-text)]">
-                      <Highlight text={c.title} idx={c._idx} />
-                    </span>
-                    {c.subtitle && (
-                      <span className="shrink-0 truncate text-[11px] text-[var(--color-muted)]">
-                        {c.subtitle}
-                      </span>
-                    )}
-                  </button>
+                      {c.subtitle && (
+                        <span className="shrink-0 truncate font-mono text-[10.5px] text-[var(--color-faint)]">
+                          {c.subtitle}
+                        </span>
+                      )}
+                      {active && (
+                        <span className="flex shrink-0 items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-muted)]">
+                          {c.actionLabel ?? "select"} <CornerDownLeft size={10} />
+                        </span>
+                      )}
+                    </button>
+                  </div>
                 </div>
               );
             })
@@ -294,12 +307,13 @@ export function CommandPalette({
         </div>
 
         {/* footer hint */}
-        <div className="flex items-center gap-3 border-t border-[var(--color-border)] px-3.5 py-2 font-mono text-[10px] text-[var(--color-faint)]">
-          <span className="flex items-center gap-1">↑↓ navigate</span>
+        <div className="flex items-center gap-3.5 border-t border-[var(--color-border)] px-4 py-2 font-mono text-[10px] text-[var(--color-faint)]">
+          <span>↑↓ navigate</span>
           <span className="flex items-center gap-1">
-            <CornerDownLeft size={10} /> select
+            <CornerDownLeft size={10} /> {selAction}
           </span>
           <span>esc close</span>
+          <span className="ml-auto text-[var(--color-faint)]">aios</span>
         </div>
       </div>
     </div>

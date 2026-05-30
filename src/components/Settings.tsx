@@ -9,6 +9,7 @@ import {
 } from "react";
 
 import {
+  Blocks,
   Brain,
   Check,
   Cpu,
@@ -19,11 +20,15 @@ import {
   Moon,
   Palette,
   Plus,
+  Radio,
   Settings as SettingsIcon,
   Sun,
   Type,
   X,
 } from "lucide-react";
+
+import { BridgesPane } from "./BridgesPane";
+import { PluginsPane } from "./PluginsPane";
 
 import {
   type AppSettings,
@@ -462,6 +467,8 @@ type SectionId =
   | "general"
   | "appearance"
   | "oracles"
+  | "channels"
+  | "plugins"
   | "memory"
   | "shortcuts"
   | "about";
@@ -470,6 +477,8 @@ const NAV: { id: SectionId; label: string; icon: ComponentType<{ size?: number }
   { id: "general", label: "general", icon: SettingsIcon },
   { id: "appearance", label: "appearance", icon: Palette },
   { id: "oracles", label: "oracles", icon: Cpu },
+  { id: "channels", label: "channels", icon: Radio },
+  { id: "plugins", label: "plugins", icon: Blocks },
   { id: "memory", label: "memory", icon: Brain },
   { id: "shortcuts", label: "shortcuts", icon: Keyboard },
   { id: "about", label: "about", icon: Info },
@@ -600,6 +609,13 @@ export function Settings({
             <X size={15} />
           </button>
 
+          {section === "channels" || section === "plugins" ? (
+            // Channels + plugins are full panes (own header + scroll) — render
+            // them full-bleed instead of inside the padded settings rows.
+            <div className="min-h-0 flex-1">
+              {section === "channels" ? <BridgesPane /> : <PluginsPane />}
+            </div>
+          ) : (
           <div className="flex-1 overflow-y-auto px-6 py-5">
             <h2 className="mb-3 text-[15px] font-medium lowercase text-[var(--color-text)]">
               {section}
@@ -843,6 +859,7 @@ export function Settings({
               )}
             </div>
           </div>
+          )}
         </div>
       </div>
     </div>

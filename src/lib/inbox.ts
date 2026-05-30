@@ -15,11 +15,20 @@ import { invoke } from "@tauri-apps/api/core";
  *  the way (`send_message` returns "channel not connected yet" for them). */
 export type InboxChannel =
   | "whatsapp"
+  | "whatsapp-personal"
   | "instagram"
   | "telegram"
   | "email"
   | "phone"
   | "other";
+
+/** The channels you can actually SEND on right now, for the composer switcher.
+ *  `whatsapp` = the 0210 business number (Meta Cloud via push.js); `whatsapp-
+ *  personal` = firaz's own number (paired wwebjs session via send-as-personal). */
+export const SENDABLE_CHANNELS: { id: InboxChannel; label: string; short: string }[] = [
+  { id: "whatsapp", label: "WhatsApp · 0210", short: "0210" },
+  { id: "whatsapp-personal", label: "WhatsApp · personal", short: "personal" },
+];
 
 /** One person you can message — a merged view of a logged WhatsApp peer and/or
  *  a manual contact from the CRM store. */

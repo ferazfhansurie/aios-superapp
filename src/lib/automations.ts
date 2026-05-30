@@ -7,6 +7,8 @@ export interface Job {
   schedule: string;
   running: boolean;
   last_exit: number;
+  /** Last-run time in unix seconds, from the log file's mtime (0 if unknown). */
+  last_run: number;
 }
 
 /** One timed intervention from the proactive nightly plan. */

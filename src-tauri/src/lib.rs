@@ -6,6 +6,8 @@ mod bridges;
 mod browser;
 mod chat;
 mod crm;
+mod db;
+mod device;
 mod inbox;
 mod files;
 mod memory;
@@ -28,6 +30,7 @@ fn read_telemetry() -> telemetry::Telemetry {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(pty::PtyState::new())
         .invoke_handler(tauri::generate_handler![
             read_telemetry,
@@ -42,10 +45,12 @@ pub fn run() {
             oracles::create_oracle,
             oracles::rename_oracle,
             oracles::delete_oracle,
+            oracles::kill_tmux_session,
             oracles::appshot,
             files::read_dir,
             files::home_dir,
             files::read_file_preview,
+            files::convert_office_to_pdf,
             plugins::list_plugins,
             browser::browser_zoom,
             browser::browser_clear_cookies,
@@ -58,13 +63,28 @@ pub fn run() {
             usage::usage_stats,
             memory::memory_graph,
             memory::memory_file,
+            memory::memory_save,
+            memory::memory_delete,
+            db::db_list_connections,
+            db::db_add_connection,
+            db::db_remove_connection,
+            db::db_test_connection,
+            db::db_list_tables,
+            db::db_table_rows,
+            db::db_query,
+            db::db_table_columns,
+            db::db_update_row,
+            db::db_insert_row,
+            db::db_delete_row,
             stats::usage_extras,
+            device::device_stats,
             automations::list_automations,
             automations::automation_detail,
             automations::run_automation,
             automations::set_automation_enabled,
             bridges::list_bridges,
             bridges::bridge_activity,
+            bridges::pair_personal_wa,
             crm::crm_load,
             crm::crm_save_contact,
             crm::crm_delete_contact,
@@ -72,6 +92,8 @@ pub fn run() {
             inbox::customer_thread,
             inbox::send_message,
             motion::motion_models,
+            motion::motion_boards,
+            motion::motion_board_save,
             motion::motion_generate,
             motion::motion_status,
             motion::motion_credits,
@@ -86,6 +108,10 @@ pub fn run() {
             chat::chat_interrupt,
             chat::chat_send_raw,
             chat::chat_stop,
+            chat::chat_detach,
+            chat::chat_reattach,
+            chat::chat_set_title,
+            chat::list_chat_live,
             chat::list_chat_sessions,
             chat::record_chat_session,
             chat::read_chat_transcript,

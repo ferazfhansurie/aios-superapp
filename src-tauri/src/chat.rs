@@ -34,10 +34,10 @@
 //! UTF-8 boundaries and re-joined into whole lines so multibyte sequences and
 //! split JSON lines never corrupt a frame.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -45,12 +45,32 @@ use parking_lot::Mutex;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 
-/// One live chat session: the spawned `claude` child plus a handle to its
-/// stdin so we can push subsequent user turns. Both are behind a `Mutex` so the
-/// whole `ChatSession` is `Sync` and lives happily in shared state.
+/// How many raw output lines a detached session keeps for replay on reattach.
+/// Generous enough to reconstruct a long agentic run; oldest lines drop first.
+const REPLAY_CAP: usize = 6000;
+
+/// One live chat session: the spawned `claude` child + its stdin (for pushing
+/// turns). The reader thread owns neither the frontend channel nor the buffer
+/// directly — it forwards through the swappable `sink` and always appends to
+/// `buffer`, so the session keeps running (and buffering) after a pane closes.
 struct ChatSession {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
+    /// Current frontend channel; `None` while detached (output only buffers).
+    sink: Mutex<Option<Channel<String>>>,
+    /// Ring buffer of recent raw lines, replayed verbatim on reattach.
+    buffer: Mutex<VecDeque<String>>,
+    /// claude's own session uuid (from the init event) — used to match a
+    /// reopened pane back to this live process.
+    claude_id: Mutex<Option<String>>,
+    /// Human label for the tray + notification.
+    title: Mutex<String>,
+    /// True while a turn is in flight (set on send, cleared on `result`).
+    busy: AtomicBool,
+    /// True once the pane closed but we kept the process alive.
+    detached: AtomicBool,
+    /// Fire an OS notification when the current/next turn completes.
+    notify_on_done: AtomicBool,
 }
 
 /// Module-level registry of every live chat session, keyed by an incrementing
@@ -179,6 +199,7 @@ pub fn chat_start(
     model: Option<String>,
     permission_mode: Option<String>,
     effort: Option<String>,
+    fast: Option<bool>,
     resume: Option<String>,
 ) -> Result<u32, String> {
     let mut cmd = Command::new(claude_bin());
@@ -237,11 +258,26 @@ pub fn chat_start(
 
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
 
-    // stdout reader: blocking reads → UTF-8-safe → split into whole lines →
-    // forward each complete JSON line over the per-session Channel. Partial
-    // lines (no trailing '\n' yet) are buffered until the rest arrives.
-    let stdout_chan = on_event.clone();
-    let app_exit = app.clone();
+    // Build the session up-front so the reader thread can forward through its
+    // swappable sink + buffer (rather than a fixed channel that dies on close).
+    let session = Arc::new(ChatSession {
+        child: Mutex::new(child),
+        stdin: Mutex::new(stdin),
+        sink: Mutex::new(Some(on_event)),
+        buffer: Mutex::new(VecDeque::with_capacity(256)),
+        claude_id: Mutex::new(None),
+        title: Mutex::new(String::new()),
+        busy: AtomicBool::new(false),
+        detached: AtomicBool::new(false),
+        notify_on_done: AtomicBool::new(false),
+    });
+
+    // stdout reader: blocking reads → UTF-8-safe → whole lines. Each line is
+    // appended to the replay buffer AND forwarded to the current sink (if any).
+    // A dropped sink no longer kills the thread — the process keeps running and
+    // buffering while detached, so a reopened pane can replay + watch it finish.
+    let sess = Arc::clone(&session);
+    let app_rdr = app.clone();
     thread::spawn(move || {
         let mut pending_bytes: Vec<u8> = Vec::new();
         let mut line_buf = String::new();
@@ -254,33 +290,30 @@ pub fn chat_start(
                     let (text, rem) = split_valid_utf8(&pending_bytes);
                     pending_bytes = rem;
                     line_buf.push_str(&text);
-                    // Emit every complete line; keep the trailing partial.
                     while let Some(nl) = line_buf.find('\n') {
                         let line: String = line_buf.drain(..=nl).collect();
                         let trimmed = line.trim_end_matches(['\n', '\r']);
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if stdout_chan.send(trimmed.to_string()).is_err() {
-                            return; // frontend dropped the channel
-                        }
+                        ingest_line(&sess, &app_rdr, trimmed);
                     }
                 }
                 Err(_) => break,
             }
         }
-        // Flush any final unterminated line.
         let tail = line_buf.trim_end_matches(['\n', '\r']);
         if !tail.is_empty() {
-            let _ = stdout_chan.send(tail.to_string());
+            ingest_line(&sess, &app_rdr, tail);
         }
-        let _ = app_exit.emit("chat-exit", id);
+        sess.busy.store(false, Ordering::SeqCst);
+        let _ = app_rdr.emit("chat-exit", id);
     });
 
-    // stderr reader: forward as synthetic error events so the UI can show why a
-    // session died (missing binary, not logged in, bad flag) without crashing.
+    // stderr reader: surface as synthetic error events through the same sink.
     if let Some(mut err) = stderr {
-        let err_chan = on_event.clone();
+        let sess = Arc::clone(&session);
+        let app_err = app.clone();
         thread::spawn(move || {
             let mut pending_bytes: Vec<u8> = Vec::new();
             let mut buf = [0u8; 8192];
@@ -300,9 +333,7 @@ pub fn chat_start(
                                 "{{\"type\":\"aios_stderr\",\"text\":\"{}\"}}",
                                 json_escape(line)
                             );
-                            if err_chan.send(ev).is_err() {
-                                return;
-                            }
+                            ingest_line(&sess, &app_err, &ev);
                         }
                     }
                     Err(_) => break,
@@ -311,12 +342,66 @@ pub fn chat_start(
         });
     }
 
-    let session = Arc::new(ChatSession {
-        child: Mutex::new(child),
-        stdin: Mutex::new(stdin),
-    });
     with_sessions(|m| m.insert(id, session));
     Ok(id)
+}
+
+/// Handles one complete output line: append to the replay buffer, update session
+/// state (claude id, busy, done-notification), and forward to the live sink.
+fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
+    // Replay buffer (ring).
+    {
+        let mut b = sess.buffer.lock();
+        if b.len() >= REPLAY_CAP {
+            b.pop_front();
+        }
+        b.push_back(line.to_string());
+    }
+
+    // Learn claude's session uuid once, from the init event.
+    if sess.claude_id.lock().is_none() {
+        if let Some(sid) = extract_json_str(line, "session_id") {
+            *sess.claude_id.lock() = Some(sid);
+        }
+    }
+
+    // A `result` event ends the current turn.
+    if line.contains("\"type\":\"result\"") {
+        sess.busy.store(false, Ordering::SeqCst);
+        if sess.detached.load(Ordering::SeqCst) && sess.notify_on_done.swap(false, Ordering::SeqCst)
+        {
+            let title = sess.title.lock().clone();
+            let label = if title.is_empty() { "chat".to_string() } else { title };
+            notify_done(app, &label);
+        }
+    }
+
+    // Forward to the live pane, if attached. Send errors are ignored — we never
+    // tear down the reader just because a channel went away.
+    if let Some(ch) = sess.sink.lock().as_ref() {
+        let _ = ch.send(line.to_string());
+    }
+}
+
+/// Cheap extractor for a top-level `"key":"value"` string field — avoids pulling
+/// a JSON parser into the hot path for the one field we need (`session_id`).
+fn extract_json_str(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Fires a native OS notification that a backgrounded chat finished.
+fn notify_done(app: &AppHandle, title: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("✓ chat finished")
+        .body(format!("{title} — done. click to reopen."))
+        .show();
 }
 
 /// Sends one user turn into a live chat session by writing a newline-delimited
@@ -324,7 +409,79 @@ pub fn chat_start(
 /// session's Channel (set at `chat_start`). No-op if the session is gone.
 #[tauri::command]
 pub fn chat_send(session_id: u32, text: String) -> Result<(), String> {
+    if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
+        s.busy.store(true, Ordering::SeqCst);
+    }
     write_line(session_id, &user_line(&text))
+}
+
+/// Detaches a session from its pane WITHOUT killing it: clears the sink so
+/// output only buffers, marks it backgrounded, and arms a done-notification if
+/// requested. The `claude` child keeps running — reattach later to watch it
+/// finish. Called when the user closes a still-working chat.
+#[tauri::command]
+pub fn chat_detach(session_id: u32, notify: bool) -> Result<(), String> {
+    let s = with_sessions(|m| m.get(&session_id).cloned())
+        .ok_or_else(|| format!("chat session {session_id} not found"))?;
+    s.detached.store(true, Ordering::SeqCst);
+    s.notify_on_done.store(notify, Ordering::SeqCst);
+    *s.sink.lock() = None;
+    Ok(())
+}
+
+/// Reattaches a reopened pane to a live (possibly backgrounded) session: rebinds
+/// the channel, replays the buffered lines so the pane reconstructs the whole
+/// run and catches up to live, and clears the detached/notify flags.
+#[tauri::command]
+pub fn chat_reattach(session_id: u32, on_event: Channel<String>) -> Result<(), String> {
+    let s = with_sessions(|m| m.get(&session_id).cloned())
+        .ok_or_else(|| format!("chat session {session_id} not found"))?;
+    // Replay buffer first, then go live — order matters so the pane sees history
+    // before new deltas.
+    for line in s.buffer.lock().iter() {
+        let _ = on_event.send(line.clone());
+    }
+    *s.sink.lock() = Some(on_event);
+    s.detached.store(false, Ordering::SeqCst);
+    s.notify_on_done.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Sets the human label used by the tray + done-notification.
+#[tauri::command]
+pub fn chat_set_title(session_id: u32, title: String) -> Result<(), String> {
+    if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
+        *s.title.lock() = title;
+    }
+    Ok(())
+}
+
+/// A live (backgrounded) chat session, for the "running" tray.
+#[derive(serde::Serialize)]
+pub struct LiveChat {
+    pub id: u32,
+    pub claude_id: Option<String>,
+    pub title: String,
+    pub busy: bool,
+    pub detached: bool,
+}
+
+/// Lists currently-detached (background) chat sessions so the UI can show + let
+/// the user reopen them.
+#[tauri::command]
+pub fn list_chat_live() -> Vec<LiveChat> {
+    with_sessions(|m| {
+        m.iter()
+            .filter(|(_, s)| s.detached.load(Ordering::SeqCst))
+            .map(|(id, s)| LiveChat {
+                id: *id,
+                claude_id: s.claude_id.lock().clone(),
+                title: s.title.lock().clone(),
+                busy: s.busy.load(Ordering::SeqCst),
+                detached: s.detached.load(Ordering::SeqCst),
+            })
+            .collect()
+    })
 }
 
 /// Interrupts the in-flight turn of a live chat session.

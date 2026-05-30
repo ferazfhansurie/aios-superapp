@@ -48,6 +48,14 @@ fn master_session() -> String {
     env_or("AIOS_MASTER_SESSION", "aios")
 }
 
+/// The identity of firaz's load-bearing primary oracle (`aios-firaz`). WhatsApp
+/// inbound routes to it; deleting it silently breaks routing, so the backend
+/// hard-blocks deletion unless the caller passes an explicit override.
+/// Override the protected identity via `AIOS_PRIMARY_ORACLE` (default `firaz`).
+fn primary_oracle_identity() -> String {
+    env_or("AIOS_PRIMARY_ORACLE", "firaz")
+}
+
 /// Sockets scanned for the all-tmux attach surface, in display order. Built from
 /// the (possibly overridden) oracle + master sockets, plus the default socket.
 fn known_sockets() -> Vec<String> {
@@ -292,12 +300,58 @@ pub fn create_oracle(identity: String, command: Option<String>) -> Result<String
     if tmux_oracle(&["has-session", "-t", &session]).is_ok() {
         return Err(format!("oracle '{id}' already exists"));
     }
+
+    // Prefer the bridge's oracle-spawn.sh — it resolves the identity's REAL
+    // workspace / sid / runtime / model from the identity registry, launches the
+    // agent (claude) in the right repo with full context, and registers the
+    // session exactly like the WhatsApp bridge + grid do. This is what makes
+    // re-spawning `aios-firaz` (or any teammate) actually restore the working
+    // oracle — not a bare shell. A bare `tmux new-session` is the fallback only
+    // when the script isn't present (non-bridge machines / OSS installs).
+    if let Some(script) = oracle_spawn_script() {
+        let _ = std::process::Command::new("bash")
+            .arg(&script)
+            .arg(&id)
+            .env("AIOS_SPAWN_FROM_SHELL", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("couldn't run oracle-spawn.sh: {e}"))?;
+        // The script creates the tmux session early, then opens the AIOS window;
+        // poll (≤6s) for the session so we return only once it's really up.
+        for _ in 0..30 {
+            if tmux_oracle(&["has-session", "-t", &session]).is_ok() {
+                return Ok(session);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // Script ran but the session never appeared — fall through to a bare
+        // session so the user still gets something rather than a silent failure.
+    }
+
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     tmux_oracle(&["new-session", "-d", "-s", &session, "-c", &home])?;
     if let Some(cmd) = command.filter(|c| !c.trim().is_empty()) {
         tmux_oracle(&["send-keys", "-t", &session, &cmd, "Enter"])?;
     }
     Ok(session)
+}
+
+/// Resolves the bridge's `oracle-spawn.sh` (the canonical real-oracle launcher).
+/// Tries the reorg'd path first, then the legacy symlinked one. `None` on a box
+/// that doesn't have the bridge checked out.
+fn oracle_spawn_script() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    for rel in [
+        "Repo/firaz/aios/bridge/scripts/oracle-spawn.sh",
+        "Repo/firaz/aios-bridge/scripts/oracle-spawn.sh",
+    ] {
+        let p = format!("{home}/{rel}");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Renames an oracle session. The master oracle cannot be renamed.
@@ -363,12 +417,42 @@ pub fn appshot(identity: Option<String>) -> Result<String, String> {
 }
 
 /// Deletes (kills) an oracle session. The master oracle cannot be deleted.
+///
+/// firaz's primary oracle (`aios-firaz`) is load-bearing — his WhatsApp routes
+/// to it — so it is hard-blocked unless `force` is `true`. The frontend only
+/// passes `force` after a distinct, explicitly-warned confirm step, so it can't
+/// be fat-fingered.
 #[tauri::command]
-pub fn delete_oracle(identity: String) -> Result<(), String> {
+pub fn delete_oracle(identity: String, force: Option<bool>) -> Result<(), String> {
     let id = sanitize_identity(&identity);
     if id.is_empty() {
         return Err("invalid identity".into());
     }
+    if id == primary_oracle_identity() && !force.unwrap_or(false) {
+        return Err(format!(
+            "deleting aios-{id} breaks your whatsapp routing — confirm with force"
+        ));
+    }
     tmux_oracle(&["kill-session", "-t", &format!("aios-{id}")])?;
+    Ok(())
+}
+
+/// Kills any tmux session on a given socket — the all-tmux attach surface's
+/// delete affordance. No session is protected: the master can be killed too
+/// (Firaz's call — he owns the mothership and may want it gone).
+#[tauri::command]
+pub fn kill_tmux_session(socket: String, session: String) -> Result<(), String> {
+    let socket = socket.trim();
+    let session = session.trim();
+    if socket.is_empty() || session.is_empty() {
+        return Err("socket and session are required".into());
+    }
+    let output = std::process::Command::new(tmux_bin())
+        .args(["-L", socket, "kill-session", "-t", session])
+        .output()
+        .map_err(|e| format!("failed to run tmux: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
     Ok(())
 }

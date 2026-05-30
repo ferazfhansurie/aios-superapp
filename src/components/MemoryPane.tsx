@@ -14,7 +14,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import ForceGraph3D, { type ForceGraph3DInstance } from "3d-force-graph";
-import { FileText, Network, RefreshCw, Search, X } from "lucide-react";
+import {
+  FileText,
+  Network,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Save,
+  Search,
+  Table2,
+  Trash2,
+  X,
+} from "lucide-react";
 import * as THREE from "three";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 
@@ -24,6 +35,7 @@ import {
   type MemoryGraph,
   type MemoryNode,
 } from "../lib/memory";
+import { memoryDelete, memorySave } from "../lib/db";
 
 // ── type → brand color map ───────────────────────────────────────────────
 const TYPE_COLOR: Record<string, string> = {
@@ -32,7 +44,7 @@ const TYPE_COLOR: Record<string, string> = {
   project: "var(--color-info)",
   reference: "var(--color-success)",
 };
-const typeColor = (t: string) => TYPE_COLOR[t] ?? "var(--color-muted)";
+export const typeColor = (t: string) => TYPE_COLOR[t] ?? "var(--color-muted)";
 
 // resolved hex (three.js can't read CSS vars).
 const TYPE_HEX: Record<string, string> = {
@@ -43,7 +55,7 @@ const TYPE_HEX: Record<string, string> = {
 };
 const typeHex = (t: string) => TYPE_HEX[t] ?? "#7a7a82";
 
-const TYPE_ORDER = ["user", "feedback", "project", "reference"];
+export const TYPE_ORDER = ["user", "feedback", "project", "reference"];
 
 // shape fed to 3d-force-graph.
 interface GNode {
@@ -63,25 +75,43 @@ interface GLink {
   target: string;
 }
 
-export function MemoryPane() {
+
+// ════════════════════════════════════════════════════════════════════════
+// MemoryView — the memory vault rendered as a database: a sortable table of
+// notes (primary), a toggle to the flashy 3D graph, and an inline editor for
+// create / update / delete straight to the markdown files.
+// ════════════════════════════════════════════════════════════════════════
+
+type SortKey = "title" | "type" | "links";
+type ViewMode = "table" | "graph";
+
+interface Draft {
+  oldName?: string;
+  name: string;
+  type: string;
+  description: string;
+  body: string;
+}
+
+export function MemoryView() {
   const [graph, setGraph] = useState<MemoryGraph | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [view, setView] = useState<ViewMode>("table");
   const [selected, setSelected] = useState<string | null>(null);
   const [content, setContent] = useState<string>("");
   const [contentErr, setContentErr] = useState<string | null>(null);
+  const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "title", dir: 1 });
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  // ── data load + poll (preserve selection if node survives) ───────────────
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
     try {
       const g = await memoryGraph();
       setGraph(g);
       setError(null);
-      setSelected((prev) =>
-        prev && g.nodes.some((n) => n.id === prev) ? prev : prev && !quiet ? null : prev,
-      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -95,7 +125,7 @@ export function MemoryPane() {
     return () => clearInterval(t);
   }, [load]);
 
-  // ── load selected file body ──────────────────────────────────────────────
+  // selected file body (reader mode).
   useEffect(() => {
     if (!selected || !graph) {
       setContent("");
@@ -115,7 +145,6 @@ export function MemoryPane() {
     return m;
   }, [graph]);
 
-  // node degree (in + out) for sizing.
   const degree = useMemo(() => {
     const d = new Map<string, number>();
     graph?.nodes.forEach((n) => d.set(n.id, 0));
@@ -126,31 +155,96 @@ export function MemoryPane() {
     return d;
   }, [graph]);
 
-  // ── grouped + filtered file list ─────────────────────────────────────────
-  const grouped = useMemo(() => {
+  // filtered + sorted rows for the table.
+  const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const groups: Record<string, MemoryNode[]> = {};
-    (graph?.nodes ?? [])
-      .filter(
-        (n) =>
-          !q ||
-          n.id.toLowerCase().includes(q) ||
-          n.title.toLowerCase().includes(q) ||
-          n.description.toLowerCase().includes(q),
-      )
-      .forEach((n) => {
-        (groups[n.type] ??= []).push(n);
-      });
-    const order = [...TYPE_ORDER, ...Object.keys(groups).filter((k) => !TYPE_ORDER.includes(k))];
-    return order.filter((t) => groups[t]?.length).map((t) => [t, groups[t]] as const);
-  }, [graph, query]);
+    const list = (graph?.nodes ?? []).filter(
+      (n) =>
+        !q ||
+        n.id.toLowerCase().includes(q) ||
+        n.title.toLowerCase().includes(q) ||
+        n.description.toLowerCase().includes(q),
+    );
+    const dir = sort.dir;
+    return [...list].sort((a, b) => {
+      if (sort.key === "links") {
+        return ((degree.get(a.id) ?? 0) - (degree.get(b.id) ?? 0)) * dir;
+      }
+      const av = sort.key === "type" ? a.type : a.title;
+      const bv = sort.key === "type" ? b.type : b.title;
+      return av.toLowerCase().localeCompare(bv.toLowerCase()) * dir;
+    });
+  }, [graph, query, sort, degree]);
 
   const selNode = selected ? nodesById.get(selected) ?? null : null;
+
+  const toggleSort = (key: SortKey) =>
+    setSort((s) => (s.key === key ? { key, dir: (s.dir * -1) as 1 | -1 } : { key, dir: 1 }));
+
+  const startNew = () => setDraft({ name: "", type: "reference", description: "", body: "" });
+
+  const startEdit = useCallback(async () => {
+    if (!selNode) return;
+    try {
+      const raw = await memoryFile(selNode.path);
+      setDraft({
+        oldName: selNode.id,
+        name: selNode.id,
+        type: selNode.type,
+        description: selNode.description,
+        body: stripFrontmatter(raw).trim(),
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [selNode]);
+
+  const saveDraft = async () => {
+    if (!draft) return;
+    const name = draft.name.trim();
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      setError("name must be a slug: letters, digits, - or _ only");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await memorySave({
+        name,
+        nodeType: draft.type,
+        description: draft.description,
+        body: draft.body,
+        oldName: draft.oldName && draft.oldName !== name ? draft.oldName : undefined,
+      });
+      setDraft(null);
+      await load(true);
+      setSelected(name);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const delNote = async (name: string) => {
+    if (!confirm(`delete memory “${name}”? this removes the markdown file.`)) return;
+    setBusy(true);
+    try {
+      await memoryDelete(name);
+      if (selected === name) setSelected(null);
+      setDraft(null);
+      await load(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)] text-[13px] text-[var(--color-text)]">
       {/* toolbar */}
-      <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-2.5 text-[var(--color-muted)]">
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-2.5 text-[var(--color-muted)]">
         <Network size={13} className="text-[var(--color-accent)]" />
         <span className="font-mono text-[11px] lowercase">memory vault</span>
         {graph && (
@@ -158,153 +252,287 @@ export function MemoryPane() {
             {graph.count} notes · {graph.edges.length} links
           </span>
         )}
+        {/* search */}
+        <div className="ml-2 flex min-w-0 max-w-[260px] flex-1 items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-panel)] px-2 py-0.5">
+          <Search size={11} className="text-[var(--color-faint)]" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="search…"
+            className="min-w-0 flex-1 bg-transparent text-[11px] text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
+          />
+          {query && (
+            <button onClick={() => setQuery("")} className="text-[var(--color-faint)] hover:text-[var(--color-text)]">
+              <X size={11} />
+            </button>
+          )}
+        </div>
+        {/* view toggle */}
+        <div className="ml-auto flex items-center rounded border border-[var(--color-border)] p-0.5 text-[11px]">
+          <button
+            onClick={() => setView("table")}
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 ${view === "table" ? "bg-[var(--color-accent-soft)] text-[var(--color-text)]" : "hover:text-[var(--color-text)]"}`}
+          >
+            <Table2 size={11} /> table
+          </button>
+          <button
+            onClick={() => setView("graph")}
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 ${view === "graph" ? "bg-[var(--color-accent-soft)] text-[var(--color-text)]" : "hover:text-[var(--color-text)]"}`}
+          >
+            <Network size={11} /> graph
+          </button>
+        </div>
+        <button
+          onClick={startNew}
+          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          title="new memory"
+        >
+          <Plus size={12} /> new
+        </button>
         <button
           onClick={() => load()}
-          className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
           title="refresh"
         >
           <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-          refresh
         </button>
       </div>
 
-      {error && <p className="px-3 py-2 text-[12px] text-[var(--color-danger)]">{error}</p>}
-      {loading && !graph && (
-        <p className="px-3 py-2 text-[12px] text-[var(--color-muted)]/70">loading vault…</p>
-      )}
-      {!loading && graph && graph.count === 0 && (
-        <p className="px-3 py-2 text-[12px] text-[var(--color-muted)]/70">vault is empty</p>
-      )}
+      {error && <p className="px-3 py-1.5 text-[12px] text-[var(--color-danger)]">{error}</p>}
 
-      {/* body: list | graph | reader */}
+      {/* body */}
       <div className="flex min-h-0 flex-1">
-        {/* (a) left list */}
-        <div className="flex w-[260px] shrink-0 min-h-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
-          <div className="flex h-8 shrink-0 items-center gap-1.5 border-b border-[var(--color-border)] px-2">
-            <Search size={12} className="text-[var(--color-faint)]" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="search…"
-              className="w-full bg-transparent text-[12px] text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
-            />
-            {query && (
-              <button
-                onClick={() => setQuery("")}
-                className="text-[var(--color-faint)] hover:text-[var(--color-text)]"
-                title="clear"
-              >
-                <X size={12} />
-              </button>
-            )}
-          </div>
-          <div className="min-h-0 flex-1 overflow-y-auto py-1">
-            {grouped.map(([type, list]) => (
-              <div key={type} className="mb-1">
-                <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] font-medium uppercase tracking-wide">
-                  <span
-                    className="h-2 w-2 shrink-0 rounded-full"
-                    style={{ background: typeColor(type), boxShadow: `0 0 6px ${typeColor(type)}` }}
-                  />
-                  <span style={{ color: typeColor(type) }}>{type}</span>
-                  <span className="text-[var(--color-faint)]">{list.length}</span>
-                </div>
-                {list.map((n) => (
-                  <button
-                    key={n.id}
-                    onClick={() => setSelected(n.id)}
-                    title={n.description || n.id}
-                    className={`flex w-full items-center gap-1.5 px-2 py-1 text-left text-[12px] transition-colors hover:bg-[var(--color-panel-2)] ${
-                      selected === n.id
-                        ? "bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                        : "text-[var(--color-text-2)]"
-                    }`}
-                  >
-                    <span
-                      className="h-1.5 w-1.5 shrink-0 rounded-full"
-                      style={{ background: typeColor(n.type) }}
-                    />
-                    <span className="truncate">{n.title}</span>
-                  </button>
+        {/* main: table or graph */}
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {view === "table" ? (
+            <div className="min-h-0 flex-1 overflow-auto">
+              <table className="w-full border-collapse text-[12px]">
+                <thead className="sticky top-0 z-10 bg-[var(--color-panel)] text-[var(--color-muted)]">
+                  <tr className="border-b border-[var(--color-border)]">
+                    <Th label="name" active={sort.key === "title"} dir={sort.dir} onClick={() => toggleSort("title")} />
+                    <Th label="type" active={sort.key === "type"} dir={sort.dir} onClick={() => toggleSort("type")} />
+                    <th className="px-3 py-1.5 text-left font-medium">description</th>
+                    <Th label="links" active={sort.key === "links"} dir={sort.dir} onClick={() => toggleSort("links")} className="w-16 text-right" />
+                    <th className="w-10" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((n) => (
+                    <tr
+                      key={n.id}
+                      onClick={() => setSelected(n.id)}
+                      className={`group cursor-pointer border-b border-[var(--color-border)]/40 ${
+                        selected === n.id ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel-2)]"
+                      }`}
+                    >
+                      <td className="max-w-[280px] truncate px-3 py-1.5 text-[var(--color-text)]">{n.title}</td>
+                      <td className="px-3 py-1.5">
+                        <span
+                          className="inline-flex items-center gap-1 rounded-full px-1.5 py-px text-[10px]"
+                          style={{ color: typeColor(n.type), background: `color-mix(in srgb, ${typeColor(n.type)} 14%, transparent)` }}
+                        >
+                          <span className="h-1.5 w-1.5 rounded-full" style={{ background: typeColor(n.type) }} />
+                          {n.type}
+                        </span>
+                      </td>
+                      <td className="max-w-[420px] truncate px-3 py-1.5 text-[var(--color-text-2)]">{n.description}</td>
+                      <td className="px-3 py-1.5 text-right text-[var(--color-faint)]">{degree.get(n.id) ?? 0}</td>
+                      <td className="px-2 py-1.5 text-right">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            delNote(n.id);
+                          }}
+                          className="text-[var(--color-faint)] opacity-0 transition-opacity hover:text-[var(--color-danger)] group-hover:opacity-100"
+                          title="delete"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {graph && rows.length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="px-3 py-3 text-center text-[12px] text-[var(--color-muted)]/60">
+                        {query ? "no matches" : loading ? "loading vault…" : "vault is empty"}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          ) : graph && graph.count > 0 ? (
+            <div className="relative min-h-0 flex-1 bg-[var(--color-pane)]">
+              <Graph3D graph={graph} degree={degree} selected={selected} onSelect={(id) => setSelected(id || null)} />
+              <div className="glass pointer-events-none absolute bottom-2 left-2 flex flex-col gap-0.5 rounded px-2 py-1.5 text-[10px]">
+                {TYPE_ORDER.map((t) => (
+                  <div key={t} className="flex items-center gap-1.5">
+                    <span className="h-2 w-2 rounded-full" style={{ background: typeColor(t), boxShadow: `0 0 6px ${typeColor(t)}` }} />
+                    <span className="text-[var(--color-text-2)]">{t}</span>
+                  </div>
                 ))}
               </div>
-            ))}
-            {graph && grouped.length === 0 && (
-              <p className="px-2 py-2 text-[11px] text-[var(--color-muted)]/60">no matches</p>
-            )}
-          </div>
-        </div>
-
-        {/* (b) center 3D graph — dominant space */}
-        <div className="relative min-h-0 min-w-0 flex-1 bg-[var(--color-pane)]">
-          {graph && graph.count > 0 ? (
-            <Graph3D
-              graph={graph}
-              degree={degree}
-              selected={selected}
-              onSelect={(id) => setSelected(id || null)}
-            />
-          ) : (
-            !loading && (
-              <div className="flex h-full items-center justify-center text-[12px] text-[var(--color-muted)]/50">
-                nothing to graph yet
-              </div>
-            )
-          )}
-          {/* legend */}
-          <div className="glass pointer-events-none absolute bottom-2 left-2 flex flex-col gap-0.5 rounded px-2 py-1.5 text-[10px]">
-            {TYPE_ORDER.map((t) => (
-              <div key={t} className="flex items-center gap-1.5">
-                <span
-                  className="h-2 w-2 rounded-full"
-                  style={{ background: typeColor(t), boxShadow: `0 0 6px ${typeColor(t)}` }}
-                />
-                <span className="text-[var(--color-text-2)]">{t}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* (c) right reader */}
-        <div className="flex w-[340px] shrink-0 min-h-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-panel)]">
-          {selNode ? (
-            <>
-              <div className="flex shrink-0 items-start gap-2 border-b border-[var(--color-border)] px-3 py-2">
-                <FileText
-                  size={13}
-                  className="mt-0.5 shrink-0"
-                  style={{ color: typeColor(selNode.type) }}
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-[13px] font-medium">{selNode.title}</div>
-                  <p className="mt-0.5 truncate font-mono text-[10px] text-[var(--color-faint)]">
-                    {selNode.id}
-                  </p>
-                </div>
-                <button
-                  onClick={() => setSelected(null)}
-                  className="shrink-0 text-[var(--color-faint)] hover:text-[var(--color-text)]"
-                  title="close"
-                >
-                  <X size={13} />
-                </button>
-              </div>
-              <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2 text-[12px] leading-relaxed text-[var(--color-text-2)]">
-                {contentErr ? (
-                  <p className="text-[var(--color-danger)]">{contentErr}</p>
-                ) : (
-                  <Markdown text={content} nodesById={nodesById} onLink={(id) => setSelected(id)} />
-                )}
-              </div>
-            </>
-          ) : (
-            <div className="flex h-full items-center justify-center px-4 text-center text-[12px] text-[var(--color-muted)]/60">
-              select a note to read it
             </div>
+          ) : (
+            <div className="grid h-full place-items-center text-[12px] text-[var(--color-muted)]/50">nothing to graph yet</div>
           )}
         </div>
+
+        {/* right: editor or reader */}
+        {(draft || selNode) && (
+          <div className="flex w-[380px] shrink-0 min-h-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-panel)]">
+            {draft ? (
+              <MemoryEditor
+                draft={draft}
+                busy={busy}
+                onChange={setDraft}
+                onSave={saveDraft}
+                onCancel={() => setDraft(null)}
+                onDelete={draft.oldName ? () => delNote(draft.oldName!) : undefined}
+              />
+            ) : selNode ? (
+              <>
+                <div className="flex shrink-0 items-start gap-2 border-b border-[var(--color-border)] px-3 py-2">
+                  <FileText size={13} className="mt-0.5 shrink-0" style={{ color: typeColor(selNode.type) }} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[13px] font-medium">{selNode.title}</div>
+                    <p className="mt-0.5 truncate font-mono text-[10px] text-[var(--color-faint)]">{selNode.id}</p>
+                  </div>
+                  <button onClick={startEdit} className="shrink-0 text-[var(--color-faint)] hover:text-[var(--color-text)]" title="edit">
+                    <Pencil size={13} />
+                  </button>
+                  <button onClick={() => setSelected(null)} className="shrink-0 text-[var(--color-faint)] hover:text-[var(--color-text)]" title="close">
+                    <X size={13} />
+                  </button>
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2 text-[12px] leading-relaxed text-[var(--color-text-2)]">
+                  {contentErr ? (
+                    <p className="text-[var(--color-danger)]">{contentErr}</p>
+                  ) : (
+                    <Markdown text={content} nodesById={nodesById} onLink={(id) => setSelected(id)} />
+                  )}
+                </div>
+              </>
+            ) : null}
+          </div>
+        )}
       </div>
     </div>
+  );
+}
+
+/** Sortable table header cell. */
+function Th({
+  label,
+  active,
+  dir,
+  onClick,
+  className = "",
+}: {
+  label: string;
+  active: boolean;
+  dir: 1 | -1;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <th className={`px-3 py-1.5 text-left font-medium ${className}`}>
+      <button onClick={onClick} className="inline-flex items-center gap-1 hover:text-[var(--color-text)]">
+        {label}
+        {active && <span className="text-[9px]">{dir === 1 ? "▲" : "▼"}</span>}
+      </button>
+    </th>
+  );
+}
+
+/** Inline create/edit form writing straight to the vault. */
+function MemoryEditor({
+  draft,
+  busy,
+  onChange,
+  onSave,
+  onCancel,
+  onDelete,
+}: {
+  draft: Draft;
+  busy: boolean;
+  onChange: (d: Draft) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  onDelete?: () => void;
+}) {
+  const set = (patch: Partial<Draft>) => onChange({ ...draft, ...patch });
+  return (
+    <>
+      <div className="flex shrink-0 items-center justify-between border-b border-[var(--color-border)] px-3 py-2">
+        <span className="text-[12px] font-medium">{draft.oldName ? "edit memory" : "new memory"}</span>
+        <button onClick={onCancel} className="text-[var(--color-faint)] hover:text-[var(--color-text)]">
+          <X size={13} />
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3 text-[12px]">
+        <label className="block">
+          <span className="mb-1 block text-[10px] uppercase tracking-wide text-[var(--color-faint)]">name (slug)</span>
+          <input
+            value={draft.name}
+            onChange={(e) => set({ name: e.target.value })}
+            placeholder="feedback-wa-must-go-through-push"
+            className="w-full rounded border border-[var(--color-border)] bg-[var(--color-pane)] px-2 py-1 font-mono text-[11px] focus:border-[var(--color-accent)]/60 focus:outline-none"
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-[10px] uppercase tracking-wide text-[var(--color-faint)]">type</span>
+          <select
+            value={draft.type}
+            onChange={(e) => set({ type: e.target.value })}
+            className="w-full rounded border border-[var(--color-border)] bg-[var(--color-pane)] px-2 py-1 text-[11px] focus:border-[var(--color-accent)]/60 focus:outline-none"
+          >
+            {TYPE_ORDER.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-[10px] uppercase tracking-wide text-[var(--color-faint)]">description</span>
+          <input
+            value={draft.description}
+            onChange={(e) => set({ description: e.target.value })}
+            placeholder="one-line summary used for recall"
+            className="w-full rounded border border-[var(--color-border)] bg-[var(--color-pane)] px-2 py-1 text-[11px] focus:border-[var(--color-accent)]/60 focus:outline-none"
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-[10px] uppercase tracking-wide text-[var(--color-faint)]">body (markdown)</span>
+          <textarea
+            value={draft.body}
+            onChange={(e) => set({ body: e.target.value })}
+            rows={12}
+            placeholder="the fact. link related notes with [[their-name]]."
+            className="w-full resize-none rounded border border-[var(--color-border)] bg-[var(--color-pane)] px-2 py-1 font-mono text-[11px] leading-relaxed focus:border-[var(--color-accent)]/60 focus:outline-none"
+          />
+        </label>
+      </div>
+      <div className="flex shrink-0 items-center gap-2 border-t border-[var(--color-border)] px-3 py-2">
+        <button
+          onClick={onSave}
+          disabled={busy}
+          className="flex items-center gap-1 rounded bg-[var(--color-accent)] px-2.5 py-1 text-[11px] font-medium text-white disabled:opacity-50"
+        >
+          <Save size={12} /> save
+        </button>
+        {onDelete && (
+          <button
+            onClick={onDelete}
+            disabled={busy}
+            className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2.5 py-1 text-[11px] text-[var(--color-danger)] hover:border-[var(--color-danger)]/50 disabled:opacity-50"
+          >
+            <Trash2 size={12} /> delete
+          </button>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -315,7 +543,7 @@ export function MemoryPane() {
 // particles flowing along links, gentle idle auto-rotation, and a fly-to on
 // select.
 // ════════════════════════════════════════════════════════════════════════
-function Graph3D({
+export function Graph3D({
   graph,
   degree,
   selected,
@@ -601,7 +829,7 @@ function escapeHtml(s: string): string {
 // ════════════════════════════════════════════════════════════════════════
 // Lightweight markdown: headings, bold, list items, code, [[wikilink]] chips.
 // ════════════════════════════════════════════════════════════════════════
-function Markdown({
+export function Markdown({
   text,
   nodesById,
   onLink,

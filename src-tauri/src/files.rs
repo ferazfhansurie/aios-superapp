@@ -7,6 +7,9 @@ pub struct DirEntry {
     name: String,
     path: String,
     is_dir: bool,
+    /// Last-modified time in unix seconds (0 if unavailable) — lets callers find
+    /// the freshest file (e.g. the idle focus tile's newest memory note).
+    mtime: f64,
 }
 
 /// Lists a directory (dirs first, alphabetical, dotfiles hidden). Empty path → $HOME.
@@ -27,11 +30,18 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
         if name.starts_with('.') {
             continue;
         }
-        let is_dir = e.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let meta = e.metadata().ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let mtime = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         entries.push(DirEntry {
             name,
             path: e.path().to_string_lossy().to_string(),
             is_dir,
+            mtime,
         });
     }
     entries.sort_by(|a, b| {
@@ -100,6 +110,18 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
         }));
     }
 
+    // Office docs (word/excel/powerpoint + OpenDocument + rtf) — frontend asks
+    // for an on-demand LibreOffice → PDF conversion and then renders that PDF.
+    if is_office_ext(&ext) {
+        return Ok(json!({
+            "kind": "office",
+            "text": serde_json::Value::Null,
+            "size": size,
+            "name": name,
+            "truncated": false,
+        }));
+    }
+
     // Read up to the cap (plus a byte to detect truncation).
     let to_read = (size as usize).min(PREVIEW_TEXT_CAP) + 1;
     let mut bytes = Vec::with_capacity(to_read.min(PREVIEW_TEXT_CAP + 1));
@@ -152,4 +174,118 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
             "truncated": false,
         })),
     }
+}
+
+/// Office / document formats LibreOffice can render to PDF.
+fn is_office_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "doc" | "docx" | "docm" | "dot" | "dotx" | "rtf" | "odt" | "ott" | "fodt"
+            | "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" | "ots" | "fods"
+            | "ppt" | "pptx" | "pptm" | "pps" | "ppsx" | "odp" | "otp" | "fodp"
+    )
+}
+
+/// Locates the LibreOffice headless binary across the common install spots.
+fn soffice_bin() -> Option<String> {
+    let candidates = [
+        "/opt/homebrew/bin/soffice",
+        "/usr/local/bin/soffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/usr/bin/soffice",
+        "/usr/bin/libreoffice",
+    ];
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    // Last resort: rely on PATH resolution.
+    Some("soffice".to_string())
+}
+
+/// FNV-1a — small, dependency-free hash for cache-key derivation.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Converts an office document to PDF via headless LibreOffice and returns the
+/// resulting PDF path. Output lands under `/tmp/aios-office-preview/` (in the
+/// asset-protocol scope) and is cached by source path + mtime + size, so
+/// re-opening an unchanged file is instant. A per-call user profile dir lets
+/// this run even while the LibreOffice GUI is open.
+#[tauri::command]
+pub fn convert_office_to_pdf(path: String) -> Result<String, String> {
+    let src = std::path::Path::new(&path);
+    let meta = std::fs::metadata(src).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".into());
+    }
+
+    // Cache key: source path + mtime + size → stable while the file is unchanged.
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let key = fnv1a(&format!("{}|{}|{}", path, mtime, meta.len()));
+
+    let out_dir = std::path::Path::new("/tmp/aios-office-preview").join(format!("{key:x}"));
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "document".into());
+    let out_pdf = out_dir.join(format!("{stem}.pdf"));
+
+    // Cached hit — return immediately.
+    if out_pdf.exists() {
+        return Ok(out_pdf.to_string_lossy().to_string());
+    }
+
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+
+    let bin = soffice_bin().ok_or("LibreOffice (soffice) not found")?;
+    // Isolated profile so we don't clash with a running LibreOffice instance.
+    let profile = format!(
+        "-env:UserInstallation=file:///tmp/aios-office-preview/.profile-{key:x}"
+    );
+
+    let output = std::process::Command::new(&bin)
+        .arg("--headless")
+        .arg(&profile)
+        .arg("--convert-to")
+        .arg("pdf")
+        .arg("--outdir")
+        .arg(&out_dir)
+        .arg(src)
+        .output()
+        .map_err(|e| format!("failed to launch soffice: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("conversion failed: {}", err.trim()));
+    }
+
+    if out_pdf.exists() {
+        return Ok(out_pdf.to_string_lossy().to_string());
+    }
+
+    // soffice occasionally sanitizes the output stem — fall back to whatever
+    // single PDF it dropped in the (otherwise empty) output dir.
+    if let Ok(rd) = std::fs::read_dir(&out_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "pdf").unwrap_or(false) {
+                return Ok(p.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    Err("conversion produced no PDF".into())
 }

@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import { fileSrc, homeDir, readDir, readFilePreview, type DirEntry, type FilePreview } from "../lib/fs";
+import { OfficePreview } from "./OfficePreview";
 
 export function FilesPane({ onOpenFile }: { onOpenFile?: (path: string, name: string) => void }) {
   const [cwd, setCwd] = useState("");
@@ -195,6 +196,8 @@ export function FilesPane({ onOpenFile }: { onOpenFile?: (path: string, name: st
                   </div>
                 ) : preview?.kind === "pdf" ? (
                   <iframe src={fileSrc(selected)} title={preview.name} className="h-full w-full border-0" />
+                ) : preview?.kind === "office" ? (
+                  <OfficePreview path={selected} name={preview.name} />
                 ) : preview?.kind === "text" ? (
                   <pre className="whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-relaxed text-[var(--color-text-2)]">
                     {preview.text}

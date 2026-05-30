@@ -48,10 +48,17 @@ const OUTBOUND_CANDIDATES: &[&str] = &[
 /// a message a customer sent us.
 const INBOUND_CANDIDATES: &[&str] = &[".aios/state/personal-wa-events.jsonl"];
 
-/// Candidate push.js scripts, probed in order — the WhatsApp send transport.
+/// Candidate push.js scripts, probed in order — the WhatsApp 0210 send transport.
 const PUSH_CANDIDATES: &[&str] = &[
     "Repo/firaz/aios/bridge/scripts/push.js",
     "Repo/firaz/aios-bridge/scripts/push.js",
+];
+
+/// Candidate send-as-personal.js scripts — the wwebjs PERSONAL WhatsApp transport
+/// (sends AS firaz's own number via the paired wweb session).
+const SEND_AS_PERSONAL_CANDIDATES: &[&str] = &[
+    "Repo/firaz/aios/bridge/scripts/send-as-personal.js",
+    "Repo/firaz/aios-bridge/scripts/send-as-personal.js",
 ];
 
 /// Resolves the first existing candidate path (absolute, or relative to HOME).
@@ -456,9 +463,6 @@ pub fn customer_thread(handle: String, limit: u32) -> Value {
 #[tauri::command]
 pub fn send_message(channel: String, to: String, text: String) -> Result<String, String> {
     let channel = channel.trim().to_lowercase();
-    if channel != "whatsapp" {
-        return Err("channel not connected yet".into());
-    }
 
     let to = to.trim();
     let text = text.trim();
@@ -469,16 +473,35 @@ pub fn send_message(channel: String, to: String, text: String) -> Result<String,
         return Err("empty message".into());
     }
 
-    let Some(script) = resolve_path(PUSH_CANDIDATES) else {
-        return Err("push.js not found (looked under ~/Repo/firaz/aios/bridge + aios-bridge)".into());
+    // Resolve the right transport per channel:
+    //   - the 0210 business number → push.js (Meta Cloud API via bisnesgpt)
+    //   - firaz's PERSONAL WhatsApp → send-as-personal.js (paired wwebjs session)
+    // Both take `<to> "<text>"`, but push.js needs the `--to` flag while
+    // send-as-personal takes the recipient positionally.
+    let (script, use_to_flag) = match channel.as_str() {
+        "whatsapp" | "whatsapp-0210" | "0210" | "business" => (
+            resolve_path(PUSH_CANDIDATES)
+                .ok_or("push.js not found (looked under ~/Repo/firaz/aios/bridge + aios-bridge)")?,
+            true,
+        ),
+        "whatsapp-personal" | "personal" | "wweb" | "wwebjs" => (
+            resolve_path(SEND_AS_PERSONAL_CANDIDATES)
+                .ok_or("send-as-personal.js not found — pair your personal WA first (connect-personal-code.js)")?,
+            false,
+        ),
+        _ => return Err("channel not connected yet".into()),
     };
 
-    // node push.js --to <phone> "<text>"
-    let output = std::process::Command::new("node")
-        .arg(&script)
-        .arg("--to")
-        .arg(to)
-        .arg(text)
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg(&script);
+    if use_to_flag {
+        // push.js (0210): node push.js --to <phone> "<text>"
+        cmd.arg("--to").arg(to).arg(text);
+    } else {
+        // wwebjs personal: node send-as-personal.js <to> "<text>"
+        cmd.arg(to).arg(text);
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("spawn node failed: {e}"))?;
 
@@ -493,7 +516,7 @@ pub fn send_message(channel: String, to: String, text: String) -> Result<String,
         } else if !stdout.is_empty() {
             stdout
         } else {
-            format!("push.js exited with {}", output.status)
+            format!("send exited with {}", output.status)
         };
         Err(trim_text(&msg, 240))
     }

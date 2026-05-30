@@ -63,8 +63,11 @@ import {
 import {
   buildApprovalLine,
   chatInterrupt,
+  chatDetach,
+  chatReattach,
   chatSend,
   chatSendRaw,
+  chatSetTitle,
   chatStart,
   chatStop,
   listChatSessions,
@@ -80,13 +83,21 @@ import {
   type ChatTurnInfo,
 } from "../lib/chat";
 import { readDir, type DirEntry } from "../lib/fs";
-import { paneWriters } from "../lib/paneBus";
+import { chatHandles, paneWriters } from "../lib/paneBus";
 
 // ── transcript model ──────────────────────────────────────────────────────
 
 type Turn =
   | { kind: "user"; id: string; text: string }
   | { kind: "assistant"; id: string; text: string; streaming: boolean }
+  | {
+      kind: "thinking";
+      id: string;
+      text: string;
+      streaming: boolean;
+      startedAt?: number;
+      durationMs?: number;
+    }
   | {
       kind: "tool";
       id: string; // tool_use id from claude
@@ -121,6 +132,7 @@ type Turn =
 type RenderBlock =
   | { kind: "user"; id: string; turn: Extract<Turn, { kind: "user" }> }
   | { kind: "assistant"; id: string; turn: Extract<Turn, { kind: "assistant" }> }
+  | { kind: "thinking"; id: string; turn: Extract<Turn, { kind: "thinking" }> }
   | { kind: "approval"; id: string; turn: Extract<Turn, { kind: "approval" }> }
   | { kind: "result"; id: string; turn: Extract<Turn, { kind: "result" }> }
   | { kind: "activity"; id: string; tools: ToolTurn[]; durationMs?: number };
@@ -399,15 +411,24 @@ export function ChatPane({
   cwd,
   paneKey,
   seed,
+  resume,
+  reattach,
 }: {
   cwd?: string;
   paneKey?: string;
   seed?: string;
+  /** Resume a prior chat session on mount (from the idle "continue" rail). */
+  resume?: { id: string; title: string };
+  /** Reattach to a still-live backgrounded session by its backend id (from the
+   *  "running" tray) — replays its buffer and continues live instead of spawning. */
+  reattach?: number;
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState(seed ?? "");
   const [streaming, setStreaming] = useState(false);
   const [started, setStarted] = useState(false);
+  // claude's init event arrived (session_id known) — gates the seed auto-send
+  const [claudeReady, setClaudeReady] = useState(false);
 
   // composer settings
   const [model, setModel] = useState<ChatModel>(CHAT_MODELS[0]);
@@ -438,16 +459,25 @@ export function ChatPane({
   const resumeSearchRef = useRef<HTMLInputElement>(null);
 
   // the claude session id to resume on (re)start; null = fresh conversation.
-  // set by the /resume picker, cleared by a fresh chat / /clear.
-  const [resumeId, setResumeId] = useState<string | null>(null);
+  // set by the /resume picker, cleared by a fresh chat / /clear. Seeded from
+  // the `resume` prop so the idle "continue" rail lands straight in a session.
+  const [resumeId, setResumeId] = useState<string | null>(resume?.id ?? null);
   // the title of the resumed session, shown as a note once after resuming
-  const [resumedTitle, setResumedTitle] = useState<string | null>(null);
+  const [resumedTitle, setResumedTitle] = useState<string | null>(resume?.title ?? null);
 
   const sessionIdRef = useRef<number | null>(null);
+  // live mirror of `streaming` for the close-handle closure (a turn in flight).
+  const streamingRef = useRef(false);
+  streamingRef.current = streaming;
+  // set true when the pane is intentionally detached (kept running) — tells the
+  // unmount cleanup NOT to kill the claude process.
+  const detachedRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   // index into `turns` of the assistant bubble currently being streamed
   const streamingTurnId = useRef<string | null>(null);
+  // id of the thinking block currently being streamed (own block, precedes text)
+  const thinkingTurnId = useRef<string | null>(null);
   // last user prompt text actually sent to claude (for regenerate)
   const lastSentRef = useRef<string | null>(null);
 
@@ -458,6 +488,9 @@ export function ChatPane({
   // true once we've recorded this chat (on the first user send of the session),
   // so subsequent sends don't re-upsert. Reset on /clear and on resume.
   const recordedRef = useRef(false);
+  // true once the launcher seed has been auto-sent as the first turn, so it
+  // fires exactly once and never re-fires on /clear or a session restart.
+  const seedSentRef = useRef(false);
 
   // ── turn timing (for the Codex-style "Worked for Xs" activity line) ────────
   // wall-clock ms when the in-flight turn began; null when idle. Drives the live
@@ -529,6 +562,32 @@ export function ChatPane({
       case "stream_event": {
         const e = ev.event;
         if (!e) return;
+        // extended-thinking tokens stream as their own block, ahead of text
+        if (e.type === "content_block_delta" && e.delta?.type === "thinking_delta") {
+          const tok = e.delta.thinking ?? "";
+          if (!tok) return;
+          setTurns((prev) => {
+            const next = [...prev];
+            const id = thinkingTurnId.current;
+            const idx = id ? next.findIndex((t) => t.id === id) : -1;
+            if (idx >= 0 && next[idx].kind === "thinking") {
+              const t = next[idx] as Extract<Turn, { kind: "thinking" }>;
+              next[idx] = { ...t, text: t.text + tok, streaming: true };
+            } else {
+              const nid = uid();
+              thinkingTurnId.current = nid;
+              next.push({
+                kind: "thinking",
+                id: nid,
+                text: tok,
+                streaming: true,
+                startedAt: Date.now(),
+              });
+            }
+            return next;
+          });
+          return;
+        }
         if (e.type === "content_block_delta" && e.delta?.type === "text_delta") {
           const tok = e.delta.text ?? "";
           if (!tok) return;
@@ -555,21 +614,48 @@ export function ChatPane({
         return;
       }
 
-      // full assistant message — finalize text + spawn tool cards
+      // full assistant message — finalize text + thinking, spawn tool cards
       case "assistant": {
         const blocks = ev.message?.content ?? [];
+        // mark any in-flight thinking block as settled (its tokens are complete)
+        const tid = thinkingTurnId.current;
+        if (tid) {
+          setTurns((prev) =>
+            prev.map((t) =>
+              t.id === tid && t.kind === "thinking"
+                ? {
+                    ...t,
+                    streaming: false,
+                    durationMs:
+                      t.startedAt != null ? Date.now() - t.startedAt : undefined,
+                  }
+                : t,
+            ),
+          );
+        }
         for (const b of blocks) {
+          // thinking fallback: if partial-message deltas didn't build a block
+          // (e.g. replay or thinking arriving whole), synthesize one from text.
+          if (b.type === "thinking") {
+            const full = (b.thinking ?? "").trim();
+            if (full && thinkingTurnId.current == null) {
+              setTurns((prev) => [
+                ...prev,
+                { kind: "thinking", id: uid(), text: full, streaming: false },
+              ]);
+            }
+          }
           if (b.type === "tool_use") {
-            const tid = b.id ?? uid();
+            const toolId = b.id ?? uid();
             setTurns((prev) => {
-              if (prev.some((t) => t.kind === "tool" && t.id === tid)) {
+              if (prev.some((t) => t.kind === "tool" && t.id === toolId)) {
                 return prev;
               }
               return [
                 ...prev,
                 {
                   kind: "tool",
-                  id: tid,
+                  id: toolId,
                   name: b.name ?? "tool",
                   input: (b.input as Record<string, unknown>) ?? {},
                 },
@@ -577,6 +663,10 @@ export function ChatPane({
             });
           }
         }
+        // step boundary: the next streamed text/thinking belongs to a fresh
+        // block (so post-tool reasoning doesn't merge into the prior bubble).
+        streamingTurnId.current = null;
+        thinkingTurnId.current = null;
         return;
       }
 
@@ -603,13 +693,21 @@ export function ChatPane({
       case "result": {
         // mark the live assistant bubble done
         setTurns((prev) =>
-          prev.map((t) =>
-            t.kind === "assistant" && t.streaming
-              ? { ...t, streaming: false }
-              : t,
-          ),
+          prev.map((t) => {
+            if (t.kind === "assistant" && t.streaming)
+              return { ...t, streaming: false };
+            if (t.kind === "thinking" && t.streaming)
+              return {
+                ...t,
+                streaming: false,
+                durationMs:
+                  t.startedAt != null ? Date.now() - t.startedAt : t.durationMs,
+              };
+            return t;
+          }),
         );
         streamingTurnId.current = null;
+        thinkingTurnId.current = null;
         setStreaming(false);
         // prefer claude's reported duration; fall back to our wall-clock measure
         const wall =
@@ -653,6 +751,7 @@ export function ChatPane({
       // so the first user send can recordChatSession() into the /resume list.
       case "system": {
         if (ev.session_id) claudeSessionIdRef.current = ev.session_id;
+        setClaudeReady(true);
         return;
       }
 
@@ -670,6 +769,7 @@ export function ChatPane({
   useEffect(() => {
     let disposed = false;
     setStarted(false);
+    setClaudeReady(false);
     const chan = new Channel<string>();
     chan.onmessage = (line) => {
       if (disposed) return;
@@ -682,16 +782,23 @@ export function ChatPane({
       handleEvent(parsed);
     };
 
-    chatStart(chan, {
-      cwd: cwd ?? null,
-      model: model.disabled ? null : model.id,
-      permissionMode: permission.id,
-      effort: effort.id,
-      resume: resumeId,
-    })
+    // Reattach to a live backgrounded session (replays its buffer) vs spawn fresh.
+    const startup =
+      reattach != null
+        ? chatReattach(reattach, chan).then(() => reattach)
+        : chatStart(chan, {
+            cwd: cwd ?? null,
+            model: model.disabled ? null : model.id,
+            permissionMode: permission.id,
+            effort: effort.id,
+            resume: resumeId,
+          });
+
+    startup
       .then((id) => {
         if (disposed) {
-          chatStop(id).catch(() => {});
+          // only kill a freshly-spawned session we're abandoning; never a reattach.
+          if (reattach == null) chatStop(id).catch(() => {});
           return;
         }
         sessionIdRef.current = id;
@@ -710,11 +817,31 @@ export function ChatPane({
       disposed = true;
       const id = sessionIdRef.current;
       sessionIdRef.current = null;
-      if (id != null) chatStop(id).catch(() => {});
+      // Skip the kill when the pane was intentionally detached (kept running in
+      // the background) — chat_detach already cleared the sink.
+      if (id != null && !detachedRef.current) chatStop(id).catch(() => {});
     };
     // model/permission/effort/resumeId are captured at start; changing them restarts the session
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model.id, permission.id, effort.id, cwd, restartKey, resumeId]);
+  }, [model.id, permission.id, effort.id, cwd, restartKey, resumeId, reattach]);
+
+  // Publish a close-handle so App can detach (keep running) vs kill a busy chat.
+  useEffect(() => {
+    if (!paneKey) return;
+    chatHandles.set(paneKey, {
+      busy: () => streamingRef.current,
+      detach: (notify: boolean) => {
+        const id = sessionIdRef.current;
+        if (id != null) {
+          detachedRef.current = true;
+          chatDetach(id, notify).catch(() => {});
+        }
+      },
+    });
+    return () => {
+      chatHandles.delete(paneKey);
+    };
+  }, [paneKey]);
 
   // autoscroll on new content
   useEffect(() => {
@@ -777,6 +904,7 @@ export function ChatPane({
       }
       setStreaming(true);
       streamingTurnId.current = null;
+      thinkingTurnId.current = null;
       // start the turn timer (drives "Working… m:ss" → "Worked for Xs")
       const t0 = Date.now();
       turnStartRef.current = t0;
@@ -810,12 +938,27 @@ export function ChatPane({
           // failed to persist → allow a later send to retry
           recordedRef.current = false;
         });
+        // Label the backend session for the background tray + done-notification.
+        if (sessionIdRef.current != null) chatSetTitle(sessionIdRef.current, title).catch(() => {});
       }
     }
     setInput("");
     setOverlay(null);
     dispatch(text);
   }, [input, streaming, dispatch, cwd]);
+
+  // ── launcher seed: auto-send as the first turn ─────────────────────────────
+  // The idle page hands over the prompt you typed as `seed`; fire it once the
+  // session is live (started) and claude's init has landed (claudeReady, so the
+  // chat records into /resume) — so the text you typed on the idle page IS the
+  // first message. No "type once to launch, type again to send".
+  useEffect(() => {
+    if (!seed || seedSentRef.current) return;
+    if (!started || !claudeReady) return;
+    seedSentRef.current = true;
+    send();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed, started, claudeReady]);
 
   // regenerate: replay the last user turn (no extra user bubble)
   const regenerate = useCallback(() => {
@@ -839,6 +982,7 @@ export function ChatPane({
     setTurns([]);
     setStreaming(false);
     streamingTurnId.current = null;
+    thinkingTurnId.current = null;
     lastSentRef.current = null;
     turnStartRef.current = null;
     setLiveStart(null);
@@ -889,6 +1033,7 @@ export function ChatPane({
       // re-record it.
       setStreaming(false);
       streamingTurnId.current = null;
+      thinkingTurnId.current = null;
       lastSentRef.current = null;
       turnStartRef.current = null;
       setLiveStart(null);
@@ -1499,6 +1644,8 @@ export function ChatPane({
         out.push({ kind: "user", id: t.id, turn: t });
       } else if (t.kind === "assistant") {
         out.push({ kind: "assistant", id: t.id, turn: t });
+      } else if (t.kind === "thinking") {
+        out.push({ kind: "thinking", id: t.id, turn: t });
       } else if (t.kind === "approval") {
         out.push({ kind: "approval", id: t.id, turn: t });
       } else if (t.kind === "result") {
@@ -1580,7 +1727,16 @@ export function ChatPane({
                 onRegenerate={regenerate}
               />
             ) : b.kind === "assistant" ? (
-              <AssistantBubble key={b.id} turn={b.turn} />
+              <AssistantBubble
+                key={b.id}
+                turn={b.turn}
+                onButton={(label) => {
+                  if (!streaming && sessionIdRef.current != null) dispatch(label);
+                }}
+                disabled={streaming}
+              />
+            ) : b.kind === "thinking" ? (
+              <ThinkingBlock key={b.id} turn={b.turn} />
             ) : b.kind === "approval" ? (
               <ApprovalCard
                 key={b.id}
@@ -1631,7 +1787,10 @@ function ActivityGroup({
   live: boolean;
   elapsedMs: number;
 }) {
-  const [open, setOpen] = useState(false);
+  // expanded while the turn is live (so you watch tools run in real time), then
+  // auto-collapses to "Worked for Xs ›" when done — unless the user toggled it.
+  const [userToggled, setUserToggled] = useState<boolean | null>(null);
+  const open = userToggled ?? live;
 
   // dedup artifacts by path (an Edit + later Write on the same file → one card)
   const artifacts = useMemo(() => {
@@ -1654,7 +1813,7 @@ function ActivityGroup({
     <div className="flex flex-col gap-1.5">
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => setUserToggled(!open)}
         className="group/act -mx-1 flex w-fit items-center gap-1.5 rounded-md px-1 py-0.5 text-left font-sans text-[12.5px] text-[var(--color-muted)] transition-colors hover:text-[var(--color-text-2)]"
       >
         {live ? (
@@ -1676,7 +1835,7 @@ function ActivityGroup({
       {open && n > 0 && (
         <div className="ml-[6px] flex flex-col gap-0.5 border-l border-[var(--color-border)] pl-3">
           {tools.map((t) => (
-            <ActivityStep key={t.id} turn={t} />
+            <ActivityStep key={t.id} turn={t} live={live} />
           ))}
         </div>
       )}
@@ -1693,22 +1852,32 @@ function ActivityGroup({
 }
 
 /** One activity step: tool icon + verb + truncated target, expandable to its
- *  result. The full (absolute) target lives in the row's title for hover. */
-function ActivityStep({ turn }: { turn: ToolTurn }) {
-  const [open, setOpen] = useState(false);
+ *  full input detail (Bash command, Edit diff, Todo checklist, or args) + result.
+ *  While the turn is live, the currently-running step (no result yet) auto-opens
+ *  so you watch the work happen — exactly the claude-code feel. */
+function ActivityStep({ turn, live }: { turn: ToolTurn; live: boolean }) {
   const Icon = toolIcon(turn.name);
   const verb = toolVerb(turn.name);
   const { label, full } = toolTarget(turn);
+  const running = turn.result == null;
   const hasResult = turn.result != null && turn.result.trim().length > 0;
+  const detail = toolDetail(turn);
+  const expandable = hasResult || detail != null;
+
+  // running step opens itself while the turn is live, and an errored step always
+  // opens (you want to see what broke); otherwise user-controlled. (AI Elements
+  // `Tool` lifecycle: auto-expand on running, error.)
+  const [userToggled, setUserToggled] = useState<boolean | null>(null);
+  const open = userToggled ?? ((live && running) || turn.isError === true);
 
   return (
     <div className="flex flex-col">
       <button
         type="button"
-        onClick={() => hasResult && setOpen((o) => !o)}
+        onClick={() => expandable && setUserToggled(!open)}
         title={full || undefined}
         className={`flex w-full items-center gap-2 rounded-md py-0.5 pr-1 text-left ${
-          hasResult ? "cursor-pointer" : "cursor-default"
+          expandable ? "cursor-pointer" : "cursor-default"
         }`}
       >
         <Icon size={13} className="shrink-0 text-[var(--color-faint)]" />
@@ -1721,25 +1890,200 @@ function ActivityStep({ turn }: { turn: ToolTurn }) {
           </span>
         )}
         <span className="flex-1" />
-        {turn.result == null ? (
+        {running ? (
           <Loader2 size={11} className="shrink-0 animate-spin text-[var(--color-faint)]" />
         ) : turn.isError ? (
           <X size={12} className="shrink-0 text-[var(--color-danger)]" />
-        ) : hasResult ? (
+        ) : expandable ? (
           <ChevronRight
             size={12}
             className={`shrink-0 text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
           />
         ) : null}
       </button>
-      {open && hasResult && (
-        <pre
-          className={`mt-1 mb-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]/60 px-2.5 py-2 font-mono text-[11px] leading-relaxed ${
-            turn.isError ? "text-[var(--color-danger)]" : "text-[var(--color-muted)]"
-          }`}
+      {open && (
+        <div className="mb-1 ml-[7px] flex flex-col gap-1.5 border-l border-[var(--color-border)] pl-3 pt-1">
+          {detail}
+          {hasResult && (
+            <pre
+              className={`max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]/60 px-2.5 py-2 font-mono text-[11px] leading-relaxed ${
+                turn.isError ? "text-[var(--color-danger)]" : "text-[var(--color-muted)]"
+              }`}
+            >
+              {turn.result}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Renders the rich INPUT detail for a tool — the part claude code shows inline:
+ *  the Bash command, an Edit's diff, a TodoWrite checklist, or the raw args.
+ *  Returns null when the target label already says everything (e.g. a plain Read). */
+function toolDetail(turn: ToolTurn): React.ReactNode {
+  const name = turn.name.toLowerCase();
+  const inp = turn.input ?? {};
+  const str = (k: string) =>
+    typeof inp[k] === "string" ? (inp[k] as string) : undefined;
+
+  if (name === "bash" || name === "bashoutput") {
+    const cmd = str("command");
+    if (!cmd) return null;
+    return (
+      <pre className="overflow-auto whitespace-pre-wrap break-words rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--color-text-2)]">
+        <span className="select-none text-[var(--color-accent)]">$ </span>
+        {cmd}
+      </pre>
+    );
+  }
+
+  if (name === "edit" || name === "multiedit") {
+    const edits =
+      name === "multiedit" && Array.isArray(inp.edits)
+        ? (inp.edits as Array<Record<string, unknown>>)
+        : [{ old_string: inp.old_string, new_string: inp.new_string }];
+    const blocks = edits
+      .map((e, i) => {
+        const oldS = typeof e.old_string === "string" ? e.old_string : "";
+        const newS = typeof e.new_string === "string" ? e.new_string : "";
+        if (!oldS && !newS) return null;
+        return <DiffBlock key={i} oldText={oldS} newText={newS} />;
+      })
+      .filter(Boolean);
+    return blocks.length > 0 ? <>{blocks}</> : null;
+  }
+
+  if (name === "todowrite" && Array.isArray(inp.todos)) {
+    return <TodoList todos={inp.todos as Array<Record<string, unknown>>} />;
+  }
+
+  if (name === "write") {
+    const content = str("content");
+    if (!content) return null;
+    const preview = content.split("\n").slice(0, 24).join("\n");
+    const more = content.split("\n").length - 24;
+    return (
+      <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--color-text-2)]">
+        {preview}
+        {more > 0 && (
+          <span className="text-[var(--color-faint)]">{`\n… +${more} more lines`}</span>
+        )}
+      </pre>
+    );
+  }
+
+  if (name === "task") {
+    const prompt = str("prompt");
+    if (!prompt) return null;
+    return (
+      <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 font-sans text-[11.5px] leading-relaxed text-[var(--color-muted)]">
+        {prompt.length > 600 ? prompt.slice(0, 600) + "…" : prompt}
+      </div>
+    );
+  }
+
+  return null;
+}
+
+/** A red/green diff for an Edit's old → new strings. Long sides cap to a preview
+ *  with a "+N more lines" tail (opcode/claude-code-webui pattern) so a big edit
+ *  doesn't flood the transcript; click the tail to reveal the rest. */
+const DIFF_CAP = 14;
+function DiffBlock({ oldText, newText }: { oldText: string; newText: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const oldLines = oldText.split("\n");
+  const newLines = newText.split("\n");
+  const capped = !expanded && oldLines.length + newLines.length > DIFF_CAP * 2;
+  const showOld = capped ? oldLines.slice(0, DIFF_CAP) : oldLines;
+  const showNew = capped ? newLines.slice(0, DIFF_CAP) : newLines;
+  const hidden =
+    oldLines.length - showOld.length + (newLines.length - showNew.length);
+
+  return (
+    <pre className="overflow-auto rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] font-mono text-[11px] leading-relaxed">
+      {showOld.map((l, i) => (
+        <div
+          key={`o${i}`}
+          className="whitespace-pre-wrap break-words bg-[var(--color-danger)]/10 px-2.5 text-[var(--color-danger)]"
         >
-          {turn.result}
-        </pre>
+          <span className="select-none opacity-60">- </span>
+          {l}
+        </div>
+      ))}
+      {showNew.map((l, i) => (
+        <div
+          key={`n${i}`}
+          className="whitespace-pre-wrap break-words bg-[var(--color-success,#22c55e)]/10 px-2.5 text-[var(--color-success,#22c55e)]"
+        >
+          <span className="select-none opacity-60">+ </span>
+          {l}
+        </div>
+      ))}
+      {hidden > 0 && (
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          className="block w-full px-2.5 py-0.5 text-left text-[var(--color-faint)] italic hover:text-[var(--color-muted)]"
+        >
+          {`… +${hidden} more line${hidden === 1 ? "" : "s"}`}
+        </button>
+      )}
+    </pre>
+  );
+}
+
+/** Renders a TodoWrite checklist — pending / in-progress / done, with a
+ *  "N of M done" progress footer. claude-code-webui / AI Elements `Task` style. */
+function TodoList({ todos }: { todos: Array<Record<string, unknown>> }) {
+  const done = todos.filter((t) => String(t.status) === "completed").length;
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2">
+      {todos.map((t, i) => {
+        const status = String(t.status ?? "pending");
+        const content =
+          (typeof t.content === "string" && t.content) ||
+          (typeof t.activeForm === "string" && t.activeForm) ||
+          "";
+        const active =
+          status === "in_progress" && typeof t.activeForm === "string"
+            ? (t.activeForm as string)
+            : null;
+        return (
+          <div key={i} className="flex items-start gap-2 font-sans text-[11.5px] leading-relaxed">
+            {status === "completed" ? (
+              <Check size={13} className="mt-0.5 shrink-0 text-[var(--color-success,#22c55e)]" />
+            ) : status === "in_progress" ? (
+              <Loader2 size={13} className="mt-0.5 shrink-0 animate-spin text-[var(--color-accent)]" />
+            ) : (
+              <Square size={13} className="mt-0.5 shrink-0 text-[var(--color-faint)]" />
+            )}
+            <span className="flex min-w-0 flex-col">
+              <span
+                className={
+                  status === "completed"
+                    ? "text-[var(--color-faint)] line-through"
+                    : status === "in_progress"
+                      ? "text-[var(--color-text)]"
+                      : "text-[var(--color-muted)]"
+                }
+              >
+                {content}
+              </span>
+              {active && active !== content && (
+                <span className="text-[10.5px] italic text-[var(--color-faint)]">
+                  {active}
+                </span>
+              )}
+            </span>
+          </div>
+        );
+      })}
+      {todos.length > 0 && (
+        <div className="mt-1 border-t border-[var(--color-border)] pt-1 font-mono text-[10.5px] text-[var(--color-faint)]">
+          {done} of {todos.length} done
+        </div>
       )}
     </div>
   );
@@ -1756,12 +2100,26 @@ function FileCard({ artifact }: { artifact: Artifact }) {
         : artifact.kind === "code"
           ? FileCode
           : FileText;
+  // surface failures instead of swallowing them — a denied scope or missing
+  // file briefly flips the label to the reason so it's debuggable, not silent.
+  const [err, setErr] = useState<string | null>(null);
+  const open = () => {
+    setErr(null);
+    openPath(artifact.path).catch((e) => {
+      setErr(String(e));
+      console.error("openPath failed:", artifact.path, e);
+    });
+  };
   return (
     <button
       type="button"
-      onClick={() => openPath(artifact.path).catch(() => {})}
-      title={`open ${artifact.path}`}
-      className="group/file flex max-w-full items-center gap-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2 text-left transition-colors hover:border-[var(--color-accent)]/50"
+      onClick={open}
+      title={err ? `${err} — ${artifact.path}` : `open ${artifact.path}`}
+      className={`group/file flex max-w-full items-center gap-2.5 rounded-lg border bg-[var(--color-panel-2)] px-3 py-2 text-left transition-colors ${
+        err
+          ? "border-[var(--color-danger)]/50"
+          : "border-[var(--color-border)] hover:border-[var(--color-accent)]/50"
+      }`}
     >
       <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
         <Icon size={14} />
@@ -1770,8 +2128,14 @@ function FileCard({ artifact }: { artifact: Artifact }) {
         <span className="truncate font-mono text-[12px] text-[var(--color-text)]">
           {artifact.name}
         </span>
-        <span className="font-sans text-[10.5px] text-[var(--color-faint)] group-hover/file:text-[var(--color-muted)]">
-          open
+        <span
+          className={`font-sans text-[10.5px] ${
+            err
+              ? "text-[var(--color-danger)]"
+              : "text-[var(--color-faint)] group-hover/file:text-[var(--color-muted)]"
+          }`}
+        >
+          {err ? "couldn’t open — see tooltip" : "open"}
         </span>
       </span>
     </button>
@@ -1867,22 +2231,101 @@ function UserBubble({
   );
 }
 
+/** Parse the WA-style `[[btn: a | b | c]]` choice sentinel out of an assistant
+ *  message: returns the prose with the sentinel stripped + up to 3 button
+ *  labels. Mirrors the bridge's WhatsApp interactive-button behavior so a choice
+ *  offered in chat is tappable here too, not dead literal text. */
+function parseButtons(text: string): { body: string; buttons: string[] } {
+  const m = text.match(/\[\[btn:\s*([^\]]+?)\s*\]\]/i);
+  if (!m) return { body: text, buttons: [] };
+  const buttons = m[1]
+    .split("|")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  return { body: text.replace(m[0], "").trimEnd(), buttons };
+}
+
+/** The model's extended-thinking trace — dim + collapsible. Auto-expanded while
+ *  the tokens are streaming in (so you read the reasoning live), then collapses
+ *  to a faint "Thought ›" line you can re-open. Mirrors claude-code's ✻ thinking. */
+function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) {
+  const [userToggled, setUserToggled] = useState<boolean | null>(null);
+  const open = userToggled ?? turn.streaming;
+  return (
+    <div className="flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={() => setUserToggled(!open)}
+        className="-mx-1 flex w-fit items-center gap-1.5 rounded-md px-1 py-0.5 text-left font-sans text-[12.5px] text-[var(--color-muted)] transition-colors hover:text-[var(--color-text-2)]"
+      >
+        <Sparkles
+          size={13}
+          className={`shrink-0 ${turn.streaming ? "animate-pulse text-[var(--color-accent)]" : "text-[var(--color-faint)]"}`}
+        />
+        <span className={turn.streaming ? "animate-pulse" : undefined}>
+          {turn.streaming
+            ? "Thinking…"
+            : turn.durationMs != null
+              ? `Thought for ${fmtDuration(turn.durationMs)}`
+              : "Thought"}
+        </span>
+        {!turn.streaming && (
+          <ChevronRight
+            size={12}
+            className={`shrink-0 text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
+          />
+        )}
+      </button>
+      {open && (
+        <div className="ml-[6px] whitespace-pre-wrap break-words border-l border-[var(--color-border)] pl-3 font-sans text-[12.5px] italic leading-relaxed text-[var(--color-muted)]">
+          {turn.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AssistantBubble({
   turn,
+  onButton,
+  disabled,
 }: {
   turn: Extract<Turn, { kind: "assistant" }>;
+  onButton: (label: string) => void;
+  disabled: boolean;
 }) {
+  // Don't render the sentinel as a half-baked pill while still streaming in —
+  // wait for the full message so we don't flicker partial `[[btn:` text.
+  const { body, buttons } = turn.streaming
+    ? { body: turn.text, buttons: [] as string[] }
+    : parseButtons(turn.text);
   return (
     <div className="group flex flex-col items-start gap-1">
       <div className="max-w-[92%] font-sans text-[14.5px] leading-relaxed text-[var(--color-text-2)]">
-        <Markdown text={turn.text} />
+        <Markdown text={body} />
         {turn.streaming && (
           <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-pulse bg-[var(--color-accent)]" />
         )}
       </div>
-      {!turn.streaming && turn.text.trim() && (
+      {buttons.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-2">
+          {buttons.map((label) => (
+            <button
+              key={label}
+              type="button"
+              disabled={disabled}
+              onClick={() => onButton(label)}
+              className="rounded-[var(--aios-radius-pill)] border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3.5 py-1.5 text-[13px] font-medium text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] hover:text-[var(--color-accent)] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+      {!turn.streaming && body.trim() && (
         <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-          <CopyButton text={turn.text} title="copy response" />
+          <CopyButton text={body} title="copy response" />
         </div>
       )}
     </div>

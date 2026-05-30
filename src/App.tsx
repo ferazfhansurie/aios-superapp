@@ -1,32 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
-  ArrowUp,
-  Blocks,
-  Bot,
-  Brain,
+  Database,
   Camera,
-  ChevronDown,
   Clock,
-  Code,
   Folder,
   Globe,
-  HelpCircle,
   MessageCircle,
   MessageSquare,
   PanelLeft,
-  Power,
   Radio,
-  RotateCcw,
   Search,
   Settings as SettingsIcon,
-  Sparkles,
   TerminalSquare,
   Wand2,
   X,
 } from "lucide-react";
-
-import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { AccountMenu } from "./components/AccountMenu";
 import { AutomationsPane } from "./components/AutomationsPane";
@@ -37,20 +26,24 @@ import { CommandPalette, type Command } from "./components/CommandPalette";
 import { CrmPane } from "./components/CrmPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileViewerPane } from "./components/FileViewerPane";
-import { MemoryPane } from "./components/MemoryPane";
+import { IdleDashboard } from "./components/IdleDashboard";
+import { DatabasePane } from "./components/DatabasePane";
 import { MotionPane } from "./components/MotionPane";
 import { OracleRoster } from "./components/OracleRoster";
 import { PluginsPane } from "./components/PluginsPane";
+import { ResizableGrid } from "./components/ResizableGrid";
 import { Settings } from "./components/Settings";
 import { TerminalPane, type PaneKind } from "./components/TerminalPane";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { VoiceButton } from "./components/VoiceButton";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
-import { appshot } from "./lib/pty";
+import { appshot, listOracles, type OracleInfo } from "./lib/pty";
+import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } from "./lib/chat";
+import { listCustomers, type Customer } from "./lib/inbox";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
-import { paneWriters } from "./lib/paneBus";
+import { chatHandles, paneWriters } from "./lib/paneBus";
 
 /** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
 type PaneContent =
@@ -61,7 +54,7 @@ type PaneContent =
   | { type: "automations" }
   | { type: "bridges" }
   | { type: "plugins" }
-  | { type: "chat"; seed?: string }
+  | { type: "chat"; seed?: string; resume?: { id: string; title: string }; reattach?: number }
   | { type: "customers" }
   | { type: "motion" }
   | { type: "file"; path: string; name: string };
@@ -77,17 +70,16 @@ const isTerminal = (k: PaneContent): k is PaneKind =>
 let seq = 0;
 const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
 
-const SPAWN: { kind: PaneContent; icon: typeof Folder; label: string }[] = [
+export type AppDef = { kind: PaneContent; icon: typeof Folder; label: string };
+const SPAWN: AppDef[] = [
   { kind: { type: "chat" }, icon: MessageSquare, label: "chat" },
   { kind: { type: "shell" }, icon: TerminalSquare, label: "terminal" },
   { kind: { type: "files" }, icon: Folder, label: "files" },
   { kind: { type: "browser" }, icon: Globe, label: "browser" },
-  { kind: { type: "memory" }, icon: Brain, label: "memory" },
+  { kind: { type: "memory" }, icon: Database, label: "database" },
   { kind: { type: "automations" }, icon: Clock, label: "automations" },
-  { kind: { type: "customers" }, icon: MessageCircle, label: "customers" },
+  { kind: { type: "customers" }, icon: MessageCircle, label: "contacts" },
   { kind: { type: "motion" }, icon: Wand2, label: "studio" },
-  { kind: { type: "bridges" }, icon: Radio, label: "channels" },
-  { kind: { type: "plugins" }, icon: Blocks, label: "plugins" },
 ];
 
 function App() {
@@ -96,11 +88,14 @@ function App() {
   const [splash, setSplash] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [accountOpen, setAccountOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  // pane key pending a close-confirm (busy chat: keep-running vs kill).
+  const [closePrompt, setClosePrompt] = useState<string | null>(null);
+  // backgrounded chat sessions still running after their pane closed.
+  const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
   // Native browser webviews paint ABOVE html, so any floating overlay (modals,
-  // the account popup) must hide them or it gets occluded.
-  const overlayOpen = settingsOpen || paletteOpen || accountOpen;
+  // palette) must hide them or it gets occluded.
+  const overlayOpen = settingsOpen || paletteOpen;
 
   useEffect(() => {
     const t = setTimeout(() => setSplash(false), 850);
@@ -128,6 +123,59 @@ function App() {
   );
   const closePane = useCallback((key: string) => {
     setPanes((p) => p.filter((x) => x.key !== key));
+  }, []);
+  // Closing a chat pane whose claude is mid-task → prompt to keep it running in
+  // the background (with optional done-notification) instead of killing it.
+  const requestClose = useCallback(
+    (key: string) => {
+      const handle = chatHandles.get(key);
+      if (handle?.busy()) {
+        setClosePrompt(key);
+        return;
+      }
+      closePane(key);
+    },
+    [closePane],
+  );
+  const resumeChat = useCallback(
+    (s: ChatSessionInfo) =>
+      spawn({ type: "chat", resume: { id: s.id, title: s.title } }, s.title || "chat"),
+    [spawn],
+  );
+
+  // Shared live data for the idle homescreen + the ⌘K palette: the fleet, the
+  // recent chats to resume, and the customer inbox. One source, polled gently;
+  // every getter is defensive so a missing backend just yields an empty list.
+  const [oracles, setOracles] = useState<OracleInfo[]>([]);
+  const [chats, setChats] = useState<ChatSessionInfo[]>([]);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      listOracles().then((v) => alive && setOracles(v)).catch(() => {});
+      listChatSessions(12).then((v) => alive && setChats(v)).catch(() => {});
+      listCustomers().then((v) => alive && setCustomers(v)).catch(() => {});
+      listChatLive().then((v) => alive && setLiveChats(v)).catch(() => {});
+    };
+    load();
+    const t = setInterval(load, 30_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+
+  // background chat tray refreshes faster so a finished/closed task shows up
+  // (and drops off on reattach) without waiting on the 30s data loop.
+  useEffect(() => {
+    let alive = true;
+    const t = setInterval(() => {
+      listChatLive().then((v) => alive && setLiveChats(v)).catch(() => {});
+    }, 5_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, []);
 
   const fireAppshot = useCallback(async () => {
@@ -187,6 +235,10 @@ function App() {
       } else if (mod && e.key.toLowerCase() === "t") {
         e.preventDefault();
         addShell();
+      } else if (mod && e.key.toLowerCase() === "r") {
+        // ⌘R — reload the cockpit fresh (re-init theme, re-poll all live data).
+        e.preventDefault();
+        window.location.reload();
       } else if (mod && e.key === ",") {
         e.preventDefault();
         setSettingsOpen(true);
@@ -242,16 +294,51 @@ function App() {
       ...SPAWN.map((s) => ({
         id: `spawn-${s.label}`,
         title: `new ${s.label}`,
-        group: "spawn",
+        group: "open",
         icon: <s.icon size={14} />,
-        keywords: "open pane spawn",
+        keywords: "open pane spawn launch new",
+        actionLabel: "open",
         run: () => spawn(s.kind, s.label),
       })),
-      { id: "sidebar", title: "toggle sidebar", subtitle: "⌘B", group: "view", icon: <PanelLeft size={14} />, run: () => setSidebarOpen((v) => !v) },
-      { id: "appshot", title: "appshot — screenshot to oracle", subtitle: "⌘⌘", group: "actions", icon: <Camera size={14} />, keywords: "screenshot capture", run: fireAppshot },
-      { id: "settings", title: "settings", subtitle: "⌘,", group: "app", icon: <SettingsIcon size={14} />, run: () => setSettingsOpen(true) },
+      // resume any recent chat — the highest-value dynamic entry (raycast-style:
+      // one box launches, asks, and continues). cwd as the faint right column.
+      ...chats.map((c) => ({
+        id: `resume-${c.id}`,
+        title: c.title || "untitled chat",
+        subtitle: c.cwd ? c.cwd.split("/").pop() : undefined,
+        group: "resume",
+        icon: <MessageSquare size={14} />,
+        keywords: `chat session continue resume ${c.cwd}`,
+        actionLabel: "resume",
+        run: () => resumeChat(c),
+      })),
+      // attach any live/known oracle from the fleet.
+      ...oracles.map((o) => ({
+        id: `oracle-${o.identity}`,
+        title: `oracle: ${o.display_name}`,
+        subtitle: o.running ? "running" : "idle",
+        group: "fleet",
+        icon: <Radio size={14} />,
+        keywords: `oracle agent attach session ${o.identity}`,
+        actionLabel: "attach",
+        run: () => addOracle(o.identity),
+      })),
+      // jump straight to a customer thread (opens the inbox).
+      ...customers.slice(0, 8).map((c) => ({
+        id: `customer-${c.id}`,
+        title: c.name,
+        subtitle: c.lastAgo ? `${c.lastAgo} ago` : undefined,
+        group: "customers",
+        icon: <MessageCircle size={14} />,
+        keywords: `customer message whatsapp inbox ${c.handle}`,
+        actionLabel: "open inbox",
+        run: () => spawn({ type: "customers" }, "customers"),
+      })),
+      { id: "sidebar", title: "toggle sidebar", subtitle: "⌘B", group: "view", icon: <PanelLeft size={14} />, keywords: "rail hide show", actionLabel: "toggle", run: () => setSidebarOpen((v) => !v) },
+      { id: "appshot", title: "appshot — screenshot to oracle", subtitle: "⌘⌘", group: "actions", icon: <Camera size={14} />, keywords: "screenshot capture", actionLabel: "run", run: fireAppshot },
+      { id: "settings", title: "settings", subtitle: "⌘,", group: "app", icon: <SettingsIcon size={14} />, keywords: "preferences theme appearance", actionLabel: "open", run: () => setSettingsOpen(true) },
     ],
-    [spawn, fireAppshot],
+    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle],
   );
 
   return (
@@ -312,41 +399,37 @@ function App() {
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
               <NavRow icon={SettingsIcon} label="settings" onClick={() => setSettingsOpen(true)} />
-              <AccountMenu
-                onOpenSettings={() => setSettingsOpen(true)}
-                onOpenChange={setAccountOpen}
-              />
+              <AccountMenu onOpenSettings={() => setSettingsOpen(true)} />
             </div>
           </aside>
         )}
 
         <main className="min-h-0 flex-1">
           {panes.length === 0 ? (
-            <EmptyState
+            <IdleDashboard
+              apps={SPAWN}
+              oracles={oracles}
+              chats={chats}
+              customers={customers}
               onSpawn={spawn}
-              onHelp={() => setPaletteOpen(true)}
-              onQuit={() => void getCurrentWindow().close()}
+              onAttachOracle={addOracle}
+              onResumeChat={resumeChat}
+              onOpenPalette={() => setPaletteOpen(true)}
             />
           ) : (
-            <div
-              className="grid h-full w-full gap-2 p-2"
-              style={{
-                gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-                gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
-              }}
-            >
+            <ResizableGrid cols={cols} rows={rows} gap={8}>
               {panes.map((pane) => (
                 <PaneCard
                   key={pane.key}
                   pane={pane}
                   active={!overlayOpen}
-                  onClose={() => closePane(pane.key)}
+                  onClose={() => requestClose(pane.key)}
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
                   onOpenFile={(path, name) => spawn({ type: "file", path, name }, name)}
                 />
               ))}
-            </div>
+            </ResizableGrid>
           )}
         </main>
       </div>
@@ -354,6 +437,75 @@ function App() {
       {toast && (
         <div className="modal-in glass absolute bottom-4 left-1/2 z-40 -translate-x-1/2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/90 px-3 py-2 text-[12px] text-[var(--color-text)] shadow-2xl">
           {toast}
+        </div>
+      )}
+
+      {/* background chat sessions — still running after their pane closed */}
+      {liveChats.length > 0 && (
+        <div className="absolute bottom-4 right-4 z-40 flex w-64 flex-col gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/95 p-2 shadow-2xl backdrop-blur">
+          <div className="px-1 text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
+            running in background
+          </div>
+          {liveChats.map((lc) => (
+            <button
+              key={lc.id}
+              onClick={() => spawn({ type: "chat", reattach: lc.id }, lc.title || "chat")}
+              className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left hover:border-[var(--color-accent)]/40"
+              title="reopen — reattach + replay"
+            >
+              <span className={`status-dot shrink-0 ${lc.busy ? "status-dot--active" : "status-dot--cold"}`} />
+              <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--color-text-2)]">
+                {lc.title || "chat"}
+              </span>
+              <span className="shrink-0 text-[9px] text-[var(--color-faint)]">{lc.busy ? "working" : "done"}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* close a busy chat: keep running in background, or kill */}
+      {closePrompt && (
+        <div className="absolute inset-0 z-50 grid place-items-center bg-black/50" onClick={() => setClosePrompt(null)}>
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="modal-in w-[400px] rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-4 shadow-2xl"
+          >
+            <div className="text-[13px] font-medium text-[var(--color-text)]">this chat is still working</div>
+            <p className="mt-1 text-[12px] leading-relaxed text-[var(--color-muted)]">
+              keep it running in the background so it finishes the task, or stop it?
+            </p>
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                onClick={() => {
+                  chatHandles.get(closePrompt)?.detach(true);
+                  closePane(closePrompt);
+                  setClosePrompt(null);
+                }}
+                className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+              >
+                keep running + notify me when done
+              </button>
+              <button
+                onClick={() => {
+                  chatHandles.get(closePrompt)?.detach(false);
+                  closePane(closePrompt);
+                  setClosePrompt(null);
+                }}
+                className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-[12px] hover:border-[var(--color-accent)]/50"
+              >
+                keep running (no notification)
+              </button>
+              <button
+                onClick={() => {
+                  closePane(closePrompt);
+                  setClosePrompt(null);
+                }}
+                className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-[12px] text-[var(--color-danger)] hover:border-[var(--color-danger)]/50"
+              >
+                stop &amp; close
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -503,7 +655,7 @@ function PaneCard({
         ) : pane.kind.type === "browser" ? (
           <BrowserPane label={pane.key} active={active} onAnnotate={onAnnotate} />
         ) : pane.kind.type === "memory" ? (
-          <MemoryPane />
+          <DatabasePane />
         ) : pane.kind.type === "automations" ? (
           <AutomationsPane />
         ) : pane.kind.type === "bridges" ? (
@@ -517,170 +669,15 @@ function PaneCard({
         ) : pane.kind.type === "file" ? (
           <FileViewerPane path={pane.kind.path} />
         ) : (
-          <ChatPane paneKey={pane.key} seed={pane.kind.type === "chat" ? pane.kind.seed : undefined} />
+          <ChatPane
+            paneKey={pane.key}
+            seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
+            resume={pane.kind.type === "chat" ? pane.kind.resume : undefined}
+            reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}
+          />
         )}
       </div>
     </div>
-  );
-}
-
-/** Start engines — picked on the idle page. "aios" = our Codex-style chat pane
- *  (claude under the hood); the rest open a session running that CLI. */
-const ENGINES: {
-  id: string;
-  label: string;
-  sub: string;
-  icon: typeof Bot;
-  primary?: boolean;
-  spawn: (s: (k: PaneContent, l: string) => void) => void;
-}[] = [
-  { id: "aios", label: "aios chat", sub: "codex-style · claude", icon: MessageSquare, primary: true, spawn: (s) => s({ type: "chat" }, "chat") },
-  { id: "claude", label: "claude", sub: "claude code", icon: Sparkles, spawn: (s) => s({ type: "shell", cmd: "claude" }, "claude") },
-  { id: "codex", label: "codex", sub: "openai codex", icon: Bot, spawn: (s) => s({ type: "shell", cmd: "codex" }, "codex") },
-  { id: "opencode", label: "opencode", sub: "open-source", icon: Code, spawn: (s) => s({ type: "shell", cmd: "opencode" }, "opencode") },
-];
-
-function EmptyState({
-  onSpawn,
-  onHelp,
-  onQuit,
-}: {
-  onSpawn: (kind: PaneContent, label: string) => void;
-  onHelp: () => void;
-  onQuit: () => void;
-}) {
-  const [text, setText] = useState("");
-  const [engineId, setEngineId] = useState("aios");
-  const [engineMenu, setEngineMenu] = useState(false);
-  const [hi, setHi] = useState(0);
-  // cycle the headline through variations
-  useEffect(() => {
-    const t = setInterval(() => setHi((i) => (i + 1) % HEADLINES.length), 4000);
-    return () => clearInterval(t);
-  }, []);
-  const engine = ENGINES.find((e) => e.id === engineId) ?? ENGINES[0];
-
-  const launch = () => {
-    if (engine.id === "aios") {
-      onSpawn({ type: "chat", seed: text.trim() || undefined }, "chat");
-    } else {
-      engine.spawn(onSpawn);
-    }
-  };
-
-  return (
-    <div className="relative flex h-full flex-col items-center justify-center overflow-hidden">
-      <div
-        className="pointer-events-none absolute inset-0"
-        style={{
-          background:
-            "radial-gradient(50% 40% at 50% 40%, color-mix(in srgb, var(--color-accent) 6%, transparent), transparent 72%)",
-        }}
-      />
-
-      <div className="relative flex w-full max-w-2xl flex-col items-center gap-7 px-6">
-        <h1 className="hero-title text-center text-[var(--color-text)] transition-opacity duration-500">
-          {HEADLINES[hi]}
-        </h1>
-
-        {/* chat-composer-style launcher */}
-        <div className="focus-accent w-full rounded-[var(--aios-radius-xl)] border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-4 pb-3 pt-3.5">
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                launch();
-              }
-            }}
-            rows={1}
-            placeholder="do anything"
-            className="block max-h-40 min-h-[28px] w-full resize-none bg-transparent text-[15px] text-[var(--color-text)] outline-none placeholder:text-[var(--color-faint)]"
-          />
-          <div className="mt-2 flex items-center justify-between">
-            {/* engine pill */}
-            <div className="relative">
-              <button
-                onClick={() => setEngineMenu((v) => !v)}
-                className="flex items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border)] px-2.5 py-1 text-[12px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)]"
-              >
-                <engine.icon size={13} className="text-[var(--color-accent)]" />
-                {engine.label}
-                <ChevronDown size={12} className="text-[var(--color-muted)]" />
-              </button>
-              {engineMenu && (
-                <>
-                  <div className="fixed inset-0 z-40" onClick={() => setEngineMenu(false)} />
-                  <div className="surface-pop absolute bottom-full left-0 z-50 mb-1.5 w-48 p-1">
-                    {ENGINES.map((e) => (
-                      <button
-                        key={e.id}
-                        onClick={() => {
-                          setEngineId(e.id);
-                          setEngineMenu(false);
-                        }}
-                        className="flex w-full items-center gap-2 rounded-[var(--aios-radius-sm)] px-2 py-1.5 text-left text-[12px] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-                      >
-                        <e.icon size={14} className="shrink-0 text-[var(--color-muted)]" />
-                        <span className="flex-1">{e.label}</span>
-                        <span className="text-[10px] text-[var(--color-faint)]">{e.sub}</span>
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
-            {/* send */}
-            <button
-              onClick={launch}
-              title="start (↵)"
-              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
-            >
-              <ArrowUp size={15} />
-            </button>
-          </div>
-        </div>
-
-        <p className="helper-line">{engine.sub} · ↵ to start</p>
-
-        <div className="flex items-center gap-2 text-[12px]">
-          <IdleAction icon={<RotateCcw size={13} />} label="resume" onClick={() => onSpawn({ type: "shell", cmd: "claude --continue" }, "resume")} />
-          <span className="text-[var(--color-faint)]">·</span>
-          <IdleAction icon={<HelpCircle size={13} />} label="help" onClick={onHelp} />
-          <span className="text-[var(--color-faint)]">·</span>
-          <IdleAction icon={<Power size={13} />} label="quit" onClick={onQuit} />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-const HEADLINES = [
-  "what should we work on?",
-  "what are we building?",
-  "what's the move?",
-  "what do you need done?",
-  "where do we start?",
-];
-
-function IdleAction({
-  icon,
-  label,
-  onClick,
-}: {
-  icon: ReactNode;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className="flex items-center gap-1.5 rounded-md px-2 py-1 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-    >
-      {icon}
-      {label}
-    </button>
   );
 }
 

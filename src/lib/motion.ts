@@ -187,6 +187,69 @@ export async function motionStatus(args: {
   });
 }
 
+// ── boards (the shared canvas, interchangeable with the motion MCP) ──────────
+
+/** One element on a board — image / video / generation / text node. Mirrors the
+ *  MotionBoards `BoardItem` (only the fields the AIOS canvas renders are typed;
+ *  the rest pass through). x/y/width/height are board-space px. */
+export interface BoardItem {
+  id: string;
+  type: "image" | "video" | "audio" | "generation" | "text" | "drawing" | string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  src?: string;
+  outputUrl?: string;
+  outputType?: "image" | "video" | "audio" | string;
+  prompt?: string;
+  model?: string;
+  modelName?: string;
+  status?: "idle" | "processing" | "completed" | "failed" | string;
+  progressText?: string;
+  cost?: string;
+  text?: string;
+  starred?: boolean;
+  createdAt?: string;
+}
+
+export interface MotionBoard {
+  id: string;
+  name: string;
+  items: BoardItem[];
+  panX?: number;
+  panY?: number;
+  zoom?: number;
+}
+
+/** The SavedState the server stores in `mb_boards` (shared with web + MCP). */
+export interface MotionSavedState {
+  boards: MotionBoard[];
+  activeBoardId: string;
+  selectedModelId?: string | null;
+  savedAt?: number;
+}
+
+export interface MotionBoardsResult {
+  ok: boolean;
+  configured: boolean;
+  baseUrl: string;
+  data: MotionSavedState | null;
+  status?: number;
+  error?: string;
+}
+
+/** Read the shared canvas (the same board the MCP writes to). Never throws. */
+export async function motionBoards(): Promise<MotionBoardsResult> {
+  return invoke<MotionBoardsResult>("motion_boards");
+}
+
+/** Write the full SavedState back. GET fresh → append → save promptly to keep
+ *  the race with the MCP / web autosave small. Rejects with the API message. */
+export async function motionBoardSave(state: MotionSavedState): Promise<unknown> {
+  return invoke("motion_board_save", { state });
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /** RM string for a SEN cost, e.g. 336 → "RM3.36". `null`/0 → "free". */

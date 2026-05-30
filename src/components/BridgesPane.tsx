@@ -14,8 +14,12 @@ import {
   ArrowUpRight,
   AtSign,
   Camera,
+  CheckCircle2,
   ChevronRight,
+  Copy,
   Hash,
+  Link2,
+  Loader2,
   Mail,
   MessageCircle,
   MessageSquare,
@@ -30,6 +34,7 @@ import {
 import {
   bridgeActivity,
   listBridges,
+  pairPersonalWa,
   type Channel,
   type BridgeMessage,
   type Bridges,
@@ -60,23 +65,21 @@ function channelIcon(id: string, size = 13, className = "") {
   }
 }
 
-/** Maps a channel's status (+ liveness) to its dot class, label, and colour.
- *  connected → green (pulsing when a live process is up).
- *  disconnected → amber, "not connected".
- *  soon → grey, "coming soon". */
+/** Maps a channel's status to a plain-language dot + label + colour — no jargon.
+ *  connected → green "on", disconnected → amber "off", soon → grey "coming soon". */
 function statusView(c: Channel): { dot: string; label: string; color: string } {
   if (c.status === "connected") {
     return {
       // green dot — pulses live (status-dot--active is the only green class).
       dot: "status-dot--active",
-      label: c.uptime ? `connected · up ${c.uptime}` : "connected",
+      label: "on",
       color: "text-[var(--color-success)]",
     };
   }
   if (c.status === "disconnected") {
     return {
       dot: "status-dot--idle",
-      label: "not connected",
+      label: "off",
       color: "text-[var(--color-warning)]",
     };
   }
@@ -86,6 +89,38 @@ function statusView(c: Channel): { dot: string; label: string; color: string } {
     label: "coming soon",
     color: "text-[var(--color-muted)]",
   };
+}
+
+/** Turns a compact duration token ("10d 14h", "5m", "14h") into plain words —
+ *  takes the largest unit only, e.g. "10 days", "5 min", "14 hours". */
+function humanizeDuration(s: string | null): string | null {
+  if (!s) return null;
+  const m = s.trim().match(/(\d+)\s*(s|m|h|d|w)/i);
+  if (!m) return s.trim();
+  const n = Number(m[1]);
+  switch (m[2].toLowerCase()) {
+    case "s":
+      return "moments";
+    case "m":
+      return `${n} min`;
+    case "h":
+      return `${n} ${n === 1 ? "hour" : "hours"}`;
+    case "d":
+      return `${n} ${n === 1 ? "day" : "days"}`;
+    default:
+      return `${n} ${n === 1 ? "week" : "weeks"}`;
+  }
+}
+
+/** A one-line, layman-readable health summary for a connected channel, e.g.
+ *  "working normally · on for 10 days · last message 5 min ago". */
+function healthSentence(c: Channel): string {
+  const parts = ["working normally"];
+  const up = humanizeDuration(c.uptime);
+  if (up && up !== "moments") parts.push(`on for ${up}`);
+  const ago = humanizeDuration(c.lastActivityAgo);
+  if (ago) parts.push(ago === "moments" ? "active just now" : `last message ${ago} ago`);
+  return parts.join(" · ");
 }
 
 export function BridgesPane() {
@@ -123,6 +158,25 @@ export function BridgesPane() {
     return () => clearInterval(t);
   }, [refresh]);
 
+  // personal-WhatsApp pairing (the wwebjs session the "personal" send-channel uses)
+  const [pairing, setPairing] = useState(false);
+  const [pairCode, setPairCode] = useState<string | null>(null);
+  const [pairErr, setPairErr] = useState<string | null>(null);
+  const pairPersonal = useCallback(async () => {
+    setPairing(true);
+    setPairErr(null);
+    setPairCode(null);
+    try {
+      const res = await pairPersonalWa();
+      if (res.ok && res.code) setPairCode(res.code);
+      else setPairErr(res.error || "couldn't get a pairing code");
+    } catch (e) {
+      setPairErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPairing(false);
+    }
+  }, []);
+
   const channels = data?.bridges ?? [];
   const connectedCount = channels.filter((c) => c.status === "connected").length;
 
@@ -138,18 +192,62 @@ export function BridgesPane() {
             </span>
           )}
         </div>
-        <button
-          onClick={refresh}
-          className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-          title="Refresh"
-        >
-          <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={pairPersonal}
+            disabled={pairing}
+            className="flex items-center gap-1 rounded-md border border-[var(--color-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)] disabled:opacity-50"
+            title="pair your personal WhatsApp (wwebjs) — enables the 'personal' send channel"
+          >
+            {pairing ? <Loader2 size={11} className="animate-spin" /> : <Link2 size={11} />}
+            pair personal
+          </button>
+          <button
+            onClick={refresh}
+            className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+            title="Refresh"
+          >
+            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+          </button>
+        </div>
       </div>
+
+      {/* personal-WA pairing banner */}
+      {(pairing || pairCode || pairErr) && (
+        <div className="shrink-0 border-b border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-3 py-2.5">
+          {pairing && (
+            <p className="flex items-center gap-1.5 text-[12px] text-[var(--color-muted)]">
+              <Loader2 size={12} className="animate-spin" /> booting the wwebjs client + requesting a code… (can take ~30-50s)
+            </p>
+          )}
+          {pairCode && (
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-[var(--color-muted)]">pairing code</span>
+                <span className="font-mono text-[18px] font-semibold tracking-[0.2em] text-[var(--color-accent)]">{pairCode}</span>
+                <button
+                  onClick={() => navigator.clipboard?.writeText(pairCode).catch(() => {})}
+                  className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)]"
+                  title="copy"
+                >
+                  <Copy size={12} />
+                </button>
+              </div>
+              <p className="text-[11px] leading-snug text-[var(--color-text-2)]">
+                on your phone: WhatsApp → Settings → Linked Devices → Link a Device →{" "}
+                <span className="text-[var(--color-text)]">Link with phone number</span> → enter this code. (it expires fast — re-pair if it lapses.)
+              </p>
+            </div>
+          )}
+          {pairErr && <p className="text-[12px] text-[var(--color-danger)]">{pairErr}</p>}
+        </div>
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
         <p className="mb-3 text-[11px] leading-relaxed text-[var(--color-muted)]">
-          every channel AIOS speaks through — dispatch, monitor, and reply across all of them.
+          all the apps AIOS can message people through. a{" "}
+          <span className="text-[var(--color-success)]">green dot</span> means it's on and
+          working — grey means it's not set up yet.
         </p>
 
         {error && <p className="text-[12px] text-[var(--color-danger)]">{error}</p>}
@@ -190,6 +288,9 @@ function ChannelCard({
   // connected channels open their feed by default — those are worth watching;
   // the rest have nothing to expand.
   const [open, setOpen] = useState(connected);
+  // the sysadmin meta (pid / launchd job / log file) stays hidden — a normal
+  // person never needs it; power users can pop it open.
+  const [showTech, setShowTech] = useState(false);
 
   return (
     <div
@@ -222,36 +323,29 @@ function ChannelCard({
 
       {connected ? (
         <>
-          {/* activity stat row */}
+          {/* plain-language health line — what a normal person actually wants to know */}
+          <div className="flex items-start gap-1.5 text-[11.5px] leading-snug text-[var(--color-text-2)]">
+            <CheckCircle2 size={13} className="mt-px shrink-0 text-[var(--color-success)]" />
+            <span>{healthSentence(c)}</span>
+          </div>
+
+          {/* message counts in plain words */}
           <div className="flex items-center gap-1.5 text-[12px] text-[var(--color-text-2)]">
             <Activity size={12} className="text-[var(--color-accent)]" />
-            <span className="font-mono">{c.messagesTotal ?? "–"}</span>
-            <span className="text-[var(--color-muted)]">sent ·</span>
-            <span className="font-mono">{c.today ?? "–"}</span>
-            <span className="text-[var(--color-muted)]">today</span>
-            {c.lastActivityAgo && (
-              <>
-                <span className="text-[var(--color-muted)]">· last</span>
-                <span className="font-mono">{c.lastActivityAgo}</span>
-                <span className="text-[var(--color-muted)]">ago</span>
-              </>
-            )}
-          </div>
-
-          {/* faint meta: pid · launchd · log path */}
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-[var(--color-faint)]">
-            {c.pid != null && (
-              <span className="flex items-center gap-1">
-                <Zap size={9} />
-                <span className="font-mono">pid {c.pid}</span>
+            <span>
+              <span className="font-medium text-[var(--color-text)]">
+                {(c.messagesTotal ?? 0).toLocaleString()}
+              </span>{" "}
+              messages sent
+            </span>
+            {c.today != null && (
+              <span className="text-[var(--color-muted)]">
+                · <span className="text-[var(--color-text-2)]">{c.today.toLocaleString()}</span> today
               </span>
             )}
-            {c.launchd && <span className="font-mono">{c.launchd}</span>}
-            {c.lastActivity && <span className="font-mono">last {c.lastActivity}</span>}
-            {c.logPath && <span className="truncate font-mono">{c.logPath}</span>}
           </div>
 
-          {/* recent activity — expandable chat-style feed */}
+          {/* recent messages — expandable chat-style feed */}
           <button
             onClick={() => setOpen((v) => !v)}
             className="-mx-1 mt-0.5 flex items-center gap-1 rounded px-1 py-0.5 text-left text-[11px] text-[var(--color-muted)] hover:bg-[var(--color-panel-2)]/50 hover:text-[var(--color-text-2)]"
@@ -261,10 +355,39 @@ function ChannelCard({
               className={`transition-transform ${open ? "rotate-90" : ""}`}
             />
             <MessageCircle size={11} />
-            <span>recent activity</span>
+            <span>recent messages</span>
           </button>
 
           {open && <ActivityFeed channelId={c.id} />}
+
+          {/* sysadmin details — hidden by default; only the curious open it */}
+          {(c.pid != null || c.launchd || c.logPath || c.lastActivity) && (
+            <>
+              <button
+                onClick={() => setShowTech((v) => !v)}
+                className="-mx-1 flex items-center gap-1 rounded px-1 py-0.5 text-left text-[10px] text-[var(--color-faint)] hover:bg-[var(--color-panel-2)]/50 hover:text-[var(--color-muted)]"
+              >
+                <ChevronRight
+                  size={10}
+                  className={`transition-transform ${showTech ? "rotate-90" : ""}`}
+                />
+                <span>technical details</span>
+              </button>
+              {showTech && (
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 pl-3 text-[10px] text-[var(--color-faint)]">
+                  {c.pid != null && (
+                    <span className="flex items-center gap-1">
+                      <Zap size={9} />
+                      <span className="font-mono">pid {c.pid}</span>
+                    </span>
+                  )}
+                  {c.launchd && <span className="font-mono">{c.launchd}</span>}
+                  {c.lastActivity && <span className="font-mono">last {c.lastActivity}</span>}
+                  {c.logPath && <span className="truncate font-mono">{c.logPath}</span>}
+                </div>
+              )}
+            </>
+          )}
         </>
       ) : (
         <NotConnectedRow channel={c} onConnect={onConnect} />
@@ -286,7 +409,7 @@ function NotConnectedRow({
   return (
     <div className="flex items-center justify-between gap-2">
       <span className="text-[11px] text-[var(--color-muted)]/80">
-        {soon ? "connector on the way" : "wired but offline — reconnect"}
+        {soon ? "not ready yet — coming soon" : "currently off — press connect to turn it back on"}
       </span>
       <button
         onClick={() => onConnect("channel connectors coming — not wired yet")}

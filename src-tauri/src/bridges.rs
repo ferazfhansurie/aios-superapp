@@ -40,6 +40,67 @@ fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".into())
 }
 
+/// The bridge's personal-WA pairing script (wwebjs, 8-digit pairing code).
+const CONNECT_PERSONAL_CANDIDATES: &[&str] = &[
+    "Repo/firaz/aios/bridge/scripts/connect-personal-code.js",
+    "Repo/firaz/aios-bridge/scripts/connect-personal-code.js",
+];
+
+/// Pairs firaz's PERSONAL WhatsApp (the wwebjs session used by `send-as-personal`
+/// / the "personal" channel). Spawns `connect-personal-code.js`, waits for the
+/// linking screen to render + the 8-digit pairing code, and returns it. The
+/// node process is LEFT RUNNING so pairing completes once firaz enters the code
+/// (WhatsApp → Linked Devices → Link with phone number). On timeout the child is
+/// killed so we don't leak a wwebjs client.
+#[tauri::command]
+pub fn pair_personal_wa() -> Value {
+    let Some(script) = resolve_log(CONNECT_PERSONAL_CANDIDATES) else {
+        return json!({ "ok": false, "error": "connect-personal-code.js not found under ~/Repo/firaz/aios/bridge (or aios-bridge)." });
+    };
+
+    let mut child = match std::process::Command::new("node")
+        .arg(&script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return json!({ "ok": false, "error": format!("couldn't spawn node: {e} (is node on PATH?)") }),
+    };
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return json!({ "ok": false, "error": "couldn't capture pairing script output" });
+    };
+
+    // Read stdout on a thread; the main path waits with a timeout so a hung
+    // wwebjs boot can't block the UI thread forever.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(idx) = line.find("pairing code:") {
+                let code = line[idx + "pairing code:".len()..].trim().to_string();
+                let _ = tx.send(code);
+                return;
+            }
+        }
+    });
+
+    // wwebjs boots a headless chromium before it can cut a code — give it room.
+    match rx.recv_timeout(std::time::Duration::from_secs(90)) {
+        Ok(code) => json!({ "ok": true, "code": code }),
+        Err(_) => {
+            let _ = child.kill();
+            json!({
+                "ok": false,
+                "error": "timed out waiting for a pairing code. check the bridge .env (OWNER_PHONE set to your personal number) and try again.",
+            })
+        }
+    }
+}
+
 /// How hard a channel's connector is wired, which drives how we detect it.
 #[derive(Clone, Copy, PartialEq)]
 enum Wiring {

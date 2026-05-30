@@ -498,6 +498,62 @@ pub fn motion_status(
     }
 }
 
+/// Reads the shared MotionBoards canvas state via `GET /api/boards` — the SAME
+/// `mb_boards` record the web app and the `motion` MCP (`add_to_board:true`)
+/// read/write. This is what makes the AIOS studio canvas interchangeable with
+/// the MCP: assets Claude generates land here, and vice-versa. Returns
+/// `{ ok, configured, baseUrl, data }` where `data` is the raw SavedState
+/// `{ boards:[{ id, name, items:[…], panX, panY, zoom, connections }],
+///    activeBoardId, selectedModelId, savedAt }`. Defensive: any miss → empty.
+#[tauri::command]
+pub fn motion_boards() -> Value {
+    let Some(key) = api_key() else {
+        let mut v = not_configured();
+        v["data"] = Value::Null;
+        return v;
+    };
+    match curl("GET", "/api/boards", &key, None, 30) {
+        Ok(out) if (200..300).contains(&out.status) => json!({
+            "ok": true,
+            "configured": true,
+            "baseUrl": base_url(),
+            "data": out.json,
+        }),
+        Ok(out) => json!({
+            "ok": false,
+            "configured": true,
+            "baseUrl": base_url(),
+            "status": out.status,
+            "error": error_message(&out),
+            "data": Value::Null,
+        }),
+        Err(e) => json!({
+            "ok": false,
+            "configured": true,
+            "baseUrl": base_url(),
+            "error": e,
+            "data": Value::Null,
+        }),
+    }
+}
+
+/// Writes the canvas state back via `POST /api/boards`. `state` is the full
+/// SavedState (`{ boards, activeBoardId, selectedModelId, savedAt }`) — the route
+/// replaces the user's `mb_boards` row, so callers should GET fresh, append, and
+/// POST promptly to keep the race window with the MCP / web autosave small.
+/// Errors surface the API's own message.
+#[tauri::command]
+pub fn motion_board_save(state: Value) -> Result<Value, String> {
+    let key = api_key()
+        .ok_or_else(|| "MotionBoards API key not set.".to_string())?;
+    let body = state.to_string();
+    let out = curl("POST", "/api/boards", &key, Some(&body), 30)?;
+    if !(200..300).contains(&out.status) {
+        return Err(error_message(&out));
+    }
+    Ok(if out.json.is_null() { json!({ "ok": true }) } else { out.json })
+}
+
 /// Minimal percent-encoder for query-param VALUES. Encodes everything outside
 /// the RFC 3986 unreserved set (`A-Z a-z 0-9 - _ . ~`). Sufficient for model ids
 /// (`/`), generation ids, and request ids without pulling in a url crate.

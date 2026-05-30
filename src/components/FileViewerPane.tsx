@@ -7,6 +7,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { ExternalLink, FileText } from "lucide-react";
 
 import { fileSrc, readFilePreview, type FilePreview } from "../lib/fs";
+import { OfficePreview } from "./OfficePreview";
 
 export function FileViewerPane({ path }: { path: string }) {
   const [preview, setPreview] = useState<FilePreview | null>(null);
@@ -47,6 +48,8 @@ export function FileViewerPane({ path }: { path: string }) {
           </div>
         ) : preview?.kind === "pdf" ? (
           <iframe src={fileSrc(path)} title={preview.name} className="h-full w-full border-0" />
+        ) : preview?.kind === "office" ? (
+          <OfficePreview path={path} name={preview.name} />
         ) : preview?.kind === "text" ? (
           <pre className="whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-relaxed text-[var(--color-text-2)]">
             {preview.text}

@@ -223,6 +223,37 @@ export async function chatStop(id: number): Promise<void> {
   return invoke("chat_stop", { sessionId: id });
 }
 
+/** Detaches a session from its pane WITHOUT killing it — the claude process
+ *  keeps running and buffering. `notify` arms a done-notification. */
+export async function chatDetach(id: number, notify: boolean): Promise<void> {
+  return invoke("chat_detach", { sessionId: id, notify });
+}
+
+/** Reattaches a reopened pane to a live/backgrounded session; replays the
+ *  buffered output through the channel, then goes live. */
+export async function chatReattach(id: number, onEvent: Channel<string>): Promise<void> {
+  return invoke("chat_reattach", { sessionId: id, onEvent });
+}
+
+/** Sets the label used by the background tray + done-notification. */
+export async function chatSetTitle(id: number, title: string): Promise<void> {
+  return invoke("chat_set_title", { sessionId: id, title });
+}
+
+/** A live (backgrounded) chat session for the "running" tray. */
+export interface LiveChat {
+  id: number;
+  claude_id: string | null;
+  title: string;
+  busy: boolean;
+  detached: boolean;
+}
+
+/** Lists currently-backgrounded chat sessions. */
+export async function listChatLive(): Promise<LiveChat[]> {
+  return invoke<LiveChat[]>("list_chat_live");
+}
+
 /**
  * Interrupts the in-flight turn via claude's control protocol (sends a
  * `control_request`/`interrupt`). The process survives — the next `chatSend`

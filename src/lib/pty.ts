@@ -44,9 +44,18 @@ export async function renameOracle(from: string, to: string): Promise<string> {
   return invoke<string>("rename_oracle", { from, to });
 }
 
-/** Deletes (kills) an oracle session. Master can't be deleted (backend rejects). */
-export async function deleteOracle(identity: string): Promise<void> {
-  return invoke("delete_oracle", { identity });
+/**
+ * Deletes (kills) an oracle session. Master can't be deleted (backend rejects).
+ * firaz's primary oracle (`aios-firaz`) is load-bearing and backend-blocked
+ * unless `force` is passed — the UI only sets it after an explicit warned confirm.
+ */
+export async function deleteOracle(identity: string, force = false): Promise<void> {
+  return invoke("delete_oracle", { identity, force });
+}
+
+/** Kills any tmux session on a socket (all-tmux attach surface). Master rejected. */
+export async function killTmuxSession(socket: string, session: string): Promise<void> {
+  return invoke("kill_tmux_session", { socket, session });
 }
 
 /** ⌘⌘ appshot: screenshot → routed into an oracle (defaults to master). */

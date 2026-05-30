@@ -290,3 +290,115 @@ pub fn memory_file(path: String) -> Result<String, String> {
     }
     std::fs::read_to_string(&canon_target).map_err(|e| e.to_string())
 }
+
+/// A slug is safe if it's a bare filename — letters, digits, `-`, `_` only.
+/// Rejects path separators, dots, and traversal so writes stay in the vault.
+fn safe_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 120
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Creates or updates a memory note, writing `<vault>/<name>.md` with standard
+/// frontmatter and keeping the `MEMORY.md` index line in sync. When `old_name`
+/// differs from `name` the prior file + index line are removed (a rename).
+/// Returns the absolute path written.
+#[tauri::command]
+pub fn memory_save(
+    name: String,
+    node_type: String,
+    description: String,
+    body: String,
+    old_name: Option<String>,
+) -> Result<String, String> {
+    if !safe_slug(&name) {
+        return Err("name must be a slug: letters, digits, - or _ only".into());
+    }
+    let dir = vault_dir();
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+
+    // type defaults to a sane bucket if blank.
+    let ntype = if node_type.trim().is_empty() {
+        "reference".to_string()
+    } else {
+        node_type.trim().to_string()
+    };
+
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&format!("name: {name}\n"));
+    out.push_str(&format!("description: {}\n", description.replace('\n', " ").trim()));
+    out.push_str("metadata:\n");
+    out.push_str(&format!("  type: {ntype}\n"));
+    out.push_str("---\n\n");
+    out.push_str(body.trim_end());
+    out.push('\n');
+
+    let path = dir.join(format!("{name}.md"));
+    std::fs::write(&path, &out).map_err(|e| e.to_string())?;
+
+    // Rename: drop the previous file + index line if the slug changed.
+    if let Some(old) = old_name.as_deref() {
+        if old != name && safe_slug(old) {
+            let old_path = dir.join(format!("{old}.md"));
+            let _ = std::fs::remove_file(&old_path);
+            update_index_remove(&dir, old);
+        }
+    }
+
+    update_index_upsert(&dir, &name, &description);
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Deletes a memory note and its `MEMORY.md` index line.
+#[tauri::command]
+pub fn memory_delete(name: String) -> Result<(), String> {
+    if !safe_slug(&name) {
+        return Err("invalid name".into());
+    }
+    let dir = vault_dir();
+    let path = dir.join(format!("{name}.md"));
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    update_index_remove(&dir, &name);
+    Ok(())
+}
+
+/// Inserts or replaces the `MEMORY.md` pointer line for a note. Best-effort —
+/// the index is a convenience, so failures here don't fail the save.
+fn update_index_upsert(dir: &std::path::Path, name: &str, description: &str) {
+    let index = dir.join("MEMORY.md");
+    let marker = format!("]({name}.md)");
+    let hook = description.replace('\n', " ");
+    let hook = hook.trim();
+    let line = if hook.is_empty() {
+        format!("- [{name}]({name}.md)")
+    } else {
+        format!("- [{name}]({name}.md) — {hook}")
+    };
+
+    let existing = std::fs::read_to_string(&index).unwrap_or_default();
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    if let Some(pos) = lines.iter().position(|l| l.contains(&marker)) {
+        lines[pos] = line;
+    } else {
+        if !lines.is_empty() && !existing.ends_with('\n') {
+            // keep clean line boundaries
+        }
+        lines.push(line);
+    }
+    let _ = std::fs::write(&index, lines.join("\n") + "\n");
+}
+
+/// Removes a note's `MEMORY.md` pointer line, if present. Best-effort.
+fn update_index_remove(dir: &std::path::Path, name: &str) {
+    let index = dir.join("MEMORY.md");
+    let marker = format!("]({name}.md)");
+    let existing = match std::fs::read_to_string(&index) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let kept: Vec<&str> = existing.lines().filter(|l| !l.contains(&marker)).collect();
+    let _ = std::fs::write(&index, kept.join("\n") + "\n");
+}
