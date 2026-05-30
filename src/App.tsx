@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
+  Bot,
   Camera,
   ChevronDown,
   ChevronRight,
+  Clock,
+  Database,
   EllipsisVertical,
+  FileText,
   Folder,
   FolderPlus,
   Globe,
@@ -15,6 +19,7 @@ import {
   MessageSquare,
   MessageCircle,
   MoveRight,
+  NotebookPen,
   PanelLeft,
   Pencil,
   Pin,
@@ -23,7 +28,9 @@ import {
   Radio,
   Search,
   Settings as SettingsIcon,
+  TerminalSquare,
   Trash2,
+  Wand2,
   Eye,
   EyeOff,
   X,
@@ -1591,12 +1598,32 @@ function PinSiteModal({ spaceId, onClose }: { spaceId: string | null; onClose: (
   );
 }
 
+/** Type → glyph for the overview cards (Mission-Control-style window thumbnails). */
+const PANE_GLYPH: Record<string, typeof Folder> = {
+  shell: TerminalSquare,
+  oracle: Bot,
+  tmux: TerminalSquare,
+  files: Folder,
+  browser: Globe,
+  memory: Database,
+  notes: NotebookPen,
+  automations: Clock,
+  bridges: Radio,
+  plugins: Layers,
+  pulse: Radio,
+  chat: MessageSquare,
+  customers: MessageCircle,
+  motion: Wand2,
+  file: FileText,
+  editor: FileText,
+};
+
 /** Mission-control-style pane overview: a full-screen scrim that fans out every
- *  open pane as a clickable card so you can SEE them all and switch. Opened by
- *  three-finger swipe-up (wheel-fling), ⌘` / Ctrl+↑, or the command palette.
+ *  open pane as a big window-thumbnail card so you can SEE them all and switch.
+ *  Opened by three-finger swipe-up (wheel-fling), ⌘` / Ctrl+↑, or the palette.
  *  Pick a card → focus that pane; "show all" → tile every pane back into the
- *  grid (un-minimize + un-maximize). Esc / click-scrim closes. Cards are static
- *  previews (label + type dot) — cheap, no live webview duplication. */
+ *  grid. ←/→/⏎ keyboard, Esc / click-scrim closes. Cards are styled previews
+ *  (window chrome + big type glyph) — no live webview duplication. */
 function PaneOverview({
   open,
   panes,
@@ -1616,48 +1643,65 @@ function PaneOverview({
   onClosePane: (key: string) => void;
   onShowAll: () => void;
 }) {
+  const [sel, setSel] = useState(0);
+
+  useEffect(() => {
+    if (!open) return;
+    const start = Math.max(0, panes.findIndex((p) => p.key === activeKey));
+    setSel(start);
+  }, [open, activeKey, panes]);
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         onClose();
+      } else if (e.key === "ArrowRight" || e.key === "Tab") {
+        e.preventDefault();
+        setSel((i) => (i + 1) % Math.max(1, panes.length));
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        setSel((i) => (i - 1 + panes.length) % Math.max(1, panes.length));
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const p = panes[sel];
+        if (p) onPick(p.key);
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, onClose]);
+  }, [open, panes, sel, onClose, onPick]);
 
   if (!open) return null;
-  const cols = Math.min(4, Math.ceil(Math.sqrt(panes.length || 1)));
+
+  // Card width adapts so 1-2 panes sit big + centered (not stretched), many panes
+  // wrap into a tidy gallery — the Mission-Control feel at any count.
+  const n = panes.length;
+  const cardW = n <= 1 ? 460 : n <= 2 ? 400 : n <= 6 ? 340 : 280;
 
   return (
     <div
-      className="modal-in fixed inset-0 z-[60] flex flex-col bg-[var(--color-bg)]/80 backdrop-blur-xl"
+      className="modal-in fixed inset-0 z-[60] flex flex-col bg-black/55 backdrop-blur-2xl"
       onMouseDown={onClose}
     >
-      <div className="flex shrink-0 items-center justify-between px-6 pt-5 pb-3">
-        <div className="flex items-center gap-2 text-[13px] font-medium text-[var(--color-text)]">
-          <Layers size={15} className="text-[var(--color-accent)]" />
-          open panes
-          <span className="text-[var(--color-faint)]">({panes.length})</span>
+      {/* top bar — title centered like macOS "Desktop", controls on the right */}
+      <div className="relative flex h-12 shrink-0 items-center justify-center px-6">
+        <div className="flex items-center gap-2 text-[13px] font-medium text-[var(--color-text-2)]">
+          <Layers size={14} className="text-[var(--color-accent)]" />
+          <span>{n} open {n === 1 ? "pane" : "panes"}</span>
+          <span className="text-[var(--color-faint)]">· ←/→ ⏎ · esc</span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="absolute right-6 flex items-center gap-2" onMouseDown={(e) => e.stopPropagation()}>
           <button
-            onMouseDown={(e) => {
-              e.stopPropagation();
-              onShowAll();
-            }}
-            className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-1.5 text-[12px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-accent)]"
+            onMouseDown={(e) => { e.stopPropagation(); onShowAll(); }}
+            className="rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/70 px-3 py-1.5 text-[12px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-accent)]"
             title="tile every pane back into the grid"
           >
             show all
           </button>
           <button
-            onMouseDown={(e) => {
-              e.stopPropagation();
-              onClose();
-            }}
+            onMouseDown={(e) => { e.stopPropagation(); onClose(); }}
             className="grid h-8 w-8 place-items-center rounded-lg text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
             title="close (Esc)"
           >
@@ -1666,52 +1710,50 @@ function PaneOverview({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6">
-        <div
-          className="grid gap-4"
-          style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
-        >
-          {panes.map((p) => {
+      {/* the gallery — vertically + horizontally centered, wraps gracefully */}
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-6" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="flex flex-wrap items-center justify-center gap-6">
+          {panes.map((p, i) => {
             const hidden = hiddenKeys.includes(p.key);
-            const isActive = activeKey === p.key && !hidden;
+            const isSel = i === sel;
+            const Glyph = PANE_GLYPH[p.kind.type] ?? Layers;
             return (
-              <button
-                key={p.key}
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  onPick(p.key);
-                }}
-                className={`group relative flex aspect-[16/10] flex-col overflow-hidden rounded-xl border text-left transition-all hover:scale-[1.02] ${
-                  isActive
-                    ? "border-[var(--color-accent)] ring-2 ring-[var(--color-accent)]/40"
-                    : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]"
-                } ${hidden ? "opacity-50" : ""}`}
-              >
-                <div className="flex h-8 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-panel)] px-3">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className={`status-dot shrink-0 ${DOT[p.kind.type] ?? "status-dot--cold"}`} />
-                    <span className="truncate font-mono text-[11px] text-[var(--color-text-2)]">
-                      {p.label}
+              <div key={p.key} className="flex flex-col items-center gap-2" style={{ width: cardW }}>
+                <button
+                  onMouseEnter={() => setSel(i)}
+                  onMouseDown={(e) => { e.stopPropagation(); onPick(p.key); }}
+                  style={{ width: cardW }}
+                  className={`group relative flex aspect-[16/10] flex-col overflow-hidden rounded-xl border bg-[var(--color-pane)] text-left shadow-2xl shadow-black/50 transition-all duration-150 hover:-translate-y-1 ${
+                    isSel
+                      ? "border-[var(--color-accent)] ring-2 ring-[var(--color-accent)]/60 scale-[1.02]"
+                      : "border-[var(--color-border-strong)] hover:border-[var(--color-accent)]/40"
+                  } ${hidden ? "opacity-60" : ""}`}
+                >
+                  {/* window chrome strip */}
+                  <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-3">
+                    <span className={`status-dot shrink-0 ${hidden ? "status-dot--cold" : DOT[p.kind.type] ?? "status-dot--cold"}`} />
+                    <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--color-text-2)]">{p.label}</span>
+                    <span
+                      onMouseDown={(e) => { e.stopPropagation(); onClosePane(p.key); }}
+                      className="grid h-5 w-5 shrink-0 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:bg-[var(--color-panel-2)] hover:text-[var(--color-danger)] group-hover:opacity-100"
+                      title="close pane"
+                    >
+                      <X size={12} />
                     </span>
                   </div>
-                  <span
-                    onMouseDown={(e) => {
-                      e.stopPropagation();
-                      onClosePane(p.key);
-                    }}
-                    className="grid h-5 w-5 shrink-0 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:bg-[var(--color-panel-2)] hover:text-[var(--color-danger)] group-hover:opacity-100"
-                    title="close pane"
-                  >
-                    <X size={12} />
-                  </span>
-                </div>
-                <div className="flex min-h-0 flex-1 items-center justify-center bg-[var(--color-pane)] p-3">
-                  <span className="text-[10px] uppercase tracking-widest text-[var(--color-faint)]">
-                    {p.kind.type}
-                    {hidden ? " · minimized" : ""}
-                  </span>
-                </div>
-              </button>
+                  {/* body — big type glyph on a faint gradient "screen" */}
+                  <div className="relative flex min-h-0 flex-1 items-center justify-center bg-gradient-to-br from-[var(--color-pane)] to-[var(--color-bg)]">
+                    <Glyph size={Math.round(cardW * 0.16)} className="text-[var(--color-faint)] opacity-50 transition-opacity group-hover:opacity-80" />
+                    {hidden && (
+                      <span className="absolute bottom-2 right-2 rounded bg-[var(--color-panel)]/80 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-[var(--color-faint)]">minimized</span>
+                    )}
+                    <span className="absolute left-2 top-2 rounded bg-[var(--color-panel)]/70 px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-faint)]">⌘{i + 1}</span>
+                  </div>
+                </button>
+                <span className={`max-w-full truncate text-[12px] ${isSel ? "text-[var(--color-text)]" : "text-[var(--color-muted)]"}`}>
+                  {p.label}
+                </span>
+              </div>
             );
           })}
         </div>
