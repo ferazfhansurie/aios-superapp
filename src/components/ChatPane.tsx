@@ -46,6 +46,7 @@ import {
   ListChecks,
   Loader2,
   Mic,
+  Paperclip,
   Pencil,
   Plus,
   RefreshCw,
@@ -82,7 +83,7 @@ import {
   type ChatSessionInfo,
   type ChatTurnInfo,
 } from "../lib/chat";
-import { readDir, type DirEntry } from "../lib/fs";
+import { readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { chatHandles, paneWriters } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
 
@@ -530,6 +531,34 @@ export function ChatPane({
     setInput((v) => (v ? v.trimEnd() + " " + path + " " : path + " "));
     taRef.current?.focus();
   }, []);
+
+  // Attach a file via a native picker. OS file-DROP doesn't fire in the webview
+  // on Windows (tauri #9448), so the reliable path is a hidden <input type=file>:
+  // read the picked file's bytes, persist to a temp file (save_image_temp stores
+  // ANY bytes), and append its quoted path to the composer — claude reads it as a
+  // real file reference. Works identically on macOS.
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const onAttachFiles = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files)) {
+      try {
+        const buf = new Uint8Array(await file.arrayBuffer());
+        // chunked base64 (avoids call-stack blowups on large files)
+        let bin = "";
+        const CHUNK = 0x8000;
+        for (let i = 0; i < buf.length; i += CHUNK) {
+          bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
+        }
+        const b64 = btoa(bin);
+        const ext = file.name.includes(".") ? file.name.split(".").pop()! : "bin";
+        const path = await saveImageTemp(b64, ext);
+        const quoted = /[\s'"]/.test(path) ? `"${path}"` : path;
+        insertPath(quoted);
+      } catch {
+        /* skip a file we couldn't read */
+      }
+    }
+  }, [insertPath]);
 
   // ── event ingestion ───────────────────────────────────────────────────────
 
@@ -1458,6 +1487,28 @@ export function ChatPane({
                 </MenuItem>
               ))}
             </Dropdown>
+
+            {/* attach a file — opens a native picker (OS file-drop doesn't fire
+                in the webview on Windows; this works everywhere). */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                onAttachFiles(e.target.files);
+                e.target.value = ""; // allow re-picking the same file
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              title="attach a file"
+              className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            >
+              <Paperclip size={13} />
+              <span>attach</span>
+            </button>
 
             {/* effort */}
             <Dropdown
