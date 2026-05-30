@@ -32,7 +32,16 @@ export interface AppSettings {
   // picked model id (null = provider default).
   chatProvider: string;
   chatModel: string | null;
+
+  // where "send to AI" actions route (notes pane "send", future quick-sends):
+  //   "claude-code" → a terminal pane running `claude` (firaz's default)
+  //   "terminal"    → a plain shell pane (paste + run)
+  //   "chat"        → the in-app chat pane (uses chatProvider/chatModel)
+  defaultAi: DefaultAi;
 }
+
+/** Routing target for "send to AI" actions. */
+export type DefaultAi = "claude-code" | "terminal" | "chat";
 
 export const DEFAULT_SETTINGS: AppSettings = {
   reopenLastLayout: true,
@@ -52,6 +61,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   chatProvider: "claude-cli",
   chatModel: null,
+
+  defaultAi: "claude-code",
 };
 
 /** Read-only display value — the memory vault lives here on this machine. */

@@ -83,7 +83,7 @@ import {
   type ChatTurnInfo,
 } from "../lib/chat";
 import { readDir, type DirEntry } from "../lib/fs";
-import { chatHandles, paneWriters } from "../lib/paneBus";
+import { chatHandles, paneWriters, paneSubmitters } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -523,8 +523,16 @@ export function ChatPane({
     paneWriters.set(paneKey, (t) =>
       setInput((v) => (v ? v.trimEnd() + " " + t : t)),
     );
+    // SUBMIT path ("send to AI" → chat): fire the text straight through the
+    // kept-fresh sendText ref so it actually sends (no input-state race). Mirror
+    // it into the box first so the user sees what went out.
+    paneSubmitters.set(paneKey, (t) => {
+      setInput(t);
+      sendTextRef.current?.(t);
+    });
     return () => {
       paneWriters.delete(paneKey);
+      paneSubmitters.delete(paneKey);
     };
   }, [paneKey]);
 
@@ -941,29 +949,42 @@ export function ChatPane({
     [goal, planMode, effort.ultra],
   );
 
-  const send = useCallback(() => {
-    const text = input.trim();
-    if (!text || streaming || sessionIdRef.current == null) return;
-    // Record this chat into the /resume list on its FIRST user send, titled by
-    // that first message. claude's session_id (from the init event) is the key
-    // used later to resume + repaint. Fire-and-forget; never blocks the send.
-    if (!recordedRef.current) {
-      const sid = claudeSessionIdRef.current;
-      if (sid) {
-        recordedRef.current = true;
-        const title = text.length > 120 ? text.slice(0, 120) : text;
-        recordChatSession(sid, title, cwd ?? null).catch(() => {
-          // failed to persist → allow a later send to retry
-          recordedRef.current = false;
-        });
-        // Label the backend session for the background tray + done-notification.
-        if (sessionIdRef.current != null) chatSetTitle(sessionIdRef.current, title).catch(() => {});
+  // Send an explicit string (used by send() with the composer text, and by the
+  // external "send to AI" submitter which passes the note body directly so it
+  // doesn't race the input state).
+  const sendText = useCallback(
+    (raw: string) => {
+      const text = raw.trim();
+      if (!text || streaming || sessionIdRef.current == null) return;
+      // Record this chat into the /resume list on its FIRST user send, titled by
+      // that first message. claude's session_id (from the init event) is the key
+      // used later to resume + repaint. Fire-and-forget; never blocks the send.
+      if (!recordedRef.current) {
+        const sid = claudeSessionIdRef.current;
+        if (sid) {
+          recordedRef.current = true;
+          const title = text.length > 120 ? text.slice(0, 120) : text;
+          recordChatSession(sid, title, cwd ?? null).catch(() => {
+            // failed to persist → allow a later send to retry
+            recordedRef.current = false;
+          });
+          // Label the backend session for the background tray + done-notification.
+          if (sessionIdRef.current != null) chatSetTitle(sessionIdRef.current, title).catch(() => {});
+        }
       }
-    }
-    setInput("");
-    setOverlay(null);
-    dispatch(text);
-  }, [input, streaming, dispatch, cwd]);
+      setInput("");
+      setOverlay(null);
+      dispatch(text);
+    },
+    [streaming, dispatch, cwd],
+  );
+
+  const send = useCallback(() => sendText(input), [sendText, input]);
+
+  // Keep a fresh ref to sendText so the external submitter (registered once per
+  // paneKey) always calls the latest closure without re-registering.
+  const sendTextRef = useRef(sendText);
+  sendTextRef.current = sendText;
 
   // ── launcher seed: auto-send as the first turn ─────────────────────────────
   // The idle page hands over the prompt you typed as `seed`; fire it once the

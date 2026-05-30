@@ -9,6 +9,7 @@ import {
   FolderPlus,
   Globe,
   GripVertical,
+  Layers,
   Maximize2,
   Minimize2,
   MessageSquare,
@@ -23,6 +24,7 @@ import {
   Search,
   Settings as SettingsIcon,
   Trash2,
+  Eye,
   EyeOff,
   X,
 } from "lucide-react";
@@ -58,7 +60,8 @@ import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } f
 import { listCustomers, type Customer } from "./lib/inbox";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
-import { chatHandles, paneWriters } from "./lib/paneBus";
+import { chatHandles, paneWriters, paneSubmitters } from "./lib/paneBus";
+import { loadSettings } from "./lib/settings";
 import { homeDir } from "./lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
@@ -134,6 +137,9 @@ function App() {
   // terminal/webview state survives — restored from the dock bar.
   const [maximizedKey, setMaximizedKey] = useState<string | null>(null);
   const [hiddenKeys, setHiddenKeys] = useState<string[]>([]);
+  // the pane the user last interacted with — drives the "OPEN" rail highlight +
+  // is where dictation / drops route. A ref alone wouldn't re-render the rail.
+  const [activeKey, setActiveKey] = useState<string | null>(null);
   const toggleMax = useCallback(
     (key: string) => setMaximizedKey((cur) => (cur === key ? null : key)),
     [],
@@ -149,14 +155,27 @@ function App() {
   const prevMaxRef = useRef<string | null>(null);
   const onVideoFullscreen = useCallback((key: string, on: boolean) => {
     if (on) {
+      // SEQUENCE, don't race: maximize the pane FIRST (webview grows to fill the
+      // window via its rAF bounds-sync), then OS-fullscreen the window on the
+      // NEXT frames once that layout has settled. Firing both at once made the
+      // webview bounds resolve mid-transition, so the fullscreen <video> locked
+      // to the small pane rect — which is why it only worked when the pane was
+      // already maximized. Two rAFs ≈ the pane is laid out full-window before the
+      // OS fullscreen space-transition begins.
       setMaximizedKey((cur) => {
         prevMaxRef.current = cur;
         return key;
       });
-      setWindowFullscreen(true).catch(() => {});
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => setWindowFullscreen(true).catch(() => {})),
+      );
     } else {
+      // reverse order on exit: drop OS fullscreen first, then restore the prior
+      // maximize state once the window is back in-space.
       setWindowFullscreen(false).catch(() => {});
-      setMaximizedKey(() => prevMaxRef.current);
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => setMaximizedKey(() => prevMaxRef.current)),
+      );
     }
   }, []);
   // backgrounded chat sessions still running after their pane closed.
@@ -183,8 +202,10 @@ function App() {
     setTimeout(() => setToast(null), 2600);
   }, []);
 
-  const spawn = useCallback((kind: PaneContent, label: string) => {
-    setPanes((p) => [...p, { key: nextKey(), kind, label }]);
+  const spawn = useCallback((kind: PaneContent, label: string): string => {
+    const key = nextKey();
+    setPanes((p) => [...p, { key, kind, label }]);
+    return key;
   }, []);
 
   // Resolve a sidebar item to a spawn: built-in apps look up their kind from the
@@ -247,6 +268,7 @@ function App() {
     setPanes((p) => p.filter((x) => x.key !== key));
     setHiddenKeys((h) => h.filter((k) => k !== key));
     setMaximizedKey((m) => (m === key ? null : m));
+    setActiveKey((a) => (a === key ? null : a));
   }, []);
   // Closing a chat pane whose claude is mid-task → prompt to keep it running in
   // the background (with optional done-notification) instead of killing it.
@@ -346,6 +368,13 @@ function App() {
 
   // voice dictation → the focused terminal pane, else clipboard.
   const focusedPane = useRef<string | null>(null);
+  // Focus a pane from the "OPEN" rail: restore it if minimized, mark it active
+  // so dictation / drops target it (and the rail row highlights).
+  const focusPane = useCallback((key: string) => {
+    setHiddenKeys((h) => h.filter((k) => k !== key));
+    focusedPane.current = key;
+    setActiveKey(key);
+  }, []);
   const handleTranscript = useCallback(
     (text: string) => {
       const k = focusedPane.current;
@@ -373,6 +402,88 @@ function App() {
         navigator.clipboard?.writeText(text).catch(() => {});
         spawn({ type: "chat" }, "chat");
         flash("opened chat · annotation copied (⌘V)");
+      }
+    },
+    [panes, flash, spawn],
+  );
+
+  // "Send to AI" (notes pane → the configured default AI). Routes by the
+  // `defaultAi` setting: claude-code terminal (firaz's default), a plain
+  // terminal, or the in-app chat. Reuses each pane's SUBMITTER (paneSubmitters)
+  // so the text is pasted AND actually sent (terminal: text + Enter; chat: real
+  // submit). Restores a minimized target, or spawns a fresh pane and fires once
+  // it's live (claude's TUI needs a beat to boot, so a freshly-spawned terminal
+  // gets a delayed submit).
+  const sendToAi = useCallback(
+    (text: string) => {
+      const body = text.trim();
+      if (!body) return;
+      const ai = loadSettings().defaultAi;
+
+      // submit into an EXISTING pane (restore it from minimized first).
+      const fireExisting = (key: string): boolean => {
+        const s = paneSubmitters.get(key);
+        if (!s) return false;
+        setHiddenKeys((h) => h.filter((k) => k !== key));
+        focusedPane.current = key;
+        setActiveKey(key);
+        s(body);
+        return true;
+      };
+
+      // spawn a fresh pane, then poll for its submitter and fire (after a boot
+      // grace for CLI TUIs like claude that aren't ready the instant they mount).
+      const spawnAndFire = (kind: PaneContent, label: string, bootMs: number) => {
+        const key = spawn(kind, label);
+        let tries = 0;
+        const tick = () => {
+          const s = paneSubmitters.get(key);
+          if (s) {
+            setTimeout(() => s(body), bootMs);
+            return;
+          }
+          if (tries++ < 50) setTimeout(tick, 150);
+        };
+        tick();
+      };
+
+      if (ai === "chat") {
+        const cp = panes.find((p) => p.kind.type === "chat");
+        if (cp && fireExisting(cp.key)) {
+          flash("sent → chat");
+          return;
+        }
+        // a fresh chat auto-sends its `seed` once claude is ready — cleanest path.
+        spawn({ type: "chat", seed: body }, "chat");
+        flash("sent → new chat");
+        return;
+      }
+
+      // claude-code: a shell pane whose command launches claude. terminal: any
+      // plain shell pane (no claude command).
+      const wantClaude = ai === "claude-code";
+      const match = panes.find(
+        (p) =>
+          p.kind.type === "shell" &&
+          (wantClaude
+            ? (p.kind.cmd ?? "").includes("claude")
+            : !(p.kind.cmd ?? "").includes("claude")),
+      );
+      if (match && fireExisting(match.key)) {
+        flash(wantClaude ? "sent → claude code" : "sent → terminal");
+        return;
+      }
+      // none open → spawn the right one and fire when it's live.
+      if (wantClaude) {
+        spawnAndFire(
+          { type: "shell", cmd: "claude --dangerously-skip-permissions" },
+          "claude code",
+          3200,
+        );
+        flash("opening claude code → sending…");
+      } else {
+        spawnAndFire({ type: "shell" }, "terminal", 600);
+        flash("opening terminal → sending…");
       }
     },
     [panes, flash, spawn],
@@ -595,6 +706,17 @@ function App() {
         {sidebarOpen && (
           <aside className="flex w-60 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
             <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-2">
+              {panes.length > 0 && (
+                <OpenPanesList
+                  panes={panes}
+                  hiddenKeys={hiddenKeys}
+                  maximizedKey={maximizedKey}
+                  activeKey={activeKey}
+                  onSelect={focusPane}
+                  onToggleHide={toggleHide}
+                  onClose={requestClose}
+                />
+              )}
               <SidebarRail
                 state={sidebar}
                 onSpawn={spawnSidebarItem}
@@ -648,8 +770,12 @@ function App() {
                   onClose={() => requestClose(pane.key)}
                   onToggleMax={() => toggleMax(pane.key)}
                   onToggleHide={() => toggleHide(pane.key)}
-                  onFocus={() => (focusedPane.current = pane.key)}
+                  onFocus={() => {
+                    focusedPane.current = pane.key;
+                    setActiveKey(pane.key);
+                  }}
                   onAnnotate={routeToChat}
+                  onSendToAi={sendToAi}
                   onOpenFile={openFile}
                   onOpenUrl={(url) => spawn({ type: "browser", url }, "browser")}
                   onProfileChange={(profile) =>
@@ -700,28 +826,8 @@ function App() {
         </div>
       )}
 
-      {/* hidden panes — still mounted + running, click to restore into the grid */}
-      {hiddenKeys.length > 0 && (
-        <div className="absolute bottom-4 left-4 z-40 flex max-w-64 flex-col gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/95 p-2 shadow-2xl backdrop-blur">
-          <div className="px-1 text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
-            hidden
-          </div>
-          {panes
-            .filter((p) => hiddenKeys.includes(p.key))
-            .map((p) => (
-              <button
-                key={p.key}
-                onClick={() => toggleHide(p.key)}
-                className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left hover:border-[var(--color-accent)]/40"
-                title="restore pane"
-              >
-                <span className={`status-dot shrink-0 ${DOT[p.kind.type] ?? "status-dot--cold"}`} />
-                <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--color-text-2)]">{p.label}</span>
-                <Maximize2 size={11} className="shrink-0 text-[var(--color-faint)]" />
-              </button>
-            ))}
-        </div>
-      )}
+      {/* minimized panes now live in the sidebar "OPEN" list (OpenPanesList) —
+          no floating overlay. Restore / hide / close all happen from the rail. */}
 
       {/* close a busy chat: keep running in background, or kill */}
       {closePrompt && (
@@ -1352,6 +1458,81 @@ const DOT: Record<string, string> = {
   file: "status-dot--cold",
 };
 
+/** The "OPEN" rail section — a live, CRUD-able list of every open pane (replaces
+ *  the old floating "hidden" overlay). Click a row to focus it (restoring it from
+ *  minimized first); the eye toggles minimize/restore; the X closes it. Minimized
+ *  rows render dimmed. This is the window-manager for the deck, in the sidebar. */
+function OpenPanesList({
+  panes,
+  hiddenKeys,
+  maximizedKey,
+  activeKey,
+  onSelect,
+  onToggleHide,
+  onClose,
+}: {
+  panes: Pane[];
+  hiddenKeys: string[];
+  maximizedKey: string | null;
+  activeKey: string | null;
+  onSelect: (key: string) => void;
+  onToggleHide: (key: string) => void;
+  onClose: (key: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-1.5 px-1.5 py-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-faint)]">
+        <Layers size={11} />
+        <span>open</span>
+        <span className="text-[var(--color-faint)]">({panes.length})</span>
+      </div>
+      {panes.map((p) => {
+        const hidden = hiddenKeys.includes(p.key);
+        const active = activeKey === p.key && !hidden;
+        const maximized = maximizedKey === p.key;
+        return (
+          <div
+            key={p.key}
+            className={`group relative flex items-center rounded-md transition-colors ${
+              active
+                ? "bg-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent)]/40"
+                : "hover:bg-[var(--color-panel-2)]"
+            }`}
+          >
+            <button
+              onClick={() => onSelect(p.key)}
+              className={`flex min-w-0 flex-1 items-center gap-2.5 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                hidden ? "text-[var(--color-faint)]" : "text-[var(--color-text-2)] group-hover:text-[var(--color-text)]"
+              }`}
+              title={hidden ? "restore pane" : "focus pane"}
+            >
+              <span className={`status-dot shrink-0 ${hidden ? "status-dot--cold" : DOT[p.kind.type] ?? "status-dot--cold"}`} />
+              <span className="truncate">{p.label}</span>
+              {maximized && <Maximize2 size={10} className="shrink-0 text-[var(--color-accent)]" />}
+            </button>
+            <div className="flex shrink-0 items-center pr-1 opacity-0 transition-opacity group-hover:opacity-100">
+              <button
+                onClick={(e) => (e.stopPropagation(), onToggleHide(p.key))}
+                className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+                title={hidden ? "restore" : "minimize"}
+              >
+                {hidden ? <Eye size={12} /> : <EyeOff size={12} />}
+              </button>
+              <button
+                onClick={(e) => (e.stopPropagation(), onClose(p.key))}
+                className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] hover:bg-[var(--color-panel)] hover:text-[var(--color-danger)]"
+                title="close"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function PaneCard({
   pane,
   active,
@@ -1363,6 +1544,7 @@ function PaneCard({
   onToggleHide,
   onFocus,
   onAnnotate,
+  onSendToAi,
   onOpenFile,
   onOpenUrl,
   onProfileChange,
@@ -1378,6 +1560,7 @@ function PaneCard({
   onToggleHide?: () => void;
   onFocus: () => void;
   onAnnotate: (text: string) => void;
+  onSendToAi: (text: string) => void;
   onOpenFile: (path: string, name: string) => void;
   onOpenUrl?: (url: string) => void;
   onProfileChange: (profile: string) => void;
@@ -1486,7 +1669,7 @@ function PaneCard({
         ) : pane.kind.type === "memory" ? (
           <DatabasePane onOpenUrl={onOpenUrl} />
         ) : pane.kind.type === "notes" ? (
-          <NotesPane onSend={onAnnotate} />
+          <NotesPane onSend={onSendToAi} />
         ) : pane.kind.type === "automations" ? (
           <AutomationsPane />
         ) : pane.kind.type === "bridges" ? (

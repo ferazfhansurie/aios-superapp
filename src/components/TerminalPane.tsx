@@ -22,7 +22,7 @@ import {
   spawnTmux,
 } from "../lib/pty";
 import { homeDir, saveImageTemp } from "../lib/fs";
-import { paneWriters } from "../lib/paneBus";
+import { paneWriters, paneSubmitters } from "../lib/paneBus";
 import { TerminalComposer } from "./TerminalComposer";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
@@ -406,6 +406,18 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     ptyWrite(id, text).catch(() => {});
     setTimeout(() => ptyWrite(id, "\r").catch(() => {}), 40);
   };
+
+  // Expose composerSend as this pane's SUBMITTER so "send to AI" (notes pane)
+  // can paste + run a whole buffer into this terminal (e.g. claude code).
+  useEffect(() => {
+    if (!paneKey) return;
+    paneSubmitters.set(paneKey, composerSend);
+    return () => {
+      paneSubmitters.delete(paneKey);
+    };
+    // composerSend closes over stable refs; re-register only if the key changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paneKey]);
 
   // Interrupt the running CLI (^C) — visible "stop" affordance.
   const interrupt = () => {

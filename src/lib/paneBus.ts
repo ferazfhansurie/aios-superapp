@@ -3,6 +3,12 @@
  *  a writer keyed by its pane key; App tracks which pane is focused. */
 export const paneWriters = new Map<string, (text: string) => void>();
 
+/** Like paneWriters, but a SUBMIT: inserts the text AND fires it (terminal →
+ *  paste + Enter via composerSend; chat → set input + send). Lets "send to AI"
+ *  actions (notes pane) hand a whole buffer to a pane and have it actually run,
+ *  not just sit in the prompt. Keyed by pane key, same lifecycle as paneWriters. */
+export const paneSubmitters = new Map<string, (text: string) => void>();
+
 /** Handle a ChatPane publishes so App can decide what to do when its pane is
  *  closed: is a task in flight, and how to detach (keep running) vs kill. */
 export interface ChatHandle {

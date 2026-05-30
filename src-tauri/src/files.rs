@@ -548,6 +548,22 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Delete a single file (used by the notes pane — full CRUD). Refuses to touch
+/// directories so a bad path can't nuke a tree; a missing file is a no-op (the
+/// note is already gone, which is the caller's intent).
+#[tauri::command]
+pub fn delete_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Ok(());
+    }
+    if p.is_dir() {
+        return Err("refusing to delete a directory".into());
+    }
+    std::fs::remove_file(p).map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
 /// Cap on inline text payloads: ~256 KB.
 const PREVIEW_TEXT_CAP: usize = 256 * 1024;
 
