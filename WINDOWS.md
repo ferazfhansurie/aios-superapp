@@ -49,9 +49,21 @@ First Rust build takes a few minutes; after that it's cached and fast.
 
 ## Syncing Firaz's updates
 
-Firaz pushes to `origin/master` constantly. To pull his changes into our Windows
-branch and rebuild — in one command:
+Firaz pushes to `origin/master` constantly. Two ways to stay current:
 
+### Automatic (recommended) — set it once, forget it
+```powershell
+.\scripts\aios-watch.ps1 -Install     # background task, checks every 15 min
+.\scripts\aios-watch.ps1 -Uninstall   # stop it
+```
+Or watch live in a terminal: `.\scripts\aios-watch.ps1` (5-min loop, Ctrl+C to stop).
+It auto-merges his commits, reinstalls deps, and rebuilds — logging to
+`scripts\aios-watch.log`. It never pushes, never clobbers uncommitted work, and
+on a real conflict it backs out and waits for you (so the tree is never left
+half-merged). It does NOT auto-relaunch the app — run `.\scripts\run.ps1` to pick
+up an update.
+
+### Manual — one command, on demand
 ```powershell
 .\scripts\aios-sync.ps1 -Preview   # SEE what he changed (no changes made)
 .\scripts\aios-sync.ps1            # merge his changes + npm install + rebuild

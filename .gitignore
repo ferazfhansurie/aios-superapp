@@ -47,3 +47,4 @@ src-tauri/.motion.key
 
 # agent worktrees + local session state
 .claude/
+scripts\aios-watch.log
