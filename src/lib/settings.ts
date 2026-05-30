@@ -26,6 +26,12 @@ export interface AppSettings {
 
   // memory
   graphPhysicsStrength: number; // 0..100
+
+  // chat provider (model-agnostic) — provider ids live in lib/providers.ts.
+  // Default "claude-cli" preserves existing behavior. chatModel is the last
+  // picked model id (null = provider default).
+  chatProvider: string;
+  chatModel: string | null;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -43,6 +49,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   showNonAiosSessions: false,
 
   graphPhysicsStrength: 50,
+
+  chatProvider: "claude-cli",
+  chatModel: null,
 };
 
 /** Read-only display value — the memory vault lives here on this machine. */
