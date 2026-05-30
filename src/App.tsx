@@ -116,6 +116,8 @@ function App() {
   const [toast, setToast] = useState<string | null>(null);
   // pane key pending a close-confirm (busy chat: keep-running vs kill).
   const [closePrompt, setClosePrompt] = useState<string | null>(null);
+  // pane currently under a native OS file drag (for the drop highlight).
+  const [dropTargetKey, setDropTargetKey] = useState<string | null>(null);
   // backgrounded chat sessions still running after their pane closed.
   const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
   // Native browser webviews paint ABOVE html, so any floating overlay (modals,
@@ -315,23 +317,52 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [addShell, fireAppshot, runF5]);
 
-  // Native OS drag-drop (Finder files/folders) → insert paths into the terminal
-  // pane under the cursor. Tauri gives real filesystem paths the webview can't.
+  // Native OS drag-drop (Finder files/folders, e.g. a screenshot) → insert paths
+  // into the targeted terminal pane. Because `dragDropEnabled` is true, macOS
+  // intercepts file drops natively and the webview's HTML5 drag events never
+  // fire — so this Tauri handler is the ONLY path for OS files (the in-app
+  // `application/x-aios-path` handler on TerminalPane covers Files-pane drags).
   useEffect(() => {
-    const un = getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type !== "drop") return;
-      const { paths, position } = event.payload;
-      if (!paths?.length) return;
+    // Resolve the pane key under a physical (device-pixel) drop position. xterm's
+    // canvas/textarea sit inside the [data-pane-key] wrapper, so closest() walks
+    // up to the pane regardless of which internal node is hit-tested.
+    const paneKeyAt = (x: number, y: number): string | null => {
       const dpr = window.devicePixelRatio || 1;
-      const el = document.elementFromPoint(position.x / dpr, position.y / dpr);
-      const key = el?.closest<HTMLElement>("[data-pane-key]")?.getAttribute("data-pane-key");
+      const el = document.elementFromPoint(x / dpr, y / dpr);
+      return el?.closest<HTMLElement>("[data-pane-key]")?.getAttribute("data-pane-key") ?? null;
+    };
+
+    const un = getCurrentWebview().onDragDropEvent((event) => {
+      const p = event.payload;
+      if (p.type === "enter" || p.type === "over") {
+        // live highlight on the pane that would receive the drop.
+        const key = paneKeyAt(p.position.x, p.position.y);
+        setDropTargetKey((cur) => (cur === key ? cur : key));
+        return;
+      }
+      if (p.type === "leave") {
+        setDropTargetKey(null);
+        return;
+      }
+      if (p.type !== "drop") return;
+      setDropTargetKey(null);
+      const { paths, position } = p;
+      if (!paths?.length) return;
+      // Prefer the pane under the cursor; fall back to the focused pane so a drop
+      // that lands on a gap / title bar still inserts (screenshots are easy to
+      // miss-aim). Only fall back to a real terminal-backed pane.
+      let key = paneKeyAt(position.x, position.y);
+      if (!key || !paneWriters.get(key)) {
+        const fk = focusedPane.current;
+        if (fk && paneWriters.get(fk)) key = fk;
+      }
       const w = key ? paneWriters.get(key) : null;
       if (!w) {
-        flash("drop onto a terminal pane to insert the path");
+        flash("open a terminal pane, then drop the file to insert its path");
         return;
       }
       const text = paths
-        .map((p) => (/[\s'"\\]/.test(p) ? `'${p.replace(/'/g, "'\\''")}' ` : `${p} `))
+        .map((path) => (/[\s'"\\]/.test(path) ? `'${path.replace(/'/g, "'\\''")}' ` : `${path} `))
         .join("");
       w(text);
       flash(`dropped ${paths.length} item${paths.length > 1 ? "s" : ""}`);
@@ -482,6 +513,7 @@ function App() {
                   key={pane.key}
                   pane={pane}
                   active={!overlayOpen}
+                  dropTarget={dropTargetKey === pane.key}
                   onClose={() => requestClose(pane.key)}
                   onFocus={() => (focusedPane.current = pane.key)}
                   onAnnotate={routeToChat}
@@ -641,6 +673,7 @@ const DOT: Record<string, string> = {
 function PaneCard({
   pane,
   active,
+  dropTarget,
   onClose,
   onFocus,
   onAnnotate,
@@ -648,6 +681,7 @@ function PaneCard({
 }: {
   pane: Pane;
   active: boolean;
+  dropTarget?: boolean;
   onClose: () => void;
   onFocus: () => void;
   onAnnotate: (text: string) => void;
@@ -675,7 +709,11 @@ function PaneCard({
     <div
       data-pane-key={pane.key}
       onMouseDownCapture={onFocus}
-      className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-pane)] transition-colors hover:border-[var(--color-border-strong)]"
+      className={`relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-[var(--color-pane)] transition-colors ${
+        dropTarget
+          ? "border-[var(--color-accent)]"
+          : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]"
+      }`}
     >
       <div className="flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-white/[0.02] px-2.5">
         <div className="flex min-w-0 items-center gap-1.5">
@@ -741,6 +779,13 @@ function PaneCard({
           />
         )}
       </div>
+      {dropTarget && isTerminal(pane.kind) && (
+        <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center border-2 border-dashed border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10">
+          <span className="rounded-md bg-[var(--color-panel)]/90 px-3 py-1.5 text-[12px] text-[var(--color-text)]">
+            drop to insert path
+          </span>
+        </div>
+      )}
     </div>
   );
 }

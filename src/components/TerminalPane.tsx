@@ -87,10 +87,17 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const term = new Xterm({
       fontFamily: FONT_FAMILY,
       fontSize: 13,
-      lineHeight: 1.3,
+      // Alacritty ships a slightly tighter leading + weight than xterm's defaults.
+      lineHeight: 1.2,
+      letterSpacing: 0,
+      fontWeight: "400",
+      fontWeightBold: "600",
       cursorBlink: true,
       cursorStyle: "bar",
       cursorWidth: 2,
+      // Alacritty copies the moment you finish a selection.
+      rightClickSelectsWord: true,
+      macOptionIsMeta: true,
       allowTransparency: true,
       scrollback: 10000,
       theme: THEME,
@@ -99,6 +106,59 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     term.loadAddon(fit);
     term.loadAddon(new WebLinksAddon());
     term.open(host);
+
+    // Key interception (runs before xterm's default handling). Returning false
+    // suppresses xterm's built-in behaviour for that key. We read sessionId from
+    // the ref so the handler always targets the live session (mirrors onData).
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown") return true;
+      const sid = sessionIdRef.current;
+      // Shift+Enter → soft newline, NOT submit. Claude Code / Ink TUIs treat
+      // meta+Enter (ESC then CR) as "insert newline"; plain Enter still submits.
+      if (e.key === "Enter" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        if (sid != null) ptyWrite(sid, "\x1b\r").catch(() => {});
+        return false;
+      }
+      // Cmd+V → paste from the system clipboard into the PTY (Ctrl+V stays
+      // literal-quote in the shell, matching Alacritty on macOS).
+      if (e.key === "v" && e.metaKey && !e.ctrlKey && !e.altKey) {
+        navigator.clipboard
+          .readText()
+          .then((t) => {
+            if (t && sid != null) ptyWrite(sid, t).catch(() => {});
+          })
+          .catch(() => {});
+        return false;
+      }
+      // Cmd+C → copy the selection. We never intercept Ctrl+C, so it always
+      // reaches the PTY as SIGINT (^C) — matching Alacritty on macOS.
+      if (e.key === "c" && e.metaKey && !e.ctrlKey && term.hasSelection()) {
+        const sel = term.getSelection();
+        if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+        return false;
+      }
+      return true;
+    });
+
+    // Copy-on-select: as soon as a selection settles, mirror it to the clipboard.
+    term.onSelectionChange(() => {
+      const sel = term.getSelection();
+      if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+    });
+
+    // Middle-click paste (X11/Alacritty muscle memory).
+    const onAuxClick = (e: MouseEvent) => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      const sid = sessionIdRef.current;
+      navigator.clipboard
+        .readText()
+        .then((t) => {
+          if (t && sid != null) ptyWrite(sid, t).catch(() => {});
+        })
+        .catch(() => {});
+    };
+    host.addEventListener("auxclick", onAuxClick);
     // WebGL renderer for speed; silently fall back to the default if unavailable.
     try {
       term.loadAddon(new WebglAddon());
@@ -210,6 +270,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     return () => {
       disposed = true;
       if (paneKey) paneWriters.delete(paneKey);
+      host.removeEventListener("auxclick", onAuxClick);
       ro.disconnect();
       inputDisposer?.dispose();
       if (sessionId != null) ptyKill(sessionId).catch(() => {});
