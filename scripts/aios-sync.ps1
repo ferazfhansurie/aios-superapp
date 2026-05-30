@@ -1,13 +1,16 @@
 <#
 .SYNOPSIS
-  Sync firaz's upstream changes into the Windows branch — and push for the team.
+  Sync firaz's upstream changes into the Windows branch - and push for the team.
 
 .DESCRIPTION
   Firaz develops the shell on origin/master (macOS). This keeps our Windows
   branch current with his work and rebuilds, in one command. All our Windows
   changes are cross-platform (cfg(windows) guards + USERPROFILE fallbacks), so
-  merging his macOS changes is almost always clean. The one expected conflict —
-  pnpm-lock.yaml (we use npm on Windows) — is auto-resolved.
+  merging his macOS changes is almost always clean. The one expected conflict -
+  pnpm-lock.yaml (we use npm on Windows) - is auto-resolved.
+
+  ASCII-only on purpose: Windows PowerShell 5.1 reads .ps1 as ANSI, so non-ASCII
+  characters would corrupt parsing. Keep this file ASCII.
 
 .PARAMETER Preview
   Only SHOW what firaz changed upstream (incoming commits + files). No merge.
@@ -16,9 +19,9 @@
   Commit any local changes and push this branch to origin (for the team).
 
 .EXAMPLE
-  ./scripts/aios-sync.ps1 -Preview      # see what's new from firaz
-  ./scripts/aios-sync.ps1               # pull his changes + rebuild
-  ./scripts/aios-sync.ps1 -Push         # publish our branch for the team
+  .\scripts\aios-sync.ps1 -Preview      # see what's new from firaz
+  .\scripts\aios-sync.ps1               # pull his changes + rebuild
+  .\scripts\aios-sync.ps1 -Push         # publish our branch for the team
 #>
 param(
   [switch]$Preview,
@@ -26,18 +29,17 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# Repo root = parent of this script's folder.
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
-function Say($msg, $color = "Cyan") { Write-Host "▸ $msg" -ForegroundColor $color }
-function Die($msg) { Write-Host "✗ $msg" -ForegroundColor Red; exit 1 }
+function Say($msg, $color = "Cyan") { Write-Host ">> $msg" -ForegroundColor $color }
+function Die($msg) { Write-Host "x $msg" -ForegroundColor Red; exit 1 }
 
 $branch = (git rev-parse --abbrev-ref HEAD).Trim()
 Say "repo:   $repo"
 Say "branch: $branch"
 
-# ── Always fetch so we're comparing against the freshest upstream ──────────────
+# Always fetch so we're comparing against the freshest upstream.
 Say "fetching origin..."
 git fetch origin --quiet
 
@@ -46,15 +48,15 @@ Say "firaz has $incoming new commit(s) on origin/master not in your branch."
 
 if ($incoming -ne "0") {
   Write-Host ""
-  Write-Host "── what firaz changed ──────────────────────────────" -ForegroundColor Yellow
+  Write-Host "-- what firaz changed -----------------------------" -ForegroundColor Yellow
   git log --oneline --no-decorate "HEAD..origin/master"
   Write-Host ""
-  Write-Host "── files he touched ────────────────────────────────" -ForegroundColor Yellow
+  Write-Host "-- files he touched -------------------------------" -ForegroundColor Yellow
   git diff --stat "HEAD..origin/master"
   Write-Host ""
 }
 
-# ── PUSH mode: commit local work + publish the branch ─────────────────────────
+# PUSH mode: commit local work + publish the branch.
 if ($Push) {
   $dirty = git status --porcelain
   if ($dirty) {
@@ -63,7 +65,7 @@ if ($Push) {
     $msg = "windows: sync " + (Get-Date -Format "yyyy-MM-dd HH:mm")
     git commit -m $msg | Out-Null
   } else {
-    Say "working tree clean — nothing new to commit."
+    Say "working tree clean - nothing new to commit."
   }
   Say "pushing $branch to origin..."
   git push -u origin $branch
@@ -71,9 +73,9 @@ if ($Push) {
   exit 0
 }
 
-# ── PREVIEW mode: stop after showing the diff ─────────────────────────────────
+# PREVIEW mode: stop after showing the diff.
 if ($Preview) {
-  Say "preview only — no changes made. Run without -Preview to merge + rebuild." "Green"
+  Say "preview only - no changes made. Run without -Preview to merge + rebuild." "Green"
   exit 0
 }
 
@@ -82,12 +84,12 @@ if ($incoming -eq "0") {
   exit 0
 }
 
-# ── SYNC mode: require a clean tree, then merge ───────────────────────────────
+# SYNC mode: require a clean tree, then merge.
 $dirty = git status --porcelain
 if ($dirty) {
-  Write-Host "✗ You have uncommitted changes. Commit or stash them first:" -ForegroundColor Red
+  Write-Host "x You have uncommitted changes. Commit or stash them first:" -ForegroundColor Red
   git status --short
-  Write-Host "  (tip: ./scripts/aios-sync.ps1 -Push   to commit + publish them)" -ForegroundColor DarkGray
+  Write-Host "  (tip: .\scripts\aios-sync.ps1 -Push   to commit + publish them)" -ForegroundColor DarkGray
   exit 1
 }
 
@@ -110,31 +112,31 @@ if ($mergeFailed) {
     }
   }
   if ($remaining.Count -gt 0) {
-    Write-Host "✗ Real conflicts need a human (likely firaz changed the same lines we did):" -ForegroundColor Red
+    Write-Host "x Real conflicts need a human (likely firaz changed the same lines we did):" -ForegroundColor Red
     $remaining | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
-    Write-Host "  Resolve them, then run:  git commit  &&  ./scripts/aios-sync.ps1" -ForegroundColor DarkGray
+    Write-Host "  Resolve them, then run:  git commit  &&  .\scripts\aios-sync.ps1" -ForegroundColor DarkGray
     exit 1
   }
   git commit --no-edit | Out-Null
   Say "lockfile conflict auto-resolved."
 }
 
-# ── Rebuild: refresh deps + verify both layers compile ────────────────────────
+# Rebuild: refresh deps + verify both layers compile.
 Say "installing frontend deps (npm)..."
 npm install --no-audit --no-fund
 if ($LASTEXITCODE -ne 0) { Die "npm install failed." }
 
 Say "type-checking frontend (tsc)..."
 npx tsc --noEmit
-if ($LASTEXITCODE -ne 0) { Die "frontend type-check failed — firaz's changes may need a Windows tweak." }
+if ($LASTEXITCODE -ne 0) { Die "frontend type-check failed - firaz's changes may need a Windows tweak." }
 
 Say "compiling Rust backend (cargo)..."
 Push-Location src-tauri
 cargo build --color never 2>&1 | Select-String -Pattern "error\[|^error:|Finished" | ForEach-Object { Write-Host "    $_" }
 $cargoOk = ($LASTEXITCODE -eq 0)
 Pop-Location
-if (-not $cargoOk) { Die "cargo build failed — firaz's changes may need a Windows tweak (check the errors above)." }
+if (-not $cargoOk) { Die "cargo build failed - firaz's changes may need a Windows tweak (check the errors above)." }
 
 Write-Host ""
-Say "✓ synced firaz's $incoming commit(s) and rebuilt clean." "Green"
-Say "  launch with:  ./scripts/run.ps1     publish with:  ./scripts/aios-sync.ps1 -Push" "Green"
+Say "synced firaz's $incoming commit(s) and rebuilt clean." "Green"
+Say "  launch with:  .\scripts\run.ps1     publish with:  .\scripts\aios-sync.ps1 -Push" "Green"
