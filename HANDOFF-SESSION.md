@@ -1,45 +1,47 @@
 # AIOS shell — live session handoff
+2026-05-31 ~02:00 MYT
 
-> **For the next session: read THIS first, then `git -C ~/Repo/firaz/aios/shell log --oneline -12` and the task board.**
-> Updated 2026-05-31. North star (firaz): **best product first, NO public launch yet** — improve continuously, tease later. Stack updates + commit each, then ONE `tauri build` + relaunch at the very end (do NOT rebuild per change).
+> **Next session: read THIS, then `git -C ~/Repo/firaz/aios/shell log --oneline -12` + TaskList.**
+> Repo `~/Repo/firaz/aios/shell`, branch `master`, head `b65da55`, **10 commits ahead of origin, NOT pushed** (don't push unprompted).
 
-## Working rules (firaz, this session)
-- **Token-budget discipline**: each session builds a clear chunk, commits, updates this doc, then hands off to a fresh session. When context gets heavy, STOP and finalize this doc rather than pushing on degraded.
-- **Stack, don't rebuild**: commit every finished unit (git = safety net). One tauri build + relaunch at the end of a batch.
-- **Build-loop has NO `cd`** (triggers Claude Code permission prompts): use `git -C <shell>`, `pnpm --dir <shell>`. Build = `pnpm --dir <shell> build` (tsc && vite build) to typecheck; the tsc warnings about `vite.config.ts` node:path/__dirname are PRE-EXISTING + harmless. Clean stray `vite.config.js/.d.ts`/`*.tsbuildinfo` after so git stays clean.
-- **Parallel-agent rule**: one agent per component, NON-overlapping file scopes. Agents sharing a file = index races. App.tsx / ChatPane are high-contention.
-- Shell repo: `~/Repo/firaz/aios/shell`, branch `master`, private remote `github.com/ferazfhansurie/aios-shell`. NOT pushed unless firaz says.
+## Working rules (firaz, this session — LOAD-BEARING)
+- **Build cadence:** edit freely → only `commit → tauri build → install → launch` when the session is bloated or at handoff. Do NOT build per-change.
+- **Build/install loop (NO `cd` — triggers permission prompts):**
+  `pnpm --dir ~/Repo/firaz/aios/shell tauri build` → `pkill -9 -f "AIOS.app/Contents/MacOS"; rm -rf /Applications/AIOS.app; cp -R ~/Repo/firaz/aios/shell/src-tauri/target/release/bundle/macos/AIOS.app /Applications/AIOS.app; open /Applications/AIOS.app`
+- **ALWAYS `npx tsc --noEmit` (must be 0 errors) BEFORE a tauri build** — `pnpm build` runs tsc and a single TS error wastes a full ~60s build.
+- **No WhatsApp** unless firaz says — keep replies in-pane.
+- App currently installed + running (the flashy-composer build).
 
-## SHIPPED this session (commits on master, all build-verified)
-- `16d0e48` composer send auto-snaps terminal to live prompt (scrolled-up no longer eats the line; `termRef.scrollToBottom()+focus()` in TerminalPane composerSend).
-- `ca9a6cb` doc links open in a new browser pane (http(s) links in ChatPane/MemoryPane/DatabasePane markdown → `spawn({type:"browser",url})`; wikilinks/mailto/relative untouched; FileViewerPane has no link path so left alone). 4 files.
-- `39be230` model-agnostic groundwork: `src/lib/providers.ts` (provider registry: claude/codex/gemini/opencode + openai/openrouter/ollama/free, per-provider capability flags) + `src/lib/settings.ts` (chatProvider/chatModel fields, default claude-cli) + `PLAN-model-agnostic.md`.
-- `933a7b9` voice dictation auto-sends hands-free (TerminalComposer autoSendRef + effect on value).
+## SHIPPED this session (all on master, build-verified, 0 TS errors)
+- `dbdbdd1` **notes pane** — apple-notes scratch pane. `src/components/NotesPane.tsx` + `src/lib/notes.ts`. One `.md`/note in `~/.aios/notes/`, title=first line, list + autosave (600ms), search, 5s cross-process poll. Backend `files::delete_path` (file-only, dir-guarded) in `src-tauri/src/files.rs` + `lib.rs`. `notes` app in `src/lib/apps.ts`.
+- **/notes skill** — `~/.claude/skills/notes/SKILL.md` (+ in `aios-firaz/.claude/skills/_INDEX.md`). Oracle reads/writes the SAME `~/.aios/notes/*.md`. firaz's one-shot idea inbox.
+- `c1f6363` **send-to-AI** — notes "send" routes to `settings.defaultAi` (claude-code|terminal|chat, default claude-code), reuses an alive pane via `paneSubmitters` (`src/lib/paneBus.ts`), spawns only if none, pastes AND submits. + **open-panes "OPEN" rail** (`OpenPanesList` in App.tsx) replacing the floating overlay. + youtube fullscreen rAF sequencing.
+- `a3df0fb` **pane navigation** — ⌘F fullscreen selected pane (any type), ⌘W close focused, ⌘`/Ctrl+↑/3-finger-swipe-up → `PaneOverview` mission-control, ⌘1-9 jump, ⌘M minimize / ⇧⌘M restore-all, Esc exit fullscreen. **Startup reopens last layout** (`loadLayout`/`saveLayout`, gated on `reopenLastLayout`; X drops a pane from the set).
+- `b65da55` **flashy composer** — `TerminalComposer.tsx`: gradient send (hover lift+glow, active spring), mic accent-glow, box accent halo + top-edge sheen on focus.
 
 ## DECISIONS locked (firaz)
-- **Model-agnostic = CLI swap (tier 1)**: keep the agentic loop, make the BINARY swappable (claude/codex/gemini/opencode). NOT a plain-API rewrite. Registry already reflects this. See `PLAN-model-agnostic.md`.
-- **SaaS = freemium**: login unlocks locked features. Cloud = auth/license/billing/sync ONLY; compute stays local. Premium tiers to sell later: (1) managed AI model (vs BYO key — bill API+markup, never resell claude sub), (2) dedicated VPS for always-on automations/WhatsApp so laptop need not stay open. See memory `project-aios-shell-saas-premium`.
-- **Control plane** ("AIOS drives every pane like firaz"): BIG, needs the architecture plan (`PLAN-control-plane.md` — was being generated by a Plan agent; CHECK if it exists/complete, regenerate if not). Recommended seam: MCP server → rust local listener → tauri `emit` → App.tsx `dispatchControl(cmd)` central dispatcher. Mirror the existing `~/Repo/firaz/aios-bridge/mcp/aios-spawn-tab` MCP pattern.
+- Default AI for "send" = **claude-code** (claude in a terminal), configurable via `settings.defaultAi`.
+- Notes = plain `.md` on disk so the oracle shares the files — that's the moat, don't regress to a DB/localStorage.
+- Flutter companion app = **parked** (seed note in `~/.aios/notes`), revisit after custom-panes + OSS readiness.
+- Send-to-AI must reuse an EXISTING alive pane; spawn only when none active.
 
-## PENDING task board (see TaskList)
-1. **Active panes at top of sidebar + better HIDDEN UX** — firaz wants currently-open panes shown as a live section at the TOP of the sidebar rail. App.tsx now UNLOCKED (doc agent done). Key anchors: `panes` state App.tsx:119, `hiddenKeys`:135, `maximizedKey`:134, `closePane`:245, sidebar `<aside>`:595, `<OracleRoster>`:602, hidden-panes strip:703-712, `SidebarRail`:926. Add an "OPEN/ACTIVE" section above OracleRoster listing `panes` (click=focus/restore-from-hidden, x=close). Rework the bottom HIDDEN strip into this.
-2. **Model-agnostic rust seam** — `src-tauri/src/chat.rs`: add `ChatProvider` enum + match-dispatch; generalize `claude_bin()` (chat.rs:95-124) → `agent_bin(provider)`; claude default. Then provider picker UI in ChatPane (model pill → provider+model). chat.ts `chatStart` keep back-compat. Deps present: reqwest+tokio in Cargo.
-3. **Git UI pane** — diff/stage/commit, settings-gated OFF by default. Backend git in `src-tauri/src/files.rs` (has `git_status`). New pane component + Settings toggle.
-4. **Workspaces / saved layouts** — save named pane arrangement (panes+sizes+cwd), restore on launch/shortcut. Touches App.tsx `panes`+grid. Later: share/import JSON.
-5. **Onboarding + freemium auth** — first-run wizard + login/register, gate locked features. Per SaaS decision above.
-6. **Control plane** — see decisions; plan first.
-7. **ONE tauri build + relaunch** at end:
-   ```
-   pnpm --dir ~/Repo/firaz/aios/shell tauri build
-   pkill -f "AIOS.app/Contents/MacOS"; cp -R ~/Repo/firaz/aios/shell/src-tauri/target/release/bundle/macos/AIOS.app /Applications/AIOS.app; open /Applications/AIOS.app
-   ```
+## PENDING (firaz asked, NOT started — next session picks one)
+1. **Default-AI picker in Settings UI** — data layer done; add toggle in `src/components/Settings.tsx` general section (~line 919, mirror the `defaultPaneType` Row): claude-code / terminal / chat.
+2. **Send ALL notes at once** — NotesPane button concatenating every note → same `onSend`.
+3. **Per-note todo/done status** — auto-detected (regex `- [ ]` or oracle), shown in the list.
+4. **Purge old duplicate AIOS apps** (causes duplicate macOS permission entries). Keep ONLY `/Applications/AIOS.app` (`com.adletic.aios`). Delete after confirming bundle ids: `~/Desktop/AIOS.app`, `~/aios-terminal-prod-snapshot-2026-05-04/applications/AIOS.app`, `~/Repo/firaz/adletic/aios-terminal/release/{mac,mac-arm64}/AIOS.app`, `~/Repo/firaz/terminal/extra/osx/AIOS.app`.
+5. **Custom panes** ("make panes as customisable as possible") — user-created/edited panes (command/url/html) + in-app builder + ai-generated. Big, unscoped.
+6. **Notes best-in-class** — research done (below).
 
-## New idea captured (not built — for the task board)
-- **Wire AIOS skills into the composer slash menu** — firaz wants `/handoff` (and other AIOS skills) to appear in the terminal composer's `/` menu alongside `/clear /plan /resume /model /help` (TerminalComposer.tsx `slashCommands` ~line 471). Today that menu only sends claude-code TUI commands to the PTY. AIOS skills are a different channel (they invoke the oracle), so this needs a second class of slash entries that fire a skill/prompt rather than PTY bytes. Small-medium feature.
-- **`/handoff` skill now EXISTS**: `~/.claude/skills/handoff/SKILL.md` — type `/handoff` in any session to auto-package (doc + commit + task sync). This doc was the manual version; the skill automates it.
+## Notes research — build-next shortlist (plain-md on disk)
+1. **Markdown live preview + code highlight** (L) — swap the raw `<textarea>` for CodeMirror 6 (md + Shiki). Biggest gap vs competitors; foundation for slash/checkboxes.
+2. **Ask-AI-across-all-notes w/ citations** (M) — oracle greps `~/.aios/notes`, answers, links source. THE differentiator (fs access + send channel already exist).
+3. **Global quick-capture hotkey** (M) — Tauri global shortcut → mini window → save+close. Kills capture-latency, the #1 universal complaint.
+4. **Tags `#tag` + daily notes + pin** (S each).
+5. **AI auto-tag + auto-status on save** (M).
+Don't out-Obsidian Obsidian on plugins — win on "the oracle IS in the notes." Defer backlinks/graph, slash, templates.
 
-## Other live context
-- Threads MCP now in GLOBAL `~/.claude.json` (motion, memory, threads) — token valid ~until late July 2026 (60-day rolling from 2026-05-23).
-- Launch kit (for WHEN firaz wants it, currently deferred): `~/Repo/firaz/adletic/aios-firaz/outputs/2026-05-30-aios-launch-kit.md`.
-- Untracked plan files in repo root: `PLAN-model-agnostic.md` (committed in 39be230), `PLAN-customizable-sidebar.md` (pre-existing, leave), `PLAN-control-plane.md` (verify state).
-- Stale worktrees: 4 `worktree-agent-*` branches from the old terminal pass, unmerged — ignore unless reconciling.
+## Gotchas
+- **Tooling flaked hard** this session: large-file Reads + `cd`-chained Bash intermittently returned "internal error". Use `git -C`/`pnpm --dir`, read ≤120-line windows, python heredocs over sed/awk for big files. A python in-place delete once OVERSHOT and removed `PaneCard`+`Splash` from App.tsx — recovered by splicing from `c1f6363`. Always `npx tsc --noEmit` == 0 before build.
+- Untracked in repo root: `PLAN-control-plane.md`, `PLAN-customizable-sidebar.md` (pre-existing, leave).
+- Detailed copy also at `~/.aios/state/handoffs/2026-05-31-0200-shell-notes-pane-nav.md`.
