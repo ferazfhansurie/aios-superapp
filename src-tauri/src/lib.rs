@@ -135,6 +135,8 @@ pub fn run() {
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,
+            browser::browser_fullscreen_state,
+            browser::set_window_fullscreen,
             browser::browser_navigate,
             browser::browser_back,
             browser::browser_forward,

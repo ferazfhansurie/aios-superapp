@@ -32,6 +32,7 @@ import {
   browserClose,
   browserCopySelection,
   browserCurrentUrl,
+  browserFullscreenState,
   browserDeviceMode,
   browserEnterAnnotate,
   browserExitAnnotate,
@@ -76,6 +77,7 @@ export function BrowserPane({
   memKey,
   onAnnotate,
   onProfileChange,
+  onVideoFullscreen,
 }: {
   label: string;
   active?: boolean;
@@ -84,6 +86,9 @@ export function BrowserPane({
   /** Stable id (pinned-site sidebar id) under which to remember this pane's last
    *  location, so reopening returns where it left off. Omit = no memory. */
   memKey?: string;
+  /** Fired when an in-page video enters/exits HTML fullscreen, so the app can
+   *  drive TRUE fullscreen (maximize pane + fullscreen the OS window). */
+  onVideoFullscreen?: (on: boolean) => void;
   /** Cookie-partition profile this pane opens in (lets a second/third Google
    *  account stay logged in alongside the first). Defaults to the shared store. */
   initialProfile?: string;
@@ -122,6 +127,11 @@ export function BrowserPane({
   // Latest `onAnnotate` without making it a poll-effect dependency.
   const onAnnotateRef = useRef(onAnnotate);
   onAnnotateRef.current = onAnnotate;
+  // Latest video-fullscreen callback + whether we're currently reporting "on",
+  // so the fullscreen poll only fires on real enter/exit transitions.
+  const onVideoFullscreenRef = useRef(onVideoFullscreen);
+  onVideoFullscreenRef.current = onVideoFullscreen;
+  const fsOnRef = useRef(false);
 
   const rect = useCallback((): Rect | null => {
     const el = slotRef.current;
@@ -182,6 +192,27 @@ export function BrowserPane({
     const poll = setInterval(tick, 1500);
     return () => clearInterval(poll);
   }, [active, label, memKey]);
+
+  // Poll WKWebView element-fullscreen state. A child webview's HTML fullscreen
+  // only fills its own rect, so on enter we ask the app for TRUE fullscreen
+  // (maximize pane + fullscreen OS window) and undo it on exit. 1/2 = entering/in,
+  // 0/3 = exiting/none.
+  useEffect(() => {
+    if (!active) return;
+    const tick = () => {
+      if (!shownRef.current) return;
+      browserFullscreenState(label)
+        .then((s) => {
+          const on = s === 1 || s === 2;
+          if (on === fsOnRef.current) return;
+          fsOnRef.current = on;
+          onVideoFullscreenRef.current?.(on);
+        })
+        .catch(() => {});
+    };
+    const poll = setInterval(tick, 350);
+    return () => clearInterval(poll);
+  }, [active, label]);
 
   // Switch the pane to another cookie partition. The data store is fixed at
   // webview creation, so switching = destroy the current webview + let the show

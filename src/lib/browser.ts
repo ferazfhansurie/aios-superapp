@@ -17,6 +17,12 @@ export const browserNavigate = (label: string, url: string) =>
   invoke("browser_navigate", { label, url });
 export const browserCurrentUrl = (label: string) =>
   invoke<string | null>("browser_current_url", { label });
+/** WKWebView element-fullscreen state: 0 none · 1 entering · 2 in · 3 exiting. */
+export const browserFullscreenState = (label: string) =>
+  invoke<number>("browser_fullscreen_state", { label });
+/** Put the OS window in/out of native fullscreen (screen-filling). */
+export const setWindowFullscreen = (on: boolean) =>
+  invoke("set_window_fullscreen", { on });
 export const browserBack = (label: string) => invoke("browser_back", { label });
 export const browserForward = (label: string) => invoke("browser_forward", { label });
 export const browserReload = (label: string) => invoke("browser_reload", { label });

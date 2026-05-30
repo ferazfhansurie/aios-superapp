@@ -135,6 +135,47 @@ pub fn browser_navigate(app: AppHandle, label: String, url: String) -> Result<()
     Ok(())
 }
 
+/// Reads the WKWebView element-fullscreen state (0 = not, 1 = entering, 2 = in,
+/// 3 = exiting). A child webview's HTML fullscreen only fills the webview's own
+/// rect, so the frontend polls this to drive TRUE fullscreen: when a video goes
+/// fullscreen we maximize the pane (webview → full window) + put the OS window
+/// in fullscreen (window → full screen). macOS-only; 0 elsewhere.
+#[tauri::command]
+pub async fn browser_fullscreen_state(app: AppHandle, label: String) -> i64 {
+    // `with_webview` needs a Send + 'static closure (dispatched to the main
+    // thread), so we ship the read back over a channel. async → this runs off
+    // the main thread, so the brief blocking recv can't deadlock the dispatch.
+    #[cfg(target_os = "macos")]
+    if let Some(wv) = app.get_webview(&label) {
+        let (tx, rx) = std::sync::mpsc::channel::<i64>();
+        let _ = wv.with_webview(move |pw| {
+            let ptr = pw.inner() as *mut objc2_web_kit::WKWebView;
+            let s = unsafe {
+                ptr.as_ref()
+                    .map(|wk| wk.fullscreenState().0 as i64)
+                    .unwrap_or(0)
+            };
+            let _ = tx.send(s);
+        });
+        return rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .unwrap_or(0);
+    }
+    let _ = (&app, &label);
+    0
+}
+
+/// Puts the main OS window into (or out of) native fullscreen — the second half
+/// of true video fullscreen (the pane-maximize covers the window, this covers the
+/// screen). Driven from the frontend's fullscreen-state poll.
+#[tauri::command]
+pub fn set_window_fullscreen(app: AppHandle, on: bool) -> Result<(), String> {
+    if let Some(win) = app.get_window("main") {
+        win.set_fullscreen(on).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn browser_back(app: AppHandle, label: String) -> Result<(), String> {
     if let Some(wv) = app.get_webview(&label) {

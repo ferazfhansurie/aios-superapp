@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 
 import { recallUrl } from "./lib/browser-mem";
+import { setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
 import { AutomationsPane } from "./components/AutomationsPane";
 import { BridgesPane } from "./components/BridgesPane";
@@ -139,6 +140,23 @@ function App() {
   const toggleHide = useCallback((key: string) => {
     setHiddenKeys((cur) => (cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]));
     setMaximizedKey((cur) => (cur === key ? null : cur));
+  }, []);
+  // TRUE video fullscreen: a child webview's HTML fullscreen only fills its rect.
+  // When a video enters fullscreen we maximize the pane (webview → whole window)
+  // AND fullscreen the OS window (window → whole screen); on exit we restore the
+  // prior maximize state. prevMax remembers what was maximized before the video.
+  const prevMaxRef = useRef<string | null>(null);
+  const onVideoFullscreen = useCallback((key: string, on: boolean) => {
+    if (on) {
+      setMaximizedKey((cur) => {
+        prevMaxRef.current = cur;
+        return key;
+      });
+      setWindowFullscreen(true).catch(() => {});
+    } else {
+      setWindowFullscreen(false).catch(() => {});
+      setMaximizedKey(() => prevMaxRef.current);
+    }
   }, []);
   // backgrounded chat sessions still running after their pane closed.
   const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
@@ -641,6 +659,7 @@ function App() {
                       ),
                     )
                   }
+                  onVideoFullscreen={(on) => onVideoFullscreen(pane.key, on)}
                 />
               ))}
             </ResizableGrid>
@@ -1343,6 +1362,7 @@ function PaneCard({
   onAnnotate,
   onOpenFile,
   onProfileChange,
+  onVideoFullscreen,
 }: {
   pane: Pane;
   active: boolean;
@@ -1356,6 +1376,7 @@ function PaneCard({
   onAnnotate: (text: string) => void;
   onOpenFile: (path: string, name: string) => void;
   onProfileChange: (profile: string) => void;
+  onVideoFullscreen?: (on: boolean) => void;
 }) {
   const t = pane.kind.type;
   const label =
@@ -1455,6 +1476,7 @@ function PaneCard({
             memKey={pane.kind.memKey}
             onAnnotate={onAnnotate}
             onProfileChange={onProfileChange}
+            onVideoFullscreen={onVideoFullscreen}
           />
         ) : pane.kind.type === "memory" ? (
           <DatabasePane />
