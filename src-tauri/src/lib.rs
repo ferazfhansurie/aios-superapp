@@ -66,6 +66,7 @@ pub fn run() {
             files::read_file_preview,
             files::read_text_file,
             files::write_text_file,
+            files::delete_path,
             files::convert_office_to_pdf,
             files::save_image_temp,
             plugins::list_plugins,

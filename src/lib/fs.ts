@@ -83,6 +83,11 @@ export async function writeTextFile(path: string, content: string): Promise<void
   return invoke<void>("write_text_file", { path, content });
 }
 
+/** Deletes a single file (notes CRUD). No-op if it's already gone; refuses dirs. */
+export async function deletePath(path: string): Promise<void> {
+  return invoke<void>("delete_path", { path });
+}
+
 /** Converts an office doc (docx/xlsx/pptx/…) to a cached PDF via headless
  *  LibreOffice and returns the resulting PDF path. Slow on first call (~1-3s),
  *  instant on re-open. Render the returned path with {@link fileSrc} in an iframe. */

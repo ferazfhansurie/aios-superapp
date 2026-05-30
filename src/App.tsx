@@ -41,6 +41,7 @@ import { FileViewerPane } from "./components/FileViewerPane";
 import { IdleDashboard } from "./components/IdleDashboard";
 import { DatabasePane } from "./components/DatabasePane";
 import { MotionPane } from "./components/MotionPane";
+import { NotesPane } from "./components/NotesPane";
 import { OracleRoster } from "./components/OracleRoster";
 import { PluginsPane } from "./components/PluginsPane";
 import { PulsePane } from "./components/PulsePane";
@@ -1340,6 +1341,7 @@ const DOT: Record<string, string> = {
   files: "status-dot--cold",
   browser: "status-dot--cold",
   memory: "status-dot--cold",
+  notes: "status-dot--cold",
   automations: "status-dot--cold",
   bridges: "status-dot--cold",
   plugins: "status-dot--cold",
@@ -1483,6 +1485,8 @@ function PaneCard({
           />
         ) : pane.kind.type === "memory" ? (
           <DatabasePane onOpenUrl={onOpenUrl} />
+        ) : pane.kind.type === "notes" ? (
+          <NotesPane onSend={onAnnotate} />
         ) : pane.kind.type === "automations" ? (
           <AutomationsPane />
         ) : pane.kind.type === "bridges" ? (
