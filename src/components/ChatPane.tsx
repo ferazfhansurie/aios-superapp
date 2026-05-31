@@ -108,6 +108,7 @@ import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel 
 import { emptyRunEventState, reduceRunEvents, type RunEventState } from "../lib/runEvents";
 import { memorySearch, type MemoryHit } from "../lib/memory";
 import { buildAiosShellContext } from "../lib/aiosContext";
+import { shouldAutoscroll } from "../lib/chatScroll";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -1318,6 +1319,7 @@ export function ChatPane({
   // set just before we programmatically pin, so the scroll event our own pin
   // fires isn't misread as the user moving the viewport.
   const programmaticRef = useRef(false);
+  const lastScrollHeightRef = useRef(0);
   const [showJump, setShowJump] = useState(false);
   const setPaused = useCallback((p: boolean) => {
     pausedRef.current = p;
@@ -1325,10 +1327,22 @@ export function ChatPane({
   }, []);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && !pausedRef.current) {
+    if (
+      el &&
+      shouldAutoscroll(
+        {
+          scrollHeight: el.scrollHeight,
+          scrollTop: el.scrollTop,
+          clientHeight: el.clientHeight,
+          previousScrollHeight: lastScrollHeightRef.current || undefined,
+        },
+        pausedRef.current,
+      )
+    ) {
       programmaticRef.current = true;
       el.scrollTop = el.scrollHeight;
     }
+    lastScrollHeightRef.current = el?.scrollHeight ?? 0;
   }, [turns]);
   useEffect(() => {
     const el = scrollRef.current;
@@ -1342,6 +1356,7 @@ export function ChatPane({
       const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
       if (dist < 8) setPaused(false); // rode back to the bottom → resume autoscroll
       else setPaused(true); // moved away from the bottom → pause (sticky)
+      lastScrollHeightRef.current = el.scrollHeight;
     };
     // scrolling up = user taking the wheel → pause immediately, even before the
     // distance math catches up (mid-stream the content keeps growing below).
