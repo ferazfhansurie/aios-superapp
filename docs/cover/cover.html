@@ -1,0 +1,176 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1280px; height:640px; }
+  body {
+    font-family:'Inter',system-ui,sans-serif;
+    background:#08080c;
+    color:#e8e8f0;
+    overflow:hidden;
+    position:relative;
+  }
+  /* layered background */
+  .bg {
+    position:absolute; inset:0;
+    background:
+      radial-gradient(900px 600px at 78% 12%, rgba(36,200,219,0.18), transparent 60%),
+      radial-gradient(700px 600px at 12% 95%, rgba(124,92,255,0.16), transparent 55%),
+      linear-gradient(160deg,#0b0b12 0%,#08080c 55%,#06060a 100%);
+  }
+  .grid {
+    position:absolute; inset:0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+    background-size:38px 38px;
+    mask-image:radial-gradient(1000px 700px at 60% 40%, #000 30%, transparent 85%);
+  }
+  .wrap { position:relative; height:100%; display:flex; align-items:center; padding:0 70px; gap:48px; }
+
+  /* left column */
+  .left { width:520px; flex:none; }
+  .brandrow { display:flex; align-items:center; gap:16px; margin-bottom:26px; }
+  .brandrow img { width:64px; height:64px; filter:drop-shadow(0 6px 18px rgba(0,0,0,0.5)); }
+  .kicker {
+    font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:600;
+    letter-spacing:3px; text-transform:uppercase; color:#7ad7e2;
+  }
+  .kicker .dot { color:#7c5cff; }
+  h1 {
+    font-size:124px; font-weight:900; line-height:0.9; letter-spacing:-4px;
+    background:linear-gradient(180deg,#ffffff 0%,#b9c2d0 100%);
+    -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+    margin-bottom:22px;
+  }
+  .tag { font-size:21px; line-height:1.45; color:#a7adba; font-weight:450; max-width:470px; margin-bottom:30px; }
+  .tag b { color:#e8e8f0; font-weight:650; }
+  .chips { display:flex; flex-wrap:wrap; gap:10px; }
+  .chip {
+    font-family:'JetBrains Mono',monospace; font-size:12.5px; font-weight:500;
+    padding:7px 13px; border-radius:8px;
+    border:1px solid rgba(255,255,255,0.10); background:rgba(255,255,255,0.03);
+    color:#cdd2dc;
+  }
+  .chip span { color:#7ad7e2; }
+
+  /* right: stylized deck */
+  .deck {
+    flex:1; height:480px; position:relative;
+    border-radius:16px;
+    background:linear-gradient(150deg,#15151f,#0d0d15);
+    border:1px solid rgba(255,255,255,0.09);
+    box-shadow:0 40px 90px -30px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.05);
+    overflow:hidden;
+    transform:perspective(1600px) rotateY(-12deg) rotateX(3deg);
+  }
+  .titlebar { height:34px; display:flex; align-items:center; gap:8px; padding:0 14px;
+    background:rgba(255,255,255,0.025); border-bottom:1px solid rgba(255,255,255,0.06); }
+  .titlebar i { width:11px; height:11px; border-radius:50%; display:inline-block; }
+  .titlebar .r{background:#ff5f57}.titlebar .y{background:#febc2e}.titlebar .g{background:#28c840}
+  .titlebar .name { margin-left:10px; font-family:'JetBrains Mono',monospace; font-size:11px; color:#6b7180; }
+  .panes { display:grid; grid-template-columns:118px 1fr 1fr; grid-template-rows:1fr 1fr; height:calc(100% - 34px); }
+  .pane { border-right:1px solid rgba(255,255,255,0.05); border-bottom:1px solid rgba(255,255,255,0.05); padding:12px; position:relative; }
+  .pl { font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:1px; text-transform:uppercase; color:#5b6170; margin-bottom:9px; }
+  /* roster */
+  .roster { grid-row:1 / span 2; background:rgba(255,255,255,0.012); }
+  .ro { display:flex; align-items:center; gap:7px; font-size:11px; color:#aeb4c0; padding:6px 4px; }
+  .ro .led{ width:7px;height:7px;border-radius:50%;background:#28c840;box-shadow:0 0 8px #28c840;}
+  .ro.off .led{ background:#454b58; box-shadow:none;}
+  .ro.master{ color:#7ad7e2; font-weight:600;}
+  /* terminal */
+  .term { font-family:'JetBrains Mono',monospace; font-size:10.5px; line-height:1.65; color:#9aa0ad; }
+  .term .p{color:#7ad7e2}.term .o{color:#7c5cff}.term .w{color:#cdd2dc}
+  /* chat */
+  .chat .b { font-size:10.5px; line-height:1.45; padding:7px 10px; border-radius:9px; margin-bottom:7px; max-width:88%; }
+  .chat .u { background:rgba(124,92,255,0.16); border:1px solid rgba(124,92,255,0.25); margin-left:auto; color:#dcd6ff; }
+  .chat .a { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.07); color:#c2c7d2; }
+  /* graph */
+  .graph { background:radial-gradient(120px 120px at 60% 45%, rgba(36,200,219,0.10), transparent 70%); }
+  .node{ position:absolute; border-radius:50%; }
+  svg{ position:absolute; inset:0; width:100%; height:100%; }
+  .vign { position:absolute; inset:0; box-shadow:inset 0 0 140px 30px rgba(0,0,0,0.55); pointer-events:none; border-radius:16px; }
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="grid"></div>
+  <div class="wrap">
+    <div class="left">
+      <div class="brandrow">
+        <img src="mascot.png" />
+        <div class="kicker">superapp <span class="dot">·</span> mission control for ai agents</div>
+      </div>
+      <h1>AIOS</h1>
+      <div class="tag">one native window to <b>drive your AI coding agents</b> — terminals, oracles, a multi-engine <b>chat</b>, an embedded browser, files, automations, and a 3D memory graph.</div>
+      <div class="chips">
+        <div class="chip"><span>⌘</span> Tauri v2 · Rust</div>
+        <div class="chip"><span>⚡</span> React · xterm.js</div>
+        <div class="chip"><span>◉</span> 3D memory graph</div>
+        <div class="chip"><span>↯</span> push-to-talk voice</div>
+      </div>
+    </div>
+
+    <div class="deck">
+      <div class="titlebar">
+        <i class="r"></i><i class="y"></i><i class="g"></i>
+        <span class="name">aios superapp — mission control</span>
+      </div>
+      <div class="panes">
+        <div class="pane roster">
+          <div class="pl">oracles</div>
+          <div class="ro master"><span class="led"></span>aios · master</div>
+          <div class="ro"><span class="led"></span>prospector</div>
+          <div class="ro"><span class="led"></span>wrms-dev</div>
+          <div class="ro off"><span class="led"></span>nightly</div>
+          <div class="ro off"><span class="led"></span>research</div>
+        </div>
+        <div class="pane term">
+          <div class="pl">terminal · pty</div>
+          <div><span class="p">~/aios</span> <span class="w">$</span> pnpm tauri dev</div>
+          <div><span class="o">›</span> <span class="w">compiling</span> src-tauri (Rust)</div>
+          <div><span class="o">›</span> vite ready in <span class="p">412ms</span></div>
+          <div><span class="w">  VITE</span> v7 · localhost:1420</div>
+          <div><span class="p">~/aios</span> <span class="w">$</span> _</div>
+        </div>
+        <div class="pane chat">
+          <div class="pl">chat · local claude</div>
+          <div class="b u">ship the cover image</div>
+          <div class="b a">on it — rendering a premium banner + wiring the screenshots into the README now.</div>
+        </div>
+        <div class="pane graph" style="grid-column:2;">
+          <div class="pl">files</div>
+          <div class="term" style="font-size:10px">
+            <div class="o">▸ src/components</div>
+            <div class="w" style="padding-left:12px">ChatPane.tsx</div>
+            <div class="w" style="padding-left:12px">MemoryGraph.tsx</div>
+            <div class="o">▸ src-tauri/src</div>
+          </div>
+        </div>
+        <div class="pane graph" style="grid-column:3;">
+          <div class="pl">memory · 3d graph</div>
+          <svg viewBox="0 0 220 150">
+            <line x1="110" y1="70" x2="60" y2="40" stroke="rgba(124,92,255,0.4)" stroke-width="1"/>
+            <line x1="110" y1="70" x2="165" y2="48" stroke="rgba(36,200,219,0.4)" stroke-width="1"/>
+            <line x1="110" y1="70" x2="80" y2="110" stroke="rgba(124,92,255,0.35)" stroke-width="1"/>
+            <line x1="110" y1="70" x2="150" y2="115" stroke="rgba(36,200,219,0.35)" stroke-width="1"/>
+            <line x1="60" y1="40" x2="40" y2="80" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>
+            <line x1="165" y1="48" x2="185" y2="95" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>
+            <circle cx="110" cy="70" r="9" fill="#7c5cff"/>
+            <circle cx="60" cy="40" r="5" fill="#24c8db"/>
+            <circle cx="165" cy="48" r="6" fill="#24c8db"/>
+            <circle cx="80" cy="110" r="4" fill="#7ad7e2"/>
+            <circle cx="150" cy="115" r="5" fill="#7c5cff"/>
+            <circle cx="40" cy="80" r="3.5" fill="#9aa0ad"/>
+            <circle cx="185" cy="95" r="3.5" fill="#9aa0ad"/>
+          </svg>
+        </div>
+      </div>
+      <div class="vign"></div>
+    </div>
+  </div>
+</body>
+</html>
