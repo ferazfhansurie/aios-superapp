@@ -74,6 +74,7 @@ import { homeDir, startupOpenPane } from "./lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
+import { commandToPaletteCommand, createCommand, type AiosCommand } from "./lib/commands";
 
 import { SPAWN, SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
 import {
@@ -833,77 +834,179 @@ function App() {
     return { cols: c, rows: Math.ceil(n / c) };
   }, [visibleCount]);
 
-  const commands: Command[] = useMemo(
-    () => [
+  const commands: Command[] = useMemo(() => {
+    const ctx = { source: "palette" as const, activePaneKey: activeKey };
+    const toPalette = (
+      command: AiosCommand,
+      group: string,
+      actionLabel: string,
+      subtitle?: string,
+    ) =>
+      commandToPaletteCommand(command, {
+        context: ctx,
+        group,
+        actionLabel,
+        subtitle,
+      });
+    const registry = [
       ...SPAWN.map((s) => ({
-        id: `spawn-${s.label}`,
-        title: `new ${s.label}`,
+        command: createCommand({
+          id: `pane.open.${s.id}`,
+          label: `new ${s.label}`,
+          scope: "pane",
+          icon: <s.icon size={14} />,
+          keywords: ["open", "pane", "spawn", "launch", "new"],
+          run: () => spawn(s.kind, s.label),
+        }),
         group: "open",
-        icon: <s.icon size={14} />,
-        keywords: "open pane spawn launch new",
         actionLabel: "open",
-        run: () => spawn(s.kind, s.label),
       })),
-      // resume any recent chat — the highest-value dynamic entry (raycast-style:
-      // one box launches, asks, and continues). cwd as the faint right column.
       ...chats.map((c) => ({
-        id: `resume-${c.id}`,
-        title: c.title || "untitled chat",
-        subtitle: c.cwd ? c.cwd.split("/").pop() : undefined,
+        command: createCommand({
+          id: `chat.resume.${c.id}`,
+          label: c.title || "untitled chat",
+          description: c.cwd ? c.cwd.split("/").pop() : undefined,
+          scope: "chat",
+          icon: <MessageSquare size={14} />,
+          keywords: ["chat", "session", "continue", "resume", c.cwd ?? ""],
+          run: () => resumeChat(c),
+        }),
         group: "resume",
-        icon: <MessageSquare size={14} />,
-        keywords: `chat session continue resume ${c.cwd}`,
         actionLabel: "resume",
-        run: () => resumeChat(c),
       })),
-      // attach any live/known oracle from the fleet.
       ...oracles.map((o) => ({
-        id: `oracle-${o.identity}`,
-        title: `oracle: ${o.display_name}`,
-        subtitle: o.running ? "running" : "idle",
+        command: createCommand({
+          id: `oracle.attach.${o.identity}`,
+          label: `oracle: ${o.display_name}`,
+          description: o.running ? "running" : "idle",
+          scope: "global",
+          icon: <Radio size={14} />,
+          keywords: ["oracle", "agent", "attach", "session", o.identity],
+          run: () => addOracle(o.identity),
+        }),
         group: "fleet",
-        icon: <Radio size={14} />,
-        keywords: `oracle agent attach session ${o.identity}`,
         actionLabel: "attach",
-        run: () => addOracle(o.identity),
       })),
-      // jump straight to a customer thread (opens the inbox).
       ...customers.slice(0, 8).map((c) => ({
-        id: `customer-${c.id}`,
-        title: c.name,
-        subtitle: c.lastAgo ? `${c.lastAgo} ago` : undefined,
+        command: createCommand({
+          id: `customer.open.${c.id}`,
+          label: c.name,
+          description: c.lastAgo ? `${c.lastAgo} ago` : undefined,
+          scope: "global",
+          icon: <MessageCircle size={14} />,
+          keywords: ["customer", "message", "whatsapp", "inbox", c.handle],
+          run: () => spawn({ type: "customers" }, "customers"),
+        }),
         group: "customers",
-        icon: <MessageCircle size={14} />,
-        keywords: `customer message whatsapp inbox ${c.handle}`,
         actionLabel: "open inbox",
-        run: () => spawn({ type: "customers" }, "customers"),
       })),
-      // one "run <name>" per discovered ~/Repo project — type a repo name in ⌘K
-      // and ⏎ launches its primary command in a fresh run terminal.
       ...projects.map((p) => {
         const rel = home && p.root.startsWith(home)
           ? p.root.slice(home.length).replace(/^\//, "")
           : p.root;
         return {
-          id: `run-project-${p.root}`,
-          title: `run ${p.name}`,
-          subtitle: `${p.kind} · ${rel}`,
+          command: createCommand({
+            id: `project.run.${p.root}`,
+            label: `run ${p.name}`,
+            description: `${p.kind} · ${rel}`,
+            scope: "run",
+            icon: <Play size={14} />,
+            keywords: ["run", "start", "launch", "project", p.name, p.kind, rel],
+            run: () => runProject(p),
+          }),
           group: "run",
-          icon: <Play size={14} />,
-          keywords: `run start launch project ${p.name} ${p.kind} ${rel}`,
           actionLabel: "run",
-          run: () => runProject(p),
         };
       }),
-      { id: "sidebar", title: "toggle sidebar", subtitle: "⌘B", group: "view", icon: <PanelLeft size={14} />, keywords: "rail hide show", actionLabel: "toggle", run: () => setSidebarOpen((v) => !v) },
-      { id: "overview", title: "show all panes", subtitle: "⌘`", group: "view", icon: <Layers size={14} />, keywords: "overview mission control switch panes windows fan out swipe", actionLabel: "open", run: () => { if (panes.length > 0) setOverviewOpen(true); } },
-      { id: "show-all-panes", title: "tile all panes", subtitle: "", group: "view", icon: <Maximize2 size={14} />, keywords: "show all restore unminimize tile grid every pane visible", actionLabel: "tile", run: () => { setHiddenKeys([]); setMaximizedKey(null); } },
-      { id: "run", title: "run focused project", subtitle: "F5", group: "actions", icon: <Play size={14} />, keywords: "f5 run debug start flutter npm dev build terminal focused open file — type a repo name for a specific project", actionLabel: "run", run: () => runF5() },
-      { id: "appshot", title: "appshot — screenshot to oracle", subtitle: "⌘⌘", group: "actions", icon: <Camera size={14} />, keywords: "screenshot capture", actionLabel: "run", run: fireAppshot },
-      { id: "settings", title: "settings", subtitle: "⌘,", group: "app", icon: <SettingsIcon size={14} />, keywords: "preferences theme appearance", actionLabel: "open", run: () => setSettingsOpen(true) },
-    ],
-    [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, projects, home, runProject, panes.length],
-  );
+      {
+        command: createCommand({
+          id: "view.sidebar.toggle",
+          label: "toggle sidebar",
+          description: "⌘B",
+          scope: "global",
+          icon: <PanelLeft size={14} />,
+          hotkeys: ["mod+b"],
+          keywords: ["rail", "hide", "show"],
+          run: () => setSidebarOpen((v) => !v),
+        }),
+        group: "view",
+        actionLabel: "toggle",
+      },
+      {
+        command: createCommand({
+          id: "view.overview.open",
+          label: "show all panes",
+          description: "⌘`",
+          scope: "pane",
+          icon: <Layers size={14} />,
+          keywords: ["overview", "mission", "control", "switch", "panes", "windows", "fan", "out"],
+          enabled: () => panes.length > 0,
+          run: () => setOverviewOpen(true),
+        }),
+        group: "view",
+        actionLabel: "open",
+      },
+      {
+        command: createCommand({
+          id: "pane.tile.all",
+          label: "tile all panes",
+          scope: "pane",
+          icon: <Maximize2 size={14} />,
+          keywords: ["show", "all", "restore", "unminimize", "tile", "grid", "every", "pane", "visible"],
+          run: () => {
+            setHiddenKeys([]);
+            setMaximizedKey(null);
+          },
+        }),
+        group: "view",
+        actionLabel: "tile",
+      },
+      {
+        command: createCommand({
+          id: "project.run.focused",
+          label: "run focused project",
+          description: "F5",
+          scope: "run",
+          icon: <Play size={14} />,
+          hotkeys: ["f5"],
+          keywords: ["f5", "run", "debug", "start", "flutter", "npm", "dev", "build", "terminal", "focused", "open", "file"],
+          run: () => runF5(),
+        }),
+        group: "actions",
+        actionLabel: "run",
+      },
+      {
+        command: createCommand({
+          id: "oracle.appshot",
+          label: "appshot — screenshot to oracle",
+          description: "⌘⌘",
+          scope: "global",
+          danger: "external",
+          icon: <Camera size={14} />,
+          keywords: ["screenshot", "capture", "oracle"],
+          run: fireAppshot,
+        }),
+        group: "actions",
+        actionLabel: "run",
+      },
+      {
+        command: createCommand({
+          id: "app.settings.open",
+          label: "settings",
+          description: "⌘,",
+          scope: "global",
+          icon: <SettingsIcon size={14} />,
+          keywords: ["preferences", "theme", "appearance"],
+          run: () => setSettingsOpen(true),
+        }),
+        group: "app",
+        actionLabel: "open",
+      },
+    ];
+    return registry.map((entry) =>
+      toPalette(entry.command, entry.group, entry.actionLabel, entry.command.description),
+    );
+  }, [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, projects, home, runProject, panes.length, activeKey]);
 
   return (
     <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-[var(--color-bg)] text-[var(--color-text)]">
