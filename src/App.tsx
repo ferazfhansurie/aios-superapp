@@ -60,6 +60,7 @@ import { TerminalPane, type PaneKind } from "./components/TerminalPane";
 import { EditorPane } from "./components/EditorPane";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { VoiceButton } from "./components/VoiceButton";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 import { appshot, listOracles, type OracleInfo } from "./lib/pty";
@@ -67,7 +68,7 @@ import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } f
 import { listCustomers, type Customer } from "./lib/inbox";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
-import { chatHandles, paneWriters, paneSubmitters } from "./lib/paneBus";
+import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, registerOpenFile } from "./lib/paneBus";
 import { loadSettings, applyFlashLevel } from "./lib/settings";
 import { homeDir } from "./lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
@@ -303,6 +304,22 @@ function App() {
     return key;
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ url: string; profile?: string }>("browser-new-pane", ({ payload }) => {
+      if (!payload.url) return;
+      spawn({ type: "browser", url: payload.url, profile: payload.profile }, "browser");
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [spawn]);
+
   // Resolve a sidebar item to a spawn: built-in apps look up their kind from the
   // catalog; link items open the embedded browser already at their url.
   const spawnSidebarItem = useCallback(
@@ -331,6 +348,9 @@ function App() {
     },
     [spawn],
   );
+  // expose openFile to deep children (chat artifact cards) via paneBus, so a
+  // produced file opens as an in-app viewer pane instead of the OS app.
+  useEffect(() => registerOpenFile(openFile), [openFile]);
 
   // F5 / Run — detect the project around the last-opened file (or $HOME) and
   // spawn a terminal running its default command in the project dir (logs +
@@ -751,10 +771,26 @@ function App() {
         flash("open a terminal pane, then drop the file to insert its path");
         return;
       }
-      const text = paths
-        .map((path) => (/[\s'"\\]/.test(path) ? `'${path.replace(/'/g, "'\\''")}' ` : `${path} `))
-        .join("");
-      w(text);
+      // Split image files from the rest: images go to the pane's IMAGE sink (chat
+      // → thumbnail chip, ready to send for vision), everything else inserts as a
+      // quoted path. A pane with no image sink (a terminal) just gets all paths
+      // as text, same as before.
+      const isImage = (p: string) => /\.(png|jpe?g|gif|webp|bmp|svg|heic|tiff?)$/i.test(p);
+      const imgs = paths.filter(isImage);
+      const rest = paths.filter((p) => !isImage(p));
+      const imgSink = key ? paneImageDrop.get(key) : null;
+      if (imgs.length && imgSink) {
+        imgSink(imgs);
+      } else if (imgs.length) {
+        // no image sink on this pane → fall back to inserting their paths as text.
+        rest.push(...imgs);
+      }
+      if (rest.length) {
+        const text = rest
+          .map((path) => (/[\s'"\\]/.test(path) ? `'${path.replace(/'/g, "'\\''")}' ` : `${path} `))
+          .join("");
+        w(text);
+      }
       flash(`dropped ${paths.length} item${paths.length > 1 ? "s" : ""}`);
     });
     return () => {

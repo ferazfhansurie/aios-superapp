@@ -53,6 +53,8 @@ export interface ChatSessionInfo {
   title: string;
   cwd: string;
   mtime: number;
+  engine?: "claude" | "codex" | "opencode" | string;
+  model?: string;
 }
 
 /** Lists the chats started in the chat pane (from the chat store) for /resume. */
@@ -61,8 +63,20 @@ export async function listChatSessions(limit = 40): Promise<ChatSessionInfo[]> {
 }
 
 /** Records (upserts) a chat-pane session so /resume lists only chats started here. */
-export async function recordChatSession(id: string, title: string, cwd?: string | null): Promise<void> {
-  return invoke("record_chat_session", { id, title, cwd: cwd ?? null });
+export async function recordChatSession(
+  id: string,
+  title: string,
+  cwd?: string | null,
+  engine?: string | null,
+  model?: string | null,
+): Promise<void> {
+  return invoke("record_chat_session", {
+    id,
+    title,
+    cwd: cwd ?? null,
+    engine: engine ?? null,
+    model: model ?? null,
+  });
 }
 
 /** A past turn loaded from a transcript, to repaint a resumed conversation. */
@@ -143,6 +157,11 @@ export interface ChatEvent {
   session_id?: string;
   model?: string;
   permissionMode?: string;
+  // synthetic `usage` event (emitted by chat.rs after each turn / on a codex
+  // rate-limit push) — drives the composer's live usage bar.
+  provider?: string; // "claude" | "codex"
+  five_hour?: { pct?: number | null; resets_at?: number | null };
+  seven_day?: { pct?: number | null; resets_at?: number | null };
   // synthetic stderr
   text?: string;
   // control protocol (interrupts + permission/approval requests in non-bypass
@@ -193,8 +212,16 @@ export const CHAT_MODELS: ChatModel[] = [
   { id: "claude-opus-4-8", label: "opus 4.8", engine: "claude" },
   { id: "claude-sonnet-4-6", label: "sonnet 4.6", engine: "claude" },
   { id: "claude-haiku-4-5", label: "haiku 4.5", engine: "claude" },
-  // ChatGPT subscription via Codex — no API key, no per-token billing.
+  // ChatGPT-subscription models via Codex — no API key, no per-token billing.
+  // The whole gpt-5.x family Codex serves on the sub (verified each returns a
+  // turn over `codex exec -m <id>`): 5.5 (flagship), 5.4 + a fast mini, the
+  // 5.3 codex-tuned build, and 5.2. NOT gpt-4o/o3/image — those are raw-API
+  // only (need a key), so they're intentionally absent.
   { id: "gpt-5.5", label: "gpt-5.5 · codex", engine: "codex" },
+  { id: "gpt-5.4", label: "gpt-5.4 · codex", engine: "codex" },
+  { id: "gpt-5.4-mini", label: "gpt-5.4 mini · codex", engine: "codex" },
+  { id: "gpt-5.3-codex", label: "gpt-5.3 codex", engine: "codex" },
+  { id: "gpt-5.2", label: "gpt-5.2 · codex", engine: "codex" },
   // ONE free fallback for when the ChatGPT sub hits its rate window:
   // NVIDIA Nemotron (Llama-based, US) via opencode — best free non-Chinese
   // model in the catalog. Deliberately the only free entry; no model sprawl.
@@ -240,6 +267,16 @@ export async function chatStart(
 /** Sends one user turn into a live chat session. Reply streams over the Channel. */
 export async function chatSend(id: number, text: string): Promise<void> {
   return invoke("chat_send", { sessionId: id, text });
+}
+
+/**
+ * Steers the in-flight turn — injects a follow-up message WITHOUT interrupting
+ * the model (codex `turn/steer`; the model folds it into the running turn at its
+ * next step). Only codex supports true mid-turn steering; for other engines this
+ * REJECTS (caller should queue the message instead). Verified live vs codex 0.135.
+ */
+export async function chatSteer(id: number, text: string): Promise<void> {
+  return invoke("chat_steer", { sessionId: id, text });
 }
 
 /** Kills a chat session and frees its claude process. */

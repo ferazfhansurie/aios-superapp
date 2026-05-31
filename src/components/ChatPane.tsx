@@ -23,7 +23,7 @@
  *   8. `@` file-mention picker sourced from cwd
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Channel } from "@tauri-apps/api/core";
+import { Channel, convertFileSrc } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
   ArrowUp,
@@ -59,6 +59,7 @@ import {
   Square,
   Target,
   Terminal,
+  Waypoints,
   Wrench,
   X,
 } from "lucide-react";
@@ -68,6 +69,7 @@ import {
   chatDetach,
   chatReattach,
   chatSend,
+  chatSteer,
   chatSendRaw,
   chatSetTitle,
   chatStart,
@@ -85,14 +87,24 @@ import {
   type ChatTurnInfo,
 } from "../lib/chat";
 import { readDir, saveImageTemp, type DirEntry } from "../lib/fs";
+import { loadSettings, saveSettings } from "../lib/settings";
+import { idleRate, codexRate, resetIn } from "../lib/dashboard";
+import {
+  cycleQueueSelection,
+  queueMessage,
+  removeQueuedMessage,
+  resumeTitle,
+  usageStack,
+  type QueuedMessage,
+} from "../lib/chatPaneState";
 import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
-import { chatHandles, paneWriters, paneSubmitters } from "../lib/paneBus";
+import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, openFileInPane } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
 
 type Turn =
-  | { kind: "user"; id: string; text: string }
+  | { kind: "user"; id: string; text: string; steered?: boolean }
   | { kind: "assistant"; id: string; text: string; streaming: boolean }
   | {
       kind: "thinking";
@@ -503,12 +515,47 @@ export function ChatPane({
   // claude's init event arrived (session_id known) — gates the seed auto-send
   const [claudeReady, setClaudeReady] = useState(false);
 
-  // composer settings
-  const [model, setModel] = useState<ChatModel>(CHAT_MODELS[0]);
+  // composer settings — boot from the saved default (settings.chatModel).
+  // The model the user last picked in the composer IS their default; persisted
+  // so codex / opus / whatever sticks across panes + restarts.
+  const [model, setModel] = useState<ChatModel>(() => {
+    const saved = loadSettings().chatModel;
+    return CHAT_MODELS.find((m) => m.id === saved) ?? CHAT_MODELS[0];
+  });
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(EFFORTS[1]);
   // running context size (prompt tokens of the latest turn) → composer indicator
   const [ctxTokens, setCtxTokens] = useState<number | null>(null);
+
+  // ── live usage bar (Phase 1) ───────────────────────────────────────────────
+  // The active engine's 5h/7d rate-limit windows, ticked as you talk: codex
+  // pushes account/rateLimits/updated, claude re-reads usage.json after each turn
+  // (both arrive as synthetic `usage` events from chat.rs). Seeded once on mount.
+  type UsageWin = { pct: number | null; resetsAt: number | null };
+  type UsageSnapshot = { fiveHour: UsageWin; sevenDay: UsageWin };
+  type UsageWindow = keyof UsageSnapshot;
+  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>("fiveHour");
+  // Snapshot each provider the first time it appears in this chat. The strip
+  // paints that baseline separately from usage added while this pane is alive.
+  const usageBaselineRef = useRef<Record<string, UsageSnapshot>>({});
+  const rememberUsage = useCallback((provider: string, next: UsageSnapshot) => {
+    if (!usageBaselineRef.current[provider]) {
+      usageBaselineRef.current[provider] = next;
+    }
+    setUsage(next);
+  }, []);
+  // cumulative $ spent this chat session (summed across result events).
+  const [sessionCost, setSessionCost] = useState(0);
+
+  // ── message queue / steering (Phase 2) ─────────────────────────────────────
+  // Type-ahead while a turn is in flight: submitting queues the message instead
+  // of dropping it; queued messages fire one-by-one as each turn completes
+  // (codex-style). Held in a ref too so the flush effect reads the latest list.
+  const [queued, setQueued] = useState<QueuedMessage[]>([]);
+  const [queuedIdx, setQueuedIdx] = useState(0);
+  const queuedRef = useRef<QueuedMessage[]>([]);
+  queuedRef.current = queued;
 
   // mode chips
   const [planMode, setPlanMode] = useState(false);
@@ -555,6 +602,19 @@ export function ChatPane({
   const thinkingTurnId = useRef<string | null>(null);
   // last user prompt text actually sent to claude (for regenerate)
   const lastSentRef = useRef<string | null>(null);
+  // ── composer autocomplete (copilot-style) ──────────────────────────────────
+  // Past sent messages, newest first — the source for inline ghost completion.
+  // Persisted across sessions so the suggestions are useful from the first keypress.
+  const HISTORY_KEY = "aios.chat.history";
+  const historyRef = useRef<string[]>([]);
+  useEffect(() => {
+    try {
+      const h = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+      if (Array.isArray(h)) historyRef.current = h.filter((x) => typeof x === "string");
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   // ── chat-session recording (for the /resume list) ─────────────────────────
   // claude's own session id, parsed from the `system`/init event each (re)start.
@@ -563,6 +623,9 @@ export function ChatPane({
   // true once we've recorded this chat (on the first user send of the session),
   // so subsequent sends don't re-upsert. Reset on /clear and on resume.
   const recordedRef = useRef(false);
+  // Codex openers are often just "hi". Keep its title promotable until the
+  // first meaningful prompt lands, then leave the topic stable.
+  const codexTitleLockedRef = useRef(Boolean(resume));
   // true once the launcher seed has been auto-sent as the first turn, so it
   // fires exactly once and never re-fires on /clear or a session restart.
   const seedSentRef = useRef(false);
@@ -640,6 +703,29 @@ export function ChatPane({
       return prev.filter((im) => im.id !== id);
     });
   }, []);
+
+  // Attach an image that already lives on disk (an OS file drop from Finder /
+  // the desktop). Tauri's native drag-drop hands us a path, not a Blob, so we
+  // skip the saveImageTemp round-trip: the chip's thumbnail renders straight off
+  // the asset-protocol URL, and `path` is set immediately (already on disk).
+  const addImageByPath = useCallback((path: string) => {
+    const id = `img${++_imgSeq}`;
+    setImages((prev) => [...prev, { id, url: convertFileSrc(path), path }]);
+  }, []);
+
+  // Register this chat pane's IMAGE-drop sink so App's native OS drag-drop
+  // handler routes dropped image files here as thumbnail chips (instead of
+  // appending their raw paths as text via paneWriters). Non-image drops still
+  // fall through to the path-insert writer.
+  useEffect(() => {
+    if (!paneKey) return;
+    paneImageDrop.set(paneKey, (paths) => {
+      for (const p of paths) addImageByPath(p);
+    });
+    return () => {
+      paneImageDrop.delete(paneKey);
+    };
+  }, [paneKey, addImageByPath]);
   // paste an image off the clipboard → thumbnail chip (temp file saved in bg)
   const onPasteImage = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -655,6 +741,22 @@ export function ChatPane({
           }
         }
       }
+    },
+    [addImage],
+  );
+  // dropped files (a screenshot dragged from Finder / desktop) → attach any
+  // image as a thumbnail chip. Returns true if it consumed ≥1 image, so the
+  // drop zone skips inserting a bare path for those.
+  const onDropFiles = useCallback(
+    (files: FileList): boolean => {
+      let took = false;
+      for (const f of Array.from(files)) {
+        if (f.type.startsWith("image/")) {
+          void addImage(f, f.type);
+          took = true;
+        }
+      }
+      return took;
     },
     [addImage],
   );
@@ -940,6 +1042,7 @@ export function ChatPane({
         const dur = durationMs != null ? fmtDuration(durationMs) : "";
         const costNum =
           typeof ev.total_cost_usd === "number" ? ev.total_cost_usd : undefined;
+        if (costNum != null && costNum > 0) setSessionCost((c) => c + costNum);
         const cost = costNum != null ? `$${costNum.toFixed(4)}` : "";
         const tokens = tokensFromUsage(ev.usage);
         const tokStr =
@@ -980,6 +1083,29 @@ export function ChatPane({
         return;
       }
 
+      // live usage tick (synthetic, from chat.rs) → move the composer's usage bar
+      case "usage": {
+        // Codex's app-server push can describe a model-specific CLI bucket. The
+        // desktop usage panel uses /backend-api/wham/usage, so re-read that exact
+        // account source instead of letting the push overwrite the visible meter.
+        if ((ev.provider ?? "claude") === "codex") {
+          void codexRate().then((r) => {
+            rememberUsage("codex", {
+              fiveHour: r.fiveHour,
+              sevenDay: r.sevenDay,
+            });
+          });
+          return;
+        }
+        const fh = ev.five_hour ?? {};
+        const sd = ev.seven_day ?? {};
+        rememberUsage(ev.provider ?? "claude", {
+          fiveHour: { pct: fh.pct ?? null, resetsAt: fh.resets_at ?? null },
+          sevenDay: { pct: sd.pct ?? null, resetsAt: sd.resets_at ?? null },
+        });
+        return;
+      }
+
       // system init: not rendered, but carries claude's session_id — capture it
       // so the first user send can recordChatSession() into the /resume list.
       case "system": {
@@ -992,7 +1118,7 @@ export function ChatPane({
       default:
         return;
     }
-  }, []);
+  }, [rememberUsage]);
 
   // ── session lifecycle: one channel + one session per mount ─────────────────
   // `restartKey` lets `/clear` tear down + re-spin the session without changing
@@ -1080,35 +1206,92 @@ export function ChatPane({
     };
   }, [paneKey]);
 
-  // autoscroll on new content — but ONLY while pinned to the bottom. If you've
-  // scrolled up to read backlog mid-stream, we stop yanking you down and show a
-  // "jump to latest" pill instead (daily-driver staple).
-  const atBottomRef = useRef(true);
+  // Seed the usage bar once on mount (and on engine switch) so it shows BEFORE
+  // the first turn ticks it — claude reads usage.json, codex reads logs_2.sqlite.
+  // After this, live `usage` events keep it moving as you talk.
+  useEffect(() => {
+    let alive = true;
+    const fn = model.engine === "codex" ? codexRate : idleRate;
+    fn()
+      .then((r) => {
+        if (alive && (r.fiveHour.pct != null || r.sevenDay.pct != null)) {
+          rememberUsage(model.engine ?? "claude", {
+            fiveHour: r.fiveHour,
+            sevenDay: r.sevenDay,
+          });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [model.engine, rememberUsage]);
+
+  // Queue flush: when a turn finishes (streaming → false) and messages are
+  // queued, fire the next one. dispatch via a ref so this effect isn't a dep of
+  // the (changing) dispatch closure. One per turn → the queue drains in order.
+  const dispatchRef = useRef<(text: string) => void>(() => {});
+  useEffect(() => {
+    if (streaming) return;
+    if (queuedRef.current.length === 0) return;
+    if (sessionIdRef.current == null) return;
+    const [next, ...rest] = queuedRef.current;
+    setQueued(rest);
+    setQueuedIdx((idx) => (rest.length === 0 ? 0 : Math.min(idx, rest.length - 1)));
+    dispatchRef.current(next.text);
+  }, [streaming]);
+
+  // autoscroll on new content — but with a STICKY pause. The moment you scroll
+  // up (wheel, scrollbar, touch) we stop yanking you down and hold there until
+  // you ride back to the very bottom OR tap the "jump to latest" pill. Sticky is
+  // the fix for the old behavior: a small up-scroll fell back inside the bottom
+  // threshold and the next token re-pinned, so it felt like it ignored you.
+  const pausedRef = useRef(false);
+  // set just before we programmatically pin, so the scroll event our own pin
+  // fires isn't misread as the user moving the viewport.
+  const programmaticRef = useRef(false);
   const [showJump, setShowJump] = useState(false);
+  const setPaused = useCallback((p: boolean) => {
+    pausedRef.current = p;
+    setShowJump(p);
+  }, []);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
+    if (el && !pausedRef.current) {
+      programmaticRef.current = true;
+      el.scrollTop = el.scrollHeight;
+    }
   }, [turns]);
-  // track whether the viewport is near the bottom; drives autoscroll + the pill.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const onScroll = () => {
+      // swallow the one scroll event our own pin just emitted
+      if (programmaticRef.current) {
+        programmaticRef.current = false;
+        return;
+      }
       const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
-      const bottom = dist < 80;
-      atBottomRef.current = bottom;
-      setShowJump(!bottom);
+      if (dist < 8) setPaused(false); // rode back to the bottom → resume autoscroll
+      else setPaused(true); // moved away from the bottom → pause (sticky)
+    };
+    // scrolling up = user taking the wheel → pause immediately, even before the
+    // distance math catches up (mid-stream the content keeps growing below).
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) setPaused(true);
     };
     el.addEventListener("scroll", onScroll, { passive: true });
-    onScroll();
-    return () => el.removeEventListener("scroll", onScroll);
-  }, []);
+    el.addEventListener("wheel", onWheel, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("wheel", onWheel);
+    };
+  }, [setPaused]);
   const jumpToLatest = useCallback(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-    atBottomRef.current = true;
-    setShowJump(false);
-  }, []);
+    setPaused(false);
+  }, [setPaused]);
 
   // autosize textarea
   useEffect(() => {
@@ -1161,6 +1344,16 @@ export function ChatPane({
       if (planMode) wire = PLAN_PREFIX + wire;
       if (effort.ultra) wire = ULTRA_PREFIX + wire;
       lastSentRef.current = display;
+      // feed the autocomplete history (dedup, newest first, capped).
+      if (display.trim()) {
+        try {
+          const h = [display, ...historyRef.current.filter((x) => x !== display)].slice(0, 200);
+          historyRef.current = h;
+          localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+        } catch {
+          /* ignore */
+        }
+      }
       if (!opts?.skipUserBubble) {
         setTurns((prev) => [...prev, { kind: "user", id: uid(), text: display }]);
       }
@@ -1184,6 +1377,46 @@ export function ChatPane({
     },
     [goal, planMode, effort.ultra],
   );
+  // keep the flush effect calling the latest dispatch closure
+  dispatchRef.current = dispatch;
+
+  // Queue a message instead of sending it (used while a turn is streaming). It
+  // fires automatically when the current turn completes (see the flush effect).
+  const enqueue = useCallback((raw: string) => {
+    setQueued((items) => {
+      const next = queueMessage(items, raw);
+      setQueuedIdx(next.selected);
+      return next.items;
+    });
+    setInput("");
+    setOverlay(null);
+  }, []);
+
+  const removeQueued = useCallback((id: string) => {
+    setQueued((items) => {
+      const next = removeQueuedMessage({ items, selected: queuedIdx }, id);
+      setQueuedIdx(next.selected);
+      return next.items;
+    });
+  }, [queuedIdx]);
+
+  // Explicitly inject one highlighted pending message into a live codex turn.
+  // If the backend cannot steer yet, leave it queued so normal auto-send wins.
+  const steerQueued = useCallback(
+    (queuedId: string) => {
+      const item = queuedRef.current.find((q) => q.id === queuedId);
+      if (!item || model.engine !== "codex") return;
+      const id = sessionIdRef.current;
+      if (id == null) return;
+      chatSteer(id, item.text)
+        .then(() => {
+          removeQueued(queuedId);
+          setTurns((prev) => [...prev, { kind: "user", id: uid(), text: item.text, steered: true }]);
+        })
+        .catch(() => {}); // no active turn yet → keep queued for automatic send
+    },
+    [model.engine, removeQueued],
+  );
 
   // Send an explicit string (used by send() with the composer text, and by the
   // external "send to AI" submitter which passes the note body directly so it
@@ -1198,21 +1431,26 @@ export function ChatPane({
         .map((im) => quotePath(im.path as string));
       if ((!text && imgPaths.length === 0) || streaming || sessionIdRef.current == null)
         return;
-      // Record this chat into the /resume list on its FIRST user send, titled by
-      // that first message. claude's session_id (from the init event) is the key
-      // used later to resume + repaint. Fire-and-forget; never blocks the send.
-      if (!recordedRef.current) {
-        const sid = claudeSessionIdRef.current;
-        if (sid) {
-          recordedRef.current = true;
-          const title = text.length > 120 ? text.slice(0, 120) : text;
-          recordChatSession(sid, title, cwd ?? null).catch(() => {
-            // failed to persist → allow a later send to retry
-            recordedRef.current = false;
-          });
-          // Label the backend session for the background tray + done-notification.
-          if (sessionIdRef.current != null) chatSetTitle(sessionIdRef.current, title).catch(() => {});
-        }
+      // Claude keeps its original first-message labels. Codex starts with a
+      // provisional label for low-signal openers, then promotes the first real
+      // request into a compact stable topic.
+      const engine = model.engine ?? "claude";
+      const suggested = resumeTitle(text, engine);
+      const firstRecord = !recordedRef.current;
+      const promoteCodex =
+        engine === "codex" && !codexTitleLockedRef.current && suggested.meaningful;
+      const sid = claudeSessionIdRef.current;
+      if (sid && (firstRecord || promoteCodex)) {
+        if (firstRecord) recordedRef.current = true;
+        if (promoteCodex) codexTitleLockedRef.current = true;
+        recordChatSession(sid, suggested.title, cwd ?? null, engine, model.id).catch(() => {
+          // failed to persist → allow a later send to retry
+          if (firstRecord) recordedRef.current = false;
+          if (promoteCodex) codexTitleLockedRef.current = false;
+        });
+        // Label the backend session for the background tray + done-notification.
+        if (sessionIdRef.current != null)
+          chatSetTitle(sessionIdRef.current, suggested.title).catch(() => {});
       }
       setInput("");
       setImages((prev) => {
@@ -1226,7 +1464,7 @@ export function ChatPane({
         : text;
       dispatch(full);
     },
-    [streaming, dispatch, cwd, images],
+    [streaming, dispatch, cwd, images, model],
   );
 
   const send = useCallback(() => sendText(input), [sendText, input]);
@@ -1277,12 +1515,17 @@ export function ChatPane({
     setLiveStart(null);
     setInput("");
     setOverlay(null);
+    setQueued([]);
+    setQueuedIdx(0);
+    setSessionCost(0);
+    usageBaselineRef.current = {};
     setResumeId(null);
     setResumedTitle(null);
     // fresh chat → forget the prior session id + recording flag so the next
     // first-send records a brand-new /resume entry (not the old one).
     claudeSessionIdRef.current = null;
     recordedRef.current = false;
+    codexTitleLockedRef.current = false;
     setRestartKey((k) => k + 1);
   }, []);
 
@@ -1331,6 +1574,11 @@ export function ChatPane({
       setResumeQuery("");
       claudeSessionIdRef.current = session.id;
       recordedRef.current = true;
+      codexTitleLockedRef.current = true;
+      const resumeModel =
+        CHAT_MODELS.find((m) => session.model && m.id === session.model) ??
+        CHAT_MODELS.find((m) => (m.engine ?? "claude") === (session.engine || "claude"));
+      if (resumeModel) setModel(resumeModel);
       setResumeId(session.id);
       setResumedTitle(session.title);
       // show the past conversation immediately while claude re-spins. Paint a
@@ -1608,6 +1856,33 @@ export function ChatPane({
         }
       }
     }
+    // Pending steer list behaves like the slash menu: arrows choose a queued
+    // follow-up, then Enter injects the highlighted row into a live codex turn.
+    if (streaming && input.trim() === "" && queued.length > 0) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        setQueuedIdx((idx) =>
+          cycleQueueSelection(idx, queued.length, e.key === "ArrowDown" ? 1 : -1),
+        );
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const item = queued[queuedIdx] ?? queued[0];
+        if (item) steerQueued(item.id);
+        return;
+      }
+    }
+    // copilot-style ghost accept: Tab, or → when the caret is at the very end.
+    if (!overlay && ghostRef.current) {
+      const ta = taRef.current;
+      const atEnd = ta != null && ta.selectionStart === input.length && ta.selectionStart === ta.selectionEnd;
+      if (e.key === "Tab" || (e.key === "ArrowRight" && atEnd)) {
+        e.preventDefault();
+        acceptGhost();
+        return;
+      }
+    }
     // ↑ on an EMPTY composer recalls the last sent message for quick edit/resend
     // (TUI staple). Empty-only so it never fights normal cursor movement.
     if (
@@ -1630,7 +1905,10 @@ export function ChatPane({
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      send();
+      // mid-turn Enter #1 queues. A second Enter on the highlighted list row
+      // explicitly steers it into codex; untouched rows auto-send on completion.
+      if (streaming) enqueue(input);
+      else send();
     }
   };
 
@@ -1638,6 +1916,23 @@ export function ChatPane({
     (input.trim().length > 0 || images.some((im) => im.path)) &&
     !streaming &&
     started;
+
+  // copilot-style ghost: the remainder of the most recent past message that
+  // prefixes what's typed. Suppressed while an overlay (slash/@/resume) or voice
+  // is active, or on a multi-line draft. Recomputed each keystroke (input dep).
+  const ghost = useMemo(() => {
+    if (!input || overlay || recording || input.includes("\n")) return "";
+    const lc = input.toLowerCase();
+    const hit = historyRef.current.find(
+      (e) => e.length > input.length && e.toLowerCase().startsWith(lc),
+    );
+    return hit ? hit.slice(input.length) : "";
+  }, [input, overlay, recording]);
+  const ghostRef = useRef("");
+  ghostRef.current = ghost;
+  const acceptGhost = useCallback(() => {
+    if (ghostRef.current) setInput((v) => v + ghostRef.current);
+  }, []);
 
   // ── composer (shared between empty hero + docked) ──────────────────────────
 
@@ -1812,17 +2107,40 @@ export function ChatPane({
               </button>
             </div>
           ) : (
-            <textarea
-              ref={taRef}
-              value={input}
-              onChange={(e) => onChangeInput(e.target.value)}
-              onKeyDown={onKeyDown}
-              onPaste={onPasteImage}
-              rows={1}
-              placeholder={planMode ? "describe the task to plan…" : "do anything"}
-              spellCheck={false}
-              className="block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
-            />
+            <div className="relative">
+              {/* copilot-style ghost suggestion: a mirror layer behind the
+                  textarea reserves the typed text (transparent) then renders the
+                  remaining suggestion dimmed, so it lines up exactly after the
+                  caret. Tab / → accepts. Same box model as the textarea. */}
+              {ghost && (
+                <div
+                  aria-hidden
+                  className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-transparent"
+                >
+                  {input}
+                  <span className="text-[var(--color-faint)]">{ghost}</span>
+                </div>
+              )}
+              <textarea
+                ref={taRef}
+                value={input}
+                onChange={(e) => onChangeInput(e.target.value)}
+                onKeyDown={onKeyDown}
+                onPaste={onPasteImage}
+                rows={1}
+                placeholder={
+                  streaming
+                    ? model.engine === "codex"
+                      ? "steer the model… (won't interrupt)"
+                      : "queue a follow-up…"
+                    : planMode
+                      ? "describe the task to plan…"
+                      : "do anything"
+                }
+                spellCheck={false}
+                className="relative block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
+              />
+            </div>
           )}
           <div className="flex flex-wrap items-center gap-1.5 px-3 pb-3 pt-1">
             {/* permission chip */}
@@ -1936,6 +2254,12 @@ export function ChatPane({
                   onClick={() => {
                     if (m.disabled) return;
                     setModel(m);
+                    // picking a model sets it as the global default (sticks
+                    // across panes + restarts). engine omitted = claude.
+                    saveSettings({
+                      chatModel: m.id,
+                      chatProvider: `${m.engine ?? "claude"}-cli`,
+                    });
                     setOpenMenu(null);
                   }}
                 >
@@ -1980,6 +2304,19 @@ export function ChatPane({
               </button>
             ) : null}
 
+            {/* First action while streaming queues the draft. The pending list
+                above the composer owns explicit steer injection. */}
+            {streaming && input.trim() && (
+              <button
+                type="button"
+                onClick={() => enqueue(input)}
+                className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-panel-2)] px-3 text-[12px] font-medium text-[var(--color-text-2)] transition-all hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+                title="queue follow-up"
+              >
+                <Waypoints size={14} />
+                queue
+              </button>
+            )}
             {/* send / stop */}
             {streaming ? (
               <button
@@ -2010,6 +2347,7 @@ export function ChatPane({
     // (images: chip row + attach-button state)
     [
       input,
+      ghost,
       openMenu,
       permission,
       effort,
@@ -2022,6 +2360,10 @@ export function ChatPane({
       canSend,
       send,
       stop,
+      enqueue,
+      queued,
+      queuedIdx,
+      steerQueued,
       planMode,
       goal,
       overlay,
@@ -2107,7 +2449,7 @@ export function ChatPane({
 
   if (empty) {
     return (
-      <PaneDropZone onPath={insertPath} label="drop to add to message">
+      <PaneDropZone onPath={insertPath} onFiles={onDropFiles} label="drop image or path">
       <div className="flex h-full min-h-0 w-full flex-col items-center justify-center bg-[var(--color-bg)] px-6">
         <div className="w-full max-w-2xl">
           <h1 className="mb-7 text-center font-sans text-3xl font-medium tracking-tight text-[var(--color-text)]">
@@ -2232,11 +2574,131 @@ export function ChatPane({
               })()}
             </div>
           )}
+          {/* Pending steer list: first Enter queues, arrows highlight, second
+              Enter injects on codex. Untouched rows auto-send after completion. */}
+          {queued.length > 0 && (
+            <div className="mb-2 overflow-hidden rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] shadow-xl shadow-black/20">
+              {queued.map((q, i) => (
+                <div
+                  key={q.id}
+                  onMouseEnter={() => setQueuedIdx(i)}
+                  className={`flex items-center gap-2 px-3 py-2 font-sans text-[12px] text-[var(--color-text-2)] ${
+                    i === queuedIdx ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
+                  }`}
+                >
+                  <Clock size={12} className="shrink-0 text-[var(--color-faint)]" />
+                  <span className="min-w-0 flex-1 truncate">{q.text}</span>
+                  <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">queued</span>
+                  {model.engine === "codex" && streaming && (
+                    <button
+                      type="button"
+                      onClick={() => steerQueued(q.id)}
+                      className="shrink-0 rounded-md px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-panel)]"
+                      title="inject into current turn"
+                    >
+                      steer
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => removeQueued(q.id)}
+                    className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                    title="cancel"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <UsageStrip
+            usage={usage}
+            baseline={usageBaselineRef.current[model.engine ?? "claude"] ?? null}
+            window={usageWindow}
+            onWindowChange={setUsageWindow}
+            cost={sessionCost}
+            engine={model.engine ?? "claude"}
+          />
           {composer}
         </div>
       </div>
     </div>
     </PaneDropZone>
+  );
+}
+
+/**
+ * The live usage strip under the composer: the active engine's 5h rate-limit
+ * window as a thin bar (color-coded), the 7d window + reset as faint text, and
+ * cumulative session cost. Ticks AS YOU TALK — codex pushes rate-limit updates,
+ * claude re-reads usage.json after each turn (both arrive as `usage` events).
+ */
+function UsageStrip({
+  usage,
+  baseline,
+  window,
+  onWindowChange,
+  cost,
+  engine,
+}: {
+  usage: { fiveHour: { pct: number | null; resetsAt: number | null }; sevenDay: { pct: number | null; resetsAt: number | null } } | null;
+  baseline: { fiveHour: { pct: number | null; resetsAt: number | null }; sevenDay: { pct: number | null; resetsAt: number | null } } | null;
+  window: "fiveHour" | "sevenDay";
+  onWindowChange: (window: "fiveHour" | "sevenDay") => void;
+  cost: number;
+  engine: string;
+}) {
+  const current = usage?.[window].pct ?? null;
+  const initial = baseline?.[window].pct ?? current;
+  // nothing to show yet (e.g. codex before its first rate-limit push) → hide.
+  if (current == null && cost <= 0) return null;
+  const stack = current != null && initial != null ? usageStack(current, initial) : null;
+  const reset = usage?.[window].resetsAt ? resetIn(usage[window].resetsAt) : "";
+  const remaining = stack ? 100 - stack.total : null;
+  return (
+    <div className="mb-2 flex items-center gap-2.5 px-1 font-mono text-[10px] tabular-nums text-[var(--color-faint)]">
+      <span className="shrink-0 lowercase tracking-wide text-[var(--color-muted)]">{engine}</span>
+      <span className="flex shrink-0 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]">
+        {(["fiveHour", "sevenDay"] as const).map((id) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => onWindowChange(id)}
+            className={`px-1.5 py-0.5 transition-colors ${
+              window === id
+                ? "bg-[var(--color-panel-2)] text-[var(--color-text-2)]"
+                : "text-[var(--color-faint)] hover:text-[var(--color-muted)]"
+            }`}
+          >
+            {id === "fiveHour" ? "5h" : "7d"}
+          </button>
+        ))}
+      </span>
+      {stack ? (
+        <>
+          <span className="flex-1">
+            <span className="flex h-1 w-full overflow-hidden rounded-full bg-[var(--color-panel-2)]">
+              <span
+                className="block h-full bg-[var(--color-muted)] transition-[width] duration-700"
+                style={{ width: `${stack.baseline}%` }}
+              />
+              <span
+                className="block h-full bg-[var(--color-accent)] transition-[width] duration-700"
+                style={{ width: `${stack.session}%` }}
+              />
+            </span>
+          </span>
+          <span className="shrink-0 text-[var(--color-text-2)]">
+            {engine === "codex" ? `${Math.round(remaining!)}% left` : `${Math.round(stack.total)}% total`}
+          </span>
+          <span className="shrink-0 text-[var(--color-accent)]">+{Math.round(stack.session)}% chat</span>
+          {reset && <span className="shrink-0">resets {reset}</span>}
+        </>
+      ) : (
+        <span className="flex-1" />
+      )}
+      {cost > 0 && <span className="shrink-0 text-[var(--color-text-2)]">${cost.toFixed(2)}</span>}
+    </div>
   );
 }
 
@@ -2563,7 +3025,8 @@ function TodoList({ todos }: { todos: Array<Record<string, unknown>> }) {
 }
 
 /** Clean artifact card for a file a turn produced (Codex "Open in…"). Click →
- *  open externally via the OS. Icon keyed by file type. */
+ *  open as an in-app viewer pane (image/pdf/text preview); falls back to the OS
+ *  app only if no pane opener is wired. Icon keyed by file type. */
 function FileCard({ artifact }: { artifact: Artifact }) {
   const Icon =
     artifact.kind === "img"
@@ -2578,6 +3041,8 @@ function FileCard({ artifact }: { artifact: Artifact }) {
   const [err, setErr] = useState<string | null>(null);
   const open = () => {
     setErr(null);
+    // prefer an in-app viewer pane; only hand off to the OS if none is wired.
+    if (openFileInPane(artifact.path, artifact.name)) return;
     openPath(artifact.path).catch((e) => {
       setErr(String(e));
       console.error("openPath failed:", artifact.path, e);
@@ -2685,6 +3150,11 @@ function UserBubble({
 }) {
   return (
     <div className="group flex flex-col items-end gap-1">
+      {turn.steered && (
+        <span className="flex items-center gap-1 pr-1 font-mono text-[10px] text-[var(--color-faint)]">
+          <Waypoints size={10} /> steered into the running turn
+        </span>
+      )}
       <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-[var(--color-accent-soft)] px-4 py-2.5 font-sans text-[14px] leading-relaxed text-[var(--color-text)]">
         {turn.text}
       </div>

@@ -146,6 +146,48 @@ export async function idleRate(): Promise<IdleRate> {
   }
 }
 
+/**
+ * Live Codex (ChatGPT-sub) usage, parsed from `~/.codex/logs_2.sqlite` by the
+ * `codex_usage` Rust command. Codex's `primary` window = 5h, `secondary` = 7d,
+ * mirroring Claude — so the sidebar renders both with the same component.
+ * Returns the empty shape when Codex hasn't logged a rate-limit event yet (the
+ * `codex exec` path the chat pane uses logs null; the desktop app/TUI populate
+ * it). `plan` is the ChatGPT plan tier (e.g. "plus") when known.
+ */
+export interface CodexRate {
+  fiveHour: RateWindow;
+  sevenDay: RateWindow;
+  plan: string | null;
+}
+export async function codexRate(): Promise<CodexRate> {
+  const empty: CodexRate = {
+    fiveHour: { pct: null, resetsAt: null },
+    sevenDay: { pct: null, resetsAt: null },
+    plan: null,
+  };
+  try {
+    const u = await invoke<{
+      five_hour?: { pct?: number | null; resets_at?: number | null };
+      seven_day?: { pct?: number | null; resets_at?: number | null };
+      plan?: string | null;
+    } | null>("codex_usage");
+    if (!u) return empty;
+    return {
+      fiveHour: {
+        pct: u.five_hour?.pct ?? null,
+        resetsAt: u.five_hour?.resets_at ?? null,
+      },
+      sevenDay: {
+        pct: u.seven_day?.pct ?? null,
+        resetsAt: u.seven_day?.resets_at ?? null,
+      },
+      plan: u.plan ?? null,
+    };
+  } catch {
+    return empty;
+  }
+}
+
 /** "58m" / "6d 22h" / "now" from a unix-seconds reset timestamp. */
 export function resetIn(ts: number | null): string {
   if (!ts) return "";

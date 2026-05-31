@@ -686,6 +686,31 @@ export function TerminalComposer({
   // ── keyboard ───────────────────────────────────────────────────────────────
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // ── TUI driver (P0) ────────────────────────────────────────────────────
+    // When the box is EMPTY and no overlay is open, route navigation keys
+    // straight to the PTY so you can drive a TUI (claude code's model picker, a
+    // menu, vim, less, fzf …) from the composer instead of having to click into
+    // the terminal. Arrows → CSI sequences, Enter → CR, Tab → HT, Esc handled
+    // below. The moment there's text in the box, this yields to normal editing +
+    // history recall, so composing a message is never hijacked.
+    if (!overlay && value.length === 0 && onRaw) {
+      const seq: Record<string, string> = {
+        ArrowUp: "\x1b[A",
+        ArrowDown: "\x1b[B",
+        ArrowRight: "\x1b[C",
+        ArrowLeft: "\x1b[D",
+        Tab: "\t",
+        Enter: "\r",
+      };
+      const bytes = seq[e.key];
+      // don't steal modified combos (⌘/⌥/^) or Shift+Enter (newline in box).
+      if (bytes && !e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey) {
+        e.preventDefault();
+        onRaw(bytes);
+        return;
+      }
+    }
+
     // overlay navigation takes priority (slash + @ menus).
     if (overlay) {
       const list = overlay === "slash" ? slashFiltered : mentionFiltered;

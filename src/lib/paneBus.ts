@@ -22,6 +22,38 @@ export interface ChatHandle {
 /** Live ChatPanes keyed by pane key — lets App intercept close on a busy chat. */
 export const chatHandles = new Map<string, ChatHandle>();
 
+/** Image-drop sink a pane registers (keyed by pane key). When an OS file drop
+ *  (Finder/desktop screenshot) lands on a pane, App routes IMAGE paths here so
+ *  they become proper attachments (chat → thumbnail chips; terminal → quoted
+ *  path) instead of raw text. Falls back to paneWriters when a pane registers no
+ *  image sink. Each path is absolute on disk; the sink reads + attaches it. */
+export const paneImageDrop = new Map<string, (paths: string[]) => void>();
+
+// ── open-file-in-pane channel ────────────────────────────────────────────────
+// App owns pane creation; deep children (e.g. a chat artifact card) need to open
+// a file as an in-app viewer pane rather than handing it to the OS. App registers
+// its opener once; callers use openFileInPane and fall back to the OS only if
+// nothing is registered.
+let openFileImpl: ((path: string, name: string) => void) | null = null;
+
+/** App registers how to open a file as an in-app pane. Returns an unregister fn. */
+export function registerOpenFile(
+  fn: (path: string, name: string) => void,
+): () => void {
+  openFileImpl = fn;
+  return () => {
+    if (openFileImpl === fn) openFileImpl = null;
+  };
+}
+
+/** Open a file in an in-app viewer pane. Returns false if no opener is wired
+ *  (caller should then fall back to the OS). */
+export function openFileInPane(path: string, name: string): boolean {
+  if (!openFileImpl) return false;
+  openFileImpl(path, name);
+  return true;
+}
+
 // ── cross-pane drag signal ───────────────────────────────────────────────────
 // When an item carrying our `application/x-aios-path` payload is dragged
 // anywhere in the app, every pane's drop overlay should light up so the drop is

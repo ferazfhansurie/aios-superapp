@@ -6,7 +6,8 @@
 //!
 //! Requires the tauri `unstable` feature (child webviews via `Window::add_child`).
 
-use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl};
 
 /// Present as desktop **Safari**, NOT Chrome. We're a WKWebView — Safari's own
 /// engine — so a Safari UA is the honest, consistent fingerprint and Google
@@ -21,6 +22,19 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 
 fn parse(url: &str) -> Result<Url, String> {
     Url::parse(url).map_err(|e| format!("bad url: {e}"))
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct BrowserNewPane {
+    url: String,
+    profile: Option<String>,
+}
+
+fn browser_new_pane(url: &Url, profile: &Option<String>) -> BrowserNewPane {
+    BrowserNewPane {
+        url: url.to_string(),
+        profile: profile.clone(),
+    }
 }
 
 /// Derive a stable 16-byte WKWebsiteDataStore identifier from a profile name.
@@ -65,8 +79,15 @@ pub fn browser_show(
     }
     let parsed = parse(&url)?;
     let window = app.get_window("main").ok_or("no main window")?;
+    let popup_app = app.clone();
+    let popup_profile = profile.clone();
     let mut builder =
-        tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed)).user_agent(UA);
+        tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+            .user_agent(UA)
+            .on_new_window(move |url, _features| {
+                let _ = popup_app.emit("browser-new-pane", browser_new_pane(&url, &popup_profile));
+                tauri::webview::NewWindowResponse::Deny
+            });
     // A named profile gets its own persistent cookie partition so multiple
     // accounts (personal / noobx29 / fathopes work) stay logged in at once.
     // The unnamed/"default" profile keeps the shared default store (preserves
@@ -511,4 +532,21 @@ pub fn read_clipboard() -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_browser_pane_keeps_the_source_profile() {
+        let url = Url::parse("https://example.com/path").unwrap();
+        assert_eq!(
+            browser_new_pane(&url, &Some("work".into())),
+            BrowserNewPane {
+                url: "https://example.com/path".into(),
+                profile: Some("work".into()),
+            }
+        );
+    }
 }
