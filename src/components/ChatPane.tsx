@@ -285,8 +285,8 @@ function toolTarget(turn: ToolTurn): { label: string; full: string } {
   if (path) return { label: ellipsizeMid(baseName(path)), full: path };
 
   // shell → the command (first line)
-  if (name === "bash" || name === "bashoutput") {
-    const cmd = str("command") ?? "";
+  if (name === "bash" || name === "bashoutput" || name === "exec_command" || name === "write_stdin") {
+    const cmd = str("command") ?? str("cmd") ?? str("chars") ?? "";
     const firstLine = cmd.split("\n")[0] ?? cmd;
     return { label: ellipsizeMid(firstLine, 60), full: cmd };
   }
@@ -333,8 +333,10 @@ function toolVerb(name: string): string {
     case "notebookedit":
       return "Edited";
     case "bash":
+    case "exec_command":
       return "Ran";
     case "bashoutput":
+    case "write_stdin":
       return "Output";
     case "grep":
     case "search":
@@ -348,6 +350,9 @@ function toolVerb(name: string): string {
       return "Web search";
     case "task":
       return "Agent";
+    case "mcp":
+    case "mcp_tool_call":
+      return "MCP";
     case "todowrite":
       return "Planned";
     default:
@@ -368,6 +373,8 @@ function toolIcon(name: string) {
       return Pencil;
     case "bash":
     case "bashoutput":
+    case "exec_command":
+    case "write_stdin":
       return Terminal;
     case "grep":
     case "glob":
@@ -377,6 +384,9 @@ function toolIcon(name: string) {
     case "webfetch_tool":
     case "websearch":
       return Globe;
+    case "mcp":
+    case "mcp_tool_call":
+      return Wrench;
     default:
       return Wrench;
   }
@@ -2864,8 +2874,8 @@ function toolDetail(turn: ToolTurn): React.ReactNode {
   const str = (k: string) =>
     typeof inp[k] === "string" ? (inp[k] as string) : undefined;
 
-  if (name === "bash" || name === "bashoutput") {
-    const cmd = str("command");
+  if (name === "bash" || name === "bashoutput" || name === "exec_command" || name === "write_stdin") {
+    const cmd = str("command") ?? str("cmd") ?? str("chars");
     if (!cmd) return null;
     return (
       <pre className="overflow-auto whitespace-pre-wrap break-words rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--color-text-2)]">

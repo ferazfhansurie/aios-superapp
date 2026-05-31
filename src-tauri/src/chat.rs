@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::thread;
 
 use parking_lot::Mutex;
-use serde_json::json;
+use serde_json::{json, Value};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 
@@ -1174,6 +1174,14 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                         *sess.answer_item.lock() = Some(id.to_string());
                     }
                 }
+                if codex_is_action_item(item) {
+                    let id = codex_item_id(item);
+                    out.push(assistant_tool_use_line(
+                        &id,
+                        &codex_tool_name(item),
+                        codex_tool_input(item),
+                    ));
+                }
             }
         }
         "item/completed" => {
@@ -1213,7 +1221,15 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                             out.push(assistant_thinking_line(&joined));
                         }
                     }
-                    _ => {} // command/file/mcp/webSearch — not surfaced in v1
+                    _ if codex_is_action_item(item) => {
+                        let id = codex_item_id(item);
+                        out.push(user_tool_result_line(
+                            &id,
+                            &codex_tool_result_text(item),
+                            codex_item_is_error(item),
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1332,6 +1348,136 @@ fn assistant_thinking_line(text: &str) -> String {
     )
 }
 
+fn assistant_tool_use_line(id: &str, name: &str, input: Value) -> String {
+    json!({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }]
+        }
+    })
+    .to_string()
+}
+
+fn user_tool_result_line(id: &str, content: &str, is_error: bool) -> String {
+    json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": content,
+                "is_error": is_error,
+            }]
+        }
+    })
+    .to_string()
+}
+
+fn codex_item_id(item: &Value) -> String {
+    item.get("id")
+        .and_then(|x| x.as_str())
+        .or_else(|| item.get("call_id").and_then(|x| x.as_str()))
+        .or_else(|| item.get("callId").and_then(|x| x.as_str()))
+        .unwrap_or("codex-action")
+        .to_string()
+}
+
+fn codex_item_type(item: &Value) -> &str {
+    item.get("type").and_then(|x| x.as_str()).unwrap_or("")
+}
+
+fn codex_is_action_item(item: &Value) -> bool {
+    !matches!(
+        codex_item_type(item),
+        "" | "agentMessage" | "agent_message" | "reasoning"
+    )
+}
+
+fn codex_tool_name(item: &Value) -> String {
+    if let Some(name) = item.get("name").and_then(|x| x.as_str()) {
+        return name.to_string();
+    }
+    match codex_item_type(item) {
+        "commandExecution" | "command_execution" | "exec" | "command" => "bash",
+        "fileChange" | "file_change" | "patch" | "apply_patch" => "edit",
+        "webSearch" | "web_search" => "websearch",
+        "mcpToolCall" | "mcp_tool_call" => "mcp",
+        other if !other.is_empty() => other,
+        _ => "codex_action",
+    }
+    .to_string()
+}
+
+fn codex_tool_input(item: &Value) -> Value {
+    if let Some(args) = item.get("arguments").or_else(|| item.get("args")) {
+        if let Some(s) = args.as_str() {
+            return serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({ "arguments": s }));
+        }
+        return args.clone();
+    }
+    let mut out = serde_json::Map::new();
+    for key in [
+        "command",
+        "cmd",
+        "cwd",
+        "path",
+        "file",
+        "query",
+        "url",
+        "server",
+        "tool",
+        "status",
+        "description",
+    ] {
+        if let Some(v) = item.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    if out.is_empty() {
+        item.clone()
+    } else {
+        Value::Object(out)
+    }
+}
+
+fn codex_tool_result_text(item: &Value) -> String {
+    for key in ["output", "result", "content", "text", "error", "message"] {
+        if let Some(v) = item.get(key) {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+            if !v.is_null() {
+                return v.to_string();
+            }
+        }
+    }
+    item.get("status")
+        .and_then(|x| x.as_str())
+        .unwrap_or("completed")
+        .to_string()
+}
+
+fn codex_item_is_error(item: &Value) -> bool {
+    item.get("is_error")
+        .or_else(|| item.get("isError"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or_else(|| {
+            item.get("status")
+                .and_then(|x| x.as_str())
+                .map(|s| matches!(s, "failed" | "error" | "cancelled"))
+                .unwrap_or(false)
+        })
+}
+
 /// Maps Codex `exec --json` JSONL → claude-shaped event lines.
 /// `thread.started{thread_id}` → capture resume id + real `system/init`;
 /// `item.completed{agent_message|reasoning}` → assistant text/thinking;
@@ -1368,7 +1514,20 @@ fn adapt_codex_line(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
                 match itype {
                     "agent_message" if !txt.is_empty() => out.push(assistant_text_line(txt)),
                     "reasoning" if !txt.is_empty() => out.push(assistant_thinking_line(txt)),
-                    _ => {} // command/file/mcp items — not surfaced in v1
+                    _ if codex_is_action_item(item) => {
+                        let id = codex_item_id(item);
+                        out.push(assistant_tool_use_line(
+                            &id,
+                            &codex_tool_name(item),
+                            codex_tool_input(item),
+                        ));
+                        out.push(user_tool_result_line(
+                            &id,
+                            &codex_tool_result_text(item),
+                            codex_item_is_error(item),
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }
