@@ -295,19 +295,21 @@ fn codex_chat_home() -> Option<String> {
         .unwrap_or_else(|| format!("{home}/.codex"));
     let chat = format!("{home}/.codex-chat");
     std::fs::create_dir_all(&chat).ok()?;
-    // Managed config — always rewritten. No `[mcp_servers.*]` = no auth stalls.
-    // The pane passes `-m` per turn, so we don't pin a model here.
-    // `trust_level = "trusted"` does double duty: it kills codex's startup trust
-    // gate (measured 2.84s → 0.55s cold start) AND lets project-local config /
-    // hooks / exec policies load so a workspace-write turn can actually run
-    // commands + write files instead of being blocked as an untrusted project.
+    // Managed config — always rewritten. Keep the real Codex personality/model
+    // defaults/plugins/hooks, but strip only `[mcp_servers.*]` tables: those auth
+    // probes are the slow part, and the CLI override merges instead of replacing.
+    let real_cfg = format!("{real}/config.toml");
+    let config = std::fs::read_to_string(&real_cfg)
+        .ok()
+        .map(|s| codex_config_without_mcp_servers(&s))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "trust_level = \"trusted\"\n".to_string());
     let _ = std::fs::write(
         format!("{chat}/config.toml"),
-        "# managed by AIOS shell — stripped codex home for the chat pane.\n\
-         # intentionally has NO mcp_servers: codex auth-probes every server each\n\
-         # turn, and `-c mcp_servers={}` is merged not replaced, so the only way\n\
-         # to kill the ~40s/turn MCP stall is a separate home with none defined.\n\
-         trust_level = \"trusted\"\n",
+        format!(
+            "# managed by AIOS shell — mirrors ~/.codex/config.toml with mcp_servers stripped.\n\
+             # keep terminal-grade model/reasoning/plugins/hooks; avoid MCP auth stalls.\n{config}"
+        ),
     );
     // Symlink auth.json → real home so the ChatGPT login stays shared.
     let link = format!("{chat}/auth.json");
@@ -321,6 +323,34 @@ fn codex_chat_home() -> Option<String> {
         std::os::unix::fs::symlink(&target, &link).ok()?;
     }
     Some(chat)
+}
+
+fn codex_config_without_mcp_servers(src: &str) -> String {
+    let mut out = String::new();
+    let mut skip = false;
+    let mut in_root = true;
+    let mut saw_root_trust = false;
+
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_root = false;
+            skip = trimmed == "[mcp_servers]" || trimmed.starts_with("[mcp_servers.");
+        }
+        if skip {
+            continue;
+        }
+        if in_root && trimmed.starts_with("trust_level") {
+            saw_root_trust = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if !saw_root_trust {
+        out.push_str("\ntrust_level = \"trusted\"\n");
+    }
+    out
 }
 
 /// JSON-escapes a string for embedding in the stream-json user line. We build
@@ -1166,9 +1196,10 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
             // Record the final-answer item id so its deltas route to the reply
             // (everything else mid-turn is preamble → thinking).
             if let Some(item) = params.and_then(|p| p.get("item")) {
-                let is_final_answer = item.get("type").and_then(|x| x.as_str())
-                    == Some("agentMessage")
-                    && item.get("phase").and_then(|x| x.as_str()) == Some("final_answer");
+                let item_type = item.get("type").and_then(|x| x.as_str());
+                let phase = item.get("phase").and_then(|x| x.as_str()).unwrap_or("");
+                let is_final_answer = matches!(item_type, Some("agentMessage" | "agent_message"))
+                    && !matches!(phase, "preamble" | "status" | "reasoning");
                 if is_final_answer {
                     if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
                         *sess.answer_item.lock() = Some(id.to_string());
@@ -1188,7 +1219,7 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
             if let Some(item) = params.and_then(|p| p.get("item")) {
                 let itype = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
                 match itype {
-                    "agentMessage" => {
+                    "agentMessage" | "agent_message" => {
                         // final_answer → the reply; any other phase (preamble /
                         // status) → thinking, so it doesn't mirror the answer.
                         let is_final = item
@@ -2206,7 +2237,35 @@ fn parse_codex_rollout(text: &str) -> Vec<ChatTurn> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_codex_rollout_in_home, infer_session_engine};
+    use super::{codex_config_without_mcp_servers, find_codex_rollout_in_home, infer_session_engine};
+
+    #[test]
+    fn codex_chat_config_keeps_terminal_defaults_but_strips_mcp_servers() {
+        let src = r#"model = "gpt-5.5"
+model_reasoning_effort = "low"
+
+[plugins."github@openai-curated"]
+enabled = true
+
+[mcp_servers.memory]
+command = "node"
+
+[mcp_servers.memory.env]
+CODEX_HOME = "/Users/firazfhansurie/.codex"
+
+[features]
+js_repl = false
+"#;
+        let out = codex_config_without_mcp_servers(src);
+
+        assert!(out.contains("model_reasoning_effort = \"low\""));
+        assert!(out.contains("[plugins.\"github@openai-curated\"]"));
+        assert!(out.contains("[features]"));
+        assert!(out.contains("trust_level = \"trusted\""));
+        assert!(!out.contains("[mcp_servers.memory]"));
+        assert!(!out.contains("[mcp_servers.memory.env]"));
+        assert!(!out.contains("command = \"node\""));
+    }
 
     #[test]
     fn finds_chatpane_codex_rollout_before_normal_codex_home() {
