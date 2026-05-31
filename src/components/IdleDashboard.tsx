@@ -32,14 +32,20 @@ import {
   ArrowRight,
   Battery,
   BatteryCharging,
+  ChevronDown,
+  ChevronUp,
   Cpu,
+  Eye,
+  EyeOff,
   Flame,
   FolderGit2,
   GitBranch,
   Globe,
   Layers,
   Radio,
+  RotateCcw,
   Search,
+  SlidersHorizontal,
   Zap,
 } from "lucide-react";
 
@@ -57,6 +63,15 @@ import {
   type IdleRate,
   type MemoryFocus,
 } from "../lib/dashboard";
+import {
+  DEFAULT_IDLE_WIDGETS,
+  IDLE_WIDGET_LABELS,
+  moveIdleWidget,
+  normalizeIdleWidgets,
+  toggleIdleWidget,
+  type IdleWidgetConfig,
+  type IdleWidgetId,
+} from "../lib/idleDashboardLayout";
 
 interface IdleDashboardProps {
   apps: AppDef[];
@@ -70,6 +85,19 @@ interface IdleDashboardProps {
   onRevealSidebar: () => void;
   onOpenPalette: () => void;
 }
+
+const IDLE_LAYOUT_KEY = "aios.idleDashboard.widgets";
+
+const widgetClasses: Record<IdleWidgetId, string> = {
+  pulse: "col-span-3 row-span-2",
+  projects: "col-span-2",
+  quick: "col-span-1",
+  dev: "col-span-2",
+  pinned: "col-span-1",
+  apps: "col-span-3",
+  device: "col-span-2",
+  fleet: "col-span-1",
+};
 
 export function IdleDashboard({
   apps,
@@ -88,6 +116,14 @@ export function IdleDashboard({
   const [focus, setFocus] = useState<MemoryFocus | null>(null);
   const [device, setDevice] = useState<DeviceStats | null>(null);
   const [pulse, setPulse] = useState<RepoPulse[]>([]);
+  const [customizing, setCustomizing] = useState(false);
+  const [widgets, setWidgets] = useState<IdleWidgetConfig[]>(() => {
+    try {
+      return normalizeIdleWidgets(JSON.parse(localStorage.getItem(IDLE_LAYOUT_KEY) ?? "null"));
+    } catch {
+      return DEFAULT_IDLE_WIDGETS;
+    }
+  });
 
   // top recent projects by dir mtime — also the set the dev-pulse tile reports on.
   const recent = [...projects].sort((a, b) => b.mtime - a.mtime).slice(0, 6);
@@ -127,6 +163,157 @@ export function IdleDashboard({
   }, [recent.map((p) => p.root).join("|")]);
 
   const awake = oracles.filter((o) => o.running).length;
+  const visibleWidgets = widgets.filter((widget) => widget.visible);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(IDLE_LAYOUT_KEY, JSON.stringify(widgets));
+    } catch {
+      /* ignore */
+    }
+  }, [widgets]);
+
+  const moveWidget = (id: IdleWidgetId, delta: -1 | 1) =>
+    setWidgets((cur) => moveIdleWidget(cur, id, delta));
+  const toggleWidget = (id: IdleWidgetId) =>
+    setWidgets((cur) => toggleIdleWidget(cur, id));
+  const resetWidgets = () => setWidgets(DEFAULT_IDLE_WIDGETS);
+
+  const renderWidget = (widget: IdleWidgetConfig, index: number) => {
+    const delay = 40 + index * 40;
+    const controls = customizing ? (
+      <WidgetControls
+        id={widget.id}
+        visible={widget.visible}
+        onMove={moveWidget}
+        onToggle={toggleWidget}
+      />
+    ) : null;
+
+    if (widget.id === "pulse") {
+      return (
+        <Tile
+          key={widget.id}
+          className={widgetClasses.pulse}
+          delay={delay}
+          hero
+          icon={<Zap size={12} className="text-[var(--color-highlight)]" />}
+          label="pulse"
+          right={controls}
+          onClick={customizing ? undefined : () => onSpawn({ type: "pulse" }, "pulse")}
+        >
+          <Pulse extras={extras} rate={rate} focus={focus} />
+        </Tile>
+      );
+    }
+    if (widget.id === "projects") {
+      return (
+        <Tile
+          key={widget.id}
+          className={widgetClasses.projects}
+          delay={delay}
+          hero
+          icon={<FolderGit2 size={12} className="text-[var(--color-highlight)]" />}
+          label="projects"
+          right={controls}
+        >
+          <RecentProjects projects={recent} onOpen={onOpenProject} />
+        </Tile>
+      );
+    }
+    if (widget.id === "quick") {
+      return (
+        <Tile
+          key={widget.id}
+          className={widgetClasses.quick}
+          delay={delay}
+          icon={<Zap size={12} className="text-[var(--color-accent)]" />}
+          label="quick"
+          right={controls}
+        >
+          <QuickActions onSpawn={onSpawn} onOpenPalette={onOpenPalette} onRevealSidebar={onRevealSidebar} />
+        </Tile>
+      );
+    }
+    if (widget.id === "dev") {
+      return (
+        <Tile
+          key={widget.id}
+          className={widgetClasses.dev}
+          delay={delay}
+          icon={<GitBranch size={12} className="text-[var(--color-info)]" />}
+          label="dev pulse"
+          right={controls}
+        >
+          <DevPulse pulse={pulse} onOpen={(root) => {
+            const p = projects.find((x) => x.root === root);
+            if (p) onOpenProject(p);
+          }} />
+        </Tile>
+      );
+    }
+    if (widget.id === "pinned") {
+      return (
+        <Tile
+          key={widget.id}
+          className={widgetClasses.pinned}
+          delay={delay}
+          icon={<Globe size={12} className="text-[var(--color-accent)]" />}
+          label="pinned"
+          right={controls}
+          onClick={customizing ? undefined : onRevealSidebar}
+        >
+          <PinnedSpaces sidebar={sidebar} onOpenItem={onOpenSidebarItem} onReveal={onRevealSidebar} />
+        </Tile>
+      );
+    }
+    if (widget.id === "apps") {
+      return (
+        <Tile
+          key={widget.id}
+          className={widgetClasses.apps}
+          delay={delay}
+          icon={<ArrowRight size={12} className="text-[var(--color-muted)]" />}
+          label="apps"
+          right={controls}
+        >
+          <AppDock apps={apps} onSpawn={onSpawn} />
+        </Tile>
+      );
+    }
+    if (widget.id === "device") {
+      return (
+        <Tile
+          key={widget.id}
+          className={widgetClasses.device}
+          delay={delay}
+          icon={<Cpu size={12} className="text-[var(--color-info)]" />}
+          label="device"
+          right={controls}
+        >
+          <DeviceTile dev={device} />
+        </Tile>
+      );
+    }
+    return (
+      <Tile
+        key={widget.id}
+        className={widgetClasses.fleet}
+        delay={delay}
+        icon={<Radio size={12} className="text-[var(--color-accent)]" />}
+        label="fleet"
+        right={
+          controls ?? (
+            <span className="font-mono text-[10px] text-[var(--color-muted)]">
+              <span className="text-[var(--color-accent)]">{awake}</span>/{oracles.length}
+            </span>
+          )
+        }
+      >
+        <FleetBoard oracles={oracles} onAttach={onAttachOracle} />
+      </Tile>
+    );
+  };
 
   return (
     <div className="relative flex h-full flex-col overflow-hidden p-4">
@@ -146,81 +333,60 @@ export function IdleDashboard({
       <div className="relative mb-4 flex shrink-0 items-center gap-4">
         <Greeting />
         <OmniInput onClick={onOpenPalette} />
+        <button
+          type="button"
+          onClick={() => setCustomizing((v) => !v)}
+          className={`aios-fade-in flex h-11 shrink-0 items-center gap-2 rounded-[var(--aios-radius-pill)] border px-3 text-[12px] transition-colors ${
+            customizing
+              ? "border-[var(--color-accent)]/50 bg-[var(--color-accent)]/10 text-[var(--color-text)]"
+              : "border-[var(--color-border)] bg-[var(--color-panel)]/60 text-[var(--color-muted)] hover:border-[var(--color-accent)]/40 hover:text-[var(--color-text)]"
+          }`}
+          title="customize idle dashboard"
+        >
+          <SlidersHorizontal size={14} />
+          customize
+        </button>
       </div>
+
+      {customizing && (
+        <div className="aios-fade-in relative mb-3 flex shrink-0 items-center gap-2 rounded-[var(--aios-radius-lg)] border border-[var(--color-border)] bg-[var(--color-panel)]/60 px-3 py-2 backdrop-blur">
+          <span className="text-[11px] text-[var(--color-muted)]">dashboard layout</span>
+          <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
+            {widgets.map((widget) => (
+              <button
+                key={widget.id}
+                onClick={() => toggleWidget(widget.id)}
+                className={`flex shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-[10px] transition-colors ${
+                  widget.visible
+                    ? "border-[var(--color-accent)]/35 bg-[var(--color-accent)]/10 text-[var(--color-text-2)]"
+                    : "border-[var(--color-border)] text-[var(--color-faint)]"
+                }`}
+              >
+                {widget.visible ? <Eye size={10} /> : <EyeOff size={10} />}
+                {IDLE_WIDGET_LABELS[widget.id]}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={resetWidgets}
+            className="flex shrink-0 items-center gap-1 rounded-md border border-[var(--color-border)] px-2 py-1 text-[10px] text-[var(--color-muted)] hover:border-[var(--color-accent)]/40 hover:text-[var(--color-text)]"
+          >
+            <RotateCcw size={11} />
+            reset
+          </button>
+        </div>
+      )}
 
       {/* ── bento grid ───────────────────────────────────────────────────── */}
       <div className="relative grid min-h-0 flex-1 grid-cols-6 grid-rows-3 gap-3">
-        {/* PULSE — hero (c1-3, r1-2) — click opens the full pulse detail pane */}
-        <Tile
-          className="col-span-3 row-span-2"
-          delay={40}
-          hero
-          icon={<Zap size={12} className="text-[var(--color-highlight)]" />}
-          label="pulse"
-          onClick={() => onSpawn({ type: "pulse" }, "pulse")}
-        >
-          <Pulse extras={extras} rate={rate} focus={focus} />
-        </Tile>
-
-        {/* PROJECTS — hero (c4-6, r1) — recent repos, click opens a terminal there */}
-        <Tile
-          className="col-span-3"
-          delay={80}
-          hero
-          icon={<FolderGit2 size={12} className="text-[var(--color-highlight)]" />}
-          label="projects"
-        >
-          <RecentProjects projects={recent} onOpen={onOpenProject} />
-        </Tile>
-
-        {/* DEV PULSE (c4-5, r2) — git state across the recent repos */}
-        <Tile
-          className="col-span-2"
-          delay={120}
-          icon={<GitBranch size={12} className="text-[var(--color-info)]" />}
-          label="dev pulse"
-        >
-          <DevPulse pulse={pulse} onOpen={(root) => {
-            const p = projects.find((x) => x.root === root);
-            if (p) onOpenProject(p);
-          }} />
-        </Tile>
-
-        {/* PINNED + SPACES (c6, r2) — quick-launch pinned sites + sidebar spaces */}
-        <Tile
-          className="col-span-1"
-          delay={160}
-          icon={<Globe size={12} className="text-[var(--color-accent)]" />}
-          label="pinned"
-          onClick={onRevealSidebar}
-        >
-          <PinnedSpaces sidebar={sidebar} onOpenItem={onOpenSidebarItem} onReveal={onRevealSidebar} />
-        </Tile>
-
-        {/* APPS — launch dock (c1-3, r3) */}
-        <Tile className="col-span-3" delay={200} icon={<ArrowRight size={12} className="text-[var(--color-muted)]" />} label="apps">
-          <AppDock apps={apps} onSpawn={onSpawn} />
-        </Tile>
-
-        {/* DEVICE — laptop monitor (c4-5, r3) */}
-        <Tile className="col-span-2" delay={240} icon={<Cpu size={12} className="text-[var(--color-info)]" />} label="device">
-          <DeviceTile dev={device} />
-        </Tile>
-
-        {/* FLEET — oracle roster (c6, r3) */}
-        <Tile
-          className="col-span-1"
-          delay={280}
-          icon={<Radio size={12} className="text-[var(--color-accent)]" />}
-          label="fleet"
-          right={
-            <span className="font-mono text-[10px] text-[var(--color-muted)]">
-              <span className="text-[var(--color-accent)]">{awake}</span>/{oracles.length}
-            </span>
-          }
-        >
-          <FleetBoard oracles={oracles} onAttach={onAttachOracle} />
-        </Tile>
+        {visibleWidgets.length > 0 ? (
+          visibleWidgets.map(renderWidget)
+        ) : (
+          <Tile className="col-span-6 row-span-3" label="dashboard" delay={40}>
+            <Empty>all widgets hidden · use customize to bring one back</Empty>
+          </Tile>
+        )}
       </div>
 
       <span className="pointer-events-none absolute bottom-1.5 right-4 font-mono text-[10px] tracking-wide text-[var(--color-faint)]">
@@ -273,6 +439,47 @@ function Tile({
   );
 }
 
+function WidgetControls({
+  id,
+  visible,
+  onMove,
+  onToggle,
+}: {
+  id: IdleWidgetId;
+  visible: boolean;
+  onMove: (id: IdleWidgetId, delta: -1 | 1) => void;
+  onToggle: (id: IdleWidgetId) => void;
+}) {
+  return (
+    <span className="ml-auto flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        onClick={() => onMove(id, -1)}
+        className="rounded p-0.5 text-[var(--color-faint)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+        title={`move ${IDLE_WIDGET_LABELS[id]} earlier`}
+      >
+        <ChevronUp size={12} />
+      </button>
+      <button
+        type="button"
+        onClick={() => onMove(id, 1)}
+        className="rounded p-0.5 text-[var(--color-faint)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+        title={`move ${IDLE_WIDGET_LABELS[id]} later`}
+      >
+        <ChevronDown size={12} />
+      </button>
+      <button
+        type="button"
+        onClick={() => onToggle(id)}
+        className="rounded p-0.5 text-[var(--color-faint)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+        title={`${visible ? "hide" : "show"} ${IDLE_WIDGET_LABELS[id]}`}
+      >
+        {visible ? <Eye size={12} /> : <EyeOff size={12} />}
+      </button>
+    </span>
+  );
+}
+
 // ── greeting + omni-input ────────────────────────────────────────────────────
 
 function Greeting() {
@@ -307,6 +514,71 @@ function OmniInput({ onClick }: { onClick: () => void }) {
       <span className="flex-1 truncate text-[13px] text-[var(--color-faint)]">launch, ask, or resume anything…</span>
       <kbd className="shrink-0 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-muted)]">⌘K</kbd>
     </button>
+  );
+}
+
+function QuickActions({
+  onSpawn,
+  onOpenPalette,
+  onRevealSidebar,
+}: {
+  onSpawn: (kind: AppDef["kind"], label: string) => void;
+  onOpenPalette: () => void;
+  onRevealSidebar: () => void;
+}) {
+  const actions: Array<{
+    label: string;
+    hint: string;
+    icon: ReactNode;
+    run: () => void;
+  }> = [
+    {
+      label: "new chat",
+      hint: "ask aios",
+      icon: <Zap size={13} />,
+      run: () => onSpawn({ type: "chat" }, "chat"),
+    },
+    {
+      label: "terminal",
+      hint: "shell pane",
+      icon: <GitBranch size={13} />,
+      run: () => onSpawn({ type: "shell" }, "terminal"),
+    },
+    {
+      label: "browser",
+      hint: "web pane",
+      icon: <Globe size={13} />,
+      run: () => onSpawn({ type: "browser" }, "browser"),
+    },
+    {
+      label: "palette",
+      hint: "all commands",
+      icon: <Search size={13} />,
+      run: onOpenPalette,
+    },
+    {
+      label: "rail",
+      hint: "spaces",
+      icon: <Layers size={13} />,
+      run: onRevealSidebar,
+    },
+  ];
+
+  return (
+    <div className="grid h-full grid-cols-1 content-start gap-1 overflow-y-auto">
+      {actions.map((action) => (
+        <button
+          key={action.label}
+          type="button"
+          onClick={action.run}
+          className="group flex items-center gap-2 rounded-md border border-transparent bg-[var(--color-panel-2)]/30 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-accent)]/30 hover:bg-[var(--color-panel-2)]"
+        >
+          <span className="text-[var(--color-muted)] group-hover:text-[var(--color-accent)]">{action.icon}</span>
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--color-text-2)]">{action.label}</span>
+          <span className="hidden shrink-0 font-mono text-[9px] text-[var(--color-faint)] xl:inline">{action.hint}</span>
+        </button>
+      ))}
+    </div>
   );
 }
 
