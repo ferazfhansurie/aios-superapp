@@ -24,7 +24,7 @@ aios should not clone the whole surface. aios should steal the operating-system 
 - pane-native link routing: chat markdown/http links open browser panes; file-ish links and inline paths open file/editor panes.
 - markdown document pane: `.md` files now open in the file viewer with clickable pane-aware links instead of dumping raw text.
 - startup pane handoff: `AIOS_OPEN_PANE=/path/or/url` lets the shell boot directly into a target pane.
-- thinking stream v2: live reasoning card, elapsed timer, collapsed preview, word/line metadata, chunked reasoning beats, raw trace fallback.
+- codex-style thinking shimmer: plain text `thinking` with a cadenced shimmer sweep while streaming, then a quiet collapsed thought disclosure after completion.
 - tauri's existing sticky autoscroll and true `chat_interrupt` stop path are now confirmed as the correct app surface to improve, not the electron terminal.
 
 ## priority backlog

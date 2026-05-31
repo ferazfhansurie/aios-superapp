@@ -209,6 +209,66 @@ html, body, #root {
 
 ::selection { background: var(--color-selection); }
 
+.aios-cadenced-shimmer {
+  --aios-shimmer-secondary: var(--color-muted);
+  --aios-shimmer-contrast: var(--color-text);
+  position: relative;
+  color: var(--aios-shimmer-secondary);
+  background: transparent;
+  -webkit-text-fill-color: currentColor;
+}
+
+.aios-cadenced-shimmer__sweep {
+  pointer-events: none;
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 50%;
+  overflow: hidden;
+  transform: translateX(-100%);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 40% 60%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0%, #000 40% 60%, transparent 100%);
+}
+
+.aios-cadenced-shimmer__highlight {
+  display: block;
+  width: 200%;
+  color: var(--aios-shimmer-contrast);
+  transform: translateX(50%);
+  -webkit-text-fill-color: currentColor;
+}
+
+.aios-cadenced-shimmer--active .aios-cadenced-shimmer__sweep,
+.aios-cadenced-shimmer--active .aios-cadenced-shimmer__highlight {
+  animation-duration: 1s;
+  animation-iteration-count: 1;
+  animation-timing-function: steps(48, end);
+}
+
+.aios-cadenced-shimmer--active .aios-cadenced-shimmer__sweep {
+  animation-name: aios-cadenced-shimmer-sweep;
+}
+
+.aios-cadenced-shimmer--active .aios-cadenced-shimmer__highlight {
+  animation-name: aios-cadenced-shimmer-highlight;
+}
+
+@keyframes aios-cadenced-shimmer-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+
+@keyframes aios-cadenced-shimmer-highlight {
+  from { transform: translateX(50%); }
+  to { transform: translateX(-125%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aios-cadenced-shimmer--active .aios-cadenced-shimmer__sweep,
+  .aios-cadenced-shimmer--active .aios-cadenced-shimmer__highlight {
+    animation: none;
+  }
+}
+
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: oklch(0.55 0.005 255 / 25%); border-radius: 8px; }
 ::-webkit-scrollbar-thumb:hover { background: oklch(0.55 0.005 255 / 45%); }
