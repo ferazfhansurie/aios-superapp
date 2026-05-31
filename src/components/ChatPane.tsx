@@ -98,7 +98,8 @@ import {
   type QueuedMessage,
 } from "../lib/chatPaneState";
 import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
-import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, openFileInPane } from "../lib/paneBus";
+import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, openFileInPane, openUrlInPane } from "../lib/paneBus";
+import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -2516,7 +2517,11 @@ export function ChatPane({
                 onOpenUrl={onOpenUrl}
               />
             ) : b.kind === "thinking" ? (
-              <ThinkingBlock key={b.id} turn={b.turn} />
+              <ThinkingBlock
+                key={b.id}
+                turn={b.turn}
+                elapsedMs={b.turn.streaming && b.turn.startedAt != null ? now - b.turn.startedAt : undefined}
+              />
             ) : b.kind === "approval" ? (
               <ApprovalCard
                 key={b.id}
@@ -3189,40 +3194,131 @@ function parseButtons(text: string): { body: string; buttons: string[] } {
   return { body: text.replace(m[0], "").trimEnd(), buttons };
 }
 
-/** The model's extended-thinking trace — dim + collapsible. Auto-expanded while
- *  the tokens are streaming in (so you read the reasoning live), then collapses
- *  to a faint "Thought ›" line you can re-open. Mirrors claude-code's ✻ thinking. */
-function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) {
+function thoughtPreview(text: string): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) return "waiting for reasoning";
+  const sentence = compact.match(/^(.{24,180}?[.!?])\s/)?.[1] ?? compact;
+  return sentence.length > 180 ? `${sentence.slice(0, 177)}...` : sentence;
+}
+
+function thoughtMetrics(text: string): string {
+  const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+  const lines = text.split("\n").filter((line) => line.trim()).length;
+  return [words ? `${words} words` : null, lines > 1 ? `${lines} lines` : null].filter(Boolean).join(" · ");
+}
+
+function thoughtSteps(text: string): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  const paragraphs = trimmed
+    .split(/\n{2,}/)
+    .map((p) => p.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  if (paragraphs.length > 1) return paragraphs.slice(0, 8);
+  return trimmed
+    .split(/(?<=[.!?])\s+/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+/** Extended-thinking stream with a Claude/Codex-grade live readout: strong live
+ *  state, useful collapsed preview, and a trace that chunks into readable beats
+ *  instead of one long italic blob. */
+function ThinkingBlock({
+  turn,
+  elapsedMs,
+}: {
+  turn: Extract<Turn, { kind: "thinking" }>;
+  elapsedMs?: number;
+}) {
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
   const open = userToggled ?? turn.streaming;
+  const preview = thoughtPreview(turn.text);
+  const metrics = thoughtMetrics(turn.text);
+  const steps = thoughtSteps(turn.text);
+  const duration = turn.streaming
+    ? elapsedMs != null
+      ? fmtDuration(elapsedMs)
+      : null
+    : turn.durationMs != null
+      ? fmtDuration(turn.durationMs)
+      : null;
   return (
-    <div className="flex flex-col gap-1">
+    <div
+      className={`flex max-w-[92%] flex-col overflow-hidden rounded-xl border ${
+        turn.streaming
+          ? "border-[var(--color-accent)]/30 bg-[var(--color-accent-soft)]/40"
+          : "border-[var(--color-border)] bg-[var(--color-panel)]/35"
+      }`}
+    >
       <button
         type="button"
         onClick={() => setUserToggled(!open)}
-        className="-mx-1 flex w-fit items-center gap-1.5 rounded-md px-1 py-0.5 text-left font-sans text-[12.5px] text-[var(--color-muted)] transition-colors hover:text-[var(--color-text-2)]"
+        className="flex min-w-0 items-center gap-2 px-3 py-2 text-left font-sans transition-colors hover:bg-white/[0.03]"
       >
-        <Sparkles
-          size={13}
-          className={`shrink-0 ${turn.streaming ? "animate-pulse text-[var(--color-accent)]" : "text-[var(--color-faint)]"}`}
-        />
-        <span className={turn.streaming ? "animate-pulse" : undefined}>
-          {turn.streaming
-            ? "Thinking…"
-            : turn.durationMs != null
-              ? `Thought for ${fmtDuration(turn.durationMs)}`
-              : "Thought"}
+        <span
+          className={`grid h-6 w-6 shrink-0 place-items-center rounded-md ${
+            turn.streaming
+              ? "bg-[var(--color-accent)]/15 text-[var(--color-accent)]"
+              : "bg-[var(--color-panel-2)] text-[var(--color-faint)]"
+          }`}
+        >
+          <Sparkles size={13} className={turn.streaming ? "animate-pulse" : ""} />
         </span>
-        {!turn.streaming && (
-          <ChevronRight
-            size={12}
-            className={`shrink-0 text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
-          />
-        )}
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-2 text-[12.5px] text-[var(--color-text-2)]">
+            <span className={turn.streaming ? "animate-pulse font-medium text-[var(--color-accent)]" : "font-medium"}>
+              {turn.streaming ? "thinking live" : duration ? `thought for ${duration}` : "thought"}
+            </span>
+            {turn.streaming && duration && (
+              <span className="inline-flex items-center gap-1 font-mono text-[10.5px] text-[var(--color-muted)]">
+                <Clock size={10} /> {duration}
+              </span>
+            )}
+            {!turn.streaming && metrics && (
+              <span className="font-mono text-[10.5px] text-[var(--color-faint)]">{metrics}</span>
+            )}
+          </span>
+          {!open && (
+            <span className="mt-0.5 block truncate text-[11.5px] text-[var(--color-muted)]">
+              {preview}
+            </span>
+          )}
+        </span>
+        <ChevronRight
+          size={13}
+          className={`shrink-0 text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
+        />
       </button>
       {open && (
-        <div className="ml-[6px] whitespace-pre-wrap break-words border-l border-[var(--color-border)] pl-3 font-sans text-[12.5px] italic leading-relaxed text-[var(--color-muted)]">
-          {turn.text}
+        <div className="border-t border-[var(--color-border)] px-3 py-2.5">
+          {steps.length ? (
+            <div className="flex flex-col gap-2">
+              {steps.map((step, i) => (
+                <div key={i} className="grid grid-cols-[18px_1fr] gap-2">
+                  <span className="mt-0.5 font-mono text-[10.5px] text-[var(--color-faint)]">
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                  <p className="whitespace-pre-wrap break-words font-sans text-[12.5px] leading-relaxed text-[var(--color-muted)]">
+                    {step}
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="font-sans text-[12.5px] text-[var(--color-muted)]">waiting for reasoning</p>
+          )}
+          {steps.length >= 8 && (
+            <details className="mt-2">
+              <summary className="cursor-pointer font-mono text-[10.5px] text-[var(--color-faint)]">
+                raw trace
+              </summary>
+              <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-[var(--color-bg)] p-2 font-mono text-[11px] text-[var(--color-muted)]">
+                {turn.text}
+              </pre>
+            </details>
+          )}
         </div>
       )}
     </div>
@@ -3593,13 +3689,30 @@ function Inline({
       const end = text.indexOf("`", i + 1);
       if (end > i) {
         flush();
+        const code = text.slice(i + 1, end);
+        const fileish = isPaneFileTarget(code);
         nodes.push(
-          <code
-            key={`c${k++}`}
-            className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-text)]"
-          >
-            {text.slice(i + 1, end)}
-          </code>,
+          fileish ? (
+            <button
+              key={`c${k++}`}
+              type="button"
+              onClick={() => {
+                const path = resolvePaneFileTarget(code);
+                openFileInPane(path, targetLabel(path));
+              }}
+              className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-accent)] underline decoration-[var(--color-accent)]/30 underline-offset-2 hover:decoration-[var(--color-accent)]"
+              title="open in pane"
+            >
+              {code}
+            </button>
+          ) : (
+            <code
+              key={`c${k++}`}
+              className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-text)]"
+            >
+              {code}
+            </code>
+          ),
         );
         i = end + 1;
         continue;
@@ -3630,17 +3743,25 @@ function Inline({
           flush();
           const label = text.slice(i + 1, close);
           const url = text.slice(close + 2, paren);
-          const http = /^https?:\/\//i.test(url);
+          const http = isHttpPaneTarget(url);
+          const fileish = isPaneFileTarget(url);
           nodes.push(
             <a
               key={`a${k++}`}
               href={url}
-              target="_blank"
+              target={http ? "_blank" : undefined}
               rel="noreferrer"
               onClick={(e) => {
-                if (http && onOpenUrl) {
+                if (http) {
                   e.preventDefault();
-                  onOpenUrl(url);
+                  if (onOpenUrl) onOpenUrl(url);
+                  else openUrlInPane(url);
+                  return;
+                }
+                if (fileish) {
+                  e.preventDefault();
+                  const path = resolvePaneFileTarget(url);
+                  openFileInPane(path, targetLabel(path));
                 }
               }}
               className="text-[var(--color-accent)] underline decoration-[var(--color-accent)]/40 underline-offset-2 hover:decoration-[var(--color-accent)]"

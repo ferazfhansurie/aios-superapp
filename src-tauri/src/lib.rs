@@ -26,6 +26,14 @@ fn read_telemetry() -> telemetry::Telemetry {
     telemetry::collect()
 }
 
+#[tauri::command]
+fn startup_open_pane() -> Option<String> {
+    std::env::var("AIOS_OPEN_PANE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // INVARIANT: this app must NEVER tear down the `-L adletic` tmux socket /
@@ -39,6 +47,7 @@ pub fn run() {
         .manage(pty::PtyState::new())
         .invoke_handler(tauri::generate_handler![
             read_telemetry,
+            startup_open_pane,
             pty::pty_spawn,
             // pty_spawn_terminal is Unix-only (tmux); on Windows it's compiled
             // out and the frontend falls back to pty_spawn (no persistence).

@@ -9,6 +9,12 @@ import {
   resumeTitle,
   usageStack,
 } from "./chatPaneState.ts";
+import {
+  isHttpPaneTarget,
+  isPaneFileTarget,
+  resolvePaneFileTarget,
+  targetLabel,
+} from "./paneRouting.ts";
 
 test("usageStack separates the pre-chat baseline from this chat delta", () => {
   assert.deepEqual(usageStack(64, 61), {
@@ -79,4 +85,19 @@ test("resumeTitle compacts the first meaningful codex prompt", () => {
       meaningful: true,
     },
   );
+});
+
+test("pane routing identifies browser links and local file targets", () => {
+  assert.equal(isHttpPaneTarget("https://docs.anthropic.com/claude-code"), true);
+  assert.equal(isPaneFileTarget("/Users/firaz/docs/research.md:12"), true);
+  assert.equal(isPaneFileTarget("docs/research/codex-desktop-steal-list.md"), true);
+  assert.equal(isPaneFileTarget("not a path"), false);
+});
+
+test("pane routing resolves markdown links relative to the current file", () => {
+  assert.equal(
+    resolvePaneFileTarget("../notes/todo.md#next", "/Users/firaz/project/docs/research/current.md"),
+    "/Users/firaz/project/docs/notes/todo.md",
+  );
+  assert.equal(targetLabel("/Users/firaz/project/docs/notes/todo.md:44"), "todo.md");
 });

@@ -54,6 +54,26 @@ export function openFileInPane(path: string, name: string): boolean {
   return true;
 }
 
+// ── open-url-in-pane channel ─────────────────────────────────────────────────
+// Same shape as file opening: App owns pane creation, deep markdown renderers can
+// ask for an in-app browser pane without knowing the layout machinery.
+let openUrlImpl: ((url: string, label?: string) => void) | null = null;
+
+export function registerOpenUrl(
+  fn: (url: string, label?: string) => void,
+): () => void {
+  openUrlImpl = fn;
+  return () => {
+    if (openUrlImpl === fn) openUrlImpl = null;
+  };
+}
+
+export function openUrlInPane(url: string, label?: string): boolean {
+  if (!openUrlImpl) return false;
+  openUrlImpl(url, label);
+  return true;
+}
+
 // ── cross-pane drag signal ───────────────────────────────────────────────────
 // When an item carrying our `application/x-aios-path` payload is dragged
 // anywhere in the app, every pane's drop overlay should light up so the drop is

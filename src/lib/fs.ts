@@ -64,6 +64,10 @@ export async function homeDir(): Promise<string> {
   return invoke<string>("home_dir");
 }
 
+export async function startupOpenPane(): Promise<string | null> {
+  return invoke<string | null>("startup_open_pane");
+}
+
 export async function readFilePreview(path: string): Promise<FilePreview> {
   return invoke<FilePreview>("read_file_preview", { path });
 }

@@ -68,11 +68,12 @@ import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } f
 import { listCustomers, type Customer } from "./lib/inbox";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
-import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, registerOpenFile } from "./lib/paneBus";
+import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, registerOpenFile, registerOpenUrl } from "./lib/paneBus";
 import { loadSettings, applyFlashLevel } from "./lib/settings";
-import { homeDir } from "./lib/fs";
+import { homeDir, startupOpenPane } from "./lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
+import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
 
 import { SPAWN, SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
 import {
@@ -111,6 +112,7 @@ const isTerminal = (k: PaneContent): k is PaneKind =>
 // externally" if the file turns out to be binary).
 const VIEWER_EXT = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico",
+  "md", "markdown",
   "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "key", "numbers", "pages",
   "zip", "gz", "tar", "dmg", "app", "mp4", "mov", "mp3", "wav", "woff", "woff2", "ttf",
 ]);
@@ -304,6 +306,13 @@ function App() {
     return key;
   }, []);
 
+  const openUrl = useCallback(
+    (url: string, label = "browser") => {
+      spawn({ type: "browser", url }, label);
+    },
+    [spawn],
+  );
+
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -351,6 +360,23 @@ function App() {
   // expose openFile to deep children (chat artifact cards) via paneBus, so a
   // produced file opens as an in-app viewer pane instead of the OS app.
   useEffect(() => registerOpenFile(openFile), [openFile]);
+  useEffect(() => registerOpenUrl(openUrl), [openUrl]);
+
+  const handledStartupOpen = useRef(false);
+  useEffect(() => {
+    if (handledStartupOpen.current) return;
+    handledStartupOpen.current = true;
+    startupOpenPane()
+      .then((target) => {
+        if (!target) return;
+        if (isHttpPaneTarget(target)) openUrl(target);
+        else {
+          const path = resolvePaneFileTarget(target);
+          openFile(path, targetLabel(path));
+        }
+      })
+      .catch(() => {});
+  }, [openFile, openUrl]);
 
   // F5 / Run — detect the project around the last-opened file (or $HOME) and
   // spawn a terminal running its default command in the project dir (logs +
@@ -993,7 +1019,7 @@ function App() {
                   onAnnotate={routeToChat}
                   onSendToAi={sendToAi}
                   onOpenFile={openFile}
-                  onOpenUrl={(url) => spawn({ type: "browser", url }, "browser")}
+                  onOpenUrl={openUrl}
                   onProfileChange={(profile) =>
                     setPanes((ps) =>
                       ps.map((p) =>
