@@ -114,7 +114,7 @@ fn send_whatsapp(message: &str) {
 
 /// Resolves a `node` binary. GUI PATH is minimal, so probe nvm/Homebrew/system
 /// before giving up (in which case we exec the +x script directly).
-fn node_bin() -> Option<String> {
+pub(crate) fn node_bin() -> Option<String> {
     #[cfg(unix)]
     {
         // Common fixed locations first.

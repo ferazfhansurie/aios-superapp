@@ -49,13 +49,53 @@ use tauri::{AppHandle, Emitter};
 /// Generous enough to reconstruct a long agentic run; oldest lines drop first.
 const REPLAY_CAP: usize = 6000;
 
-/// One live chat session: the spawned `claude` child + its stdin (for pushing
-/// turns). The reader thread owns neither the frontend channel nor the buffer
-/// directly — it forwards through the swappable `sink` and always appends to
+/// Which CLI backend drives a chat session. `claude` is a single PERSISTENT
+/// process (stream-json on stdin). `codex` (ChatGPT-subscription) and `opencode`
+/// (everything else — incl openrouter + free models) are NOT persistent: each
+/// turn spawns a fresh subprocess and resumes the prior thread/session by id.
+/// Their differing event JSONL is normalized into claude's wire shape in Rust
+/// (see `adapt_codex_line` / `adapt_opencode_line`) so the frontend is untouched.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+impl Engine {
+    fn parse(s: Option<&str>) -> Engine {
+        match s {
+            Some("codex") => Engine::Codex,
+            Some("opencode") => Engine::Opencode,
+            _ => Engine::Claude,
+        }
+    }
+    /// True for spawn-per-turn engines (no persistent stdin process).
+    fn per_turn(self) -> bool {
+        matches!(self, Engine::Codex | Engine::Opencode)
+    }
+}
+
+/// One live chat session. For `claude` this is a persistent child + its stdin
+/// (turns are pushed as stream-json lines). For `codex`/`opencode` there is no
+/// persistent process: `child` holds the CURRENT turn's subprocess (so an
+/// interrupt can kill it) and `thread_id` is the resume handle for the next turn.
+/// The reader thread forwards through the swappable `sink` and always appends to
 /// `buffer`, so the session keeps running (and buffering) after a pane closes.
 struct ChatSession {
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    /// Which CLI backend this session drives.
+    engine: Engine,
+    /// claude → the persistent process; codex/opencode → the in-flight turn's
+    /// child (None when idle). Kept so an interrupt can kill the current turn.
+    child: Mutex<Option<Child>>,
+    /// claude's persistent stdin. `None` for spawn-per-turn engines.
+    stdin: Mutex<Option<ChildStdin>>,
+    /// Resume handle for spawn-per-turn engines (codex thread_id / opencode ses_).
+    thread_id: Mutex<Option<String>>,
+    /// Working dir, captured for per-turn re-spawns.
+    cwd: Mutex<Option<String>>,
+    /// Model id, captured for per-turn re-spawns (e.g. `gpt-5.5`, `opencode/...`).
+    model: Mutex<Option<String>>,
     /// Current frontend channel; `None` while detached (output only buffers).
     sink: Mutex<Option<Channel<String>>>,
     /// Ring buffer of recent raw lines, replayed verbatim on reattach.
@@ -156,6 +196,56 @@ fn which_on_path(exe: &str) -> Option<String> {
     None
 }
 
+/// Resolves a CLI binary that's normally on PATH but may live under an
+/// nvm-managed node bin (GUI-launched apps don't inherit the user's shell PATH).
+/// Checks an explicit env override, common global locations, then PATH.
+fn resolve_bin(name: &str, env_override: &str, extra: &[&str]) -> String {
+    if let Ok(p) = std::env::var(env_override) {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    let mut candidates: Vec<String> = vec![
+        format!("/opt/homebrew/bin/{name}"),
+        format!("/usr/local/bin/{name}"),
+    ];
+    for e in extra {
+        candidates.push(e.to_string());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!("{home}/.local/bin/{name}"));
+        // nvm: pick the newest versioned bin that has the binary.
+        let nvm = format!("{home}/.nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm) {
+            let mut versions: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            versions.sort();
+            versions.reverse();
+            for v in versions {
+                candidates.push(v.join(format!("bin/{name}")).to_string_lossy().to_string());
+            }
+        }
+    }
+    for c in &candidates {
+        if std::path::Path::new(c).exists() {
+            return c.clone();
+        }
+    }
+    name.to_string()
+}
+
+/// Resolves the `codex` binary (OpenAI Codex CLI — drives the ChatGPT sub).
+fn codex_bin() -> String {
+    resolve_bin("codex", "AIOS_CODEX_BIN", &[])
+}
+
+/// Resolves the `opencode` binary (its installer drops it under ~/.opencode/bin).
+fn opencode_bin() -> String {
+    let extra = std::env::var("HOME")
+        .map(|h| format!("{h}/.opencode/bin/opencode"))
+        .unwrap_or_default();
+    resolve_bin("opencode", "AIOS_OPENCODE_BIN", &[extra.as_str()])
+}
+
 /// JSON-escapes a string for embedding in the stream-json user line. We build
 /// the line by hand (rather than pulling a serializer into the hot path) since
 /// the shape is fixed and tiny; only the text field is untrusted.
@@ -192,7 +282,10 @@ fn write_line(session_id: u32, line: &str) -> Result<(), String> {
         Some(s) => s,
         None => return Err(format!("chat session {session_id} not found")),
     };
-    let mut stdin = session.stdin.lock();
+    let mut guard = session.stdin.lock();
+    let stdin = guard
+        .as_mut()
+        .ok_or_else(|| "chat session has no stdin (spawn-per-turn engine)".to_string())?;
     stdin
         .write_all(line.as_bytes())
         .map_err(|e| format!("failed to write to claude stdin: {e}"))?;
@@ -228,6 +321,7 @@ fn split_valid_utf8(buf: &[u8]) -> (String, Vec<u8>) {
 pub fn chat_start(
     app: AppHandle,
     on_event: Channel<String>,
+    engine: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
@@ -235,6 +329,13 @@ pub fn chat_start(
     fast: Option<bool>,
     resume: Option<String>,
 ) -> Result<u32, String> {
+    // codex (ChatGPT sub) + opencode (openrouter/everything) are spawn-per-turn —
+    // register the session here, spawn nothing; chat_send runs each turn.
+    let eng = Engine::parse(engine.as_deref());
+    if eng.per_turn() {
+        return start_per_turn(eng, on_event, cwd, model, resume);
+    }
+
     let mut cmd = Command::new(claude_bin());
     cmd.arg("-p")
         .arg("--output-format")
@@ -302,8 +403,12 @@ pub fn chat_start(
     // Build the session up-front so the reader thread can forward through its
     // swappable sink + buffer (rather than a fixed channel that dies on close).
     let session = Arc::new(ChatSession {
-        child: Mutex::new(child),
-        stdin: Mutex::new(stdin),
+        engine: Engine::Claude,
+        child: Mutex::new(Some(child)),
+        stdin: Mutex::new(Some(stdin)),
+        thread_id: Mutex::new(None),
+        cwd: Mutex::new(None),
+        model: Mutex::new(None),
         sink: Mutex::new(Some(on_event)),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
         claude_id: Mutex::new(None),
@@ -387,6 +492,316 @@ pub fn chat_start(
     Ok(id)
 }
 
+/// Registers a spawn-per-turn (codex/opencode) session WITHOUT spawning a process.
+/// Emits a bare synthetic `system/init` so the pane flips `claudeReady` and the
+/// composer is usable immediately; the real resume id (codex thread / opencode
+/// ses_) is captured + re-emitted on the first turn. `resume` seeds the thread so
+/// a reopened chat keeps its history.
+fn start_per_turn(
+    engine: Engine,
+    on_event: Channel<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+    resume: Option<String>,
+) -> Result<u32, String> {
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let session = Arc::new(ChatSession {
+        engine,
+        child: Mutex::new(None),
+        stdin: Mutex::new(None),
+        thread_id: Mutex::new(resume.filter(|s| !s.is_empty())),
+        cwd: Mutex::new(cwd.filter(|s| !s.is_empty())),
+        model: Mutex::new(model.filter(|s| !s.is_empty())),
+        sink: Mutex::new(Some(on_event)),
+        buffer: Mutex::new(VecDeque::with_capacity(256)),
+        claude_id: Mutex::new(None),
+        title: Mutex::new(String::new()),
+        busy: AtomicBool::new(false),
+        detached: AtomicBool::new(false),
+        notify_on_done: AtomicBool::new(false),
+    });
+    // Bare init (no session_id) just flips claudeReady — the real id arrives on
+    // turn 1. ingest into the buffer too so a reattach replays it.
+    ingest_line_arc(&session, "{\"type\":\"system\",\"subtype\":\"init\"}");
+    with_sessions(|m| m.insert(id, session));
+    Ok(id)
+}
+
+/// Buffers + forwards a line on a session that has no AppHandle context (startup).
+fn ingest_line_arc(sess: &Arc<ChatSession>, line: &str) {
+    {
+        let mut b = sess.buffer.lock();
+        if b.len() >= REPLAY_CAP {
+            b.pop_front();
+        }
+        b.push_back(line.to_string());
+    }
+    if let Some(ch) = sess.sink.lock().as_ref() {
+        let _ = ch.send(line.to_string());
+    }
+}
+
+/// Runs ONE turn for a spawn-per-turn engine: builds + spawns the per-turn
+/// command, stores its child (so an interrupt can kill it), and wires a reader
+/// thread that adapts the engine's JSONL into claude-shaped lines, ingests them,
+/// and on EOF emits a fallback `result` if the engine didn't already close the
+/// turn. Heavy stderr (codex skill/MCP warnings) is drained + dropped, not shown.
+fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<(), String> {
+    let engine = sess.engine;
+    let model = sess.model.lock().clone();
+    let thread = sess.thread_id.lock().clone();
+    let cwd = sess.cwd.lock().clone();
+
+    let mut cmd = match engine {
+        Engine::Codex => Command::new(codex_bin()),
+        Engine::Opencode => Command::new(opencode_bin()),
+        Engine::Claude => return Err("claude is not a per-turn engine".into()),
+    };
+    match engine {
+        Engine::Codex => {
+            cmd.arg("exec");
+            match thread.as_deref().filter(|s| !s.is_empty()) {
+                // resume rejects -s; the thread inherits turn-1's read-only policy.
+                Some(t) => {
+                    cmd.arg("resume").arg(t);
+                }
+                None => {
+                    cmd.arg("-s").arg("read-only");
+                }
+            }
+            cmd.arg("--json").arg("--skip-git-repo-check");
+            // Chat is conversational — skip MCP servers so each turn doesn't
+            // re-attempt (and time out on) figma/vercel auth, which adds seconds
+            // of tail latency per message. Pure speed win for the chat path.
+            cmd.arg("-c").arg("mcp_servers={}");
+            if let Some(m) = model.as_deref().filter(|s| !s.is_empty()) {
+                cmd.arg("-m").arg(m);
+            }
+            cmd.arg(&text);
+        }
+        Engine::Opencode => {
+            cmd.arg("run").arg("--format").arg("json");
+            if let Some(s) = thread.as_deref().filter(|s| !s.is_empty()) {
+                cmd.arg("-s").arg(s);
+            }
+            if let Some(m) = model.as_deref().filter(|s| !s.is_empty()) {
+                cmd.arg("-m").arg(m);
+            }
+            cmd.arg(&text);
+        }
+        Engine::Claude => unreachable!(),
+    }
+    match cwd.as_deref().filter(|s| !s.is_empty()) {
+        Some(dir) => {
+            cmd.current_dir(dir);
+        }
+        None => {
+            if let Ok(home) = std::env::var("HOME") {
+                cmd.current_dir(home);
+            }
+        }
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let engine_name = match engine {
+        Engine::Codex => "codex",
+        _ => "opencode",
+    };
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {engine_name}: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("failed to capture {engine_name} stdout"))?;
+    let stderr = child.stderr.take();
+    *sess.child.lock() = Some(child);
+
+    // Drain stderr so the pipe never blocks the child; it's pure noise here.
+    if let Some(mut err) = stderr {
+        thread::spawn(move || {
+            let mut b = [0u8; 8192];
+            while let Ok(n) = err.read(&mut b) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+    }
+
+    let rsess = Arc::clone(&sess);
+    thread::spawn(move || {
+        let mut pending_bytes: Vec<u8> = Vec::new();
+        let mut line_buf = String::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pending_bytes.extend_from_slice(&buf[..n]);
+                    let (t, rem) = split_valid_utf8(&pending_bytes);
+                    pending_bytes = rem;
+                    line_buf.push_str(&t);
+                    while let Some(nl) = line_buf.find('\n') {
+                        let line: String = line_buf.drain(..=nl).collect();
+                        let trimmed = line.trim_end_matches(['\n', '\r']);
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        for out in adapt_line(&rsess, engine, trimmed) {
+                            ingest_line(&rsess, &app, &out);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let tail = line_buf.trim_end_matches(['\n', '\r']);
+        if !tail.is_empty() {
+            for out in adapt_line(&rsess, engine, tail) {
+                ingest_line(&rsess, &app, &out);
+            }
+        }
+        *rsess.child.lock() = None;
+        // Fallback close: if the engine never emitted a turn-end (crash / kill /
+        // an engine that just EOFs), synthesize a result so the composer frees.
+        // `busy` is still true ONLY if no adapted `result` line cleared it.
+        if rsess.busy.swap(false, Ordering::SeqCst) {
+            let tid = rsess.thread_id.lock().clone().unwrap_or_default();
+            let result = format!(
+                "{{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
+                json_escape(&tid)
+            );
+            ingest_line(&rsess, &app, &result);
+        }
+    });
+    Ok(())
+}
+
+/// Routes a raw engine line to the right adapter; claude lines pass through.
+fn adapt_line(sess: &Arc<ChatSession>, engine: Engine, line: &str) -> Vec<String> {
+    match engine {
+        Engine::Codex => adapt_codex_line(sess, line),
+        Engine::Opencode => adapt_opencode_line(sess, line),
+        Engine::Claude => vec![line.to_string()],
+    }
+}
+
+/// One claude-shaped assistant text line.
+fn assistant_text_line(text: &str) -> String {
+    format!(
+        "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}",
+        json_escape(text)
+    )
+}
+
+/// One claude-shaped assistant thinking line.
+fn assistant_thinking_line(text: &str) -> String {
+    format!(
+        "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"{}\"}}]}}}}",
+        json_escape(text)
+    )
+}
+
+/// Maps Codex `exec --json` JSONL → claude-shaped event lines.
+/// `thread.started{thread_id}` → capture resume id + real `system/init`;
+/// `item.completed{agent_message|reasoning}` → assistant text/thinking;
+/// `turn.completed{usage}` → `result`; `turn.failed`/`error` → error result.
+fn adapt_codex_line(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    let mut out = Vec::new();
+    match t {
+        "thread.started" => {
+            if let Some(tid) = v.get("thread_id").and_then(|x| x.as_str()) {
+                let mut g = sess.thread_id.lock();
+                let fresh = g.as_deref() != Some(tid);
+                *g = Some(tid.to_string());
+                drop(g);
+                if fresh {
+                    out.push(format!(
+                        "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{}\"}}",
+                        json_escape(tid)
+                    ));
+                }
+            }
+        }
+        "item.completed" => {
+            if let Some(item) = v.get("item") {
+                let itype = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                let txt = item
+                    .get("text")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| item.get("content").and_then(|x| x.as_str()))
+                    .unwrap_or("");
+                match itype {
+                    "agent_message" if !txt.is_empty() => out.push(assistant_text_line(txt)),
+                    "reasoning" if !txt.is_empty() => out.push(assistant_thinking_line(txt)),
+                    _ => {} // command/file/mcp items — not surfaced in v1
+                }
+            }
+        }
+        "turn.completed" => {
+            let tid = sess.thread_id.lock().clone().unwrap_or_default();
+            let usage = v
+                .get("usage")
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "{}".to_string());
+            out.push(format!(
+                "{{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"{}\",\"usage\":{usage},\"total_cost_usd\":0}}",
+                json_escape(&tid)
+            ));
+        }
+        "turn.failed" | "error" => {
+            let tid = sess.thread_id.lock().clone().unwrap_or_default();
+            out.push(format!(
+                "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
+                json_escape(&tid)
+            ));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Maps opencode `run --format json` JSONL → claude-shaped event lines.
+/// First `sessionID` (`ses_…`) → resume id + real `system/init`; `text` parts →
+/// assistant text; `reasoning` parts → thinking. Turn-end is handled by the EOF
+/// fallback in `run_per_turn` (opencode just exits when the run completes).
+fn adapt_opencode_line(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(sid) = v.get("sessionID").and_then(|x| x.as_str()) {
+        let mut g = sess.thread_id.lock();
+        if g.is_none() {
+            *g = Some(sid.to_string());
+            drop(g);
+            out.push(format!(
+                "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{}\"}}",
+                json_escape(sid)
+            ));
+        }
+    }
+    let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    let part_text = v
+        .get("part")
+        .and_then(|p| p.get("text"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    match t {
+        "text" if !part_text.is_empty() => out.push(assistant_text_line(part_text)),
+        "reasoning" if !part_text.is_empty() => out.push(assistant_thinking_line(part_text)),
+        _ => {}
+    }
+    out
+}
+
 /// Handles one complete output line: append to the replay buffer, update session
 /// state (claude id, busy, done-notification), and forward to the live sink.
 fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
@@ -445,13 +860,18 @@ fn notify_done(app: &AppHandle, title: &str) {
         .show();
 }
 
-/// Sends one user turn into a live chat session by writing a newline-delimited
-/// stream-json user line to the child's stdin. The reply streams back over the
-/// session's Channel (set at `chat_start`). No-op if the session is gone.
+/// Sends one user turn. For claude: writes a stream-json user line to the live
+/// process's stdin. For codex/opencode (spawn-per-turn): spawns a fresh subprocess
+/// resuming the prior thread, whose output is adapted into claude-shaped events.
+/// The reply streams back over the session's Channel. No-op if the session's gone.
 #[tauri::command]
-pub fn chat_send(session_id: u32, text: String) -> Result<(), String> {
-    if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
-        s.busy.store(true, Ordering::SeqCst);
+pub fn chat_send(app: AppHandle, session_id: u32, text: String) -> Result<(), String> {
+    let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) else {
+        return Err(format!("chat session {session_id} not found"));
+    };
+    s.busy.store(true, Ordering::SeqCst);
+    if s.engine.per_turn() {
+        return run_per_turn(s, app, text);
     }
     write_line(session_id, &user_line(&text))
 }
@@ -537,6 +957,18 @@ pub fn list_chat_live() -> Vec<LiveChat> {
 /// stops consuming deltas and re-enables the composer when it sees the result.
 #[tauri::command]
 pub fn chat_interrupt(session_id: u32) -> Result<(), String> {
+    // codex/opencode have no control protocol — kill the in-flight turn's child.
+    // Its stdout EOFs, the reader thread runs, and the EOF fallback emits a
+    // `result` that frees the composer. The session stays registered for the
+    // next turn (a fresh subprocess), so this is still a true interrupt.
+    if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
+        if s.engine.per_turn() {
+            if let Some(child) = s.child.lock().as_mut() {
+                let _ = child.kill();
+            }
+            return Ok(());
+        }
+    }
     let rid = NEXT_REQ.fetch_add(1, Ordering::SeqCst);
     let line = format!(
         "{{\"type\":\"control_request\",\"request_id\":\"int-{rid}\",\"request\":{{\"subtype\":\"interrupt\"}}}}\n"
@@ -567,8 +999,10 @@ pub fn chat_send_raw(session_id: u32, line: String) -> Result<(), String> {
 pub fn chat_stop(session_id: u32) -> Result<(), String> {
     let removed = with_sessions(|m| m.remove(&session_id));
     if let Some(s) = removed {
-        let _ = s.child.lock().kill();
-        let _ = s.child.lock().wait();
+        if let Some(child) = s.child.lock().as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
     Ok(())
 }

@@ -264,6 +264,7 @@ pub fn pty_spawn_terminal(
     on_data: Channel<String>,
     name: String,
     cmd: Option<String>,
+    cwd: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<u32, String> {
@@ -274,26 +275,49 @@ pub fn pty_spawn_terminal(
     }
     let tmux = tmux_bin();
     let session = format!("aios-term-{name}");
+    // Single-quote for the outer `sh -c` so spaces/args survive.
+    let sq = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    // Optional start directory — `new-session -c <dir>`. Drives "run project"
+    // (the command MUST execute in the project root, else `npm run`/`flutter run`
+    // fail in $HOME and the pane exits). Only applied when the dir exists.
+    let cdir = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && std::path::Path::new(c).is_dir())
+        .map(|c| format!(" -c {}", sq(c)))
+        .unwrap_or_default();
     // Build the optional startup command for `new-session`. tmux runs it via its
     // own default-shell, so a bare string like `claude` is fine; empty → login shell.
     let startup = cmd
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .unwrap_or_default();
-    let new_session = if startup.is_empty() {
-        format!("{tmux} -L adletic new-session -d -s {session}")
+    // `new-session -A -d` is atomic create-or-noop: it creates the session
+    // detached if absent and is a harmless no-op (NOT a re-launch of `cmd`) if it
+    // already exists. This replaces the old `has-session || new-session` pair,
+    // whose gap before `attach` was a TOCTOU race — if the session wasn't present
+    // at attach time tmux printed `can't find session: aios-term-<name>`. With
+    // `-A` the session is GUARANTEED to exist before we attach, so that error
+    // class is gone.
+    let create = if startup.is_empty() {
+        format!("{tmux} -L adletic new-session -A -d -s {session}{cdir}")
     } else {
-        // Single-quote the command so spaces/args survive the outer `sh -c`.
-        let quoted = format!("'{}'", startup.replace('\'', "'\\''"));
-        format!("{tmux} -L adletic new-session -d -s {session} {quoted}")
+        // Run the command, then drop to an interactive shell so the pane STAYS
+        // ALIVE after the command finishes or errors (a VS Code-style run
+        // terminal: logs remain, you can re-run) instead of the tmux session
+        // dying the instant the command exits.
+        let keepalive = format!("{startup}; exec ${{SHELL:-/bin/zsh}}");
+        format!("{tmux} -L adletic new-session -A -d -s {session}{cdir} {}", sq(&keepalive))
     };
     let mut cmdb = CommandBuilder::new("/bin/sh");
     cmdb.arg("-c");
-    // Create the session if absent, enable mouse so the wheel scrolls inside tmux
-    // (it owns the alt-screen, bypassing xterm's scrollback), then attach. `exec`
-    // replaces the shell so closing the pane detaches the client — see pty_kill.
+    // Ensure the session exists (atomic), enable mouse so the wheel scrolls inside
+    // tmux (it owns the alt-screen, bypassing xterm's scrollback), then attach.
+    // `exec` replaces the shell so closing the pane detaches the client — see
+    // pty_kill. mouse is also set globally in ~/.config/adletic/tmux.conf; this
+    // inline set is a belt-and-braces fallback for a server started without it.
     cmdb.arg(format!(
-        "{tmux} -L adletic has-session -t {session} 2>/dev/null || {new_session}; \
+        "{create} 2>/dev/null; \
          {tmux} -L adletic set -g mouse on 2>/dev/null; \
          exec {tmux} -L adletic attach -t {session}"
     ));

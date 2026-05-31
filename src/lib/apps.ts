@@ -11,6 +11,7 @@ import {
   Globe,
   MessageCircle,
   MessageSquare,
+  NotebookPen,
   Wand2,
   TerminalSquare,
 } from "lucide-react";
@@ -23,6 +24,7 @@ export type PaneContent =
   | { type: "files" }
   | { type: "browser"; url?: string; profile?: string; memKey?: string }
   | { type: "memory" }
+  | { type: "notes" }
   | { type: "automations" }
   | { type: "bridges" }
   | { type: "plugins" }
@@ -46,9 +48,10 @@ export type AppDef = {
 
 /** Default app catalog — order here == the seeded default sidebar order. */
 export const SPAWN: AppDef[] = [
-  { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "sessions" },
-  { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "sessions" },
+  { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "tools" },
+  { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "tools" },
   { id: "claude-code", kind: { type: "shell", cmd: "claude --dangerously-skip-permissions" }, icon: Bot, label: "claude code", group: "tools" },
+  { id: "notes", kind: { type: "notes" }, icon: NotebookPen, label: "notes", group: "tools" },
   { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools" },
   { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools" },
   { id: "database", kind: { type: "memory" }, icon: Database, label: "database", group: "tools" },

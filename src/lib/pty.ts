@@ -84,10 +84,11 @@ export async function spawnTerminal(
   onData: Channel<string>,
   name: string,
   cmd: string | null,
+  cwd: string | null,
   cols: number,
   rows: number,
 ): Promise<number> {
-  return invoke<number>("pty_spawn_terminal", { onData, name, cmd: cmd ?? null, cols, rows });
+  return invoke<number>("pty_spawn_terminal", { onData, name, cmd: cmd ?? null, cwd: cwd ?? null, cols, rows });
 }
 
 /** Spawns a pane attached to the oracle tmux session `aios-<identity>`. */

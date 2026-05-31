@@ -30,6 +30,11 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 
 /** Options for starting a chat session. All optional. */
 export interface ChatStartOpts {
+  /** Which engine drives the session: "claude" (default) | "codex" | "opencode".
+   *  codex runs on the ChatGPT subscription; opencode bridges openrouter + 75
+   *  providers (incl free models). The backend normalizes every engine's output
+   *  into claude's event shape, so the pane renders them identically. */
+  engine?: string | null;
   /** Working directory for the claude process (so tools hit the right repo). */
   cwd?: string | null;
   /** Model id or alias, e.g. `claude-opus-4-8` or `opus`. */
@@ -165,10 +170,12 @@ export type ApprovalDecision = "allow" | "allow_always" | "deny";
 
 /** One selectable chat model in the composer's model picker. */
 export interface ChatModel {
-  /** Value passed to claude `--model` (or ignored if disabled). */
+  /** Value passed to the engine (claude `--model`, codex/opencode `-m`). */
   id: string;
   /** Display label. */
   label: string;
+  /** Which backend runs it. Omitted = claude. */
+  engine?: "claude" | "codex" | "opencode";
   /** If true, shown greyed and not selectable yet. */
   disabled?: boolean;
   /** Tooltip note (e.g. availability date) shown for disabled entries. */
@@ -176,15 +183,26 @@ export interface ChatModel {
 }
 
 /**
- * The model list for the Codex-style picker. Claude models are live; the OpenAI
- * entry is a greyed placeholder — the OpenAI subscription SDK isn't permitted
- * until ~June 1, so it's shown but not selectable.
+ * Built-in model list for the composer picker. Claude models run the native
+ * stream-json process; codex models run on the ChatGPT subscription (no API
+ * key); opencode models bridge openrouter + 75 providers (incl free models for
+ * when the ChatGPT sub hits its rate window). Settings adds the full live
+ * opencode/openrouter catalog on top of these.
  */
 export const CHAT_MODELS: ChatModel[] = [
-  { id: "claude-opus-4-8", label: "opus 4.8" },
-  { id: "claude-sonnet-4-6", label: "sonnet 4.6" },
-  { id: "claude-haiku-4-5", label: "haiku 4.5" },
-  { id: "openai", label: "openai", disabled: true, note: "june 1" },
+  { id: "claude-opus-4-8", label: "opus 4.8", engine: "claude" },
+  { id: "claude-sonnet-4-6", label: "sonnet 4.6", engine: "claude" },
+  { id: "claude-haiku-4-5", label: "haiku 4.5", engine: "claude" },
+  // ChatGPT subscription via Codex — no API key, no per-token billing.
+  { id: "gpt-5.5", label: "gpt-5.5 · codex", engine: "codex" },
+  // ONE free fallback for when the ChatGPT sub hits its rate window:
+  // NVIDIA Nemotron (Llama-based, US) via opencode — best free non-Chinese
+  // model in the catalog. Deliberately the only free entry; no model sprawl.
+  {
+    id: "opencode/nemotron-3-super-free",
+    label: "nemotron · free",
+    engine: "opencode",
+  },
 ];
 
 /** Permission modes claude accepts, for the "Full access ▾" chip. */
@@ -210,6 +228,7 @@ export async function chatStart(
 ): Promise<number> {
   return invoke<number>("chat_start", {
     onEvent,
+    engine: opts.engine ?? null,
     cwd: opts.cwd ?? null,
     model: opts.model ?? null,
     permissionMode: opts.permissionMode ?? null,

@@ -45,6 +45,21 @@ export async function gitStatus(path: string): Promise<GitStatus> {
   return invoke<GitStatus>("git_status", { path });
 }
 
+/** Compact per-repo git summary for the homescreen "dev pulse" tile. */
+export interface RepoPulse {
+  root: string;
+  name: string;
+  branch: string;
+  dirty: number;
+  ahead: number;
+  behind: number;
+}
+
+/** Branch + dirty-count + ahead/behind for each repo path (best-effort). */
+export async function gitPulse(paths: string[]): Promise<RepoPulse[]> {
+  return invoke<RepoPulse[]>("git_pulse", { paths });
+}
+
 export async function homeDir(): Promise<string> {
   return invoke<string>("home_dir");
 }
@@ -66,6 +81,11 @@ export async function readTextFile(path: string): Promise<string> {
 /** Writes UTF-8 contents back to a file (editor save, atomic via temp+rename). */
 export async function writeTextFile(path: string, content: string): Promise<void> {
   return invoke<void>("write_text_file", { path, content });
+}
+
+/** Deletes a single file (notes CRUD). No-op if it's already gone; refuses dirs. */
+export async function deletePath(path: string): Promise<void> {
+  return invoke<void>("delete_path", { path });
 }
 
 /** Converts an office doc (docx/xlsx/pptx/…) to a cached PDF via headless

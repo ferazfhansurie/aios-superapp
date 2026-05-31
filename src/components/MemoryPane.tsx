@@ -93,7 +93,7 @@ interface Draft {
   body: string;
 }
 
-export function MemoryView() {
+export function MemoryView({ onOpenUrl }: { onOpenUrl?: (url: string) => void } = {}) {
   const [graph, setGraph] = useState<MemoryGraph | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -409,7 +409,7 @@ export function MemoryView() {
                   {contentErr ? (
                     <p className="text-[var(--color-danger)]">{contentErr}</p>
                   ) : (
-                    <Markdown text={content} nodesById={nodesById} onLink={(id) => setSelected(id)} />
+                    <Markdown text={content} nodesById={nodesById} onLink={(id) => setSelected(id)} onOpenUrl={onOpenUrl} />
                   )}
                 </div>
               </>
@@ -833,10 +833,13 @@ export function Markdown({
   text,
   nodesById,
   onLink,
+  onOpenUrl,
 }: {
   text: string;
   nodesById: Map<string, MemoryNode>;
   onLink: (id: string) => void;
+  /** Open an http(s) link from rendered markdown in an in-app browser pane. */
+  onOpenUrl?: (url: string) => void;
 }) {
   const body = useMemo(() => stripFrontmatter(text), [text]);
   if (!body.trim()) {
@@ -861,7 +864,7 @@ export function Markdown({
                 : "text-[12px] font-medium text-[var(--color-text-2)]";
           return (
             <div key={i} className={`mt-2 ${cls}`}>
-              {renderInline(hm[2], nodesById, onLink)}
+              {renderInline(hm[2], nodesById, onLink, onOpenUrl)}
             </div>
           );
         }
@@ -871,12 +874,12 @@ export function Markdown({
           return (
             <div key={i} className="flex gap-1.5 pl-1.5" style={{ marginLeft: lm[1].length * 4 }}>
               <span className="text-[var(--color-faint)]">•</span>
-              <span className="flex-1">{renderInline(lm[3], nodesById, onLink)}</span>
+              <span className="flex-1">{renderInline(lm[3], nodesById, onLink, onOpenUrl)}</span>
             </div>
           );
         }
 
-        return <p key={i}>{renderInline(trimmed, nodesById, onLink)}</p>;
+        return <p key={i}>{renderInline(trimmed, nodesById, onLink, onOpenUrl)}</p>;
       })}
     </div>
   );
@@ -894,14 +897,15 @@ function stripFrontmatter(text: string): string {
   return t;
 }
 
-/** Renders inline markup: **bold**, `code`, and [[wikilink]] chips. */
+/** Renders inline markup: **bold**, `code`, [[wikilink]] chips, and [text](url) links. */
 function renderInline(
   text: string,
   nodesById: Map<string, MemoryNode>,
   onLink: (id: string) => void,
+  onOpenUrl?: (url: string) => void,
 ): React.ReactNode[] {
   const out: React.ReactNode[] = [];
-  const re = /(\[\[[^\]]+\]\])|(\*\*[^*]+\*\*)|(`[^`]+`)/g;
+  const re = /(\[\[[^\]]+\]\])|(\[[^\]]+\]\([^)]+\))|(\*\*[^*]+\*\*)|(`[^`]+`)/g;
   let last = 0;
   let m: RegExpExecArray | null;
   let key = 0;
@@ -927,6 +931,28 @@ function renderInline(
         >
           {label}
         </button>,
+      );
+    } else if (token.startsWith("[")) {
+      const close = token.indexOf("]");
+      const label = token.slice(1, close);
+      const url = token.slice(close + 2, -1);
+      const http = /^https?:\/\//i.test(url);
+      out.push(
+        <a
+          key={key++}
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          onClick={(e) => {
+            if (http && onOpenUrl) {
+              e.preventDefault();
+              onOpenUrl(url);
+            }
+          }}
+          className="text-[var(--color-accent)] underline decoration-[var(--color-accent)]/40 underline-offset-2 hover:decoration-[var(--color-accent)]"
+        >
+          {label}
+        </a>,
       );
     } else if (token.startsWith("**")) {
       out.push(

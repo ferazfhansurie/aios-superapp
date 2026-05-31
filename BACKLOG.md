@@ -1,0 +1,3 @@
+
+## Pending pickup (2026-05-30, deferred — firaz confirmed "YUP")
+- **Per-pane top-right controls**: beyond just close (X), add maximize/fullscreen + hide/minimize + an options menu (duplicate, etc). DESIGN NOTE: maximize must lift `maximizedKey` to App (App.tsx) and set `active=false` on all NON-maximized panes — native browser webviews paint ABOVE html, so siblings must deactivate (shrink to 0) or they'll overpaint the maximized pane. ResizableGrid uses CSS grid (no transform), so a `fixed inset-2 z-30` on the maximized PaneCard escapes to viewport cleanly. Keep all panes mounted (don't unmount → webview/terminal state loss). Header lives at PaneCard ~line 1310.

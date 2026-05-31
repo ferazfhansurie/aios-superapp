@@ -211,7 +211,10 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
             let mut parts = line.splitn(2, '|');
             let session = parts.next().unwrap_or("").trim().to_string();
             let attached = parts.next().unwrap_or("0").trim() != "0";
-            if !session.starts_with("aios-") {
+            // Real oracles are `aios-<identity>`. EXCLUDE `aios-term-*` — those are
+            // the shell's own persistent terminal panes, not oracles; they were
+            // leaking into the roster as cryptic "oracle: term-k3-…" entries.
+            if !session.starts_with("aios-") || session.starts_with("aios-term-") {
                 continue;
             }
             let identity = session.trim_start_matches("aios-").to_string();

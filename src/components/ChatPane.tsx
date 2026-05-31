@@ -27,6 +27,8 @@ import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
   ArrowUp,
+  ArrowDown,
+  PackageOpen,
   AtSign,
   Check,
   CheckCheck,
@@ -84,7 +86,8 @@ import {
   type ChatTurnInfo,
 } from "../lib/chat";
 import { readDir, saveImageTemp, type DirEntry } from "../lib/fs";
-import { chatHandles, paneWriters } from "../lib/paneBus";
+import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
+import { chatHandles, paneWriters, paneSubmitters } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -141,6 +144,43 @@ type RenderBlock =
 
 let _uid = 0;
 const uid = () => `t${++_uid}`;
+
+/** A pasted/attached image: live thumbnail + its saved temp path (null while saving). */
+interface ImageChip {
+  id: string;
+  url: string;
+  path: string | null;
+}
+let _imgSeq = 0;
+/** Shell-quote a path for embedding in a message (single-quote, escape inner '). */
+function quotePath(path: string): string {
+  return `'${path.replace(/'/g, "'\\''")}'`;
+}
+/** "0:05" from elapsed seconds (dictation timer). */
+function fmtElapsed(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+/** Precomputed equalizer bars for the inline dictation waveform (time-keyed). */
+const WAVEFORM_BARS: { h: number; delay: number }[] = Array.from(
+  { length: 40 },
+  (_, i) => ({ h: 28 + ((i * 37) % 60), delay: (i * 70) % 900 }),
+);
+const WAVE_KEYFRAMES = `@keyframes aios-wave {
+  0%, 100% { transform: scaleY(0.32); opacity: 0.55; }
+  50% { transform: scaleY(1); opacity: 1; }
+}`;
+
+/** File extension for a clipboard/file image mime. */
+function extFromMime(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("png")) return "png";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("webp")) return "webp";
+  return "png";
+}
 
 // instruction prefixes for the composer modes
 const PLAN_PREFIX =
@@ -420,6 +460,7 @@ export function ChatPane({
   seed,
   resume,
   reattach,
+  onOpenUrl,
 }: {
   cwd?: string;
   paneKey?: string;
@@ -429,9 +470,35 @@ export function ChatPane({
   /** Reattach to a still-live backgrounded session by its backend id (from the
    *  "running" tray) — replays its buffer and continues live instead of spawning. */
   reattach?: number;
+  /** Open an http(s) link from rendered markdown in an in-app browser pane. */
+  onOpenUrl?: (url: string) => void;
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [input, setInput] = useState(seed ?? "");
+  // composer draft persists per pane so /clear, a restart, or a remount never
+  // loses what you were typing. Keyed by paneKey; seed (e.g. notes "send to AI")
+  // still wins on first mount.
+  const draftKey = paneKey ? `aios-chat-draft:${paneKey}` : null;
+  const [input, setInput] = useState<string>(() => {
+    if (seed) return seed;
+    if (draftKey) {
+      try {
+        return localStorage.getItem(draftKey) ?? "";
+      } catch {
+        /* ignore */
+      }
+    }
+    return "";
+  });
+  // persist the draft as it changes (cleared on send).
+  useEffect(() => {
+    if (!draftKey) return;
+    try {
+      if (input) localStorage.setItem(draftKey, input);
+      else localStorage.removeItem(draftKey);
+    } catch {
+      /* ignore */
+    }
+  }, [input, draftKey]);
   const [streaming, setStreaming] = useState(false);
   const [started, setStarted] = useState(false);
   // claude's init event arrived (session_id known) — gates the seed auto-send
@@ -441,6 +508,8 @@ export function ChatPane({
   const [model, setModel] = useState<ChatModel>(CHAT_MODELS[0]);
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(EFFORTS[1]);
+  // running context size (prompt tokens of the latest turn) → composer indicator
+  const [ctxTokens, setCtxTokens] = useState<number | null>(null);
 
   // mode chips
   const [planMode, setPlanMode] = useState(false);
@@ -521,8 +590,16 @@ export function ChatPane({
     paneWriters.set(paneKey, (t) =>
       setInput((v) => (v ? v.trimEnd() + " " + t : t)),
     );
+    // SUBMIT path ("send to AI" → chat): fire the text straight through the
+    // kept-fresh sendText ref so it actually sends (no input-state race). Mirror
+    // it into the box first so the user sees what went out.
+    paneSubmitters.set(paneKey, (t) => {
+      setInput(t);
+      sendTextRef.current?.(t);
+    });
     return () => {
       paneWriters.delete(paneKey);
+      paneSubmitters.delete(paneKey);
     };
   }, [paneKey]);
 
@@ -559,6 +636,124 @@ export function ChatPane({
       }
     }
   }, [insertPath]);
+  // ── image attach: paste a screenshot / pick a file → temp file + thumbnail ──
+  const [images, setImages] = useState<ImageChip[]>([]);
+  const imgInputRef = useRef<HTMLInputElement>(null);
+  const addImage = useCallback(async (file: Blob, mime: string) => {
+    const id = `img${++_imgSeq}`;
+    const url = URL.createObjectURL(file);
+    setImages((prev) => [...prev, { id, url, path: null }]);
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+      }
+      const path = await saveImageTemp(btoa(bin), extFromMime(mime));
+      setImages((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
+    } catch {
+      setImages((prev) => {
+        const gone = prev.find((im) => im.id === id);
+        if (gone) URL.revokeObjectURL(gone.url);
+        return prev.filter((im) => im.id !== id);
+      });
+    }
+  }, []);
+  const removeImage = useCallback((id: string) => {
+    setImages((prev) => {
+      const gone = prev.find((im) => im.id === id);
+      if (gone) URL.revokeObjectURL(gone.url);
+      return prev.filter((im) => im.id !== id);
+    });
+  }, []);
+  // paste an image off the clipboard → thumbnail chip (temp file saved in bg)
+  const onPasteImage = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const it of items) {
+        if (it.kind === "file" && it.type.startsWith("image/")) {
+          const file = it.getAsFile();
+          if (file) {
+            e.preventDefault();
+            void addImage(file, it.type);
+            return;
+          }
+        }
+      }
+    },
+    [addImage],
+  );
+  const savingImg = images.some((im) => im.path == null);
+
+  // ── voice dictation: click mic → inline waveform + timer → transcript ───────
+  // Ported from TerminalComposer (the polished one). Records via lib/voice, swaps
+  // the textarea for a live equalizer while recording, drops the transcript into
+  // the box on stop. Esc cancels.
+  type VoicePhase = "idle" | "recording" | "transcribing";
+  const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
+  const [voiceElapsed, setVoiceElapsed] = useState(0);
+  const voicePhaseRef = useRef<VoicePhase>("idle");
+  voicePhaseRef.current = voicePhase;
+  useEffect(() => {
+    if (voicePhase !== "recording") return;
+    setVoiceElapsed(0);
+    const base = Date.now();
+    const t = setInterval(
+      () => setVoiceElapsed(Math.floor((Date.now() - base) / 1000)),
+      250,
+    );
+    return () => clearInterval(t);
+  }, [voicePhase]);
+  const micStart = useCallback(async () => {
+    if (voicePhaseRef.current !== "idle") return;
+    try {
+      await dictateStart();
+      setVoicePhase("recording");
+    } catch {
+      setVoicePhase("idle");
+    }
+  }, []);
+  const micStop = useCallback(async () => {
+    if (voicePhaseRef.current !== "recording") return;
+    setVoicePhase("transcribing");
+    try {
+      const text = await dictateStop();
+      if (text) {
+        setInput((v) => (v ? v.trimEnd() + " " + text : text));
+      }
+    } catch {
+      /* best-effort dictation */
+    } finally {
+      setVoicePhase("idle");
+      taRef.current?.focus();
+    }
+  }, []);
+  const micCancel = useCallback(async () => {
+    if (voicePhaseRef.current !== "recording") return;
+    setVoicePhase("idle");
+    try {
+      await dictateCancel();
+    } catch {
+      /* best-effort */
+    }
+  }, []);
+  const recording = voicePhase === "recording";
+  // Esc cancels an in-progress recording (the textarea is swapped out then, so a
+  // window listener catches it).
+  useEffect(() => {
+    if (!recording) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        void micCancel();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [recording, micCancel]);
 
   // ── event ingestion ───────────────────────────────────────────────────────
 
@@ -675,6 +870,19 @@ export function ChatPane({
           );
         }
         for (const b of blocks) {
+          // text fallback: claude streams text via content_block_delta tokens, so
+          // the bubble is already built by the time this final message lands. But
+          // engines without token-streaming (codex/opencode) emit ONLY the whole
+          // message — so when no streaming bubble exists, render the text here.
+          if (b.type === "text") {
+            const full = (b.text ?? "").trim();
+            if (full && streamingTurnId.current == null) {
+              setTurns((prev) => [
+                ...prev,
+                { kind: "assistant", id: uid(), text: full, streaming: false },
+              ]);
+            }
+          }
           // thinking fallback: if partial-message deltas didn't build a block
           // (e.g. replay or thinking arriving whole), synthesize one from text.
           if (b.type === "thinking") {
@@ -764,6 +972,18 @@ export function ChatPane({
         const tokens = tokensFromUsage(ev.usage);
         const tokStr =
           tokens != null ? `${tokens.toLocaleString()} tok` : "";
+        // context size = the prompt the model saw this turn (input + cached
+        // input). Drives the composer's running "Nk ctx" indicator, TUI-style.
+        const u = (ev.usage ?? {}) as Record<string, unknown>;
+        const ctx =
+          (typeof u.input_tokens === "number" ? u.input_tokens : 0) +
+          (typeof u.cache_read_input_tokens === "number"
+            ? u.cache_read_input_tokens
+            : 0) +
+          (typeof u.cache_creation_input_tokens === "number"
+            ? u.cache_creation_input_tokens
+            : 0);
+        if (ctx > 0) setCtxTokens(ctx);
         const foot = [dur, tokStr, cost].filter(Boolean).join(" · ");
         // always emit a result turn (carries durationMs for the activity line),
         // even if the human-readable footer would be empty.
@@ -811,6 +1031,7 @@ export function ChatPane({
     let disposed = false;
     setStarted(false);
     setClaudeReady(false);
+    setCtxTokens(null);
     const chan = new Channel<string>();
     chan.onmessage = (line) => {
       if (disposed) return;
@@ -828,6 +1049,7 @@ export function ChatPane({
       reattach != null
         ? chatReattach(reattach, chan).then(() => reattach)
         : chatStart(chan, {
+            engine: model.engine ?? "claude",
             cwd: cwd ?? null,
             model: model.disabled ? null : model.id,
             permissionMode: permission.id,
@@ -886,11 +1108,35 @@ export function ChatPane({
     };
   }, [paneKey]);
 
-  // autoscroll on new content
+  // autoscroll on new content — but ONLY while pinned to the bottom. If you've
+  // scrolled up to read backlog mid-stream, we stop yanking you down and show a
+  // "jump to latest" pill instead (daily-driver staple).
+  const atBottomRef = useRef(true);
+  const [showJump, setShowJump] = useState(false);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [turns]);
+  // track whether the viewport is near the bottom; drives autoscroll + the pill.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+      const bottom = dist < 80;
+      atBottomRef.current = bottom;
+      setShowJump(!bottom);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+  const jumpToLatest = useCallback(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    atBottomRef.current = true;
+    setShowJump(false);
+  }, []);
 
   // autosize textarea
   useEffect(() => {
@@ -967,29 +1213,56 @@ export function ChatPane({
     [goal, planMode, effort.ultra],
   );
 
-  const send = useCallback(() => {
-    const text = input.trim();
-    if (!text || streaming || sessionIdRef.current == null) return;
-    // Record this chat into the /resume list on its FIRST user send, titled by
-    // that first message. claude's session_id (from the init event) is the key
-    // used later to resume + repaint. Fire-and-forget; never blocks the send.
-    if (!recordedRef.current) {
-      const sid = claudeSessionIdRef.current;
-      if (sid) {
-        recordedRef.current = true;
-        const title = text.length > 120 ? text.slice(0, 120) : text;
-        recordChatSession(sid, title, cwd ?? null).catch(() => {
-          // failed to persist → allow a later send to retry
-          recordedRef.current = false;
-        });
-        // Label the backend session for the background tray + done-notification.
-        if (sessionIdRef.current != null) chatSetTitle(sessionIdRef.current, title).catch(() => {});
+  // Send an explicit string (used by send() with the composer text, and by the
+  // external "send to AI" submitter which passes the note body directly so it
+  // doesn't race the input state).
+  const sendText = useCallback(
+    (raw: string) => {
+      const text = raw.trim();
+      // attached images go in as quoted temp paths the model can read; allow a
+      // send with images even when the text is empty.
+      const imgPaths = images
+        .filter((im) => im.path)
+        .map((im) => quotePath(im.path as string));
+      if ((!text && imgPaths.length === 0) || streaming || sessionIdRef.current == null)
+        return;
+      // Record this chat into the /resume list on its FIRST user send, titled by
+      // that first message. claude's session_id (from the init event) is the key
+      // used later to resume + repaint. Fire-and-forget; never blocks the send.
+      if (!recordedRef.current) {
+        const sid = claudeSessionIdRef.current;
+        if (sid) {
+          recordedRef.current = true;
+          const title = text.length > 120 ? text.slice(0, 120) : text;
+          recordChatSession(sid, title, cwd ?? null).catch(() => {
+            // failed to persist → allow a later send to retry
+            recordedRef.current = false;
+          });
+          // Label the backend session for the background tray + done-notification.
+          if (sessionIdRef.current != null) chatSetTitle(sessionIdRef.current, title).catch(() => {});
+        }
       }
-    }
-    setInput("");
-    setOverlay(null);
-    dispatch(text);
-  }, [input, streaming, dispatch, cwd]);
+      setInput("");
+      setImages((prev) => {
+        prev.forEach((im) => URL.revokeObjectURL(im.url));
+        return [];
+      });
+      setOverlay(null);
+      // prepend the image paths so the model sees them with the message
+      const full = imgPaths.length
+        ? imgPaths.join(" ") + (text ? " " + text : "")
+        : text;
+      dispatch(full);
+    },
+    [streaming, dispatch, cwd, images],
+  );
+
+  const send = useCallback(() => sendText(input), [sendText, input]);
+
+  // Keep a fresh ref to sendText so the external submitter (registered once per
+  // paneKey) always calls the latest closure without re-registering.
+  const sendTextRef = useRef(sendText);
+  sendTextRef.current = sendText;
 
   // ── launcher seed: auto-send as the first turn ─────────────────────────────
   // The idle page hands over the prompt you typed as `seed`; fire it once the
@@ -1130,6 +1403,21 @@ export function ChatPane({
         },
       },
       {
+        id: "goal",
+        label: "/goal",
+        desc: "set an ongoing goal (prepended each turn)",
+        icon: <Target size={14} />,
+        run: () => {
+          setOverlay(null);
+          setInput("");
+          const next = window.prompt(
+            "pursue goal — prepended as context each turn until cleared:",
+            goal,
+          );
+          if (next != null) setGoal(next.trim());
+        },
+      },
+      {
         id: "resume",
         label: "/resume",
         desc: "reopen a past conversation",
@@ -1156,6 +1444,17 @@ export function ChatPane({
         },
       },
       {
+        id: "handoff",
+        label: "/handoff",
+        desc: "package this session for a fresh one",
+        icon: <PackageOpen size={14} />,
+        run: () => {
+          setInput("");
+          setOverlay(null);
+          sendText("/handoff");
+        },
+      },
+      {
         id: "help",
         label: "/help",
         desc: "what can this do",
@@ -1175,7 +1474,7 @@ export function ChatPane({
         },
       },
     ],
-    [clearSession, loadResumeSessions],
+    [clearSession, loadResumeSessions, sendText, goal],
   );
 
   // load dir entries for the @-mention picker (lazy, on first open)
@@ -1337,13 +1636,36 @@ export function ChatPane({
         }
       }
     }
+    // ↑ on an EMPTY composer recalls the last sent message for quick edit/resend
+    // (TUI staple). Empty-only so it never fights normal cursor movement.
+    if (
+      e.key === "ArrowUp" &&
+      !overlay &&
+      input.trim() === "" &&
+      lastSentRef.current
+    ) {
+      e.preventDefault();
+      const recalled = lastSentRef.current;
+      setInput(recalled);
+      requestAnimationFrame(() => {
+        const ta = taRef.current;
+        if (ta) {
+          ta.focus();
+          ta.setSelectionRange(recalled.length, recalled.length);
+        }
+      });
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
     }
   };
 
-  const canSend = input.trim().length > 0 && !streaming && started;
+  const canSend =
+    (input.trim().length > 0 || images.some((im) => im.path)) &&
+    !streaming &&
+    started;
 
   // ── composer (shared between empty hero + docked) ──────────────────────────
 
@@ -1386,7 +1708,7 @@ export function ChatPane({
 
         {/* slash / @-mention overlay */}
         {overlay === "slash" && slashFiltered.length > 0 && (
-          <OverlayPanel>
+          <OverlayPanel compact>
             {slashFiltered.map((c, i) => (
               <OverlayRow
                 key={c.id}
@@ -1450,18 +1772,87 @@ export function ChatPane({
           />
         )}
 
-        <div className="rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
-          <textarea
-            ref={taRef}
-            value={input}
-            onChange={(e) => onChangeInput(e.target.value)}
-            onKeyDown={onKeyDown}
-            rows={1}
-            placeholder={planMode ? "describe the task to plan…" : "do anything"}
-            spellCheck={false}
-            className="block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
+        <div className="flash-composer relative rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
+          {/* attached-image thumbnails (paste a screenshot / + attach) */}
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3 pt-3">
+              {images.map((im) => (
+                <div
+                  key={im.id}
+                  className="group relative h-14 w-14 overflow-hidden rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-panel)]"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={im.url} alt="" className="h-full w-full object-cover" />
+                  {im.path == null && (
+                    <div className="absolute inset-0 grid place-items-center bg-[var(--color-bg)]/60">
+                      <Loader2 size={14} className="animate-spin text-[var(--color-accent)]" />
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => removeImage(im.id)}
+                    className="absolute right-0.5 top-0.5 grid h-4 w-4 place-items-center rounded-full bg-[var(--color-bg)]/80 text-[var(--color-muted)] opacity-0 transition-opacity hover:text-[var(--color-text)] group-hover:opacity-100"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <input
+            ref={imgInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const files = e.target.files;
+              if (files) for (const f of files) void addImage(f, f.type);
+              e.target.value = "";
+            }}
           />
-          <div className="flex items-center gap-1.5 px-3 pb-3 pt-1">
+          <style>{WAVE_KEYFRAMES}</style>
+          {recording ? (
+            <div className="flex items-center gap-3 px-4 pt-4 pb-2">
+              <div className="flex h-7 flex-1 items-center gap-[3px] overflow-hidden">
+                {WAVEFORM_BARS.map((b, i) => (
+                  <span
+                    key={i}
+                    className="w-[3px] shrink-0 origin-center rounded-full bg-[var(--color-accent)]"
+                    style={{
+                      height: `${b.h}%`,
+                      animation: "aios-wave 0.9s ease-in-out infinite",
+                      animationDelay: `${b.delay}ms`,
+                    }}
+                  />
+                ))}
+              </div>
+              <span className="font-mono text-[12px] tabular-nums text-[var(--color-text)]">
+                {fmtElapsed(voiceElapsed)}
+              </span>
+              <button
+                type="button"
+                onClick={() => void micStop()}
+                title="stop dictation (esc to cancel)"
+                className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
+              >
+                <Square size={14} className="fill-current" />
+              </button>
+            </div>
+          ) : (
+            <textarea
+              ref={taRef}
+              value={input}
+              onChange={(e) => onChangeInput(e.target.value)}
+              onKeyDown={onKeyDown}
+              onPaste={onPasteImage}
+              rows={1}
+              placeholder={planMode ? "describe the task to plan…" : "do anything"}
+              spellCheck={false}
+              className="block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
+            />
+          )}
+          <div className="flex flex-wrap items-center gap-1.5 px-3 pb-3 pt-1">
             {/* permission chip */}
             <Dropdown
               open={openMenu === "perm"}
@@ -1568,44 +1959,12 @@ export function ChatPane({
               )}
             </Dropdown>
 
-            {/* plan toggle */}
-            <button
-              type="button"
-              onClick={() => setPlanMode((p) => !p)}
-              title="plan first on the next message"
-              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
-                planMode
-                  ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                  : "border-[var(--color-border)] bg-[var(--color-panel)]/50 text-[var(--color-text-2)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
-              }`}
-            >
-              <ListChecks size={13} />
-              <span>plan</span>
-            </button>
+            {/* plan + goal moved off the bar (use /plan, /goal) to keep it sleek;
+                their active state still shows as a chip above the composer. */}
 
-            {/* pursue-goal pill: set / focus */}
-            <button
-              type="button"
-              onClick={() => {
-                const next = window.prompt(
-                  "pursue goal — prepended as context each turn until cleared:",
-                  goal,
-                );
-                if (next != null) setGoal(next.trim());
-              }}
-              title="set an ongoing goal"
-              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
-                goal
-                  ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                  : "border-[var(--color-border)] bg-[var(--color-panel)]/50 text-[var(--color-text-2)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
-              }`}
-            >
-              <Target size={13} />
-              <span>goal</span>
-            </button>
-
-            <div className="flex-1" />
-
+            {/* right action cluster — pinned right (ml-auto), stays together and
+                wraps to its own line on a narrow pane so send is never clipped */}
+            <div className="ml-auto flex shrink-0 items-center gap-1.5">
             {/* model selector (right) */}
             <Dropdown
               open={openMenu === "model"}
@@ -1613,7 +1972,7 @@ export function ChatPane({
               align="right"
               trigger={
                 <>
-                  <span>{model.label}</span>
+                  <span className="whitespace-nowrap">{model.label}</span>
                   <ChevronDown size={12} className="text-[var(--color-faint)]" />
                 </>
               }
@@ -1642,14 +2001,34 @@ export function ChatPane({
               ))}
             </Dropdown>
 
-            {/* mic */}
+            {/* attach image (or paste a screenshot / drag a file in) */}
             <button
               type="button"
-              className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-              title="dictate (⌘J)"
+              onClick={() => imgInputRef.current?.click()}
+              className={`grid h-8 w-8 place-items-center rounded-full transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)] ${
+                savingImg ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]"
+              }`}
+              title="attach image (or ⌘V a screenshot)"
             >
-              <Mic size={16} />
+              <ImageIcon size={16} />
             </button>
+
+            {/* mic — click to dictate (waveform takes over the input row while
+                recording; this shows idle / transcribing) */}
+            {voicePhase === "transcribing" ? (
+              <div className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-accent)]">
+                <Loader2 size={16} className="animate-spin" />
+              </div>
+            ) : !recording ? (
+              <button
+                type="button"
+                onClick={() => void micStart()}
+                className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-all duration-200 hover:scale-110 hover:bg-[var(--color-accent-soft)] hover:text-[var(--color-accent)] hover:shadow-[0_0_14px_-3px_var(--color-accent)]"
+                title="dictate (⌘J)"
+              >
+                <Mic size={16} />
+              </button>
+            ) : null}
 
             {/* send / stop */}
             {streaming ? (
@@ -1672,17 +2051,23 @@ export function ChatPane({
                 <ArrowUp size={16} />
               </button>
             )}
+            </div>
           </div>
         </div>
       </div>
     ),
     // re-render composer on the inputs that affect it
+    // (images: chip row + attach-button state)
     [
       input,
       openMenu,
       permission,
       effort,
       model,
+      ctxTokens,
+      images,
+      voicePhase,
+      voiceElapsed,
       streaming,
       canSend,
       send,
@@ -1802,7 +2187,7 @@ export function ChatPane({
 
   return (
     <PaneDropZone onPath={insertPath} label="drop to add to message">
-    <div className="flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
+    <div className="relative flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-2xl flex-col gap-5 px-6 py-8">
           {resumedTitle && (
@@ -1836,6 +2221,7 @@ export function ChatPane({
                   if (!streaming && sessionIdRef.current != null) dispatch(label);
                 }}
                 disabled={streaming}
+                onOpenUrl={onOpenUrl}
               />
             ) : b.kind === "thinking" ? (
               <ThinkingBlock key={b.id} turn={b.turn} />
@@ -1862,8 +2248,42 @@ export function ChatPane({
             )}
         </div>
       </div>
+      {/* jump-to-latest pill — appears when you've scrolled up off the bottom */}
+      {showJump && (
+        <button
+          type="button"
+          onClick={jumpToLatest}
+          title="jump to latest"
+          className="absolute bottom-28 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/90 px-3 py-1.5 font-sans text-[12px] text-[var(--color-text-2)] shadow-2xl shadow-black/40 backdrop-blur transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+        >
+          <ArrowDown size={13} />
+          latest
+        </button>
+      )}
       <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg)]/80 px-6 pb-5 pt-3 backdrop-blur">
-        <div className="mx-auto max-w-2xl">{composer}</div>
+        <div className="mx-auto max-w-2xl">
+          {/* context readout — out of the cramped composer, model-aware window
+              (opus 4.8 = 1M, sonnet/haiku = 200K, codex = 272K) */}
+          {ctxTokens != null && (
+            <div
+              title={`${ctxTokens.toLocaleString()} tokens of context`}
+              className="mb-1.5 flex justify-end px-1 font-mono text-[10.5px] tabular-nums text-[var(--color-faint)]"
+            >
+              {(() => {
+                const win = model.id.startsWith("claude-opus")
+                  ? 1_000_000
+                  : model.engine === "codex"
+                    ? 272_000
+                    : model.engine === "opencode"
+                      ? 256_000
+                      : 200_000;
+                const pct = Math.round((ctxTokens / win) * 100);
+                return `${(ctxTokens / 1000).toFixed(1)}K${pct > 0 ? ` · ${pct}%` : ""} ctx`;
+              })()}
+            </div>
+          )}
+          {composer}
+        </div>
       </div>
     </div>
     </PaneDropZone>
@@ -2393,10 +2813,12 @@ function AssistantBubble({
   turn,
   onButton,
   disabled,
+  onOpenUrl,
 }: {
   turn: Extract<Turn, { kind: "assistant" }>;
   onButton: (label: string) => void;
   disabled: boolean;
+  onOpenUrl?: (url: string) => void;
 }) {
   // Don't render the sentinel as a half-baked pill while still streaming in —
   // wait for the full message so we don't flicker partial `[[btn:` text.
@@ -2406,7 +2828,7 @@ function AssistantBubble({
   return (
     <div className="group flex flex-col items-start gap-1">
       <div className="max-w-[92%] font-sans text-[14.5px] leading-relaxed text-[var(--color-text-2)]">
-        <Markdown text={body} />
+        <Markdown text={body} onOpenUrl={onOpenUrl} />
         {turn.streaming && (
           <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-pulse bg-[var(--color-accent)]" />
         )}
@@ -2574,7 +2996,13 @@ function splitFences(
   return out;
 }
 
-function Markdown({ text }: { text: string }) {
+function Markdown({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   const segments = useMemo(() => splitFences(text), [text]);
   return (
     <div className="flex flex-col gap-2">
@@ -2582,7 +3010,7 @@ function Markdown({ text }: { text: string }) {
         seg.code ? (
           <CodeBlock key={i} lang={seg.lang} body={seg.body} />
         ) : (
-          <MarkdownBlocks key={i} text={seg.body} />
+          <MarkdownBlocks key={i} text={seg.body} onOpenUrl={onOpenUrl} />
         ),
       )}
     </div>
@@ -2609,7 +3037,13 @@ function CodeBlock({ lang, body }: { lang: string; body: string }) {
 
 /** Render the non-code body: split into block-level lines (headings / lists /
  *  paragraphs), each with inline formatting. */
-function MarkdownBlocks({ text }: { text: string }) {
+function MarkdownBlocks({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   if (!text.trim()) return null;
   const lines = text.split("\n");
   const out: React.ReactNode[] = [];
@@ -2629,7 +3063,7 @@ function MarkdownBlocks({ text }: { text: string }) {
             <li key={j} className="flex gap-2">
               <span className="select-none text-[var(--color-faint)]">{j + 1}.</span>
               <span className="flex-1">
-                <Inline text={it} />
+                <Inline text={it} onOpenUrl={onOpenUrl} />
               </span>
             </li>
           ))}
@@ -2640,7 +3074,7 @@ function MarkdownBlocks({ text }: { text: string }) {
             <li key={j} className="flex gap-2">
               <span className="select-none text-[var(--color-accent)]">•</span>
               <span className="flex-1">
-                <Inline text={it} />
+                <Inline text={it} onOpenUrl={onOpenUrl} />
               </span>
             </li>
           ))}
@@ -2668,7 +3102,7 @@ function MarkdownBlocks({ text }: { text: string }) {
           key={`h${key++}`}
           className={`mt-1 font-sans font-semibold text-[var(--color-text)] ${size}`}
         >
-          <Inline text={h[2]} />
+          <Inline text={h[2]} onOpenUrl={onOpenUrl} />
         </div>,
       );
       continue;
@@ -2702,7 +3136,7 @@ function MarkdownBlocks({ text }: { text: string }) {
     flushList();
     out.push(
       <p key={`p${key++}`} className="whitespace-pre-wrap break-words">
-        <Inline text={line} />
+        <Inline text={line} onOpenUrl={onOpenUrl} />
       </p>,
     );
   }
@@ -2713,7 +3147,13 @@ function MarkdownBlocks({ text }: { text: string }) {
 /** Inline span formatting: `code`, **bold**, *italic* / _italic_, [text](url).
  *  Single-pass tokenizer — partial markers (e.g. a lone trailing `**` during
  *  streaming) just render literally, never throw. */
-function Inline({ text }: { text: string }) {
+function Inline({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   const nodes: React.ReactNode[] = [];
   let i = 0;
   let k = 0;
@@ -2753,7 +3193,7 @@ function Inline({ text }: { text: string }) {
         flush();
         nodes.push(
           <strong key={`b${k++}`} className="font-semibold text-[var(--color-text)]">
-            <Inline text={text.slice(i + 2, end)} />
+            <Inline text={text.slice(i + 2, end)} onOpenUrl={onOpenUrl} />
           </strong>,
         );
         i = end + 2;
@@ -2770,12 +3210,19 @@ function Inline({ text }: { text: string }) {
           flush();
           const label = text.slice(i + 1, close);
           const url = text.slice(close + 2, paren);
+          const http = /^https?:\/\//i.test(url);
           nodes.push(
             <a
               key={`a${k++}`}
               href={url}
               target="_blank"
               rel="noreferrer"
+              onClick={(e) => {
+                if (http && onOpenUrl) {
+                  e.preventDefault();
+                  onOpenUrl(url);
+                }
+              }}
               className="text-[var(--color-accent)] underline decoration-[var(--color-accent)]/40 underline-offset-2 hover:decoration-[var(--color-accent)]"
             >
               {label}
@@ -2896,9 +3343,20 @@ interface SlashCommand {
 }
 
 /** The floating panel that sits just above the composer for `/` and `@`. */
-function OverlayPanel({ children }: { children: React.ReactNode }) {
+function OverlayPanel({
+  children,
+  compact = false,
+}: {
+  children: React.ReactNode;
+  /** compact = a left-anchored dropdown (slash menu) vs the full-width panel. */
+  compact?: boolean;
+}) {
   return (
-    <div className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50">
+    <div
+      className={`absolute bottom-full z-40 mb-2 max-h-64 overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50 ${
+        compact ? "left-3 min-w-[220px] max-w-[min(360px,90%)]" : "left-0 right-0"
+      }`}
+    >
       {children}
     </div>
   );

@@ -22,7 +22,7 @@ import {
   spawnTmux,
 } from "../lib/pty";
 import { homeDir, saveImageTemp } from "../lib/fs";
-import { paneWriters } from "../lib/paneBus";
+import { paneWriters, paneSubmitters } from "../lib/paneBus";
 import { TerminalComposer } from "./TerminalComposer";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
@@ -112,7 +112,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   const [composerOpen, setComposerOpen] = useState(
     kind.type === "oracle" ||
       kind.type === "tmux" ||
-      (kind.type === "shell" && kind.cmd === "claude"),
+      (kind.type === "shell" && !!kind.cmd && kind.cmd.startsWith("claude")),
   );
   const [savingImg, setSavingImg] = useState(false);
   // Best-effort cwd for the composer's context bar: a shell pane's explicit cwd,
@@ -123,11 +123,27 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // [[btn: a | b | c]] sentinel → clickable buttons (mirrors the WhatsApp UX).
   const [buttons, setButtons] = useState<string[] | null>(null);
   const bufRef = useRef("");
+  // claude-code's live state, parsed best-effort from its TUI output (the raw
+  // PTY has no API to query it). Drives the composer's mode + model pills so they
+  // reflect REALITY instead of generic labels. Kept in a ref + state so the
+  // per-chunk parse only re-renders when something actually changes.
+  const [claudeStatus, setClaudeStatus] = useState<{
+    mode?: string;
+    model?: string;
+    ctxPct?: number;
+  }>({});
+  const claudeStatusRef = useRef<{ mode?: string; model?: string; ctxPct?: number }>(
+    {},
+  );
   const lastBtnRef = useRef("");
   // When the compose box is open, an "append to box" writer it registers — so
   // global ⌘J dictation (App's single VoiceButton) lands in the box, exactly
   // like ChatPane. null = no composer mounted → fall back to the PTY writer.
   const composerAppendRef = useRef<((text: string) => void) | null>(null);
+  // Live xterm handle so composerSend can snap the viewport to the prompt before
+  // writing — the common "wrong spot" is a scrolled-up terminal (reading backlog
+  // / tmux copy-mode) that would eat the sent line.
+  const termRef = useRef<Xterm | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -151,6 +167,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       scrollback: 10000,
       theme: THEME,
     });
+    termRef.current = term;
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.loadAddon(new WebLinksAddon());
@@ -271,6 +288,43 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       const clean = raw
         .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
         .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+      // parse claude-code's live status out of the same cleaned window:
+      //   mode  — the footer hint "⏵⏵ bypass permissions on / plan mode on / …"
+      //   model — "Opus 4.8" / "Sonnet 4.6" / "Haiku 4.5" wherever it's printed
+      //   ctx%  — claude's "NN% context left" / "context: NN%" readout
+      // Best-effort + sticky: update only on a fresh match, keep last otherwise.
+      {
+        const prev = claudeStatusRef.current;
+        const next = { ...prev };
+        const modeM = clean.match(
+          /(bypass permissions|accept edits|plan mode|normal mode)\b/i,
+        );
+        if (modeM) {
+          const m = modeM[1].toLowerCase();
+          next.mode = m.startsWith("bypass")
+            ? "full access"
+            : m.startsWith("accept")
+              ? "accept edits"
+              : m.startsWith("plan")
+                ? "plan"
+                : "ask each time";
+        }
+        const modelM = clean.match(/\b(opus|sonnet|haiku)\s+(\d+(?:\.\d+)?)/i);
+        if (modelM) {
+          next.model = `${modelM[1][0].toUpperCase()}${modelM[1].slice(1).toLowerCase()} ${modelM[2]}`;
+        }
+        const ctxM = clean.match(/(\d+)%\s*context\s*(?:left|remaining)/i);
+        if (ctxM) next.ctxPct = Number(ctxM[1]);
+        if (
+          next.mode !== prev.mode ||
+          next.model !== prev.model ||
+          next.ctxPct !== prev.ctxPct
+        ) {
+          claudeStatusRef.current = next;
+          setClaudeStatus(next);
+        }
+      }
+
       const matches = [...clean.matchAll(/\[\[btn:\s*([^\]]+?)\]\]/gi)];
       const last = matches[matches.length - 1];
       if (last && last[1] !== lastBtnRef.current) {
@@ -309,8 +363,9 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
           sessionId = await spawnTmux(onData, kind.socket, kind.session, cols, rows);
         } else {
           const name = termSessionName(paneKey);
+          const cwd = kind.type === "shell" ? kind.cwd ?? null : null;
           try {
-            sessionId = await spawnTerminal(onData, name, kind.cmd ?? null, cols, rows);
+            sessionId = await spawnTerminal(onData, name, kind.cmd ?? null, cwd, cols, rows);
             persisted = true;
           } catch {
             // no tmux (Windows / non-AIOS box) → ephemeral shell fallback.
@@ -391,9 +446,27 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   const composerSend = (text: string) => {
     const id = sessionIdRef.current;
     if (id == null) return;
+    // auto-correct the "wrong spot": if the terminal is scrolled up (reading
+    // backlog / tmux copy-mode), the prompt isn't in view and the sent line gets
+    // lost. Snap to the live bottom + refocus first, then write. No-op when
+    // already at the bottom, so normal sends are unaffected.
+    termRef.current?.scrollToBottom();
+    termRef.current?.focus();
     ptyWrite(id, text).catch(() => {});
     setTimeout(() => ptyWrite(id, "\r").catch(() => {}), 40);
   };
+
+  // Expose composerSend as this pane's SUBMITTER so "send to AI" (notes pane)
+  // can paste + run a whole buffer into this terminal (e.g. claude code).
+  useEffect(() => {
+    if (!paneKey) return;
+    paneSubmitters.set(paneKey, composerSend);
+    return () => {
+      paneSubmitters.delete(paneKey);
+    };
+    // composerSend closes over stable refs; re-register only if the key changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paneKey]);
 
   // Interrupt the running CLI (^C) — visible "stop" affordance.
   const interrupt = () => {
@@ -548,6 +621,9 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
           }}
           register={registerComposer}
           cwd={paneCwd}
+          liveMode={claudeStatus.mode}
+          liveModel={claudeStatus.model}
+          liveCtxPct={claudeStatus.ctxPct}
         />
       )}
     </div>

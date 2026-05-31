@@ -169,6 +169,96 @@ fn simplify_status(xy: &str) -> &'static str {
 }
 
 #[derive(Serialize)]
+pub struct RepoPulse {
+    /// The input path, echoed back so the frontend can map results.
+    root: String,
+    /// Final path component of root.
+    name: String,
+    /// Current branch; "" if detached / not a repo.
+    branch: String,
+    /// Count of porcelain status lines (working-tree changes).
+    dirty: u32,
+    /// Commits ahead of upstream; 0 if no upstream / error.
+    ahead: u32,
+    /// Commits behind upstream; 0 if no upstream / error.
+    behind: u32,
+}
+
+/// Best-effort dev-pulse for a set of repo paths (the "dev pulse" dashboard tile).
+/// For each path: current branch, working-tree dirty count, and ahead/behind vs
+/// upstream. Never errors — a non-repo (or any git failure) yields a zeroed
+/// RepoPulse for that path. Results preserve input order, one per path. Frontend
+/// passes only a handful of paths so the git calls run sequentially.
+#[tauri::command]
+pub fn git_pulse(paths: Vec<String>) -> Vec<RepoPulse> {
+    let mut out: Vec<RepoPulse> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        // branch — "" if detached / not a repo
+        let branch = match std::process::Command::new("git")
+            .args(["-C", &path, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => String::new(),
+        };
+
+        // dirty — count of porcelain status lines
+        let dirty = match std::process::Command::new("git")
+            .args(["-C", &path, "status", "--porcelain", "--ignored=no"])
+            .output()
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count() as u32,
+            _ => 0,
+        };
+
+        // ahead/behind vs upstream — output is "<behind>\t<ahead>"
+        let (mut ahead, mut behind) = (0u32, 0u32);
+        if let Ok(o) = std::process::Command::new("git")
+            .args([
+                "-C",
+                &path,
+                "rev-list",
+                "--count",
+                "--left-right",
+                "@{upstream}...HEAD",
+            ])
+            .output()
+        {
+            if o.status.success() {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let mut parts = text.split_whitespace();
+                if let Some(b) = parts.next() {
+                    behind = b.parse().unwrap_or(0);
+                }
+                if let Some(a) = parts.next() {
+                    ahead = a.parse().unwrap_or(0);
+                }
+            }
+        }
+
+        out.push(RepoPulse {
+            root: path,
+            name,
+            branch,
+            dirty,
+            ahead,
+            behind,
+        });
+    }
+    out
+}
+
+#[derive(Serialize)]
 pub struct RunCommand {
     label: String,
     cmd: String,
@@ -280,6 +370,8 @@ pub struct ProjectInfo {
     kind: String,
     /// Candidate run commands; the first is the primary (default for the palette).
     commands: Vec<RunCommand>,
+    /// Unix epoch seconds of the project dir's last modification.
+    mtime: u64,
 }
 
 /// Directory names we never descend into — heavy build/dep/vcs dirs that would
@@ -332,11 +424,18 @@ pub fn list_projects() -> Vec<ProjectInfo> {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| dir.to_string_lossy().to_string());
+            let mtime = std::fs::metadata(&dir)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             out.push(ProjectInfo {
                 name,
                 root: dir.to_string_lossy().to_string(),
                 kind,
                 commands,
+                mtime,
             });
             continue;
         }
@@ -459,6 +558,22 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     ));
     std::fs::write(&tmp, content.as_bytes()).map_err(|e| format!("{e}"))?;
     std::fs::rename(&tmp, p).map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+/// Delete a single file (used by the notes pane — full CRUD). Refuses to touch
+/// directories so a bad path can't nuke a tree; a missing file is a no-op (the
+/// note is already gone, which is the caller's intent).
+#[tauri::command]
+pub fn delete_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Ok(());
+    }
+    if p.is_dir() {
+        return Err("refusing to delete a directory".into());
+    }
+    std::fs::remove_file(p).map_err(|e| format!("{e}"))?;
     Ok(())
 }
 
