@@ -90,10 +90,14 @@ import { readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
 import { idleRate, codexRate, resetIn } from "../lib/dashboard";
 import {
+  composerContextChips,
   cycleQueueSelection,
+  moveQueuedMessage,
   queueMessage,
   removeQueuedMessage,
   resumeTitle,
+  sendContract,
+  updateQueuedMessage,
   usageStack,
   type QueuedMessage,
 } from "../lib/chatPaneState";
@@ -565,6 +569,8 @@ export function ChatPane({
   // (codex-style). Held in a ref too so the flush effect reads the latest list.
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [queuedIdx, setQueuedIdx] = useState(0);
+  const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
+  const [editingQueuedText, setEditingQueuedText] = useState("");
   const queuedRef = useRef<QueuedMessage[]>([]);
   queuedRef.current = queued;
 
@@ -1409,6 +1415,39 @@ export function ChatPane({
       setQueuedIdx(next.selected);
       return next.items;
     });
+    if (editingQueuedId === id) {
+      setEditingQueuedId(null);
+      setEditingQueuedText("");
+    }
+  }, [queuedIdx, editingQueuedId]);
+
+  const editQueued = useCallback((item: QueuedMessage) => {
+    setEditingQueuedId(item.id);
+    setEditingQueuedText(item.text);
+  }, []);
+
+  const saveQueuedEdit = useCallback(() => {
+    const id = editingQueuedId;
+    if (!id) return;
+    setQueued((items) => {
+      const next = updateQueuedMessage(
+        { items, selected: queuedIdx },
+        id,
+        editingQueuedText,
+      );
+      setQueuedIdx(next.selected);
+      return next.items;
+    });
+    setEditingQueuedId(null);
+    setEditingQueuedText("");
+  }, [editingQueuedId, editingQueuedText, queuedIdx]);
+
+  const moveQueued = useCallback((id: string, delta: number) => {
+    setQueued((items) => {
+      const next = moveQueuedMessage({ items, selected: queuedIdx }, id, delta);
+      setQueuedIdx(next.selected);
+      return next.items;
+    });
   }, [queuedIdx]);
 
   // Explicitly inject one highlighted pending message into a live codex turn.
@@ -1479,6 +1518,19 @@ export function ChatPane({
   );
 
   const send = useCallback(() => sendText(input), [sendText, input]);
+
+  const steerDraft = useCallback(() => {
+    const text = input.trim();
+    const id = sessionIdRef.current;
+    if (!text || model.engine !== "codex" || id == null) return;
+    chatSteer(id, text)
+      .then(() => {
+        setTurns((prev) => [...prev, { kind: "user", id: uid(), text, steered: true }]);
+        setInput("");
+        setOverlay(null);
+      })
+      .catch(() => enqueue(text));
+  }, [input, model.engine, enqueue]);
 
   // Keep a fresh ref to sendText so the external submitter (registered once per
   // paneKey) always calls the latest closure without re-registering.
@@ -1916,17 +1968,36 @@ export function ChatPane({
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      // mid-turn Enter #1 queues. A second Enter on the highlighted list row
-      // explicitly steers it into codex; untouched rows auto-send on completion.
-      if (streaming) enqueue(input);
+      // mid-turn Enter is explicit now: Codex steers the active turn; engines
+      // without true steering queue the follow-up for the next turn.
+      if (streaming) {
+        if (model.engine === "codex") steerDraft();
+        else enqueue(input);
+      }
       else send();
     }
   };
 
-  const canSend =
-    (input.trim().length > 0 || images.some((im) => im.path)) &&
-    !streaming &&
-    started;
+  const hasDraft = input.trim().length > 0;
+  const hasReadyImages = images.some((im) => im.path);
+  const action = sendContract({
+    streaming,
+    hasDraft,
+    hasImages: hasReadyImages,
+    engine: model.engine ?? "claude",
+    started,
+  });
+  const contextChips = composerContextChips({
+    cwd,
+    modelLabel: model.label,
+    effortLabel: effort.label,
+    permissionLabel: permission.label,
+    engine: model.engine ?? "claude",
+    queuedCount: queued.length,
+    imageCount: images.length,
+    planMode,
+    hasGoal: Boolean(goal.trim()),
+  });
 
   // copilot-style ghost: the remainder of the most recent past message that
   // prefixes what's typed. Suppressed while an overlay (slash/@/resume) or voice
@@ -1950,37 +2021,55 @@ export function ChatPane({
   const composer = useMemo(
     () => (
       <div className="relative">
-        {/* mode chips above the box: plan + pursue-goal */}
-        {(planMode || goal) && (
-          <div className="mb-2 flex flex-wrap items-center gap-2">
-            {planMode && (
-              <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text)]">
-                <ListChecks size={12} className="text-[var(--color-accent)]" />
-                plan first
-                <button
-                  type="button"
-                  onClick={() => setPlanMode(false)}
-                  className="ml-0.5 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                  title="cancel plan mode"
-                >
-                  <X size={11} />
-                </button>
+        {/* context contract: what this send will use, before the user fires it. */}
+        {contextChips.length > 0 && (
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            {contextChips.map((chip) => (
+              <span
+                key={chip.id}
+                className={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] ${
+                  chip.id === "plan" || chip.id === "goal"
+                    ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
+                    : "border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 text-[var(--color-text-2)]"
+                }`}
+                title={chip.label}
+              >
+                {chip.id === "cwd" ? (
+                  <Folder size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "engine" ? (
+                  <Terminal size={12} className="shrink-0 text-[var(--color-muted)]" />
+                ) : chip.id === "attachments" ? (
+                  <ImageIcon size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "queue" ? (
+                  <Waypoints size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "plan" ? (
+                  <ListChecks size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "goal" ? (
+                  <Target size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : null}
+                <span className="truncate">{chip.label}</span>
+                {chip.id === "plan" && (
+                  <button
+                    type="button"
+                    onClick={() => setPlanMode(false)}
+                    className="ml-0.5 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                    title="cancel plan mode"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+                {chip.id === "goal" && (
+                  <button
+                    type="button"
+                    onClick={() => setGoal("")}
+                    className="ml-0.5 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                    title="clear goal"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
               </span>
-            )}
-            {goal && (
-              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)]">
-                <Target size={12} className="shrink-0 text-[var(--color-accent)]" />
-                <span className="truncate">goal: {goal}</span>
-                <button
-                  type="button"
-                  onClick={() => setGoal("")}
-                  className="ml-0.5 shrink-0 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                  title="clear goal"
-                >
-                  <X size={11} />
-                </button>
-              </span>
-            )}
+            ))}
           </div>
         )}
 
@@ -2315,38 +2404,44 @@ export function ChatPane({
               </button>
             ) : null}
 
-            {/* First action while streaming queues the draft. The pending list
-                above the composer owns explicit steer injection. */}
-            {streaming && input.trim() && (
-              <button
-                type="button"
-                onClick={() => enqueue(input)}
-                className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-panel-2)] px-3 text-[12px] font-medium text-[var(--color-text-2)] transition-all hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-                title="queue follow-up"
-              >
-                <Waypoints size={14} />
-                queue
-              </button>
-            )}
-            {/* send / stop */}
+            {/* send / steer / queue / stop. The label is the contract. */}
             {streaming ? (
-              <button
-                type="button"
-                onClick={stop}
-                className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-danger)] text-[var(--color-bg)] transition-all hover:opacity-90"
-                title="stop"
-              >
-                <Square size={14} className="fill-current" />
-              </button>
+              <>
+                {hasDraft && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (action.mode === "steer") steerDraft();
+                      else enqueue(input);
+                    }}
+                    disabled={action.disabled}
+                    className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
+                    title={action.title}
+                  >
+                    {action.mode === "steer" ? <Waypoints size={14} /> : <Clock size={14} />}
+                    {action.label}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={stop}
+                  className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-danger)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:opacity-90"
+                  title="interrupt active run"
+                >
+                  <Square size={13} className="fill-current" />
+                  stop
+                </button>
+              </>
             ) : (
               <button
                 type="button"
                 onClick={send}
-                disabled={!canSend}
-                className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
-                title="send"
+                disabled={action.disabled}
+                className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
+                title={action.title}
               >
                 <ArrowUp size={16} />
+                {action.label}
               </button>
             )}
             </div>
@@ -2368,13 +2463,21 @@ export function ChatPane({
       voicePhase,
       voiceElapsed,
       streaming,
-      canSend,
+      action,
+      contextChips,
+      hasDraft,
       send,
       stop,
       enqueue,
       queued,
       queuedIdx,
+      editingQueuedId,
+      editingQueuedText,
+      editQueued,
+      saveQueuedEdit,
+      moveQueued,
       steerQueued,
+      steerDraft,
       planMode,
       goal,
       overlay,
@@ -2598,8 +2701,66 @@ export function ChatPane({
                   }`}
                 >
                   <Clock size={12} className="shrink-0 text-[var(--color-faint)]" />
-                  <span className="min-w-0 flex-1 truncate">{q.text}</span>
+                  {editingQueuedId === q.id ? (
+                    <input
+                      value={editingQueuedText}
+                      onChange={(e) => setEditingQueuedText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          saveQueuedEdit();
+                        }
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          setEditingQueuedId(null);
+                          setEditingQueuedText("");
+                        }
+                      }}
+                      onBlur={saveQueuedEdit}
+                      autoFocus
+                      className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+                    />
+                  ) : (
+                    <span className="min-w-0 flex-1 truncate">{q.text}</span>
+                  )}
                   <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">queued</span>
+                  {editingQueuedId === q.id ? (
+                    <button
+                      type="button"
+                      onClick={saveQueuedEdit}
+                      className="shrink-0 rounded p-0.5 text-[var(--color-accent)] hover:bg-[var(--color-panel)]"
+                      title="save"
+                    >
+                      <Check size={12} />
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => editQueued(q)}
+                      className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                      title="edit queued message"
+                    >
+                      <Pencil size={12} />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => moveQueued(q.id, -1)}
+                    disabled={i === 0}
+                    className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)] disabled:opacity-30"
+                    title="move up"
+                  >
+                    <ArrowUp size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => moveQueued(q.id, 1)}
+                    disabled={i === queued.length - 1}
+                    className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)] disabled:opacity-30"
+                    title="move down"
+                  >
+                    <ArrowDown size={12} />
+                  </button>
                   {model.engine === "codex" && streaming && (
                     <button
                       type="button"

@@ -3,10 +3,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  composerContextChips,
   cycleQueueSelection,
+  moveQueuedMessage,
   queueMessage,
   removeQueuedMessage,
   resumeTitle,
+  sendContract,
+  updateQueuedMessage,
   usageStack,
 } from "./chatPaneState.ts";
 import {
@@ -61,6 +65,121 @@ test("removeQueuedMessage removes the selected steer item and keeps selection va
     ],
     selected: 1,
   });
+});
+
+test("updateQueuedMessage edits text and drops blank queued rows", () => {
+  const state = {
+    items: [
+      { id: "q1", text: "one" },
+      { id: "q2", text: "two" },
+    ],
+    selected: 1,
+  };
+
+  assert.deepEqual(updateQueuedMessage(state, "q2", "  run tests again  "), {
+    items: [
+      { id: "q1", text: "one" },
+      { id: "q2", text: "run tests again" },
+    ],
+    selected: 1,
+  });
+  assert.deepEqual(updateQueuedMessage(state, "q2", "   "), {
+    items: [{ id: "q1", text: "one" }],
+    selected: 0,
+  });
+});
+
+test("moveQueuedMessage reorders queued rows and tracks the moved row", () => {
+  const state = {
+    items: [
+      { id: "q1", text: "one" },
+      { id: "q2", text: "two" },
+      { id: "q3", text: "three" },
+    ],
+    selected: 1,
+  };
+
+  assert.deepEqual(moveQueuedMessage(state, "q2", -1), {
+    items: [
+      { id: "q2", text: "two" },
+      { id: "q1", text: "one" },
+      { id: "q3", text: "three" },
+    ],
+    selected: 0,
+  });
+  assert.deepEqual(moveQueuedMessage(state, "q2", 1), {
+    items: [
+      { id: "q1", text: "one" },
+      { id: "q3", text: "three" },
+      { id: "q2", text: "two" },
+    ],
+    selected: 2,
+  });
+});
+
+test("sendContract makes streaming send behavior explicit", () => {
+  assert.deepEqual(
+    sendContract({
+      streaming: true,
+      hasDraft: true,
+      hasImages: false,
+      engine: "codex",
+      started: true,
+    }),
+    {
+      mode: "steer",
+      label: "steer",
+      title: "inject into the running codex turn",
+      disabled: false,
+    },
+  );
+  assert.deepEqual(
+    sendContract({
+      streaming: true,
+      hasDraft: true,
+      hasImages: false,
+      engine: "claude",
+      started: true,
+    }).mode,
+    "queue",
+  );
+  assert.equal(
+    sendContract({
+      streaming: false,
+      hasDraft: false,
+      hasImages: false,
+      engine: "codex",
+      started: true,
+    }).disabled,
+    true,
+  );
+});
+
+test("composerContextChips exposes the control contract at a glance", () => {
+  assert.deepEqual(
+    composerContextChips({
+      cwd: "/Users/firaz/Repo/firaz/aios/shell",
+      modelLabel: "gpt-5.5 · codex",
+      effortLabel: "low",
+      permissionLabel: "full access",
+      engine: "codex",
+      queuedCount: 2,
+      imageCount: 1,
+      planMode: true,
+      hasGoal: true,
+    }),
+    [
+      { id: "cwd", label: "shell" },
+      { id: "engine", label: "codex" },
+      { id: "model", label: "gpt-5.5 · codex" },
+      { id: "effort", label: "low" },
+      { id: "permission", label: "full access" },
+      { id: "attachments", label: "1 image" },
+      { id: "queue", label: "2 queued" },
+      { id: "plan", label: "plan" },
+      { id: "goal", label: "goal" },
+    ],
+  );
 });
 
 test("resumeTitle keeps claude's first-message title behavior unchanged", () => {
