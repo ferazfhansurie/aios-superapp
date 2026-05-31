@@ -107,6 +107,7 @@ import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, openFileInPane
 import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import { emptyRunEventState, reduceRunEvents, type RunEventState } from "../lib/runEvents";
 import { memorySearch, type MemoryHit } from "../lib/memory";
+import { buildAiosShellContext } from "../lib/aiosContext";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -211,9 +212,6 @@ const GOAL_PREFIX = (goal: string) =>
 // orchestrate, fan out, verify — be maximally thorough.
 const ULTRA_PREFIX =
   "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel sub-agents (Task tool) to cover it, then adversarially verify findings before concluding. Prefer orchestrated multi-agent execution over a single pass; only handle trivially small tasks inline.\n\n";
-
-const AIOS_SHELL_PREFIX =
-  "AIOS shell superapp context: you are running inside Firaz's local Tauri AIOS shell, not a generic chat box. Treat the app as a multi-pane operating system. Native concepts: chat panes, terminal panes, browser panes, file viewer panes, editor panes, notes, memory, crm, automations, plugins, motion studio, oracle/tmux panes, background chat sessions, pane-native links, file routing, and drag/drop context. When useful, ask to open or control panes explicitly: open browser pane for URLs, open file/editor pane for paths, spawn terminal pane for commands, send text to the focused pane, attach files/folders as context, hand off long work to an oracle, or request permission for risky actions. Prefer aios-native workflows over dumping instructions for the user to perform manually. Keep actions observable and explain what pane/context you need.\n\n";
 
 function memoryContextBlock(memories: MemoryHit[]): string {
   if (memories.length === 0) return "";
@@ -1409,7 +1407,12 @@ export function ChatPane({
     (display: string, opts?: { skipUserBubble?: boolean; wirePrefix?: string }) => {
       const id = sessionIdRef.current;
       if (id == null) return;
-      let wire = AIOS_SHELL_PREFIX + (opts?.wirePrefix ?? "") + display;
+      const shellContext = buildAiosShellContext({
+        cwd,
+        paneKey,
+        attachedMemoryCount: attachedMemories.length,
+      });
+      let wire = shellContext + (opts?.wirePrefix ?? "") + display;
       if (goal.trim()) wire = GOAL_PREFIX(goal.trim()) + wire;
       if (planMode) wire = PLAN_PREFIX + wire;
       if (effort.ultra) wire = ULTRA_PREFIX + wire;
@@ -1445,7 +1448,7 @@ export function ChatPane({
         setStreaming(false);
       });
     },
-    [goal, planMode, effort.ultra],
+    [goal, planMode, effort.ultra, cwd, paneKey, attachedMemories.length],
   );
   // keep the flush effect calling the latest dispatch closure
   dispatchRef.current = dispatch;
