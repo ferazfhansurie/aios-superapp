@@ -81,20 +81,21 @@ pub fn browser_show(
     let window = app.get_window("main").ok_or("no main window")?;
     let popup_app = app.clone();
     let popup_profile = profile.clone();
-    let mut builder =
-        tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
-            .user_agent(UA)
-            .on_new_window(move |url, _features| {
-                let _ = popup_app.emit("browser-new-pane", browser_new_pane(&url, &popup_profile));
-                tauri::webview::NewWindowResponse::Deny
-            });
-    // A named profile gets its own persistent cookie partition so multiple
-    // accounts (personal / noobx29 / fathopes work) stay logged in at once.
-    // The unnamed/"default" profile keeps the shared default store (preserves
-    // any existing login). macOS 14+ only — the only platform this app ships on.
+    let mut builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+        .user_agent(UA)
+        .on_new_window(move |url, _features| {
+            let _ = popup_app.emit("browser-new-pane", browser_new_pane(&url, &popup_profile));
+            tauri::webview::NewWindowResponse::Deny
+        });
+    // A named profile gets its own persistent cookie partition on macOS. Other
+    // platforms keep the default store for now: Windows WebView2 profile
+    // partitioning needs a separate implementation, so don't make pulls fail.
+    #[cfg(target_os = "macos")]
     if let Some(name) = profile.as_deref().filter(|p| !p.is_empty() && *p != "default") {
         builder = builder.data_store_identifier(profile_store_id(name));
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = &profile;
     window
         .add_child(
             builder,
@@ -319,6 +320,14 @@ pub fn browser_screenshot(
     width: f64,
     height: f64,
 ) -> Result<String, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, label, x, y, width, height);
+        return Err("browser screenshots are macos-only right now".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     // Touch `app`/`label` so the call shape matches the other commands and the
     // capture is clearly scoped to a live pane.
     let _ = app.get_webview(&label).ok_or("browser not open")?;
@@ -347,6 +356,7 @@ pub fn browser_screenshot(
         ));
     }
     Ok(path)
+    }
 }
 
 // ─── Annotate mode (Codex-style "select-on-page → send to chat") ──────────────
@@ -514,20 +524,33 @@ pub fn browser_copy_selection(app: AppHandle, label: String) -> Result<(), Strin
 }
 
 /// Reads the system clipboard as text — the receive end of the clipboard-bridge.
-/// macOS: `pbpaste`. The frontend polls this and filters for the `AIOS_ANNOT:`
-/// sentinel, so unrelated clipboard contents are ignored.
-///
-/// Windows fallback (not compiled here — macOS-only build): run
-/// `powershell -NoProfile -Command Get-Clipboard` and read its stdout instead.
-/// Linux fallback: `xclip -selection clipboard -o` (or `wl-paste`).
+/// The frontend polls this and filters for the `AIOS_ANNOT:` sentinel, so
+/// unrelated clipboard contents are ignored.
 #[tauri::command]
 pub fn read_clipboard() -> Result<String, String> {
-    let out = std::process::Command::new("/usr/bin/pbpaste")
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("/usr/bin/pbpaste");
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("powershell.exe");
+        c.args(["-NoProfile", "-Command", "Get-Clipboard"]);
+        c
+    };
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.args([
+            "-c",
+            "command -v wl-paste >/dev/null 2>&1 && wl-paste || xclip -selection clipboard -o",
+        ]);
+        c
+    };
+    let out = cmd
         .output()
-        .map_err(|e| format!("pbpaste failed to launch: {e}"))?;
+        .map_err(|e| format!("clipboard read failed to launch: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "pbpaste exited with {}",
+            "clipboard read exited with {}",
             out.status.code().unwrap_or(-1)
         ));
     }

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test:chatpane": "node --experimental-strip-types --test src/lib/chatPaneState.test.ts src/lib/runEvents.test.ts src/lib/commands.test.ts",
+    "test:chatpane": "node --experimental-strip-types --test src/lib/chatPaneState.test.ts src/lib/runEvents.test.ts src/lib/commands.test.ts src/lib/paneLayout.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

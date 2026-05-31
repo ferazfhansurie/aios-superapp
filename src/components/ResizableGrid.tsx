@@ -5,6 +5,8 @@
  *  grid dimensions change (pane added/closed). */
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
+import { loadGridTracks, saveGridTracks } from "../lib/paneLayout";
+
 /** Minimum share of total a single track may shrink to (8%). */
 const MIN_FRAC = 0.08;
 
@@ -22,11 +24,13 @@ export function ResizableGrid({
   cols,
   rows,
   gap = 8,
+  storageKey,
   children,
 }: {
   cols: number;
   rows: number;
   gap?: number;
+  storageKey?: string;
   children: ReactNode;
 }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -36,11 +40,16 @@ export function ResizableGrid({
 
   // Reset tracks to equal shares whenever the grid shape changes.
   useEffect(() => {
-    setColFr(Array(cols).fill(1));
-  }, [cols]);
+    setColFr(storageKey ? (loadGridTracks(storageKey, cols, rows)?.cols ?? Array(cols).fill(1)) : Array(cols).fill(1));
+  }, [cols, rows, storageKey]);
   useEffect(() => {
-    setRowFr(Array(rows).fill(1));
-  }, [rows]);
+    setRowFr(storageKey ? (loadGridTracks(storageKey, cols, rows)?.rows ?? Array(rows).fill(1)) : Array(rows).fill(1));
+  }, [cols, rows, storageKey]);
+
+  useEffect(() => {
+    if (!storageKey || colFr.length !== cols || rowFr.length !== rows) return;
+    saveGridTracks(storageKey, colFr, rowFr);
+  }, [storageKey, colFr, rowFr, cols, rows]);
 
   const totalCol = colFr.reduce((a, b) => a + b, 0);
   const totalRow = rowFr.reduce((a, b) => a + b, 0);

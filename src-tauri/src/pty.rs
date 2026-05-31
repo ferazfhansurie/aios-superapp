@@ -130,8 +130,14 @@ pub fn pty_spawn(
     cols: u16,
     rows: u16,
 ) -> Result<u32, String> {
+    #[cfg(windows)]
+    let shell = std::env::var("COMSPEC")
+        .or_else(|_| std::env::var("ComSpec"))
+        .unwrap_or_else(|_| "powershell.exe".into());
+    #[cfg(not(windows))]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let mut cmd = CommandBuilder::new(shell);
+    #[cfg(not(windows))]
     cmd.arg("-l");
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -158,17 +164,25 @@ pub fn pty_spawn_oracle(
     cols: u16,
     rows: u16,
 ) -> Result<u32, String> {
-    let tmux = tmux_bin();
-    let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.arg("-c");
-    // enable mouse so the wheel scrolls inside tmux (it owns the alt-screen, so
-    // xterm's own scrollback is bypassed), then attach.
-    cmd.arg(format!(
+    #[cfg(windows)]
+    {
+        let _ = (app, state, on_data, identity, cols, rows);
+        return Err("oracle tmux attach is not supported on windows yet".into());
+    }
+    #[cfg(not(windows))]
+    {
+        let tmux = tmux_bin();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        // enable mouse so the wheel scrolls inside tmux (it owns the alt-screen, so
+        // xterm's own scrollback is bypassed), then attach.
+        cmd.arg(format!(
         "{tmux} -L adletic set -g mouse on 2>/dev/null; exec {tmux} -L adletic attach -t aios-{identity}"
     ));
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    spawn_internal(app, &state, on_data, cmd, cols, rows)
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        spawn_internal(app, &state, on_data, cmd, cols, rows)
+    }
 }
 
 /// Attaches a pane to a PERSISTENT terminal tmux session (`aios-term-<name>` on
@@ -195,7 +209,10 @@ pub fn pty_spawn_terminal(
     rows: u16,
 ) -> Result<u32, String> {
     // Guard against shell-injection via the pane-derived session name.
-    let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    let safe = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
     if name.is_empty() || !safe(&name) {
         return Err("invalid terminal name".into());
     }
@@ -233,7 +250,10 @@ pub fn pty_spawn_terminal(
         // terminal: logs remain, you can re-run) instead of the tmux session
         // dying the instant the command exits.
         let keepalive = format!("{startup}; exec ${{SHELL:-/bin/zsh}}");
-        format!("{tmux} -L adletic new-session -A -d -s {session}{cdir} {}", sq(&keepalive))
+        format!(
+            "{tmux} -L adletic new-session -A -d -s {session}{cdir} {}",
+            sq(&keepalive)
+        )
     };
     let mut cmdb = CommandBuilder::new("/bin/sh");
     cmdb.arg("-c");
@@ -266,20 +286,31 @@ pub fn pty_spawn_tmux(
     cols: u16,
     rows: u16,
 ) -> Result<u32, String> {
-    // Guard against shell-injection via socket/session names.
-    let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
-    if !safe(&socket) || !safe(&session) {
-        return Err("invalid socket or session name".into());
+    #[cfg(windows)]
+    {
+        let _ = (app, state, on_data, socket, session, cols, rows);
+        return Err("tmux attach is not supported on windows yet".into());
     }
-    let tmux = tmux_bin();
-    let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.arg("-c");
-    cmd.arg(format!(
+    #[cfg(not(windows))]
+    {
+        // Guard against shell-injection via socket/session names.
+        let safe = |s: &str| {
+            s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        };
+        if !safe(&socket) || !safe(&session) {
+            return Err("invalid socket or session name".into());
+        }
+        let tmux = tmux_bin();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg(format!(
         "{tmux} -L {socket} set -g mouse on 2>/dev/null; exec {tmux} -L {socket} attach -t {session}"
     ));
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    spawn_internal(app, &state, on_data, cmd, cols, rows)
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        spawn_internal(app, &state, on_data, cmd, cols, rows)
+    }
 }
 
 /// Writes raw input bytes to a session's PTY stdin.

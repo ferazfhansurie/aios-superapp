@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
 import {
   Bot,
@@ -75,6 +75,7 @@ import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
 import { commandToPaletteCommand, createCommand, type AiosCommand } from "./lib/commands";
+import { gridTrackStorageKey, movePane } from "./lib/paneLayout";
 
 import { SPAWN, SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
 import {
@@ -137,6 +138,7 @@ const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
 // one-shot fields (chat seed/resume/reattach) are stripped so a restored chat
 // doesn't re-fire its launcher prompt or try to reattach a dead backend id.
 const LAYOUT_KEY = "aios.layout";
+const GRID_TRACK_KEY = "aios.grid.tracks";
 
 /** Strip a pane kind down to its restorable shape (drop one-shot fields). */
 function persistableKind(kind: PaneContent): PaneContent | null {
@@ -203,6 +205,14 @@ function App() {
   const toggleHide = useCallback((key: string) => {
     setHiddenKeys((cur) => (cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]));
     setMaximizedKey((cur) => (cur === key ? null : cur));
+  }, []);
+  const movePaneByKey = useCallback((key: string, delta: -1 | 1) => {
+    setPanes((cur) => {
+      const index = cur.findIndex((p) => p.key === key);
+      const next = movePane(cur, index, delta);
+      setActiveKey(next.items[next.selected]?.key ?? key);
+      return next.items;
+    });
   }, []);
   // TRUE video fullscreen: a child webview's HTML fullscreen only fills its rect.
   // When a video enters fullscreen we maximize the pane (webview → whole window)
@@ -1099,8 +1109,16 @@ function App() {
             return (
               <>
                 {visibleCount === 0 && <div className="absolute inset-0 z-10">{idleDash}</div>}
-            <ResizableGrid cols={cols} rows={rows} gap={8}>
-              {panes.map((pane) => (
+            <ResizableGrid cols={cols} rows={rows} gap={8} storageKey={gridTrackStorageKey(GRID_TRACK_KEY, cols, rows)}>
+              {panes.map((pane) => {
+                const visibleIndex = panes
+                  .filter((p) => !hiddenKeys.includes(p.key))
+                  .findIndex((p) => p.key === pane.key);
+                const paneStyle =
+                  visibleCount === 3 && visibleIndex === 2
+                    ? ({ gridColumn: "2", gridRow: "1 / span 2" } satisfies CSSProperties)
+                    : undefined;
+                return (
                 <PaneCard
                   key={pane.key}
                   pane={pane}
@@ -1111,10 +1129,13 @@ function App() {
                   }
                   maximized={maximizedKey === pane.key}
                   hidden={hiddenKeys.includes(pane.key)}
+                  style={paneStyle}
                   dropTarget={dropTargetKey === pane.key}
                   onClose={() => requestClose(pane.key)}
                   onToggleMax={() => toggleMax(pane.key)}
                   onToggleHide={() => toggleHide(pane.key)}
+                  onMoveLeft={() => movePaneByKey(pane.key, -1)}
+                  onMoveRight={() => movePaneByKey(pane.key, 1)}
                   onFocus={() => {
                     focusedPane.current = pane.key;
                     setActiveKey(pane.key);
@@ -1134,7 +1155,8 @@ function App() {
                   }
                   onVideoFullscreen={(on) => onVideoFullscreen(pane.key, on)}
                 />
-              ))}
+                );
+              })}
             </ResizableGrid>
               </>
             );
@@ -2109,10 +2131,13 @@ function PaneCard({
   active,
   maximized,
   hidden,
+  style,
   dropTarget,
   onClose,
   onToggleMax,
   onToggleHide,
+  onMoveLeft,
+  onMoveRight,
   onFocus,
   onAnnotate,
   onSendToAi,
@@ -2125,10 +2150,13 @@ function PaneCard({
   active: boolean;
   maximized?: boolean;
   hidden?: boolean;
+  style?: CSSProperties;
   dropTarget?: boolean;
   onClose: () => void;
   onToggleMax?: () => void;
   onToggleHide?: () => void;
+  onMoveLeft?: () => void;
+  onMoveRight?: () => void;
   onFocus: () => void;
   onAnnotate: (text: string) => void;
   onSendToAi: (text: string) => void;
@@ -2159,7 +2187,7 @@ function PaneCard({
     <div
       data-pane-key={pane.key}
       onMouseDownCapture={onFocus}
-      style={hidden ? { display: "none" } : undefined}
+      style={hidden ? { display: "none" } : style}
       className={`flex min-h-0 min-w-0 flex-col overflow-hidden bg-[var(--color-pane)] transition-colors ${
         maximized
           ? // truly fullscreen — edge-to-edge over the top bar + sidebar, no chrome
@@ -2199,6 +2227,26 @@ function PaneCard({
               title="Hide pane (keeps running)"
             >
               <EyeOff size={12} />
+            </button>
+          )}
+          {onMoveLeft && (
+            <button
+              type="button"
+              onClick={(e) => (e.stopPropagation(), onMoveLeft())}
+              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              title="Move pane left"
+            >
+              <MoveRight size={12} className="rotate-180" />
+            </button>
+          )}
+          {onMoveRight && (
+            <button
+              type="button"
+              onClick={(e) => (e.stopPropagation(), onMoveRight())}
+              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              title="Move pane right"
+            >
+              <MoveRight size={12} />
             </button>
           )}
           {onToggleMax && (
