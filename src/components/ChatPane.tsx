@@ -104,6 +104,7 @@ import {
 import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
 import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, openFileInPane, openUrlInPane } from "../lib/paneBus";
 import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
+import { emptyRunEventState, reduceRunEvents, type RunEventState } from "../lib/runEvents";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -208,6 +209,9 @@ const GOAL_PREFIX = (goal: string) =>
 // orchestrate, fan out, verify — be maximally thorough.
 const ULTRA_PREFIX =
   "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel sub-agents (Task tool) to cover it, then adversarially verify findings before concluding. Prefer orchestrated multi-agent execution over a single pass; only handle trivially small tasks inline.\n\n";
+
+const AIOS_SHELL_PREFIX =
+  "AIOS shell superapp context: you are running inside Firaz's local Tauri AIOS shell, not a generic chat box. Treat the app as a multi-pane operating system. Native concepts: chat panes, terminal panes, browser panes, file viewer panes, editor panes, notes, memory, crm, automations, plugins, motion studio, oracle/tmux panes, background chat sessions, pane-native links, file routing, and drag/drop context. When useful, ask to open or control panes explicitly: open browser pane for URLs, open file/editor pane for paths, spawn terminal pane for commands, send text to the focused pane, attach files/folders as context, hand off long work to an oracle, or request permission for risky actions. Prefer aios-native workflows over dumping instructions for the user to perform manually. Keep actions observable and explain what pane/context you need.\n\n";
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -500,6 +504,9 @@ export function ChatPane({
   onOpenUrl?: (url: string) => void;
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
+  const [runEventState, setRunEventState] = useState<RunEventState>(() =>
+    emptyRunEventState(),
+  );
   // composer draft persists per pane so /clear, a restart, or a remount never
   // loses what you were typing. Keyed by paneKey; seed (e.g. notes "send to AI")
   // still wins on first mount.
@@ -849,6 +856,7 @@ export function ChatPane({
   // ── event ingestion ───────────────────────────────────────────────────────
 
   const handleEvent = useCallback((ev: ChatEvent) => {
+    setRunEventState((state) => reduceRunEvents(state, ev));
     // ---- control protocol: tool approval requests + acks --------------------
     // claude → us, non-bypass modes: a `control_request` whose request.subtype
     // is `can_use_tool`. We surface an inline approval card; the reply goes back
@@ -1356,7 +1364,7 @@ export function ChatPane({
     (display: string, opts?: { skipUserBubble?: boolean }) => {
       const id = sessionIdRef.current;
       if (id == null) return;
-      let wire = display;
+      let wire = AIOS_SHELL_PREFIX + display;
       if (goal.trim()) wire = GOAL_PREFIX(goal.trim()) + wire;
       if (planMode) wire = PLAN_PREFIX + wire;
       if (effort.ultra) wire = ULTRA_PREFIX + wire;
@@ -1570,6 +1578,7 @@ export function ChatPane({
   // resume id, so a new chat / /clear never keeps continuing a past session).
   const clearSession = useCallback(() => {
     setTurns([]);
+    setRunEventState(emptyRunEventState());
     setStreaming(false);
     streamingTurnId.current = null;
     thinkingTurnId.current = null;
@@ -1648,6 +1657,7 @@ export function ChatPane({
       // placeholder first, then swap in the real transcript when it loads (the
       // session-restart effect never clears `turns`, so this is safe).
       setTurns([]);
+      setRunEventState(emptyRunEventState());
       readChatTranscript(session.id)
         .then((rows) => {
           if (rows.length) setTurns(transcriptToTurns(rows));
@@ -1828,7 +1838,13 @@ export function ChatPane({
   const resumeFiltered = useMemo(() => {
     const q = resumeQuery.trim().toLowerCase();
     if (!q) return resumeSessions;
-    return resumeSessions.filter((s) => s.title.toLowerCase().includes(q));
+    return resumeSessions.filter((s) =>
+      [s.title, s.cwd, s.engine, s.model, s.id]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(q),
+    );
   }, [resumeSessions, resumeQuery]);
 
   // keep the /resume highlight in-bounds as the typed filter shrinks the list
@@ -1998,6 +2014,8 @@ export function ChatPane({
     planMode,
     hasGoal: Boolean(goal.trim()),
   });
+  const runPhase = runEventState.phase;
+  const runEventCount = runEventState.events.length;
 
   // copilot-style ghost: the remainder of the most recent past message that
   // prefixes what's typed. Suppressed while an overlay (slash/@/resume) or voice
@@ -2070,6 +2088,12 @@ export function ChatPane({
                 )}
               </span>
             ))}
+            {runEventCount > 0 && (
+              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)]">
+                <Waypoints size={12} className="shrink-0 text-[var(--color-accent)]" />
+                <span className="truncate">run: {runPhase}</span>
+              </span>
+            )}
           </div>
         )}
 
@@ -2333,6 +2357,20 @@ export function ChatPane({
             {/* right action cluster — pinned right (ml-auto), stays together and
                 wraps to its own line on a narrow pane so send is never clipped */}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                setResumeQuery("");
+                setOverlay("resume");
+                setOverlayIdx(0);
+                void loadResumeSessions();
+                setTimeout(() => resumeSearchRef.current?.focus(), 0);
+              }}
+              className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+              title="resume codex/chatpane session"
+            >
+              <History size={16} />
+            </button>
             {/* model selector (right) */}
             <Dropdown
               open={openMenu === "model"}
@@ -2491,6 +2529,7 @@ export function ChatPane({
       resumeSessions.length,
       resumeLoading,
       resumeQuery,
+      loadResumeSessions,
       onResumeKeyDown,
       resumeSession,
       closeResume,
@@ -4094,6 +4133,21 @@ function ResumePicker({
   onPick: (s: ChatSessionInfo) => void;
   onClose: () => void;
 }) {
+  const byProject = sessions.reduce<Array<{ key: string; label: string; items: ChatSessionInfo[] }>>(
+    (groups, session) => {
+      const label = baseName(session.cwd || "") || "unknown project";
+      const key = `${label}:${session.cwd || ""}`;
+      const group = groups.find((g) => g.key === key);
+      if (group) {
+        group.items.push(session);
+      } else {
+        groups.push({ key, label, items: [session] });
+      }
+      return groups;
+    },
+    [],
+  );
+  let rowIndex = 0;
   return (
     <div className="absolute bottom-full left-0 right-0 z-40 mb-2 overflow-hidden rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] shadow-2xl shadow-black/50">
       {/* sticky search header */}
@@ -4102,6 +4156,9 @@ function ResumePicker({
         <span className="shrink-0 font-sans text-[12px] text-[var(--color-text-2)]">
           resume
         </span>
+        <span className="shrink-0 rounded-full border border-[var(--color-border)] px-1.5 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
+          {total} sessions
+        </span>
         <span className="ml-1 flex min-w-0 flex-1 items-center gap-1.5">
           <Search size={12} className="shrink-0 text-[var(--color-faint)]" />
           <input
@@ -4109,7 +4166,7 @@ function ResumePicker({
             value={query}
             onChange={(e) => onQueryChange(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="filter by title…"
+            placeholder="search title, project, model, id…"
             spellCheck={false}
             className="min-w-0 flex-1 bg-transparent font-sans text-[12.5px] text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
           />
@@ -4125,11 +4182,11 @@ function ResumePicker({
       </div>
 
       {/* body */}
-      <div className="max-h-72 overflow-y-auto py-1">
+      <div className="max-h-[22rem] overflow-y-auto py-1">
         {loading ? (
           <div className="flex items-center gap-2 px-3 py-3 font-sans text-[12px] text-[var(--color-faint)]">
             <Loader2 size={13} className="animate-spin" />
-            loading recent sessions…
+            loading codex + chatpane sessions…
           </div>
         ) : sessions.length === 0 ? (
           <div className="px-3 py-3 font-sans text-[12px] text-[var(--color-faint)]">
@@ -4138,14 +4195,25 @@ function ResumePicker({
               : `no sessions match “${query}”`}
           </div>
         ) : (
-          sessions.map((s, i) => (
-            <ResumeRow
-              key={s.id}
-              session={s}
-              active={i === activeIdx}
-              onMouseEnter={() => onHover(i)}
-              onClick={() => onPick(s)}
-            />
+          byProject.map((group) => (
+            <div key={group.key}>
+              <div className="sticky top-0 z-10 flex items-center justify-between border-y border-[var(--color-border)] bg-[var(--color-panel-2)]/95 px-3 py-1 font-sans text-[10px] uppercase tracking-[0.08em] text-[var(--color-faint)] backdrop-blur first:border-t-0">
+                <span className="truncate">{group.label}</span>
+                <span className="font-mono tracking-normal">{group.items.length}</span>
+              </div>
+              {group.items.map((s) => {
+                const i = rowIndex++;
+                return (
+                  <ResumeRow
+                    key={s.id}
+                    session={s}
+                    active={i === activeIdx}
+                    onMouseEnter={() => onHover(i)}
+                    onClick={() => onPick(s)}
+                  />
+                );
+              })}
+            </div>
           ))
         )}
       </div>
@@ -4168,12 +4236,17 @@ function ResumeRow({
 }) {
   const dir = baseName(session.cwd || "");
   const when = session.mtime ? fmtRelativeTime(session.mtime) : "";
+  const engine = session.engine || "claude";
+  const model = session.model || "";
+  const shortId = session.id ? session.id.slice(0, 8) : "";
+  const sourceLabel =
+    engine === "codex" ? "codex terminal/chat" : engine === "opencode" ? "opencode" : "chatpane";
   return (
     <button
       type="button"
       onClick={onClick}
       onMouseEnter={onMouseEnter}
-      className={`flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors ${
+      className={`flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors ${
         active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
       }`}
     >
@@ -4184,10 +4257,15 @@ function ResumeRow({
         }`}
       />
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate font-sans text-[13px] text-[var(--color-text)]">
-          {session.title || "untitled session"}
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate font-sans text-[13px] text-[var(--color-text)]">
+            {session.title || "untitled session"}
+          </span>
+          <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
+            {engine}
+          </span>
         </span>
-        <span className="flex items-center gap-1.5 truncate font-sans text-[11px] text-[var(--color-faint)]">
+        <span className="mt-1 flex items-center gap-1.5 truncate font-sans text-[11px] text-[var(--color-faint)]">
           {dir && (
             <span className="inline-flex items-center gap-1">
               <Folder size={10} />
@@ -4201,11 +4279,23 @@ function ResumeRow({
               {when}
             </span>
           )}
+          {model && <span className="text-[var(--color-border-strong)]">·</span>}
+          {model && <span className="truncate">{model}</span>}
+          {shortId && <span className="text-[var(--color-border-strong)]">·</span>}
+          {shortId && <span className="font-mono">{shortId}</span>}
         </span>
       </span>
-      {active && (
-        <CornerDownLeft size={12} className="shrink-0 text-[var(--color-faint)]" />
-      )}
+      <span className="hidden shrink-0 items-center gap-1.5 sm:flex">
+        <span className="rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-faint)]">
+          {sourceLabel}
+        </span>
+        {active && (
+          <span className="inline-flex items-center gap-1 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-panel)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-text-2)]">
+            resume
+            <CornerDownLeft size={11} />
+          </span>
+        )}
+      </span>
     </button>
   );
 }

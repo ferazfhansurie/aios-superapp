@@ -10,6 +10,17 @@
 
 ---
 
+## intelligence requirement
+
+chatpane ai must be at least as smart as codex desktop and more native to aios. that means:
+
+- keep codex terminal-grade config: model defaults, reasoning, plugins, hooks, and auth, while avoiding mcp auth stalls.
+- inject an aios-native system contract so the model knows it is inside the tauri superapp, not a generic terminal.
+- expose app actions as structured tools/events: spawn pane, open file pane, open editor pane, open browser pane, write to pane, submit to pane, attach file/folder context, inspect current panes, hand off to oracle, request permission.
+- every app action must become a `runevent`, so the run cockpit and right rail show what the ai did.
+- do not rely on hidden magic. the composer must show the context and permissions before send.
+- product philosophy: more, better, more, better. if adding more power makes a surface worse, create a stronger primitive instead of hiding capability.
+
 ### task 1: composer control contract v1
 
 **files:**
@@ -31,10 +42,28 @@
 - modify: `src/components/ChatPane.tsx`
 - modify: `src-tauri/src/chat.rs`
 
-- [ ] define `RunEvent`: reasoning, action.started, action.completed, permission.requested, artifact.created, file.changed, diff.ready, message.delta, run.completed, run.failed, run.interrupted.
-- [ ] write reducer tests for codex/claude stream events.
+- [x] define first `RunEvent` core: reasoning, message.delta, action.started, action.completed, permission.requested, run.completed, run.failed, run.interrupted.
+- [x] write reducer tests for stream deltas, tool lifecycle, permission request, and completion metadata.
+- [x] wire chatpane to maintain `RunEventState` in parallel with the existing transcript.
+- [ ] extend `RunEvent` for artifact.created, file.changed, diff.ready, pane.opened, pane.written, pane.submitted, oracle.handoff.
 - [ ] adapt current `Turn` construction to derive from `RunEvent[]`.
 - [ ] keep rendered transcript behavior unchanged while events become source of truth.
+
+### task 2b: aios-native tool contract
+
+**files:**
+- create: `src/lib/aiosTools.ts`
+- create: `src/lib/aiosTools.test.ts`
+- modify: `src/components/ChatPane.tsx`
+- modify: `src/App.tsx`
+- modify: `src/lib/paneBus.ts`
+- modify: `src-tauri/src/chat.rs`
+
+- [ ] define model-visible aios tool schema: `aios.open_pane`, `aios.open_file`, `aios.open_editor`, `aios.open_browser`, `aios.spawn_terminal`, `aios.write_pane`, `aios.submit_pane`, `aios.list_panes`, `aios.attach_context`, `aios.handoff_oracle`.
+- [ ] inject compact aios capability prompt into chat starts for codex and claude paths.
+- [ ] add pane bus request/response bridge for app actions.
+- [ ] require permission events for destructive or broad actions.
+- [ ] map every tool request/result into `RunEvent`.
 
 ### task 3: run cockpit v2
 
@@ -137,7 +166,36 @@
 - [ ] migrate chat/run/file/review actions second.
 - [ ] use the registry for slash commands and future voice/whatsapp command routing.
 
+### task 11: pane window manager
+
+**files:**
+- modify: `src/App.tsx`
+- modify: `src/lib/paneBus.ts`
+- create: `src/lib/paneLayout.ts`
+- create: `src/components/PaneChrome.tsx`
+
+- [ ] make every pane resizable with stable min/max constraints.
+- [ ] support drag reorder, split, stack, pop-out, pin, close, focus, and duplicate.
+- [ ] persist layouts per project/conversation.
+- [ ] expose pane dimensions and focus state to chat context.
+- [ ] wire ai-controllable pane commands through the command registry: `pane.resize`, `pane.move`, `pane.focus`, `pane.split`, `pane.stack`, `pane.popout`.
+- [ ] emit `pane.opened`, `pane.focused`, `pane.resized`, `pane.moved`, `pane.closed` run events.
+
+### task 12: browser panes as native aios tabs
+
+**files:**
+- modify: `src/components/BrowserPane.tsx`
+- modify: `src/lib/paneRouting.ts`
+- modify: `src/lib/paneBus.ts`
+- modify: `src/App.tsx`
+
+- [ ] treat browser instances as panes, not external tabs.
+- [ ] support multiple browser panes grouped like chrome tabs inside aios.
+- [ ] add browser pane commands: open url, duplicate, back, forward, reload, inspect, screenshot, attach page to chat.
+- [ ] route http links to existing browser group or a new side-by-side browser pane based on modifier/context.
+- [ ] let ai open multiple browser panes for comparison/research and attach the visible page context.
+- [ ] persist browser groups per conversation/project.
+
 ## sequencing rule
 
 do not build right rail, artifacts, permissions, or worktrees before `runevent` exists. otherwise every panel will parse transcript text differently and the app will rot.
-

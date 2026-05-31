@@ -2027,7 +2027,7 @@ pub fn record_chat_session(
     Ok(())
 }
 
-/// Lists chat-pane sessions (from the store), newest first.
+/// Lists chat-pane sessions plus local Codex rollouts, newest first.
 #[tauri::command]
 pub fn list_chat_sessions(limit: Option<u32>) -> Vec<ChatSessionInfo> {
     let mut store = load_store();
@@ -2036,6 +2036,11 @@ pub fn list_chat_sessions(limit: Option<u32>) -> Vec<ChatSessionInfo> {
         for session in &mut store {
             if session.engine.is_empty() {
                 session.engine = infer_session_engine(home, &session.id).to_string();
+            }
+        }
+        for session in discover_codex_sessions(home, 200) {
+            if !store.iter().any(|existing| existing.id == session.id) {
+                store.push(session);
             }
         }
     }
@@ -2154,6 +2159,170 @@ fn find_codex_rollout_in_home(home: &std::path::Path, id: &str) -> Option<std::p
         .find_map(|rel| find_codex_rollout(&home.join(rel), id))
 }
 
+fn discover_codex_sessions(home: &std::path::Path, limit: usize) -> Vec<ChatSessionInfo> {
+    let mut sessions = Vec::new();
+    for rel in [".codex-chat/sessions", ".codex/sessions"] {
+        collect_codex_rollouts(&home.join(rel), &mut sessions, limit.saturating_mul(2), 0);
+    }
+    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    let mut seen = std::collections::HashSet::new();
+    sessions.retain(|session| seen.insert(session.id.clone()));
+    sessions.truncate(limit);
+    sessions
+}
+
+fn collect_codex_rollouts(
+    dir: &std::path::Path,
+    out: &mut Vec<ChatSessionInfo>,
+    max: usize,
+    depth: u8,
+) {
+    if depth > 4 || out.len() >= max {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= max {
+            return;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_rollouts(&path, out, max, depth + 1);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+        {
+            if let Some(session) = codex_session_info_from_rollout(&path) {
+                out.push(session);
+            }
+        }
+    }
+}
+
+fn codex_session_info_from_rollout(path: &std::path::Path) -> Option<ChatSessionInfo> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut id = String::new();
+    let mut cwd = String::new();
+    let mut model = String::new();
+    let mut title = String::new();
+
+    for line in text.lines().take(200) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(payload) = v.get("payload") else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+            if let Some(s) = payload.get("id").and_then(|x| x.as_str()) {
+                id = s.to_string();
+            }
+            if let Some(s) = payload.get("cwd").and_then(|x| x.as_str()) {
+                cwd = s.to_string();
+            }
+            if let Some(s) = payload.get("model").and_then(|x| x.as_str()) {
+                model = s.to_string();
+            }
+            if model.is_empty() {
+                if let Some(s) = payload.get("model_slug").and_then(|x| x.as_str()) {
+                    model = s.to_string();
+                }
+            }
+            continue;
+        }
+        if title.is_empty() {
+            if let Some(candidate) = first_codex_user_text(payload) {
+                title = title_from_text(&candidate);
+            }
+        }
+        if !id.is_empty() && !title.is_empty() {
+            break;
+        }
+    }
+
+    if id.is_empty() {
+        id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(id_from_codex_rollout_stem)
+            .unwrap_or_default();
+    }
+    if id.is_empty() {
+        return None;
+    }
+    if title.is_empty() {
+        title = "(untitled codex chat)".to_string();
+    }
+    let mtime = path
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    Some(ChatSessionInfo {
+        id,
+        title,
+        cwd,
+        mtime,
+        engine: "codex".to_string(),
+        model,
+    })
+}
+
+fn first_codex_user_text(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("type").and_then(|t| t.as_str()) != Some("message") {
+        return None;
+    }
+    if payload.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return None;
+    }
+    let mut text_acc = String::new();
+    for block in payload.get("content").and_then(|c| c.as_array())? {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("input_text") | Some("text") => {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    text_acc.push_str(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    let text = text_acc.trim();
+    if text.is_empty()
+        || text.starts_with("<permissions")
+        || text.starts_with("<user_instructions")
+        || text.starts_with("<environment_context")
+    {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn title_from_text(text: &str) -> String {
+    let one_line = text.trim().replace('\n', " ");
+    if one_line.chars().count() > 90 {
+        format!("{}…", one_line.chars().take(90).collect::<String>())
+    } else if one_line.is_empty() {
+        "(untitled codex chat)".to_string()
+    } else {
+        one_line
+    }
+}
+
+fn id_from_codex_rollout_stem(stem: &str) -> String {
+    // rollout-2026-06-01t02-18-15-019e7f41-aaaa-bbbb
+    // keep the entire thread id, not only the uuid suffix after its last dash.
+    stem.find("-019")
+        .map(|idx| stem[idx + 1..].to_string())
+        .unwrap_or_else(|| stem.strip_prefix("rollout-").unwrap_or(stem).to_string())
+}
+
 fn infer_session_engine(home: &std::path::Path, id: &str) -> &'static str {
     if find_codex_rollout_in_home(home, id).is_some() {
         "codex"
@@ -2237,7 +2406,10 @@ fn parse_codex_rollout(text: &str) -> Vec<ChatTurn> {
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_config_without_mcp_servers, find_codex_rollout_in_home, infer_session_engine};
+    use super::{
+        codex_config_without_mcp_servers, discover_codex_sessions, find_codex_rollout_in_home,
+        infer_session_engine,
+    };
 
     #[test]
     fn codex_chat_config_keeps_terminal_defaults_but_strips_mcp_servers() {
@@ -2310,6 +2482,32 @@ js_repl = false
 
         assert_eq!(infer_session_engine(&root, id), "codex");
         assert_eq!(infer_session_engine(&root, "missing"), "claude");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_normal_codex_rollouts_for_resume() {
+        let root =
+            std::env::temp_dir().join(format!("aios-discover-codex-test-{}", std::process::id()));
+        let normal = root.join(".codex/sessions/2026/06/01");
+        std::fs::create_dir_all(&normal).unwrap();
+        let id = "019e7f41-aaaa-bbbb-cccc-000000000001";
+        let rollout = normal.join(format!("rollout-2026-06-01t02-18-15-{id}.jsonl"));
+        let text = format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"/Users/firazfhansurie/Repo/firaz/aios/shell","model":"gpt-5-codex"}}}}
+{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"make resume and buttons commercial ready"}}]}}}}
+"#
+        );
+        std::fs::write(&rollout, text).unwrap();
+
+        let sessions = discover_codex_sessions(&root, 40);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, id);
+        assert_eq!(sessions[0].engine, "codex");
+        assert_eq!(sessions[0].model, "gpt-5-codex");
+        assert_eq!(sessions[0].title, "make resume and buttons commercial ready");
+        assert_eq!(sessions[0].cwd, "/Users/firazfhansurie/Repo/firaz/aios/shell");
         let _ = std::fs::remove_dir_all(root);
     }
 }
