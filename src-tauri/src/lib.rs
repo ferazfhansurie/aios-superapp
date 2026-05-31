@@ -8,18 +8,18 @@ mod chat;
 mod crm;
 mod db;
 mod device;
-mod inbox;
 mod files;
+mod inbox;
 mod memory;
 mod monitor;
 mod motion;
-mod plugins;
-mod voice;
 mod oracles;
+mod plugins;
 mod pty;
 mod stats;
 mod telemetry;
 mod usage;
+mod voice;
 
 #[tauri::command]
 fn read_telemetry() -> telemetry::Telemetry {
@@ -91,6 +91,7 @@ pub fn run() {
             usage::codex_usage,
             memory::memory_graph,
             memory::memory_file,
+            memory::memory_search,
             memory::memory_save,
             memory::memory_delete,
             db::db_list_connections,

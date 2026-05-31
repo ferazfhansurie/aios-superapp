@@ -30,6 +30,7 @@ import {
   ArrowDown,
   PackageOpen,
   AtSign,
+  Brain,
   Check,
   CheckCheck,
   ChevronDown,
@@ -105,6 +106,7 @@ import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
 import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, openFileInPane, openUrlInPane } from "../lib/paneBus";
 import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import { emptyRunEventState, reduceRunEvents, type RunEventState } from "../lib/runEvents";
+import { memorySearch, type MemoryHit } from "../lib/memory";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -212,6 +214,16 @@ const ULTRA_PREFIX =
 
 const AIOS_SHELL_PREFIX =
   "AIOS shell superapp context: you are running inside Firaz's local Tauri AIOS shell, not a generic chat box. Treat the app as a multi-pane operating system. Native concepts: chat panes, terminal panes, browser panes, file viewer panes, editor panes, notes, memory, crm, automations, plugins, motion studio, oracle/tmux panes, background chat sessions, pane-native links, file routing, and drag/drop context. When useful, ask to open or control panes explicitly: open browser pane for URLs, open file/editor pane for paths, spawn terminal pane for commands, send text to the focused pane, attach files/folders as context, hand off long work to an oracle, or request permission for risky actions. Prefer aios-native workflows over dumping instructions for the user to perform manually. Keep actions observable and explain what pane/context you need.\n\n";
+
+function memoryContextBlock(memories: MemoryHit[]): string {
+  if (memories.length === 0) return "";
+  return `Relevant AIOS memory context:\n${memories
+    .map((m, i) => {
+      const reasons = m.reasons.length ? ` reasons: ${m.reasons.join("; ")}` : "";
+      return `${i + 1}. ${m.title} [${m.type}] — ${m.description || m.preview}${reasons}`;
+    })
+    .join("\n")}\n\n`;
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -532,6 +544,31 @@ export function ChatPane({
       /* ignore */
     }
   }, [input, draftKey]);
+
+  useEffect(() => {
+    const q = input.trim();
+    if (q.length < 4) {
+      setMemoryHits([]);
+      setAttachedMemoryIds([]);
+      return;
+    }
+    let cancelled = false;
+    const t = window.setTimeout(() => {
+      memorySearch(q, cwd ?? null, 5)
+        .then((hits) => {
+          if (cancelled) return;
+          setMemoryHits(hits);
+          setAttachedMemoryIds((ids) => ids.filter((id) => hits.some((h) => h.id === id)));
+        })
+        .catch(() => {
+          if (!cancelled) setMemoryHits([]);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+  }, [input, cwd]);
   const [streaming, setStreaming] = useState(false);
   const [started, setStarted] = useState(false);
   // claude's init event arrived (session_id known) — gates the seed auto-send
@@ -584,6 +621,14 @@ export function ChatPane({
   // mode chips
   const [planMode, setPlanMode] = useState(false);
   const [goal, setGoal] = useState<string>("");
+  const [memoryHits, setMemoryHits] = useState<MemoryHit[]>([]);
+  const [attachedMemoryIds, setAttachedMemoryIds] = useState<string[]>([]);
+  const attachedMemories = useMemo(
+    () => attachedMemoryIds
+      .map((id) => memoryHits.find((hit) => hit.id === id))
+      .filter((hit): hit is MemoryHit => Boolean(hit)),
+    [attachedMemoryIds, memoryHits],
+  );
 
   // open-dropdown tracking (single source so only one is open)
   const [openMenu, setOpenMenu] = useState<null | "model" | "perm" | "effort">(
@@ -1361,10 +1406,10 @@ export function ChatPane({
   // the transcript (the raw text the user typed); `wire` is what claude receives
   // (display + any plan / goal prefixes). Regenerate replays the same display.
   const dispatch = useCallback(
-    (display: string, opts?: { skipUserBubble?: boolean }) => {
+    (display: string, opts?: { skipUserBubble?: boolean; wirePrefix?: string }) => {
       const id = sessionIdRef.current;
       if (id == null) return;
-      let wire = AIOS_SHELL_PREFIX + display;
+      let wire = AIOS_SHELL_PREFIX + (opts?.wirePrefix ?? "") + display;
       if (goal.trim()) wire = GOAL_PREFIX(goal.trim()) + wire;
       if (planMode) wire = PLAN_PREFIX + wire;
       if (effort.ultra) wire = ULTRA_PREFIX + wire;
@@ -1516,13 +1561,15 @@ export function ChatPane({
         return [];
       });
       setOverlay(null);
+      const attachedMemoryBlock = memoryContextBlock(attachedMemories);
+      setAttachedMemoryIds([]);
       // prepend the image paths so the model sees them with the message
       const full = imgPaths.length
         ? imgPaths.join(" ") + (text ? " " + text : "")
         : text;
-      dispatch(full);
+      dispatch(full, { wirePrefix: attachedMemoryBlock });
     },
-    [streaming, dispatch, cwd, images, model],
+    [streaming, dispatch, cwd, images, model, attachedMemories],
   );
 
   const send = useCallback(() => sendText(input), [sendText, input]);
@@ -2094,6 +2141,46 @@ export function ChatPane({
                 <span className="truncate">run: {runPhase}</span>
               </span>
             )}
+            {attachedMemories.length > 0 && (
+              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text)]">
+                <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
+                <span className="truncate">{attachedMemories.length} memories attached</span>
+              </span>
+            )}
+          </div>
+        )}
+
+        {memoryHits.length > 0 && input.trim().length >= 4 && (
+          <div className="mb-2 flex max-h-24 flex-col gap-1 overflow-y-auto rounded-xl border border-[var(--color-border)] bg-[var(--color-panel)]/70 p-1.5">
+            {memoryHits.slice(0, 3).map((hit) => {
+              const attached = attachedMemoryIds.includes(hit.id);
+              return (
+                <button
+                  key={hit.id}
+                  type="button"
+                  onClick={() =>
+                    setAttachedMemoryIds((ids) =>
+                      attached ? ids.filter((id) => id !== hit.id) : [...ids, hit.id],
+                    )
+                  }
+                  className={`flex min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left font-sans text-[11.5px] transition-colors ${
+                    attached
+                      ? "bg-[var(--color-accent-soft)] text-[var(--color-text)]"
+                      : "text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)]"
+                  }`}
+                  title={hit.reasons.join("; ")}
+                >
+                  <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
+                  <span className="min-w-0 flex-1 truncate">
+                    {hit.title}{" "}
+                    <span className="text-[var(--color-faint)]">· {hit.description || hit.preview}</span>
+                  </span>
+                  <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
+                    {attached ? "attached" : hit.score}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
 
@@ -2503,6 +2590,9 @@ export function ChatPane({
       streaming,
       action,
       contextChips,
+      memoryHits,
+      attachedMemoryIds,
+      attachedMemories,
       hasDraft,
       send,
       stop,
