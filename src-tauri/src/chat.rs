@@ -36,6 +36,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -50,6 +51,13 @@ use tauri::{AppHandle, Emitter};
 /// How many raw output lines a detached session keeps for replay on reattach.
 /// Generous enough to reconstruct a long agentic run; oldest lines drop first.
 const REPLAY_CAP: usize = 6000;
+
+fn detach_child_process(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+}
 
 /// Which CLI backend drives a chat session. `claude` is a single PERSISTENT
 /// process (stream-json on stdin). `codex` (ChatGPT-subscription) is ALSO
@@ -326,9 +334,28 @@ fn codex_chat_home(fast_requested: bool) -> Option<String> {
     };
     if needs_link {
         let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&target, &link).ok()?;
+        link_or_copy_auth(&target, &link)?;
     }
     Some(chat)
+}
+
+fn link_or_copy_auth(target: &str, link: &str) -> Option<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).ok()
+    }
+
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+            .or_else(|_| std::fs::copy(target, link).map(|_| ()))
+            .ok()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::copy(target, link).map(|_| ()).ok()
+    }
 }
 
 fn codex_config_without_mcp_servers(src: &str) -> String {
@@ -499,13 +526,11 @@ pub fn chat_start(
         .stdout(Stdio::piped())
         // Merge nothing from stderr into the event stream — surface it on its
         // own so a missing-binary / auth error doesn't masquerade as JSON.
-        .stderr(Stdio::piped())
-        // Own process group: a force-quit of the cockpit sends signals to the
-        // app's group, NOT this child — so an in-flight turn finishes (and writes
-        // its transcript) instead of being aborted. Survives app quit; the next
-        // launch resumes via the saved session id. (See PLAN — daemon is the
-        // full cross-restart reattach; this is the cheap "don't abort" win.)
-        .process_group(0);
+        .stderr(Stdio::piped());
+    // Own process group on unix: a force-quit of the cockpit sends signals to
+    // the app's group, NOT this child — so an in-flight turn finishes. Windows
+    // needs a job-object based follow-up for equivalent behavior.
+    detach_child_process(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -740,8 +765,8 @@ fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0); // survive a cockpit force-quit (see chat_start)
+        .stderr(Stdio::piped());
+    detach_child_process(&mut cmd); // survive a cockpit force-quit on unix
 
     let engine_name = match engine {
         Engine::Codex => "codex",
@@ -976,8 +1001,8 @@ fn start_codex_appserver(
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0); // survive a cockpit force-quit (see chat_start)
+        .stderr(Stdio::piped());
+    detach_child_process(&mut cmd); // survive a cockpit force-quit on unix
 
     let mut child = cmd
         .spawn()

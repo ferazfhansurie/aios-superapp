@@ -1,0 +1,41 @@
+name: cloudflare pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: build web shell
+        run: pnpm build
+
+      - name: verify cloudflare credentials
+        if: env.CLOUDFLARE_ACCOUNT_ID == '' || env.CLOUDFLARE_API_TOKEN == ''
+        run: |
+          echo "missing CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN repo secret"
+          exit 1
+
+      - name: deploy to cloudflare pages
+        run: npx --yes wrangler@latest pages deploy dist --project-name=aios-superapp --branch=${{ github.ref_name }}
