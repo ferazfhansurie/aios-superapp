@@ -31,11 +31,10 @@ jobs:
       - name: build web shell
         run: pnpm build
 
-      - name: verify cloudflare credentials
+      - name: cloudflare credentials missing
         if: env.CLOUDFLARE_ACCOUNT_ID == '' || env.CLOUDFLARE_API_TOKEN == ''
-        run: |
-          echo "missing CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN repo secret"
-          exit 1
+        run: echo "::warning::cloudflare deploy skipped; add CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN repo secrets"
 
       - name: deploy to cloudflare pages
+        if: env.CLOUDFLARE_ACCOUNT_ID != '' && env.CLOUDFLARE_API_TOKEN != ''
         run: npx --yes wrangler@latest pages deploy dist --project-name=aios-superapp --branch=${{ github.ref_name }}
