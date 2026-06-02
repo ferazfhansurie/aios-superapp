@@ -54,6 +54,7 @@ import { setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { IdleDashboard } from "./components/IdleDashboard";
+import { MirrorViewer } from "./components/MirrorViewer";
 import { OracleRoster } from "./components/OracleRoster";
 import { ResizableGrid } from "./components/ResizableGrid";
 import { VoiceButton } from "./components/VoiceButton";
@@ -82,9 +83,22 @@ import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
 import { buildAppCommands } from "./lib/appCommands";
+import type { AgentAction } from "./lib/agentActions";
 import { isTauriRuntime } from "./lib/tauri";
 import {
+  ensureMirrorPairing,
+  mirrorPairingFromLocation,
+  mirrorShareUrl,
+  mirrorWebSocketUrl,
+  parseMirrorSocketMessage,
+  savedMirrorPairing,
+  type MirrorConnectionStatus,
+  type MirrorPairing,
+  type MirrorPresence,
+} from "./lib/mirrorTransport";
+import {
   createAgentController,
+  type AgentController,
   type AgentDispatchInput,
   type AgentDispatchResult,
 } from "./lib/agentController";
@@ -266,6 +280,7 @@ function startWindowDrag(e: React.MouseEvent<HTMLElement>) {
 }
 
 function App() {
+  const nativeRuntime = useMemo(() => isTauriRuntime(), []);
   const [panes, setPanes] = useState<Pane[]>(() =>
     loadSettings().reopenLastLayout ? loadLayout() : [],
   );
@@ -274,6 +289,20 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [notifications, setNotifications] = useState<AiosNotification[]>(listNotifications);
+  const [remoteMirrorSnapshot, setRemoteMirrorSnapshot] = useState<MirrorSnapshot | null>(null);
+  const [mirrorStatus, setMirrorStatus] = useState<MirrorConnectionStatus>("off");
+  const [mirrorPresence, setMirrorPresence] = useState<MirrorPresence | null>(null);
+  const mirrorWsRef = useRef<WebSocket | null>(null);
+  const mirrorOpenRef = useRef(false);
+  const agentControllerRef = useRef<AgentController | null>(null);
+  const mirrorPairing = useMemo<MirrorPairing | null>(() => {
+    if (nativeRuntime) return ensureMirrorPairing();
+    return mirrorPairingFromLocation() ?? savedMirrorPairing();
+  }, [nativeRuntime]);
+  const mirrorUrl = useMemo(
+    () => (nativeRuntime && mirrorPairing ? mirrorShareUrl(mirrorPairing) : null),
+    [nativeRuntime, mirrorPairing],
+  );
   // mission-control-style pane overview: fan out every open pane to switch.
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -1018,6 +1047,10 @@ function App() {
   );
 
   useEffect(() => {
+    agentControllerRef.current = agentController;
+  }, [agentController]);
+
+  useEffect(() => {
     const dispatchAgentAction = (input: AgentDispatchInput) => agentController.dispatch(input);
     (window as typeof window & {
       __aiosAgentControl?: (
@@ -1092,6 +1125,97 @@ function App() {
     };
   }, [mirrorSnapshot]);
 
+  useEffect(() => {
+    if (!mirrorPairing) {
+      setMirrorStatus("off");
+      return;
+    }
+
+    let disposed = false;
+    let retryTimer: number | null = null;
+    let retry = 0;
+    const role = nativeRuntime ? "desktop" : "viewer";
+
+    const connect = () => {
+      if (disposed) return;
+      setMirrorStatus("connecting");
+      const ws = new WebSocket(mirrorWebSocketUrl(mirrorPairing));
+      mirrorWsRef.current = ws;
+
+      ws.onopen = () => {
+        retry = 0;
+        mirrorOpenRef.current = true;
+        setMirrorStatus("connected");
+        ws.send(JSON.stringify({ type: "hello", role, token: mirrorPairing.token }));
+        if (role === "desktop") {
+          ws.send(JSON.stringify({ type: "snapshot", snapshot: mirrorSnapshot }));
+        }
+      };
+
+      ws.onmessage = (event) => {
+        const msg = parseMirrorSocketMessage(event.data);
+        if (!msg) return;
+        if ((msg.type === "hello" || msg.type === "presence") && msg.presence) {
+          setMirrorPresence(msg.presence);
+        }
+        if ((msg.type === "hello" || msg.type === "snapshot") && "snapshot" in msg && !nativeRuntime) {
+          setRemoteMirrorSnapshot((msg.snapshot as MirrorSnapshot | null) ?? null);
+        }
+        if (msg.type === "control" && nativeRuntime) {
+          const requestId = msg.requestId;
+          void agentControllerRef.current
+            ?.dispatch({ source: "mirror", action: msg.action, confirmed: true })
+            .then((result) => {
+              if (mirrorWsRef.current?.readyState === WebSocket.OPEN) {
+                mirrorWsRef.current.send(
+                  JSON.stringify({ type: "control_result", requestId, result }),
+                );
+              }
+            });
+        }
+      };
+
+      ws.onerror = () => {
+        setMirrorStatus("error");
+      };
+
+      ws.onclose = () => {
+        if (mirrorWsRef.current === ws) mirrorWsRef.current = null;
+        mirrorOpenRef.current = false;
+        if (disposed) return;
+        setMirrorStatus("error");
+        retryTimer = window.setTimeout(connect, Math.min(10_000, 1000 + retry++ * 1500));
+      };
+    };
+
+    connect();
+    return () => {
+      disposed = true;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      mirrorOpenRef.current = false;
+      mirrorWsRef.current?.close(1000, "app closing");
+      mirrorWsRef.current = null;
+    };
+    // connect once per pairing/role; snapshots publish through the separate effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nativeRuntime, mirrorPairing?.room, mirrorPairing?.token]);
+
+  useEffect(() => {
+    if (!nativeRuntime || !mirrorOpenRef.current || mirrorWsRef.current?.readyState !== WebSocket.OPEN) return;
+    mirrorWsRef.current.send(JSON.stringify({ type: "snapshot", snapshot: mirrorSnapshot }));
+  }, [nativeRuntime, mirrorSnapshot]);
+
+  const sendMirrorControl = useCallback((action: AgentAction) => {
+    if (!mirrorWsRef.current || mirrorWsRef.current.readyState !== WebSocket.OPEN) return;
+    mirrorWsRef.current.send(
+      JSON.stringify({
+        type: "control",
+        requestId: `mirror-${Date.now().toString(36)}`,
+        action,
+      }),
+    );
+  }, []);
+
   const unreadNotifications = notifications.filter((n) => !n.read).length;
   const notificationsPane = panes.find((pane) => pane.kind.type === "notifications");
   const notificationsActive = notificationsPane?.key === activeKey;
@@ -1140,6 +1264,18 @@ function App() {
   );
   const topBarRight = (
     <div className="flex items-center gap-1">
+      {mirrorUrl && (
+        <IconBtn
+          title={`Copy desktop mirror link · ${mirrorStatus}`}
+          onClick={() => {
+            navigator.clipboard?.writeText(mirrorUrl).catch(() => {});
+            flash("mirror link copied");
+          }}
+          active={mirrorStatus === "connected"}
+        >
+          <MonitorUp size={15} />
+        </IconBtn>
+      )}
       <VoiceButton onTranscript={handleTranscript} />
       <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
         <Camera size={15} />
@@ -1234,6 +1370,16 @@ function App() {
 
         <main className="relative min-h-0 flex-1">
           {(() => {
+            if (!nativeRuntime) {
+              return (
+                <MirrorViewer
+                  snapshot={remoteMirrorSnapshot}
+                  status={mirrorPairing ? mirrorStatus : "off"}
+                  presence={mirrorPresence}
+                  onControl={sendMirrorControl}
+                />
+              );
+            }
             const idleDash = (
               <IdleDashboard
                 apps={SPAWN}

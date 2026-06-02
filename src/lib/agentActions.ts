@@ -1,4 +1,4 @@
-export type AgentSource = "chatpane" | "codex" | "oracle" | "test";
+export type AgentSource = "chatpane" | "codex" | "oracle" | "mirror" | "test";
 export type AgentPolicyLevel = "readonly" | "ui" | "external" | "destructive";
 
 export type AgentAction =
