@@ -373,3 +373,49 @@ export function buildApprovalLine(
     response: { subtype: "success", request_id: requestId, response: inner },
   });
 }
+
+export interface WebChatTurn {
+  role: "user" | "assistant";
+  text: string;
+}
+
+export interface WebChatResponse {
+  text: string;
+  model?: string;
+  usage?: Record<string, unknown>;
+}
+
+/** Browser-hosted chat path. Desktop uses the Tauri channel above; web posts to
+ *  the Pages Function so the hosted shell can answer without a local binary. */
+export async function webChatSend(
+  text: string,
+  opts: {
+    model?: string | null;
+    messages?: WebChatTurn[];
+    signal?: AbortSignal;
+  } = {},
+): Promise<WebChatResponse> {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      text,
+      model: opts.model ?? null,
+      messages: opts.messages ?? [],
+    }),
+    signal: opts.signal,
+  });
+  const data = await res.json().catch(() => null) as
+    | (WebChatResponse & { error?: string })
+    | null;
+  if (!res.ok) {
+    if (res.status === 404) {
+      throw new Error("web chat endpoint is not deployed yet");
+    }
+    throw new Error(data?.error ?? `web chat failed (${res.status})`);
+  }
+  if (!data || typeof data.text !== "string") {
+    throw new Error("web chat returned an invalid response");
+  }
+  return data;
+}

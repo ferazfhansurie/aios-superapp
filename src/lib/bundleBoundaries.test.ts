@@ -156,8 +156,9 @@ test("web shell guards tauri-only runtime APIs", () => {
   assert.match(app, /if \(!isTauriRuntime\(\)\) return;\s+\/\/ Resolve the pane key/);
   assert.match(app, /onDragDropEvent/);
   assert.match(fs, /if \(!isTauriRuntime\(\)\) return path/);
-  assert.match(chatPane, /if \(!isTauriRuntime\(\)\) \{/);
-  assert.match(chatPane, /web preview loaded\. live chat runs inside the desktop shell/);
+  assert.match(chatPane, /if \(webChatRuntime\) \{/);
+  assert.match(chatPane, /webChatSend\(wire/);
+  assert.doesNotMatch(chatPane, /web preview loaded\. live chat runs inside the desktop shell/);
   assert.match(chatPane, /url: fileSrc\(path\)/);
   assert.doesNotMatch(chatPane, /convertFileSrc/);
   assert.match(terminalRuntime, /if \(!isTauriRuntime\(\)\) \{/);
@@ -185,6 +186,42 @@ test("web mirror uses a cloudflare durable object transport", () => {
   assert.match(worker, /type: "snapshot"/);
   assert.match(worker, /type: "control"/);
   assert.match(workflow, /wrangler@latest deploy --config workers\/mirror\/wrangler\.jsonc/);
+});
+
+test("hosted web opens the real shell unless the url is a mirror link", () => {
+  const app = read("src/App.tsx");
+
+  assert.match(app, /const webMirrorMode = !nativeRuntime && mirrorPairing != null/);
+  assert.match(app, /if \(webMirrorMode\) \{/);
+  assert.doesNotMatch(app, /if \(!nativeRuntime\) \{\s+return \(\s+<MirrorViewer/);
+  assert.match(app, /if \(panes\.length === 0\) return idleDash/);
+});
+
+test("hosted web chat uses a cloud chat transport instead of a dead preview", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+  const chatLib = read("src/lib/chat.ts");
+  const fn = read("functions/api/chat.ts");
+
+  assert.match(chatLib, /export async function webChatSend/);
+  assert.match(chatLib, /fetch\("\/api\/chat"/);
+  assert.match(chatPane, /const webChatRuntime = !nativeRuntime/);
+  assert.match(chatPane, /webChatSend\(wire/);
+  assert.doesNotMatch(chatPane, /web preview loaded\. live chat runs inside the desktop shell/);
+  assert.match(fn, /OPENAI_API_KEY/);
+  assert.match(fn, /AIOS_CHAT_MODEL/);
+  assert.match(fn, /https:\/\/api\.openai\.com\/v1\/responses/);
+});
+
+test("hosted web shell is mobile and ipad first", () => {
+  const app = read("src/App.tsx");
+
+  assert.match(app, /const compactWebLayout = !nativeRuntime && webViewportCompact/);
+  assert.match(app, /matchMedia\("\(max-width: 1024px\)"/);
+  assert.match(app, /useState\(\(\) => !\(!nativeRuntime && window\.matchMedia/);
+  assert.match(app, /if \(compactWebLayout\) return \{ cols: 1, rows: n \}/);
+  assert.match(app, /sidebarOpen && !compactWebLayout/);
+  assert.match(app, /compactWebLayout && \(\s+<MobileBottomNav/);
+  assert.match(app, /function MobileBottomNav/);
 });
 
 test("sidebar exposes an icon-only rail mode", () => {
@@ -407,6 +444,9 @@ test("chatpane autoscroll follows live output until user scrolls away", () => {
   assert.match(chatPane, /syncJumpVisibility/);
   assert.match(chatPane, /distanceFromBottom/);
   assert.match(chatPane, /scroll to bottom/);
+  assert.match(chatPane, /lastArrowDownRef/);
+  assert.match(chatPane, /e\.key === "ArrowDown" && !overlay/);
+  assert.match(chatPane, /jumpToLatest\(\)/);
   assert.match(scroll, /nextAutoscrollPaused/);
 });
 

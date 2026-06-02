@@ -75,6 +75,7 @@ import {
   chatSetTitle,
   chatStart,
   chatStop,
+  webChatSend,
   listChatSessions,
   readChatTranscript,
   recordChatSession,
@@ -86,6 +87,7 @@ import {
   type ChatModel,
   type ChatSessionInfo,
   type ChatTurnInfo,
+  type WebChatTurn,
 } from "../lib/chat";
 import { fileSrc, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
@@ -555,7 +557,11 @@ export function ChatPane({
   /** Open an http(s) link from rendered markdown in an in-app browser pane. */
   onOpenUrl?: (url: string) => void;
 }) {
+  const nativeRuntime = useMemo(() => isTauriRuntime(), []);
+  const webChatRuntime = !nativeRuntime;
   const [turns, setTurns] = useState<Turn[]>([]);
+  const turnsRef = useRef<Turn[]>([]);
+  turnsRef.current = turns;
   const [runEventState, setRunEventState] = useState<RunEventState>(() =>
     emptyRunEventState(),
   );
@@ -737,6 +743,7 @@ export function ChatPane({
   const [resumedTitle, setResumedTitle] = useState<string | null>(resume?.title ?? null);
 
   const sessionIdRef = useRef<number | null>(null);
+  const webAbortRef = useRef<AbortController | null>(null);
   // live mirror of `streaming` for the close-handle closure (a turn in flight).
   const activeRunRef = useRef(false);
   activeRunRef.current = streaming || backendBusy;
@@ -1181,19 +1188,17 @@ export function ChatPane({
     setStarted(false);
     setClaudeReady(false);
     setCtxTokens(null);
-    if (!isTauriRuntime()) {
-      setTurns((prev) =>
-        prev.length
-          ? prev
-          : [
-              {
-                kind: "result",
-                id: uid(),
-                text: "web preview loaded. live chat runs inside the desktop shell.",
-              },
-            ],
-      );
-      return;
+    if (webChatRuntime) {
+      sessionIdRef.current = 0;
+      claudeSessionIdRef.current = `web-${paneKey ?? "chat"}`;
+      setRunEventsKey(runEventsStorageKey(claudeSessionIdRef.current));
+      setStarted(true);
+      setClaudeReady(true);
+      return () => {
+        webAbortRef.current?.abort();
+        webAbortRef.current = null;
+        sessionIdRef.current = null;
+      };
     }
     const chan = new Channel<string>();
     chan.onmessage = (line) => {
@@ -1259,7 +1264,7 @@ export function ChatPane({
     };
     // model/permission/effort/resumeId are captured at start; changing them restarts the session
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model.id, permission.id, effort.id, effectiveBudget, cwd, restartKey, resumeId, reattach]);
+  }, [model.id, permission.id, effort.id, effectiveBudget, cwd, restartKey, resumeId, reattach, webChatRuntime, paneKey]);
 
   // Publish a close-handle so App can detach (keep running) vs kill a busy chat.
   useEffect(() => {
@@ -1327,6 +1332,7 @@ export function ChatPane({
   const programmaticRef = useRef(false);
   const lastScrollHeightRef = useRef(0);
   const lastScrollTopRef = useRef(0);
+  const lastArrowDownRef = useRef(0);
   const [showJump, setShowJump] = useState(false);
   const syncJumpVisibility = useCallback((el: HTMLDivElement | null, paused = pausedRef.current) => {
     if (!el) {
@@ -1508,6 +1514,51 @@ export function ChatPane({
       setNow(t0);
       // plan-mode is a per-message instruction; clear it after firing
       if (planMode) setPlanMode(false);
+      if (webChatRuntime) {
+        webAbortRef.current?.abort();
+        const controller = new AbortController();
+        webAbortRef.current = controller;
+        const messages: WebChatTurn[] = turnsRef.current.flatMap((turn): WebChatTurn[] => {
+          if (turn.kind === "user") return [{ role: "user" as const, text: turn.text }];
+          if (turn.kind === "assistant") return [{ role: "assistant" as const, text: turn.text }];
+          return [];
+        });
+        webChatSend(wire, {
+          model: model.disabled ? null : model.id,
+          messages,
+          signal: controller.signal,
+        })
+          .then((reply) => {
+            if (controller.signal.aborted) return;
+            handleEvent({
+              type: "assistant",
+              model: reply.model,
+              message: {
+                role: "assistant",
+                model: reply.model,
+                content: [{ type: "text", text: reply.text }],
+              },
+            });
+            handleEvent({
+              type: "result",
+              duration_ms: Date.now() - t0,
+              usage: reply.usage,
+            });
+          })
+          .catch((err) => {
+            if (controller.signal.aborted) return;
+            setTurns((prev) => [
+              ...prev,
+              { kind: "result", id: uid(), text: `send failed: ${err}` },
+            ]);
+            setStreaming(false);
+            setBackendBusy(false);
+          })
+          .finally(() => {
+            if (webAbortRef.current === controller) webAbortRef.current = null;
+          });
+        return;
+      }
       chatSend(id, wire).catch((err) => {
         setTurns((prev) => [
           ...prev,
@@ -1517,7 +1568,18 @@ export function ChatPane({
         setBackendBusy(false);
       });
     },
-    [goal, planMode, effectiveBudget, cwd, paneKey, attachedMemories.length],
+    [
+      goal,
+      planMode,
+      effectiveBudget,
+      cwd,
+      paneKey,
+      attachedMemories.length,
+      webChatRuntime,
+      model.id,
+      model.disabled,
+      handleEvent,
+    ],
   );
   // keep the flush effect calling the latest dispatch closure
   dispatchRef.current = dispatch;
@@ -1729,6 +1791,11 @@ export function ChatPane({
       setStreaming(false);
       setBackendBusy(false);
       setTurns((prev) => [...prev, { kind: "result", id: uid(), text: note }]);
+      if (webChatRuntime) {
+        webAbortRef.current?.abort();
+        webAbortRef.current = null;
+        return;
+      }
       if (id != null) {
         if (mode === "kill-and-restart") {
           sessionIdRef.current = null;
@@ -1744,7 +1811,7 @@ export function ChatPane({
         }
       }
     },
-    [],
+    [webChatRuntime],
   );
 
   // true interrupt of the in-flight turn (process survives)
@@ -1774,6 +1841,8 @@ export function ChatPane({
     setRunEventState(emptyRunEventState());
     setRunEventsKey(null);
     setStreaming(false);
+    webAbortRef.current?.abort();
+    webAbortRef.current = null;
     streamingTurnId.current = null;
     thinkingTurnId.current = null;
     lastSentRef.current = null;
@@ -2160,6 +2229,16 @@ export function ChatPane({
         if (item) steerQueued(item.id);
         return;
       }
+    }
+    if (e.key === "ArrowDown" && !overlay) {
+      const now = e.timeStamp || performance.now();
+      if (now - lastArrowDownRef.current < 360) {
+        e.preventDefault();
+        lastArrowDownRef.current = 0;
+        jumpToLatest();
+        return;
+      }
+      lastArrowDownRef.current = now;
     }
     // copilot-style ghost accept: Tab, or → when the caret is at the very end.
     if (!overlay && ghostRef.current) {

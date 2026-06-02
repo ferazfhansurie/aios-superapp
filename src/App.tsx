@@ -91,7 +91,6 @@ import {
   mirrorShareUrl,
   mirrorWebSocketUrl,
   parseMirrorSocketMessage,
-  savedMirrorPairing,
   type MirrorConnectionStatus,
   type MirrorPairing,
   type MirrorPresence,
@@ -281,10 +280,13 @@ function startWindowDrag(e: React.MouseEvent<HTMLElement>) {
 
 function App() {
   const nativeRuntime = useMemo(() => isTauriRuntime(), []);
+  const [webViewportCompact, setWebViewportCompact] = useState(() =>
+    !nativeRuntime && window.matchMedia("(max-width: 1024px)").matches,
+  );
   const [panes, setPanes] = useState<Pane[]>(() =>
     loadSettings().reopenLastLayout ? loadLayout() : [],
   );
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() => !(!nativeRuntime && window.matchMedia("(max-width: 1024px)").matches));
   const [splash, setSplash] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -297,12 +299,14 @@ function App() {
   const agentControllerRef = useRef<AgentController | null>(null);
   const mirrorPairing = useMemo<MirrorPairing | null>(() => {
     if (nativeRuntime) return ensureMirrorPairing();
-    return mirrorPairingFromLocation() ?? savedMirrorPairing();
+    return mirrorPairingFromLocation();
   }, [nativeRuntime]);
+  const webMirrorMode = !nativeRuntime && mirrorPairing != null;
   const mirrorUrl = useMemo(
     () => (nativeRuntime && mirrorPairing ? mirrorShareUrl(mirrorPairing) : null),
     [nativeRuntime, mirrorPairing],
   );
+  const compactWebLayout = !nativeRuntime && webViewportCompact;
   // mission-control-style pane overview: fan out every open pane to switch.
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -405,6 +409,19 @@ function App() {
     const t = setTimeout(() => setSplash(false), 850);
     return () => clearTimeout(t);
   }, []);
+
+  useEffect(() => {
+    if (nativeRuntime) return;
+    const mq = window.matchMedia("(max-width: 1024px)");
+    const update = () => setWebViewportCompact(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, [nativeRuntime]);
+
+  useEffect(() => {
+    if (compactWebLayout) setSidebarOpen(false);
+  }, [compactWebLayout]);
 
   useEffect(() => {
     const teardown = initTheme();
@@ -981,9 +998,10 @@ function App() {
   const visibleCount = panes.length - hiddenKeys.length;
   const { cols, rows } = useMemo(() => {
     const n = visibleCount || 1;
+    if (compactWebLayout) return { cols: 1, rows: n };
     const c = Math.ceil(Math.sqrt(n));
     return { cols: c, rows: Math.ceil(n / c) };
-  }, [visibleCount]);
+  }, [visibleCount, compactWebLayout]);
 
   const commands: Command[] = useMemo(() => {
     return buildAppCommands({
@@ -1333,7 +1351,7 @@ function App() {
 
       {/* body: sidebar + pane grid */}
       <div className="flex min-h-0 flex-1">
-        {sidebarOpen && (
+        {sidebarOpen && !compactWebLayout && (
           <aside
             className={`flex shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)] transition-[width] ${
               iconsOnly ? "w-16" : "w-60"
@@ -1370,7 +1388,7 @@ function App() {
 
         <main className="relative min-h-0 flex-1">
           {(() => {
-            if (!nativeRuntime) {
+            if (webMirrorMode) {
               return (
                 <MirrorViewer
                   snapshot={remoteMirrorSnapshot}
@@ -1470,6 +1488,20 @@ function App() {
           })()}
         </main>
       </div>
+
+      {compactWebLayout && (
+        <MobileBottomNav
+          panesCount={panes.length}
+          onNewChat={() => spawn({ type: "chat" }, "chat")}
+          onOpenPalette={() => setPaletteOpen(true)}
+          onOpenBrowser={() => spawn({ type: "browser" }, "browser")}
+          onOpenPet={() => spawn({ type: "pet" }, "pet")}
+          onShowPanes={() => {
+            if (panes.length > 0) setOverviewOpen(true);
+          }}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
+      )}
 
       {toast && (
         <div className="modal-in glass absolute bottom-4 left-1/2 z-40 -translate-x-1/2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/90 px-3 py-2 text-[12px] text-[var(--color-text)] shadow-2xl">
@@ -1592,6 +1624,60 @@ function IconBtn({
     >
       {children}
     </button>
+  );
+}
+
+function MobileBottomNav({
+  panesCount,
+  onNewChat,
+  onOpenPalette,
+  onOpenBrowser,
+  onOpenPet,
+  onShowPanes,
+  onOpenSettings,
+}: {
+  panesCount: number;
+  onNewChat: () => void;
+  onOpenPalette: () => void;
+  onOpenBrowser: () => void;
+  onOpenPet: () => void;
+  onShowPanes: () => void;
+  onOpenSettings: () => void;
+}) {
+  const items = [
+    { label: "chat", icon: MessageSquare, action: onNewChat },
+    { label: "search", icon: Search, action: onOpenPalette },
+    { label: "web", icon: Globe, action: onOpenBrowser },
+    { label: panesCount > 0 ? "panes" : "pet", icon: panesCount > 0 ? Layers : Bot, action: panesCount > 0 ? onShowPanes : onOpenPet },
+    { label: "settings", icon: SettingsIcon, action: onOpenSettings },
+  ];
+  return (
+    <nav
+      className="glass z-40 grid h-16 shrink-0 grid-cols-5 border-t border-[var(--color-border)] bg-[var(--color-panel)]/92 px-1 pb-[max(env(safe-area-inset-bottom),0px)]"
+      aria-label="mobile navigation"
+      data-no-window-drag
+    >
+      {items.map((item) => {
+        const Icon = item.icon;
+        return (
+          <button
+            key={item.label}
+            type="button"
+            onClick={item.action}
+            className="relative flex min-w-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[10px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+            title={item.label}
+          >
+            <Icon size={19} />
+            <span className="w-full truncate text-center leading-none">{item.label}</span>
+            {item.label === "panes" && panesCount > 0 && (
+              <span className="absolute right-3 top-1.5 grid h-4 min-w-4 place-items-center rounded-full bg-[var(--color-accent)] px-1 text-[9px] font-semibold leading-none text-black">
+                {panesCount > 9 ? "9+" : panesCount}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </nav>
   );
 }
 
