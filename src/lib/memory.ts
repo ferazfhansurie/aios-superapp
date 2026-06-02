@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /** One memory note in the vault graph. */
 export interface MemoryNode {

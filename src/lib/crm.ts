@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /**
  * Typed wrappers over the Rust CRM contacts store (see `src-tauri/src/crm.rs`).

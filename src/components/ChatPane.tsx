@@ -23,7 +23,7 @@
  *   8. `@` file-mention picker sourced from cwd
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Channel, convertFileSrc } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
   ArrowUp,
@@ -87,7 +87,7 @@ import {
   type ChatSessionInfo,
   type ChatTurnInfo,
 } from "../lib/chat";
-import { readDir, saveImageTemp, type DirEntry } from "../lib/fs";
+import { fileSrc, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
 import { idleRate, codexRate, resetIn } from "../lib/dashboard";
 import {
@@ -135,6 +135,7 @@ import {
   shouldAutoscroll,
   type ScrollIntent,
 } from "../lib/chatScroll";
+import { isTauriRuntime } from "../lib/tauri";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -861,7 +862,7 @@ export function ChatPane({
   // the asset-protocol URL, and `path` is set immediately (already on disk).
   const addImageByPath = useCallback((path: string) => {
     const id = `img${++_imgSeq}`;
-    setImages((prev) => [...prev, { id, url: convertFileSrc(path), path }]);
+    setImages((prev) => [...prev, { id, url: fileSrc(path), path }]);
   }, []);
 
   // Register this chat pane's IMAGE-drop sink so App's native OS drag-drop
@@ -1180,6 +1181,20 @@ export function ChatPane({
     setStarted(false);
     setClaudeReady(false);
     setCtxTokens(null);
+    if (!isTauriRuntime()) {
+      setTurns((prev) =>
+        prev.length
+          ? prev
+          : [
+              {
+                kind: "result",
+                id: uid(),
+                text: "web preview loaded. live chat runs inside the desktop shell.",
+              },
+            ],
+      );
+      return;
+    }
     const chan = new Channel<string>();
     chan.onmessage = (line) => {
       if (disposed) return;

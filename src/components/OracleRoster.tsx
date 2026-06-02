@@ -31,6 +31,7 @@ import {
   type OracleInfo,
   type TmuxSession,
 } from "../lib/pty";
+import { isTauriRuntime } from "../lib/tauri";
 import { SidebarUsage } from "./SidebarUsage";
 
 interface Props {
@@ -59,6 +60,7 @@ const loadHidden = (): Set<string> => {
 const COLLAPSE_KEY = "aios.agentsCollapsed";
 
 export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }: Props) {
+  const nativeReady = isTauriRuntime();
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -90,6 +92,12 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
 
   const refresh = useCallback(async () => {
     setError(null);
+    if (!nativeReady) {
+      setOracles([]);
+      setSessions([]);
+      setLoading(false);
+      return;
+    }
     try {
       const [o, s] = await Promise.all([listOracles(), listTmuxSessions()]);
       setOracles(o);
@@ -99,7 +107,7 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [nativeReady]);
 
   useEffect(() => {
     refresh();
@@ -140,7 +148,7 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
         >
           <Radio size={14} />
         </button>
-        {!collapsed && !primaryRunning && (
+        {!collapsed && nativeReady && !primaryRunning && (
           <button
             onClick={spawnPrimary}
             disabled={spawning}
@@ -196,7 +204,7 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
               <span className="text-[var(--color-faint)]">({oracles.length})</span>
             )}
           </button>
-          {!collapsed && (
+          {!collapsed && nativeReady && (
             <div className="flex items-center gap-0.5">
               <button
                 onClick={() => setCreating((v) => !v)}
@@ -237,7 +245,7 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
 
         {!collapsed && (
         <div className="flex flex-col gap-1">
-          {!primaryRunning && (
+          {nativeReady && !primaryRunning && (
             <button
               onClick={spawnPrimary}
               disabled={spawning}

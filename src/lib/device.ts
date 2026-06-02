@@ -1,7 +1,7 @@
 /** Host machine stats for the idle homescreen's device-monitor tile.
  *  Wraps the Rust `device_stats` command (sysinfo + pmset). All sizes are bytes;
  *  battery fields are null off-mac / when unavailable. */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 export interface DeviceStats {
   cpuPct: number;

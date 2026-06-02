@@ -1,6 +1,6 @@
 /** Wrappers over the native embedded-browser (child webview) commands. Each
  *  browser pane drives its own webview, addressed by a per-pane `label`. */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 export interface Rect {
   x: number;

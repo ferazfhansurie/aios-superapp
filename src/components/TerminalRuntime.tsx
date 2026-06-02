@@ -23,6 +23,7 @@ import {
 } from "../lib/pty";
 import { homeDir, saveImageTemp } from "../lib/fs";
 import { paneWriters, paneSubmitters } from "../lib/paneBus";
+import { isTauriRuntime } from "../lib/tauri";
 import { TerminalComposer } from "./TerminalComposer";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
@@ -274,6 +275,15 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     let sessionId: number | null = null;
     let disposed = false;
     let inputDisposer: { dispose: () => void } | null = null;
+
+    if (!isTauriRuntime()) {
+      term.write("\r\n\x1b[33m[aios] terminal panes run inside the desktop shell.\x1b[0m\r\n");
+      return () => {
+        disposed = true;
+        host.removeEventListener("auxclick", onAuxClick);
+        term.dispose();
+      };
+    }
 
     const onData = new Channel<string>();
     onData.onmessage = (chunk) => {

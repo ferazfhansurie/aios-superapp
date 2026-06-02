@@ -1,4 +1,5 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { invoke, isTauriRuntime } from "./tauri";
 
 export interface DirEntry {
   name: string;
@@ -85,6 +86,7 @@ export async function readFilePreview(path: string): Promise<FilePreview> {
 
 /** Asset-protocol URL for rendering a local file (images/pdf) in the webview. */
 export function fileSrc(path: string): string {
+  if (!isTauriRuntime()) return path;
   return convertFileSrc(path);
 }
 

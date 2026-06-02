@@ -138,6 +138,32 @@ test("browser video fullscreen avoids macos native space transition", () => {
   assert.match(source, /set_simple_fullscreen\(on\)/);
 });
 
+test("web shell guards tauri-only runtime APIs", () => {
+  const app = read("src/App.tsx");
+  const chatPane = read("src/components/ChatPane.tsx");
+  const terminalRuntime = read("src/components/TerminalRuntime.tsx");
+  const tauri = read("src/lib/tauri.ts");
+  const fs = read("src/lib/fs.ts");
+
+  assert.match(tauri, /function isTauriRuntime/);
+  assert.match(tauri, /__TAURI_INTERNALS__/);
+  assert.match(tauri, /Promise\.reject\(new Error\(`tauri runtime unavailable/);
+  assert.match(app, /import \{ isTauriRuntime \} from "\.\/lib\/tauri"/);
+  assert.match(app, /if \(!isTauriRuntime\(\)\) return;\s+void getCurrentWindow\(\)\.startDragging\(\)\.catch/);
+  assert.match(app, /if \(!isTauriRuntime\(\)\) return;\s+let disposed = false/);
+  assert.match(app, /const win = getCurrentWindow\(\)/);
+  assert.match(app, /await win\.hide\(\)\.catch/);
+  assert.match(app, /if \(!isTauriRuntime\(\)\) return;\s+\/\/ Resolve the pane key/);
+  assert.match(app, /onDragDropEvent/);
+  assert.match(fs, /if \(!isTauriRuntime\(\)\) return path/);
+  assert.match(chatPane, /if \(!isTauriRuntime\(\)\) \{/);
+  assert.match(chatPane, /web preview loaded\. live chat runs inside the desktop shell/);
+  assert.match(chatPane, /url: fileSrc\(path\)/);
+  assert.doesNotMatch(chatPane, /convertFileSrc/);
+  assert.match(terminalRuntime, /if \(!isTauriRuntime\(\)\) \{/);
+  assert.match(terminalRuntime, /terminal panes run inside the desktop shell/);
+});
+
 test("sidebar exposes an icon-only rail mode", () => {
   const app = read("src/App.tsx");
   const settings = read("src/lib/settings.ts");

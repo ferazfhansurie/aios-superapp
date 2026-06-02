@@ -12,7 +12,7 @@
  * Every getter is defensive: a missing file / unparseable JSON / absent command
  * yields a graceful empty shape, never a throw that blanks the idle page.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 export interface IdleFocus {
   phaseTitle: string | null;

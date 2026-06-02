@@ -1,7 +1,7 @@
 /** Wrapper over the `usage_extras` Rust command — long-horizon usage stats
  *  (activity heatmap, streaks, totals) derived from ~/.claude/stats-cache.json.
  *  Distinct from `usage_stats`, which is the live 5h/7d rate-limit feed. */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 export interface HeatmapDay {
   date: string; // YYYY-MM-DD

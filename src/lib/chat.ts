@@ -26,7 +26,8 @@
  * raw JSON lines stream over a per-session Tauri `Channel<string>`; parsing
  * happens in `ChatPane.tsx`.
  */
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /** Options for starting a chat session. All optional. */
 export interface ChatStartOpts {

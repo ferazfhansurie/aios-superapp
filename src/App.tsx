@@ -82,6 +82,7 @@ import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
 import { buildAppCommands } from "./lib/appCommands";
+import { isTauriRuntime } from "./lib/tauri";
 import {
   createAgentController,
   type AgentDispatchInput,
@@ -260,7 +261,8 @@ function saveLayout(panes: Pane[]) {
 function startWindowDrag(e: React.MouseEvent<HTMLElement>) {
   if (e.button !== 0) return;
   if ((e.target as HTMLElement | null)?.closest(INTERACTIVE_SELECTOR)) return;
-  void getCurrentWindow().startDragging();
+  if (!isTauriRuntime()) return;
+  void getCurrentWindow().startDragging().catch(() => {});
 }
 
 function App() {
@@ -393,10 +395,12 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!isTauriRuntime()) return;
     let disposed = false;
     let unlisten: (() => void) | null = null;
+    const win = getCurrentWindow();
 
-    getCurrentWindow()
+    win
       .onCloseRequested(async (event) => {
         const detachedNow = detachBusyChats(true);
         let alreadyBackgrounded = false;
@@ -422,12 +426,13 @@ function App() {
               ? `${detachedNow} chat${detachedNow === 1 ? "" : "s"} will keep generating after the shell hides.`
               : "open status to reattach when it finishes.",
         });
-        await getCurrentWindow().hide();
+        await win.hide().catch(() => {});
       })
       .then((stop) => {
         if (disposed) stop();
         else unlisten = stop;
-      });
+      })
+      .catch(() => {});
 
     return () => {
       disposed = true;
@@ -467,6 +472,7 @@ function App() {
   );
 
   useEffect(() => {
+    if (!isTauriRuntime()) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen<{ url: string; profile?: string }>("browser-new-pane", ({ payload }) => {
@@ -475,7 +481,7 @@ function App() {
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
-    });
+    }).catch(() => {});
     return () => {
       disposed = true;
       unlisten?.();
@@ -875,6 +881,7 @@ function App() {
   // fire — so this Tauri handler is the ONLY path for OS files (the in-app
   // `application/x-aios-path` handler on TerminalPane covers Files-pane drags).
   useEffect(() => {
+    if (!isTauriRuntime()) return;
     // Resolve the pane key under a physical (device-pixel) drop position. xterm's
     // canvas/textarea sit inside the [data-pane-key] wrapper, so closest() walks
     // up to the pane regardless of which internal node is hit-tested.
@@ -936,7 +943,7 @@ function App() {
       flash(`dropped ${paths.length} item${paths.length > 1 ? "s" : ""}`);
     });
     return () => {
-      void un.then((f) => f());
+      void un.then((f) => f()).catch(() => {});
     };
   }, [flash]);
 

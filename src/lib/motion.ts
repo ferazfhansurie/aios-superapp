@@ -17,7 +17,7 @@
  * absent every call returns `{ configured: false }` so the pane can show a
  * clear setup state rather than failing.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 // ── model catalog ────────────────────────────────────────────────────────
 

@@ -2,7 +2,8 @@
  * Thin wrappers over the Rust PTY commands. Output streams per-session over a
  * Tauri `Channel<string>` (passed into the spawn call), not the global event bus.
  */
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /** An AIOS oracle session discovered by the backend (tmux + instances.json). */
 export interface OracleInfo {

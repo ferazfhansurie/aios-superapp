@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /** A saved external database connection (credentials live only in the backend). */
 export interface ConnMeta {
