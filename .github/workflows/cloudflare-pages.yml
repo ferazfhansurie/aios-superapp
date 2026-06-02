@@ -37,4 +37,6 @@ jobs:
 
       - name: deploy to cloudflare pages
         if: env.CLOUDFLARE_ACCOUNT_ID != '' && env.CLOUDFLARE_API_TOKEN != ''
-        run: npx --yes wrangler@latest pages deploy dist --project-name=aios-superapp --branch=${{ github.ref_name }}
+        run: |
+          npx --yes wrangler@latest pages project create aios-superapp --production-branch=master || true
+          npx --yes wrangler@latest pages deploy dist --project-name=aios-superapp --branch=${{ github.ref_name }}
