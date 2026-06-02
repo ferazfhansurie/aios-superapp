@@ -2,14 +2,5 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "aios-superapp",
   "pages_build_output_dir": "./dist",
-  "compatibility_date": "2026-06-02",
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "AIOS_MIRROR",
-        "class_name": "MirrorRoom",
-        "script_name": "aios-mirror-worker"
-      }
-    ]
-  }
+  "compatibility_date": "2026-06-02"
 }

@@ -169,9 +169,7 @@ test("web mirror uses a cloudflare durable object transport", () => {
   const viewer = read("src/components/MirrorViewer.tsx");
   const transport = read("src/lib/mirrorTransport.ts");
   const worker = read("workers/mirror/src/index.ts");
-  const pagesFn = read("functions/api/mirror/[room].ts");
   const workflow = read(".github/workflows/cloudflare-pages.yml");
-  const wrangler = read("wrangler.jsonc");
 
   assert.match(app, /ensureMirrorPairing/);
   assert.match(app, /mirrorShareUrl/);
@@ -180,15 +178,13 @@ test("web mirror uses a cloudflare durable object transport", () => {
   assert.match(app, /source: "mirror"/);
   assert.match(viewer, /desktop mirror/);
   assert.match(viewer, /pixel streaming is not enabled yet/);
-  assert.match(transport, /aios-superapp\.pages\.dev\/api\/mirror/);
+  assert.match(transport, /aios-mirror-worker\.firazfhansurie\.workers\.dev/);
   assert.match(transport, /#mirror=/);
   assert.match(worker, /class MirrorRoom extends DurableObject/);
   assert.match(worker, /ctx\.acceptWebSocket/);
   assert.match(worker, /type: "snapshot"/);
   assert.match(worker, /type: "control"/);
-  assert.match(pagesFn, /AIOS_MIRROR\.idFromName/);
   assert.match(workflow, /wrangler@latest deploy --config workers\/mirror\/wrangler\.jsonc/);
-  assert.match(wrangler, /script_name/);
 });
 
 test("sidebar exposes an icon-only rail mode", () => {

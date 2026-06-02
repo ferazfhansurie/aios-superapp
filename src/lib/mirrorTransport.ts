@@ -25,7 +25,7 @@ export type MirrorSocketMessage =
 
 const ROOM_KEY = "aios.mirror.room";
 const TOKEN_KEY = "aios.mirror.token";
-const DEFAULT_HTTP_ENDPOINT = "https://aios-superapp.pages.dev/api/mirror";
+const DEFAULT_HTTP_ENDPOINT = "https://aios-mirror-worker.firazfhansurie.workers.dev";
 
 function randomToken(bytes: number): string {
   const data = new Uint8Array(bytes);
@@ -89,7 +89,7 @@ export function mirrorShareUrl(pairing: MirrorPairing): string {
 export function mirrorWebSocketUrl(pairing: MirrorPairing): string {
   const base =
     import.meta.env.VITE_AIOS_MIRROR_URL ||
-    (window.location.protocol.startsWith("http") ? `${window.location.origin}/api/mirror` : DEFAULT_HTTP_ENDPOINT);
+    DEFAULT_HTTP_ENDPOINT;
   const url = new URL(`${base.replace(/\/+$/, "")}/${encodeURIComponent(pairing.room)}`);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
