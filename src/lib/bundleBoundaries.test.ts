@@ -377,6 +377,22 @@ test("chatpane pending steer queue stays attached to the shared composer", () =>
   assert.match(chatPane, /editQueued\(q\)/);
 });
 
+test("chatpane docked composer can collapse and reopen", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+  const composerStart = chatPane.indexOf("const composer = useMemo");
+  const dockStart = chatPane.indexOf("shrink-0 border-t border-[var(--color-border)]");
+  const hideButton = chatPane.indexOf("hide composer");
+  const showButton = chatPane.indexOf("show composer");
+
+  assert.notEqual(composerStart, -1);
+  assert.notEqual(dockStart, -1);
+  assert.ok(hideButton > composerStart, "hide control must live with the composer");
+  assert.ok(showButton > dockStart, "reopen control must be available in the docked footer");
+  assert.match(chatPane, /isComposerCollapsed/);
+  assert.match(chatPane, /setComposerCollapsed\(true\)/);
+  assert.match(chatPane, /setComposerCollapsed\(false\)/);
+});
+
 test("shell exposes a policy-gated agent control bridge", () => {
   const app = read("src/App.tsx");
   const actions = read("src/lib/agentActions.ts");

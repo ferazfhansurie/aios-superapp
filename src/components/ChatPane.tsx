@@ -610,6 +610,7 @@ export function ChatPane({
       /* ignore */
     }
   }, [input, draftKey]);
+  const [isComposerCollapsed, setComposerCollapsed] = useState(false);
 
   const [streaming, setStreaming] = useState(false);
   const [backendBusy, setBackendBusy] = useState(false);
@@ -2691,6 +2692,19 @@ export function ChatPane({
           <div className="flex flex-wrap items-center justify-end gap-1.5 px-3 pb-3 pt-1">
             {/* advanced controls stay available, but the composer stays clean. */}
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            {!empty && (
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenMenu(null);
+                  setComposerCollapsed(true);
+                }}
+                className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+                title="hide composer"
+              >
+                <ChevronDown size={15} />
+              </button>
+            )}
             <Dropdown
               open={openMenu === "advanced"}
               onToggle={() => setOpenMenu(openMenu === "advanced" ? null : "advanced")}
@@ -2895,6 +2909,7 @@ export function ChatPane({
     [
       input,
       ghost,
+      empty,
       openMenu,
       permission,
       effort,
@@ -3143,7 +3158,24 @@ export function ChatPane({
             cost={sessionCost}
             engine={usageLabel}
           />
-          {composer}
+          {isComposerCollapsed ? (
+            <button
+              type="button"
+              onClick={() => setComposerCollapsed(false)}
+              title="show composer"
+              className="flex min-h-10 w-full items-center justify-between gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-panel-2)]/80 px-3 py-2 text-left text-[12px] text-[var(--color-text-2)] shadow-xl shadow-black/25 backdrop-blur transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <CornerDownLeft size={14} className="shrink-0 text-[var(--color-accent)]" />
+                <span className="truncate">composer hidden</span>
+              </span>
+              <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">
+                {hasDraft ? "draft saved" : activeRun ? "run active" : "open"}
+              </span>
+            </button>
+          ) : (
+            composer
+          )}
         </div>
       </div>
     </div>
