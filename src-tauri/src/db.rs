@@ -205,7 +205,10 @@ pub async fn db_table_rows(
 /// Runs an arbitrary statement. SELECTs return rows; other statements return
 /// `affected`. A hard LIMIT is applied to SELECTs that lack one.
 #[tauri::command]
-pub async fn db_query(id: String, sql: String) -> Result<QueryResult, String> {
+pub async fn db_query(id: String, sql: String, allow_write: bool) -> Result<QueryResult, String> {
+    if !allow_write && sql_requires_write_confirmation(&sql) {
+        return Err("write query blocked: enable write mode to run mutating SQL".into());
+    }
     let c = find(&id)?;
     match c.kind.as_str() {
         "postgres" => pg_query(&c.url, &sql).await,
@@ -279,6 +282,28 @@ async fn pg_list_tables(url: &str) -> Result<Vec<TableInfo>, String> {
 fn is_select(sql: &str) -> bool {
     let t = sql.trim_start().to_lowercase();
     t.starts_with("select") || t.starts_with("with") || t.starts_with("show") || t.starts_with("table")
+}
+
+fn first_sql_word(sql: &str) -> String {
+    let t = sql
+        .trim_start()
+        .trim_start_matches('\u{feff}')
+        .trim_start_matches(|c: char| c == '(' || c.is_whitespace());
+    t.chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn is_readonly_sql(sql: &str) -> bool {
+    matches!(
+        first_sql_word(sql).as_str(),
+        "select" | "with" | "show" | "table" | "explain" | "describe" | "desc"
+    )
+}
+
+fn sql_requires_write_confirmation(sql: &str) -> bool {
+    !is_readonly_sql(sql)
 }
 
 async fn pg_query(url: &str, sql: &str) -> Result<QueryResult, String> {
@@ -454,6 +479,34 @@ fn fnv1a(s: &str) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readonly_sql_allows_browse_queries() {
+        assert!(is_readonly_sql("select * from contacts"));
+        assert!(is_readonly_sql("WITH recent AS (SELECT 1) SELECT * FROM recent"));
+        assert!(is_readonly_sql("show search_path"));
+        assert!(is_readonly_sql("explain select * from contacts"));
+    }
+
+    #[test]
+    fn readonly_sql_blocks_mutations_until_confirmed() {
+        for sql in [
+            "insert into contacts(name) values ('a')",
+            "update contacts set name = 'a'",
+            "delete from contacts",
+            "drop table contacts",
+            "alter table contacts add column x text",
+            "truncate contacts",
+        ] {
+            assert!(!is_readonly_sql(sql), "{sql}");
+            assert!(sql_requires_write_confirmation(sql), "{sql}");
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -689,4 +742,3 @@ async fn run_write(url: &str, sql: &str, binds: Vec<Option<String>>) -> Result<u
     pool.close().await;
     Ok(res?.rows_affected())
 }
-

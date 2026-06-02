@@ -2,6 +2,8 @@
  *  AIOS cockpit. Left nav rail + scrollable right panel. Esc / backdrop close.
  *  Every control persists through src/lib/settings.ts. lowercase, terse. */
 import {
+  lazy,
+  Suspense,
   type ComponentType,
   type ReactNode,
   useEffect,
@@ -10,6 +12,7 @@ import {
 } from "react";
 
 import {
+  Bell,
   Blocks,
   Brain,
   Check,
@@ -45,13 +48,13 @@ import {
   setOverride as setProjectOverride,
 } from "../lib/projects";
 
-import { BridgesPane } from "./BridgesPane";
-import { PluginsPane } from "./PluginsPane";
-
 import {
   type AppSettings,
   type PaneType,
   type FlashLevel,
+  type NotificationNativeMode,
+  type SidebarMode,
+  type TopBarMode,
   loadSettings,
   saveSettings,
   applyFlashLevel,
@@ -84,6 +87,9 @@ import {
   subscribe as subscribeTheme,
   subscribeAccent,
 } from "../lib/theme";
+
+const BridgesPane = lazy(() => import("./BridgesPane").then((m) => ({ default: m.BridgesPane })));
+const PluginsPane = lazy(() => import("./PluginsPane").then((m) => ({ default: m.PluginsPane })));
 
 /* ── control primitives ─────────────────────────────────────────────── */
 
@@ -304,7 +310,7 @@ function applyReduceMotion(on: boolean) {
 
 /** Codex-style theme picker — segmented, icon + label, with a preview hint
  *  swatch under each option. Wired through theme.ts so it stays in sync with
- *  the header ThemeSwitcher. */
+ *  the settings surface. */
 function ThemePicker({
   value,
   onChange,
@@ -567,7 +573,7 @@ function AppearancePreview({ fontPx }: { fontPx: number }) {
             className="font-mono leading-relaxed text-[var(--color-text)]"
             style={{ fontSize: fontPx }}
           >
-            <span style={{ color: "var(--color-accent)" }}>aios</span>
+            <span style={{ color: "var(--color-accent)" }}>prompt</span>
             <span className="text-[var(--color-muted)]"> ❯ </span>
             ship it.
             <span
@@ -614,6 +620,7 @@ type SectionId =
   | "general"
   | "appearance"
   | "sidebar"
+  | "notifications"
   | "projects"
   | "oracles"
   | "channels"
@@ -626,6 +633,7 @@ const NAV: { id: SectionId; label: string; icon: ComponentType<{ size?: number }
   { id: "general", label: "general", icon: SettingsIcon },
   { id: "appearance", label: "appearance", icon: Palette },
   { id: "sidebar", label: "sidebar", icon: PanelLeft },
+  { id: "notifications", label: "notifications", icon: Bell },
   { id: "projects", label: "projects", icon: FolderGit2 },
   { id: "oracles", label: "oracles", icon: Cpu },
   { id: "channels", label: "channels", icon: Radio },
@@ -891,7 +899,9 @@ export function Settings({
             // Channels + plugins are full panes (own header + scroll) — render
             // them full-bleed instead of inside the padded settings rows.
             <div className="min-h-0 flex-1">
-              {section === "channels" ? <BridgesPane /> : <PluginsPane />}
+              <Suspense fallback={<div className="grid h-full place-items-center font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--color-faint)]">loading pane</div>}>
+                {section === "channels" ? <BridgesPane /> : <PluginsPane />}
+              </Suspense>
             </div>
           ) : (
           <div className="flex-1 overflow-y-auto px-6 py-5">
@@ -1044,6 +1054,17 @@ export function Settings({
                       ]}
                     />
                   </Row>
+                  <Row label="top bar" sub="show brand chrome, compact controls, or hide it">
+                    <Segmented<TopBarMode>
+                      value={s.topBarMode}
+                      onChange={(v) => patch({ topBarMode: v })}
+                      options={[
+                        { value: "full", label: "full" },
+                        { value: "compact", label: "compact" },
+                        { value: "hidden", label: "hidden" },
+                      ]}
+                    />
+                  </Row>
                   <Row label="reduce motion" sub="cut animations + transitions">
                     <Toggle
                       checked={s.reduceMotion}
@@ -1062,6 +1083,18 @@ export function Settings({
                     show or hide rail items. drag to reorder them right in the
                     sidebar. pinned sites can be unpinned here or via their ⋯ menu.
                   </p>
+                  <div className="mb-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/25 p-3">
+                    <Row label="rail style" sub="full labels or compact icons only">
+                      <Segmented<SidebarMode>
+                        value={s.sidebarMode}
+                        onChange={(v) => patch({ sidebarMode: v })}
+                        options={[
+                          { value: "full", label: "full" },
+                          { value: "icons", label: "icons" },
+                        ]}
+                      />
+                    </Row>
+                  </div>
                   {sidebar.items.map((it) => {
                     const isLink = it.kind.type === "link";
                     const app = it.kind.type === "app" ? SPAWN_BY_ID[it.kind.appId] : undefined;
@@ -1119,6 +1152,37 @@ export function Settings({
                       <RotateCcw size={13} />
                       reset sidebar to default
                     </button>
+                  </div>
+                </div>
+              )}
+
+              {section === "notifications" && (
+                <div className="-mt-1">
+                  <p className="pb-3 pt-1 text-[12px] leading-snug text-[var(--color-muted)]">
+                    control how panes and background runs interrupt you. the shell notification center always keeps a local history.
+                  </p>
+                  <Row label="native alerts" sub="macos notifications outside the shell">
+                    <Segmented<NotificationNativeMode>
+                      value={s.notificationNativeMode}
+                      onChange={(v) => patch({ notificationNativeMode: v })}
+                      options={[
+                        { value: "important", label: "important" },
+                        { value: "all", label: "all" },
+                        { value: "off", label: "off" },
+                      ]}
+                    />
+                  </Row>
+                  <Row label="quiet mode" sub="keep events in the bell without interrupting">
+                    <Toggle
+                      checked={s.notificationQuietMode}
+                      onChange={(v) => patch({ notificationQuietMode: v })}
+                    />
+                  </Row>
+                  <div className="mt-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/25 p-3">
+                    <div className="text-[11px] font-medium text-[var(--color-text)]">next control layer</div>
+                    <p className="mt-1 text-[11px] leading-snug text-[var(--color-muted)]">
+                      per-pane mute, importance, quiet hours, and action buttons will plug into the same notification center.
+                    </p>
                   </div>
                 </div>
               )}

@@ -8,7 +8,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { Check, Circle, ExternalLink, Loader2 } from "lucide-react";
 
 import { readTextFile, writeTextFile } from "../lib/fs";
-import { initMonaco, languageForPath } from "../lib/monaco";
+import { languageForPath } from "../lib/editorLanguage";
 
 export function EditorPane({ path, name }: { path: string; name: string }) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -26,7 +26,6 @@ export function EditorPane({ path, name }: { path: string; name: string }) {
     let editor: Monaco.editor.IStandaloneCodeEditor | null = null;
 
     (async () => {
-      const monaco = initMonaco();
       let content: string;
       try {
         content = await readTextFile(path);
@@ -38,6 +37,10 @@ export function EditorPane({ path, name }: { path: string; name: string }) {
         return;
       }
       if (disposed || !hostRef.current) return;
+
+      const { initMonaco } = await import("../lib/monaco");
+      if (disposed || !hostRef.current) return;
+      const monaco = initMonaco();
 
       editor = monaco.editor.create(hostRef.current, {
         value: content,

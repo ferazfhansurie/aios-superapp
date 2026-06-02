@@ -1,12 +1,8 @@
 /**
  * SidebarUsage — a compact, narrow-sidebar rendering of the user's live usage
- * for BOTH providers: Claude (5h / 7d rate-limit windows from the statusline)
- * and Codex (ChatGPT-sub primary/secondary windows from ~/.codex logs). Each
- * provider gets its own labelled block so you can see, at a glance, which brain
- * has headroom — the whole point now that codex is the daily driver.
+ * for codex (ChatGPT-sub primary/secondary windows from ~/.codex logs).
  *
  * Data paths (both already-wired, defensive Tauri commands; see lib/dashboard):
- *   claude ← idleRate()  → usage_stats   (statusline 5h/7d %)
  *   codex  ← codexRate() → codex_usage   (logs_2.sqlite codex.rate_limits)
  *
  * A provider block hides itself when it has no data (e.g. codex before its first
@@ -17,7 +13,15 @@
  */
 import { useEffect, useState } from "react";
 
-import { idleRate, codexRate, resetIn, type IdleRate, type CodexRate } from "../lib/dashboard";
+import {
+  codexRate,
+  resetIn,
+  type CodexRate,
+} from "../lib/dashboard";
+import { usagePaceRisk, type UsagePaceRisk } from "../lib/usagePace";
+
+const FIVE_HOURS = 5 * 3600;
+const SEVEN_DAYS = 7 * 24 * 3600;
 
 /** accent < 65% · warning < 85% · danger above — matches IdleDashboard's Meter. */
 function barColor(pct: number): string {
@@ -61,6 +65,33 @@ function UsageBar({
   );
 }
 
+function PaceWarning({ risk }: { risk: UsagePaceRisk | null }) {
+  if (!risk) return null;
+  return (
+    <div
+      className={`rounded-md border px-2 py-1 text-[10px] leading-snug ${
+        risk.level === "danger"
+          ? "border-[color-mix(in_srgb,var(--color-danger)_45%,transparent)] bg-[color-mix(in_srgb,var(--color-danger)_12%,transparent)] text-[var(--color-danger)]"
+          : "border-[color-mix(in_srgb,var(--color-warning)_45%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_12%,transparent)] text-[var(--color-warning)]"
+      }`}
+    >
+      <span className="font-medium">{risk.title}</span>
+      <span className="text-[var(--color-muted)]"> · {risk.detail}</span>
+    </div>
+  );
+}
+
+function topRisk(...risks: Array<UsagePaceRisk | null>): UsagePaceRisk | null {
+  return risks.find((risk) => risk?.level === "danger") ?? risks.find(Boolean) ?? null;
+}
+
+function labelModel(name: string): string {
+  if (name === "gpt-5.3-codex-spark") {
+    return "gpt-5.3 spark";
+  }
+  return name;
+}
+
 /** One provider's titled block (e.g. "claude" / "codex") with its 5h + 7d bars. */
 function ProviderBlock({
   name,
@@ -74,6 +105,17 @@ function ProviderBlock({
   showRemaining?: boolean;
 }) {
   if (fiveHour.pct == null && sevenDay.pct == null) return null;
+  const fiveHourRisk = usagePaceRisk({
+    pct: fiveHour.pct,
+    resetsAt: fiveHour.resetsAt,
+    windowSeconds: FIVE_HOURS,
+  });
+  const sevenDayRisk = usagePaceRisk({
+    pct: sevenDay.pct,
+    resetsAt: sevenDay.resetsAt,
+    windowSeconds: SEVEN_DAYS,
+  });
+  const risk = topRisk(fiveHourRisk, sevenDayRisk);
   return (
     <div className="flex flex-col gap-2">
       <span className="text-[10px] font-medium lowercase tracking-wide text-[var(--color-text-2)]">
@@ -81,20 +123,17 @@ function ProviderBlock({
       </span>
       <UsageBar label="5h" pct={fiveHour.pct} resetsAt={fiveHour.resetsAt} showRemaining={showRemaining} />
       <UsageBar label="7d" pct={sevenDay.pct} resetsAt={sevenDay.resetsAt} showRemaining={showRemaining} />
+      <PaceWarning risk={risk} />
     </div>
   );
 }
 
 export function SidebarUsage() {
-  const [rate, setRate] = useState<IdleRate | null>(null);
   const [codex, setCodex] = useState<CodexRate | null>(null);
 
   useEffect(() => {
     let alive = true;
     const load = () => {
-      idleRate()
-        .then((v) => alive && setRate(v))
-        .catch(() => {});
       codexRate()
         .then((v) => alive && setCodex(v))
         .catch(() => {});
@@ -107,18 +146,34 @@ export function SidebarUsage() {
     };
   }, []);
 
-  const hasClaude = rate && (rate.fiveHour.pct != null || rate.sevenDay.pct != null);
   const hasCodex = codex && (codex.fiveHour.pct != null || codex.sevenDay.pct != null);
-  if (!hasClaude && !hasCodex) return null;
+  const sparkKey = codex
+    ? Object.keys(codex.models).find(
+        (m) => /^gpt-5\.3-codex-spark$/i.test(m),
+      )
+    : undefined;
+  const sparkModel =
+    sparkKey && codex?.models[sparkKey] && codex.models[sparkKey].fiveHour.pct != null
+      ? sparkKey
+      : Object.keys(codex?.models ?? {}).find(
+          (m) => codex?.models[m]?.sevenDay?.pct != null && /\bcodex\b/i.test(m),
+        );
+  const hasSpark = sparkModel != null;
+  if (!hasCodex && !hasSpark) return null;
 
   return (
     <div className="flex flex-col gap-3 border-t border-[var(--color-border)] pt-3">
       <span className="text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">usage</span>
-      {hasClaude && (
-        <ProviderBlock name="claude" fiveHour={rate!.fiveHour} sevenDay={rate!.sevenDay} />
-      )}
       {hasCodex && (
         <ProviderBlock name="codex" fiveHour={codex!.fiveHour} sevenDay={codex!.sevenDay} showRemaining />
+      )}
+      {hasSpark && sparkModel && codex?.models[sparkModel] && (
+        <ProviderBlock
+          name={labelModel(sparkModel)}
+          fiveHour={codex.models[sparkModel].fiveHour}
+          sevenDay={codex.models[sparkModel].sevenDay}
+          showRemaining
+        />
       )}
     </div>
   );

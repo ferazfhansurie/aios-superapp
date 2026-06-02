@@ -2,7 +2,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { emptyRunEventState, reduceRunEvents } from "./runEvents.ts";
+import {
+  emptyRunEventState,
+  parseRunEventState,
+  reduceRunEvents,
+  serializeRunEventState,
+} from "./runEvents.ts";
 
 test("reduceRunEvents captures thinking and text deltas as structured events", () => {
   let state = emptyRunEventState();
@@ -147,3 +152,53 @@ test("reduceRunEvents captures permission requests and completion metadata", () 
   ]);
 });
 
+test("run event state serializes with a bounded event tail", () => {
+  let state = emptyRunEventState();
+  state = reduceRunEvents(
+    state,
+    {
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "one" },
+      },
+    },
+    { now: 1 },
+  );
+  state = reduceRunEvents(
+    state,
+    {
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "two" },
+      },
+    },
+    { now: 2 },
+  );
+
+  const restored = parseRunEventState(serializeRunEventState(state, 1));
+
+  assert.equal(restored?.phase, "writing");
+  assert.equal(restored?.events.length, 1);
+  assert.equal(restored?.events[0].type, "message.delta");
+  assert.equal(restored?.events[0].at, 2);
+});
+
+test("run event state parser rejects malformed storage", () => {
+  assert.equal(parseRunEventState("not json"), null);
+  assert.equal(parseRunEventState(JSON.stringify({ phase: "writing", events: "bad" })), null);
+  assert.deepEqual(
+    parseRunEventState(
+      JSON.stringify({
+        phase: "not-real",
+        events: [{ type: "run.completed", id: "run1", at: 10 }],
+      }),
+    ),
+    {
+      phase: "completed",
+      events: [{ type: "run.completed", id: "run1", at: 10 }],
+      activeActionId: undefined,
+    },
+  );
+});

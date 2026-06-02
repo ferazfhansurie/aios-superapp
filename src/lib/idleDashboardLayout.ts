@@ -8,20 +8,23 @@ export type IdleWidgetId =
   | "device"
   | "fleet";
 
+export type IdleWidgetSize = "compact" | "standard" | "wide" | "hero";
+
 export interface IdleWidgetConfig {
   id: IdleWidgetId;
   visible: boolean;
+  size: IdleWidgetSize;
 }
 
 export const DEFAULT_IDLE_WIDGETS: IdleWidgetConfig[] = [
-  { id: "pulse", visible: true },
-  { id: "projects", visible: true },
-  { id: "quick", visible: true },
-  { id: "dev", visible: true },
-  { id: "pinned", visible: true },
-  { id: "apps", visible: true },
-  { id: "device", visible: true },
-  { id: "fleet", visible: true },
+  { id: "pulse", visible: true, size: "hero" },
+  { id: "projects", visible: true, size: "standard" },
+  { id: "quick", visible: true, size: "compact" },
+  { id: "dev", visible: true, size: "standard" },
+  { id: "pinned", visible: true, size: "compact" },
+  { id: "apps", visible: true, size: "wide" },
+  { id: "device", visible: true, size: "standard" },
+  { id: "fleet", visible: true, size: "compact" },
 ];
 
 export const IDLE_WIDGET_LABELS: Record<IdleWidgetId, string> = {
@@ -36,6 +39,15 @@ export const IDLE_WIDGET_LABELS: Record<IdleWidgetId, string> = {
 };
 
 const knownIds = new Set<IdleWidgetId>(DEFAULT_IDLE_WIDGETS.map((w) => w.id));
+const knownSizes = new Set<IdleWidgetSize>(["compact", "standard", "wide", "hero"]);
+const sizeOrder: IdleWidgetSize[] = ["compact", "standard", "wide", "hero"];
+const defaultSizeById = new Map(DEFAULT_IDLE_WIDGETS.map((widget) => [widget.id, widget.size]));
+
+function normalizeSize(id: IdleWidgetId, value: unknown): IdleWidgetSize {
+  return typeof value === "string" && knownSizes.has(value as IdleWidgetSize)
+    ? (value as IdleWidgetSize)
+    : defaultSizeById.get(id) ?? "standard";
+}
 
 export function normalizeIdleWidgets(input: unknown): IdleWidgetConfig[] {
   const seen = new Set<IdleWidgetId>();
@@ -46,7 +58,12 @@ export function normalizeIdleWidgets(input: unknown): IdleWidgetConfig[] {
         if (typeof id !== "string" || !knownIds.has(id as IdleWidgetId)) return [];
         if (seen.has(id as IdleWidgetId)) return [];
         seen.add(id as IdleWidgetId);
-        return [{ id: id as IdleWidgetId, visible: (item as { visible?: unknown }).visible !== false }];
+        const widgetId = id as IdleWidgetId;
+        return [{
+          id: widgetId,
+          visible: (item as { visible?: unknown }).visible !== false,
+          size: normalizeSize(widgetId, (item as { size?: unknown }).size),
+        }];
       })
     : [];
 
@@ -78,4 +95,16 @@ export function toggleIdleWidget(
   return widgets.map((widget) =>
     widget.id === id ? { ...widget, visible: !widget.visible } : widget,
   );
+}
+
+export function cycleIdleWidgetSize(
+  widgets: IdleWidgetConfig[],
+  id: IdleWidgetId,
+): IdleWidgetConfig[] {
+  return widgets.map((widget) => {
+    if (widget.id !== id) return widget;
+    const index = sizeOrder.indexOf(widget.size);
+    const next = sizeOrder[(index + 1) % sizeOrder.length] ?? "standard";
+    return { ...widget, size: next };
+  });
 }

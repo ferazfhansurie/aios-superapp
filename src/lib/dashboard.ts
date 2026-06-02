@@ -108,6 +108,10 @@ export interface RateWindow {
   pct: number | null;
   resetsAt: number | null;
 }
+export interface CodexModelRate {
+  fiveHour: RateWindow;
+  sevenDay: RateWindow;
+}
 export interface IdleRate {
   fiveHour: RateWindow;
   sevenDay: RateWindow;
@@ -158,20 +162,48 @@ export interface CodexRate {
   fiveHour: RateWindow;
   sevenDay: RateWindow;
   plan: string | null;
+  models: Record<string, CodexModelRate>;
 }
 export async function codexRate(): Promise<CodexRate> {
   const empty: CodexRate = {
     fiveHour: { pct: null, resetsAt: null },
     sevenDay: { pct: null, resetsAt: null },
     plan: null,
+    models: {},
   };
   try {
     const u = await invoke<{
       five_hour?: { pct?: number | null; resets_at?: number | null };
       seven_day?: { pct?: number | null; resets_at?: number | null };
       plan?: string | null;
+      models?: Record<
+        string,
+        {
+          five_hour?: { pct?: number | null; resets_at?: number | null };
+          seven_day?: { pct?: number | null; resets_at?: number | null };
+        }
+      >;
     } | null>("codex_usage");
     if (!u) return empty;
+    const models = u.models ?? {};
+    const parsedModels: Record<string, CodexModelRate> = {};
+    for (const [name, m] of Object.entries(models)) {
+      if (!m || typeof m !== "object") continue;
+      const mAny = m as {
+        five_hour?: { pct?: number | null; resets_at?: number | null };
+        seven_day?: { pct?: number | null; resets_at?: number | null };
+      };
+      parsedModels[name] = {
+        fiveHour: {
+          pct: mAny.five_hour?.pct ?? null,
+          resetsAt: mAny.five_hour?.resets_at ?? null,
+        },
+        sevenDay: {
+          pct: mAny.seven_day?.pct ?? null,
+          resetsAt: mAny.seven_day?.resets_at ?? null,
+        },
+      };
+    }
     return {
       fiveHour: {
         pct: u.five_hour?.pct ?? null,
@@ -182,6 +214,7 @@ export async function codexRate(): Promise<CodexRate> {
         resetsAt: u.seven_day?.resets_at ?? null,
       },
       plan: u.plan ?? null,
+      models: parsedModels,
     };
   } catch {
     return empty;

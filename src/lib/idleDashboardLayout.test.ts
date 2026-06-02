@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   DEFAULT_IDLE_WIDGETS,
+  cycleIdleWidgetSize,
   moveIdleWidget,
   normalizeIdleWidgets,
   toggleIdleWidget,
@@ -43,4 +44,26 @@ test("toggleIdleWidget flips visibility only for the target widget", () => {
 
   assert.equal(next.find((w) => w.id === "pulse")?.visible, false);
   assert.equal(next.find((w) => w.id === "projects")?.visible, true);
+});
+
+test("normalizeIdleWidgets preserves valid custom sizes and backfills default sizes", () => {
+  const widgets = normalizeIdleWidgets([
+    { id: "quick", visible: true, size: "hero" },
+    { id: "apps", visible: true, size: "tiny" },
+  ]);
+
+  assert.equal(widgets.find((w) => w.id === "quick")?.size, "hero");
+  assert.equal(widgets.find((w) => w.id === "apps")?.size, "wide");
+  assert.equal(widgets.find((w) => w.id === "pulse")?.size, "hero");
+});
+
+test("cycleIdleWidgetSize advances through dashboard size presets", () => {
+  const widgets = normalizeIdleWidgets([{ id: "quick", size: "compact" }]);
+
+  assert.equal(cycleIdleWidgetSize(widgets, "quick").find((w) => w.id === "quick")?.size, "standard");
+  assert.equal(
+    cycleIdleWidgetSize(normalizeIdleWidgets([{ id: "quick", size: "hero" }]), "quick")
+      .find((w) => w.id === "quick")?.size,
+    "compact",
+  );
 });

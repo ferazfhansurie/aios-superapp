@@ -27,7 +27,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/**", "/tmp/**", "/Users/**"]
+        "scope": ["$HOME/**", "/tmp/**"]
       }
     }
   },
@@ -42,7 +42,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "-",
+      "signingIdentity": "Apple Development: Firaz Fhansurie (KL78M575FW)",
       "entitlements": "./Entitlements.plist"
     }
   }

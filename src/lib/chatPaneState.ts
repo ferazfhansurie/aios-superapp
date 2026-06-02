@@ -20,6 +20,8 @@ export interface ResumeTitle {
 }
 
 export type ComposerSendMode = "send" | "steer" | "queue" | "waiting";
+export type ChatStopStrategy = "interrupt" | "kill-and-restart";
+export type ContextBudgetMode = "lean" | "agent" | "ultracode";
 
 export interface ComposerSendContractInput {
   streaming: boolean;
@@ -42,6 +44,7 @@ export interface ComposerContextInput {
   effortLabel: string;
   permissionLabel: string;
   engine: string;
+  contextBudget: ContextBudgetMode;
   queuedCount: number;
   imageCount: number;
   planMode: boolean;
@@ -51,6 +54,23 @@ export interface ComposerContextInput {
 export interface ComposerContextChip {
   id: string;
   label: string;
+}
+
+export interface ContextLedgerInput {
+  draft: string;
+  goal: string;
+  planMode: boolean;
+  memoryCount: number;
+  imageCount: number;
+  queuedCount: number;
+  contextBudget: ContextBudgetMode;
+}
+
+export interface ContextLedgerBucket {
+  id: string;
+  label: string;
+  tokens: number;
+  level: "quiet" | "normal" | "warning";
 }
 
 let queueSeq = 0;
@@ -205,6 +225,10 @@ export function sendContract(input: ComposerSendContractInput): ComposerSendCont
   };
 }
 
+export function stopStrategy(engine: string | null | undefined): ChatStopStrategy {
+  return engine === "codex" || engine === "opencode" ? "kill-and-restart" : "interrupt";
+}
+
 /** Compact chips shown above the composer, ordered by operational importance. */
 export function composerContextChips(input: ComposerContextInput): ComposerContextChip[] {
   const chips: ComposerContextChip[] = [];
@@ -213,6 +237,7 @@ export function composerContextChips(input: ComposerContextInput): ComposerConte
   chips.push({ id: "model", label: input.modelLabel });
   chips.push({ id: "effort", label: input.effortLabel });
   chips.push({ id: "permission", label: input.permissionLabel });
+  chips.push({ id: "budget", label: input.contextBudget });
   if (input.imageCount > 0) {
     chips.push({
       id: "attachments",
@@ -228,4 +253,72 @@ export function composerContextChips(input: ComposerContextInput): ComposerConte
   if (input.planMode) chips.push({ id: "plan", label: "plan" });
   if (input.hasGoal) chips.push({ id: "goal", label: "goal" });
   return chips;
+}
+
+function estimateTextTokens(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+  return Math.max(1, Math.ceil(trimmed.length / 4));
+}
+
+/** Rough pre-send context ledger. This is a warning system, not billing truth. */
+export function contextLedger(input: ContextLedgerInput): ContextLedgerBucket[] {
+  const buckets: ContextLedgerBucket[] = [
+    {
+      id: "budget",
+      label: input.contextBudget,
+      tokens:
+        input.contextBudget === "lean"
+          ? 120
+          : input.contextBudget === "agent"
+            ? 650
+            : 1800,
+      level: input.contextBudget === "ultracode" ? "warning" : "quiet",
+    },
+  ];
+  const draftTokens = estimateTextTokens(input.draft);
+  if (draftTokens > 0) {
+    buckets.push({
+      id: "draft",
+      label: "draft",
+      tokens: draftTokens,
+      level: draftTokens > 1200 ? "warning" : "normal",
+    });
+  }
+  if (input.goal.trim()) {
+    buckets.push({
+      id: "goal",
+      label: "goal",
+      tokens: estimateTextTokens(input.goal) + 40,
+      level: "normal",
+    });
+  }
+  if (input.planMode) {
+    buckets.push({ id: "plan", label: "plan", tokens: 180, level: "normal" });
+  }
+  if (input.memoryCount > 0) {
+    buckets.push({
+      id: "memory",
+      label: "memory",
+      tokens: input.memoryCount * 220,
+      level: input.memoryCount > 3 ? "warning" : "normal",
+    });
+  }
+  if (input.imageCount > 0) {
+    buckets.push({
+      id: "images",
+      label: "images",
+      tokens: input.imageCount * 1100,
+      level: input.imageCount > 1 ? "warning" : "normal",
+    });
+  }
+  if (input.queuedCount > 0) {
+    buckets.push({
+      id: "queue",
+      label: "queue",
+      tokens: input.queuedCount * 90,
+      level: input.queuedCount > 4 ? "warning" : "normal",
+    });
+  }
+  return buckets;
 }

@@ -4,7 +4,7 @@
  *  lib. The ordered `items` array IS the render order. Persisted as JSON under
  *  a single key. */
 
-import { SPAWN } from "./apps";
+import { SPAWN } from "./apps.ts";
 
 const STORAGE_KEY = "aios.sidebar";
 const SCHEMA_VERSION = 3;
@@ -226,6 +226,17 @@ export function renameItem(id: string, label: string): SidebarState {
   return saveSidebar({
     ...cur,
     items: cur.items.map((it) => (it.id === id ? { ...it, label } : it)),
+  });
+}
+
+/** Change an item's sidebar icon. Links may use "favicon" to restore the site icon. */
+export function setItemIcon(id: string, iconName: string): SidebarState {
+  const clean = iconName.trim();
+  if (!clean) return loadSidebar();
+  const cur = loadSidebar();
+  return saveSidebar({
+    ...cur,
+    items: cur.items.map((it) => (it.id === id ? { ...it, iconName: clean } : it)),
   });
 }
 

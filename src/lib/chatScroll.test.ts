@@ -2,7 +2,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { distanceFromBottom, shouldAutoscroll } from "./chatScroll.ts";
+import {
+  distanceFromBottom,
+  nextAutoscrollPaused,
+  shouldAutoscroll,
+} from "./chatScroll.ts";
 
 test("distanceFromBottom measures how far the viewport is from the live bottom", () => {
   assert.equal(
@@ -47,5 +51,32 @@ test("shouldAutoscroll keeps streaming pinned when content grows from the bottom
       false,
     ),
     true,
+  );
+});
+
+test("nextAutoscrollPaused pauses on manual scroll up and resumes only at bottom", () => {
+  assert.equal(
+    nextAutoscrollPaused(
+      false,
+      { scrollHeight: 1400, scrollTop: 960, clientHeight: 300 },
+      "up",
+    ),
+    true,
+  );
+  assert.equal(
+    nextAutoscrollPaused(
+      true,
+      { scrollHeight: 1400, scrollTop: 960, clientHeight: 300 },
+      "down",
+    ),
+    true,
+  );
+  assert.equal(
+    nextAutoscrollPaused(
+      true,
+      { scrollHeight: 1400, scrollTop: 1100, clientHeight: 300 },
+      "down",
+    ),
+    false,
   );
 });

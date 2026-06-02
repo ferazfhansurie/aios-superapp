@@ -76,10 +76,12 @@ fn map_wham_usage(payload: &Value) -> Option<Value> {
             "resets_at": w.get("reset_at").and_then(|v| v.as_i64()),
         })
     };
+    let models = map_model_windows_from_wham(payload);
     Some(json!({
         "five_hour": win("primary_window"),
         "seven_day": win("secondary_window"),
         "plan": payload.get("plan_type").and_then(|v| v.as_str()),
+        "models": models,
     }))
 }
 
@@ -129,11 +131,86 @@ fn codex_usage_from_sqlite() -> Value {
             rest.chars().take_while(|c| *c != '"').collect::<String>()
         })
     };
+    let model = {
+        let key = "\"model\":\"";
+        body.find(key).map(|i| {
+            let rest = &body[i + key.len()..];
+            rest.chars().take_while(|c| *c != '"').collect::<String>()
+        })
+    };
+    let mut models = serde_json::Map::new();
+    if let Some(m) = model {
+        models.insert(
+            m.clone(),
+            json!({
+                "five_hour": win("primary"),
+                "seven_day": win("secondary"),
+            }),
+        );
+    }
     json!({
         "five_hour": win("primary"),
         "seven_day": win("secondary"),
         "plan": plan,
+        "models": Value::Object(models),
     })
+}
+
+fn map_model_windows_from_wham(payload: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let Some(additional) = payload.get("additional_rate_limits").and_then(|v| v.as_array()) else {
+        return Value::Object(out);
+    };
+    for entry in additional {
+        let name = entry
+            .get("limit_name")
+            .or_else(|| entry.get("model"))
+            .or_else(|| entry.get("name"))
+            .and_then(|v| v.as_str());
+        let Some(name) = name else {
+            continue;
+        };
+        let windows = entry.get("rate_limit").or_else(|| entry.get("rate_limits"));
+        let windows = match windows.and_then(|v| v.as_object()) {
+            Some(w) => w,
+            None => continue,
+        };
+        let primary = windows
+            .get("primary_window")
+            .or_else(|| windows.get("primary"))
+            .or_else(|| windows.get("five_hour"));
+        let secondary = windows
+            .get("secondary_window")
+            .or_else(|| windows.get("secondary"))
+            .or_else(|| windows.get("seven_day"));
+        if primary.is_none() && secondary.is_none() {
+            continue;
+        }
+        let parse = |w: Option<&Value>| -> Value {
+            let Some(w) = w else {
+                return json!({ "pct": null, "resets_at": null });
+            };
+            json!({
+                "pct": w
+                    .get("used_percent")
+                    .or_else(|| w.get("usedPercent"))
+                    .and_then(|v| v.as_f64()),
+                "resets_at": w
+                    .get("reset_at")
+                    .or_else(|| w.get("resetAt"))
+                    .or_else(|| w.get("resets_at"))
+                    .and_then(|v| v.as_i64()),
+            })
+        };
+        out.insert(
+            name.to_string(),
+            json!({
+                "five_hour": parse(primary),
+                "seven_day": parse(secondary),
+            }),
+        );
+    }
+    Value::Object(out)
 }
 
 /// Extracts the first balanced `{…}` JSON object that follows `key` in `s`.
@@ -198,7 +275,35 @@ mod tests {
             Some(json!({
                 "five_hour": { "pct": 46.0, "resets_at": 111 },
                 "seven_day": { "pct": 7.0, "resets_at": 222 },
-                "plan": "plus"
+                "plan": "plus",
+                "models": {}
+            }))
+        );
+    }
+
+    #[test]
+    fn maps_codex_wham_additional_rate_limits_by_model() {
+        let payload = json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": { "used_percent": 46, "reset_at": 111 },
+                "secondary_window": { "used_percent": 7, "reset_at": 222 }
+            },
+            "additional_rate_limits": [
+                {
+                    "model": "gpt-5.3-codex-spark",
+                    "rate_limit": {
+                        "primary_window": { "used_percent": 80, "reset_at": 333 },
+                        "secondary_window": { "used_percent": 20, "reset_at": 444 }
+                    }
+                }
+            ]
+        });
+        assert_eq!(
+            map_wham_usage(&payload).and_then(|v| v.pointer("/models/gpt-5.3-codex-spark").cloned()),
+            Some(json!({
+                "five_hour": { "pct": 80.0, "resets_at": 333 },
+                "seven_day": { "pct": 20.0, "resets_at": 444 }
             }))
         );
     }

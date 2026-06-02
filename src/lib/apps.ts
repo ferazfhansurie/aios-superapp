@@ -5,12 +5,15 @@
 
 import {
   Database,
+  Activity,
   Bot,
+  Bug,
   Clock,
   Folder,
   Globe,
   MessageCircle,
   MessageSquare,
+  MonitorUp,
   NotebookPen,
   Wand2,
   TerminalSquare,
@@ -29,8 +32,13 @@ export type PaneContent =
   | { type: "bridges" }
   | { type: "plugins" }
   | { type: "pulse" }
+  | { type: "notifications" }
+  | { type: "status" }
+  | { type: "apps" }
+  | { type: "app"; name: string; bundleId?: string | null }
   | { type: "chat"; seed?: string; resume?: { id: string; title: string }; reattach?: number }
   | { type: "customers" }
+  | { type: "pet" }
   | { type: "motion" }
   | { type: "file"; path: string; name: string }
   | { type: "editor"; path: string; name: string };
@@ -49,11 +57,15 @@ export type AppDef = {
 /** Default app catalog — order here == the seeded default sidebar order. */
 export const SPAWN: AppDef[] = [
   { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "tools" },
+  { id: "pet", kind: { type: "pet" }, icon: Bug, label: "pet", group: "tools" },
   { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "tools" },
+  { id: "codex-code", kind: { type: "shell", cmd: "codex --model gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" }, icon: Bot, label: "codex", group: "tools" },
   { id: "claude-code", kind: { type: "shell", cmd: "claude --dangerously-skip-permissions" }, icon: Bot, label: "claude code", group: "tools" },
   { id: "notes", kind: { type: "notes" }, icon: NotebookPen, label: "notes", group: "tools" },
   { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools" },
   { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools" },
+  { id: "status", kind: { type: "status" }, icon: Activity, label: "status", group: "tools" },
+  { id: "apps", kind: { type: "apps" }, icon: MonitorUp, label: "apps", group: "tools" },
   { id: "database", kind: { type: "memory" }, icon: Database, label: "database", group: "tools" },
   { id: "automations", kind: { type: "automations" }, icon: Clock, label: "automations", group: "tools" },
   { id: "contacts", kind: { type: "customers" }, icon: MessageCircle, label: "contacts", group: "tools" },

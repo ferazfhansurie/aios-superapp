@@ -42,6 +42,7 @@ import {
   GitBranch,
   Globe,
   Layers,
+  Maximize2,
   Radio,
   RotateCcw,
   Search,
@@ -66,11 +67,13 @@ import {
 import {
   DEFAULT_IDLE_WIDGETS,
   IDLE_WIDGET_LABELS,
+  cycleIdleWidgetSize,
   moveIdleWidget,
   normalizeIdleWidgets,
   toggleIdleWidget,
   type IdleWidgetConfig,
   type IdleWidgetId,
+  type IdleWidgetSize,
 } from "../lib/idleDashboardLayout";
 
 interface IdleDashboardProps {
@@ -88,15 +91,11 @@ interface IdleDashboardProps {
 
 const IDLE_LAYOUT_KEY = "aios.idleDashboard.widgets";
 
-const widgetClasses: Record<IdleWidgetId, string> = {
-  pulse: "col-span-3 row-span-2",
-  projects: "col-span-2",
-  quick: "col-span-1",
-  dev: "col-span-2",
-  pinned: "col-span-1",
-  apps: "col-span-3",
-  device: "col-span-2",
-  fleet: "col-span-1",
+const widgetSizeClasses: Record<IdleWidgetSize, string> = {
+  compact: "col-span-1 row-span-1",
+  standard: "col-span-2 row-span-1",
+  wide: "col-span-3 row-span-1",
+  hero: "col-span-3 row-span-2",
 };
 
 export function IdleDashboard({
@@ -177,6 +176,8 @@ export function IdleDashboard({
     setWidgets((cur) => moveIdleWidget(cur, id, delta));
   const toggleWidget = (id: IdleWidgetId) =>
     setWidgets((cur) => toggleIdleWidget(cur, id));
+  const cycleWidgetSize = (id: IdleWidgetId) =>
+    setWidgets((cur) => cycleIdleWidgetSize(cur, id));
   const resetWidgets = () => setWidgets(DEFAULT_IDLE_WIDGETS);
 
   const renderWidget = (widget: IdleWidgetConfig, index: number) => {
@@ -185,16 +186,19 @@ export function IdleDashboard({
       <WidgetControls
         id={widget.id}
         visible={widget.visible}
+        size={widget.size}
         onMove={moveWidget}
         onToggle={toggleWidget}
+        onCycleSize={cycleWidgetSize}
       />
     ) : null;
+    const className = widgetSizeClasses[widget.size] ?? widgetSizeClasses.standard;
 
     if (widget.id === "pulse") {
       return (
         <Tile
           key={widget.id}
-          className={widgetClasses.pulse}
+          className={className}
           delay={delay}
           hero
           icon={<Zap size={12} className="text-[var(--color-highlight)]" />}
@@ -210,7 +214,7 @@ export function IdleDashboard({
       return (
         <Tile
           key={widget.id}
-          className={widgetClasses.projects}
+          className={className}
           delay={delay}
           hero
           icon={<FolderGit2 size={12} className="text-[var(--color-highlight)]" />}
@@ -225,7 +229,7 @@ export function IdleDashboard({
       return (
         <Tile
           key={widget.id}
-          className={widgetClasses.quick}
+          className={className}
           delay={delay}
           icon={<Zap size={12} className="text-[var(--color-accent)]" />}
           label="quick"
@@ -239,7 +243,7 @@ export function IdleDashboard({
       return (
         <Tile
           key={widget.id}
-          className={widgetClasses.dev}
+          className={className}
           delay={delay}
           icon={<GitBranch size={12} className="text-[var(--color-info)]" />}
           label="dev pulse"
@@ -256,7 +260,7 @@ export function IdleDashboard({
       return (
         <Tile
           key={widget.id}
-          className={widgetClasses.pinned}
+          className={className}
           delay={delay}
           icon={<Globe size={12} className="text-[var(--color-accent)]" />}
           label="pinned"
@@ -271,7 +275,7 @@ export function IdleDashboard({
       return (
         <Tile
           key={widget.id}
-          className={widgetClasses.apps}
+          className={className}
           delay={delay}
           icon={<ArrowRight size={12} className="text-[var(--color-muted)]" />}
           label="apps"
@@ -285,7 +289,7 @@ export function IdleDashboard({
       return (
         <Tile
           key={widget.id}
-          className={widgetClasses.device}
+          className={className}
           delay={delay}
           icon={<Cpu size={12} className="text-[var(--color-info)]" />}
           label="device"
@@ -298,7 +302,7 @@ export function IdleDashboard({
     return (
       <Tile
         key={widget.id}
-        className={widgetClasses.fleet}
+        className={className}
         delay={delay}
         icon={<Radio size={12} className="text-[var(--color-accent)]" />}
         label="fleet"
@@ -364,6 +368,7 @@ export function IdleDashboard({
               >
                 {widget.visible ? <Eye size={10} /> : <EyeOff size={10} />}
                 {IDLE_WIDGET_LABELS[widget.id]}
+                <span className="font-mono text-[9px] text-[var(--color-faint)]">{widget.size}</span>
               </button>
             ))}
           </div>
@@ -379,7 +384,7 @@ export function IdleDashboard({
       )}
 
       {/* ── bento grid ───────────────────────────────────────────────────── */}
-      <div className="relative grid min-h-0 flex-1 grid-cols-6 grid-rows-3 gap-3">
+      <div className="relative grid min-h-0 flex-1 grid-cols-6 auto-rows-[minmax(128px,1fr)] gap-3 overflow-y-auto pr-1">
         {visibleWidgets.length > 0 ? (
           visibleWidgets.map(renderWidget)
         ) : (
@@ -442,13 +447,17 @@ function Tile({
 function WidgetControls({
   id,
   visible,
+  size,
   onMove,
   onToggle,
+  onCycleSize,
 }: {
   id: IdleWidgetId;
   visible: boolean;
+  size: IdleWidgetSize;
   onMove: (id: IdleWidgetId, delta: -1 | 1) => void;
   onToggle: (id: IdleWidgetId) => void;
+  onCycleSize: (id: IdleWidgetId) => void;
 }) {
   return (
     <span className="ml-auto flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
@@ -459,6 +468,14 @@ function WidgetControls({
         title={`move ${IDLE_WIDGET_LABELS[id]} earlier`}
       >
         <ChevronUp size={12} />
+      </button>
+      <button
+        type="button"
+        onClick={() => onCycleSize(id)}
+        className="rounded p-0.5 text-[var(--color-faint)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+        title={`${IDLE_WIDGET_LABELS[id]} size · ${size}`}
+      >
+        <Maximize2 size={12} />
       </button>
       <button
         type="button"

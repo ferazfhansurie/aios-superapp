@@ -1,8 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 
 import {
+  Activity,
+  Bell,
   Bot,
   Camera,
+  CheckCheck,
   ChevronDown,
   ChevronRight,
   Clock,
@@ -18,12 +31,12 @@ import {
   Minimize2,
   MessageSquare,
   MessageCircle,
+  MonitorUp,
   MoveRight,
   NotebookPen,
   PanelLeft,
   Pencil,
   Pin,
-  Play,
   Plus,
   Radio,
   Search,
@@ -39,43 +52,54 @@ import {
 import { recallUrl } from "./lib/browser-mem";
 import { setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
-import { AutomationsPane } from "./components/AutomationsPane";
-import { BridgesPane } from "./components/BridgesPane";
-import { BrowserPane } from "./components/BrowserPane";
-import { ChatPane } from "./components/ChatPane";
 import { CommandPalette, type Command } from "./components/CommandPalette";
-import { CrmPane } from "./components/CrmPane";
-import { FilesPane } from "./components/FilesPane";
-import { FileViewerPane } from "./components/FileViewerPane";
 import { IdleDashboard } from "./components/IdleDashboard";
-import { DatabasePane } from "./components/DatabasePane";
-import { MotionPane } from "./components/MotionPane";
-import { NotesPane } from "./components/NotesPane";
 import { OracleRoster } from "./components/OracleRoster";
-import { PluginsPane } from "./components/PluginsPane";
-import { PulsePane } from "./components/PulsePane";
 import { ResizableGrid } from "./components/ResizableGrid";
-import { Settings } from "./components/Settings";
-import { TerminalPane, type PaneKind } from "./components/TerminalPane";
-import { EditorPane } from "./components/EditorPane";
-import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { VoiceButton } from "./components/VoiceButton";
+import type { PaneKind } from "./components/TerminalPane";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { appshot, listOracles, type OracleInfo } from "./lib/pty";
 import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } from "./lib/chat";
 import { listCustomers, type Customer } from "./lib/inbox";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
-import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, registerOpenFile, registerOpenUrl } from "./lib/paneBus";
-import { loadSettings, applyFlashLevel } from "./lib/settings";
+import {
+  chatHandles,
+  detachBusyChats,
+  paneWriters,
+  paneSubmitters,
+  paneImageDrop,
+  registerOpenFile,
+  registerOpenUrl,
+} from "./lib/paneBus";
+import { loadSettings, saveSettings, applyFlashLevel, subscribe as subscribeSettings } from "./lib/settings";
 import { homeDir, startupOpenPane } from "./lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
 import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
-import { commandToPaletteCommand, createCommand, type AiosCommand } from "./lib/commands";
+import { buildAppCommands } from "./lib/appCommands";
+import {
+  createAgentController,
+  type AgentDispatchInput,
+  type AgentDispatchResult,
+} from "./lib/agentController";
+import type { AgentAuditEntry } from "./lib/agentActions";
+import { buildMirrorSnapshot, type MirrorSnapshot } from "./lib/mirror";
 import { gridTrackStorageKey, movePane } from "./lib/paneLayout";
+import {
+  clearAllNotifications,
+  clearNotification,
+  listNotifications,
+  markAllNotificationsRead,
+  markNotificationRead,
+  pushNotification,
+  subscribeNotifications,
+  type AiosNotification,
+} from "./lib/notifications";
 
 import { SPAWN, SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
 import {
@@ -84,6 +108,7 @@ import {
   addLink,
   removeItem,
   renameItem,
+  setItemIcon,
   toggleHidden,
   setGroup,
   addSpace,
@@ -99,6 +124,38 @@ import {
 // re-export the catalog types so existing consumers (IdleDashboard) keep their
 // `import { AppDef } from "../App"` path working without churn.
 export type { AppDef, PaneContent };
+
+const AutomationsPane = lazy(() =>
+  import("./components/AutomationsPane").then((m) => ({ default: m.AutomationsPane })),
+);
+const PetPane = lazy(() => import("./components/PetPane").then((m) => ({ default: m.PetPane })));
+const AttachAppsPane = lazy(() =>
+  import("./components/AttachAppsPane").then((m) => ({ default: m.AttachAppsPane })),
+);
+const AppAttachPane = lazy(() =>
+  import("./components/AppAttachPane").then((m) => ({ default: m.AppAttachPane })),
+);
+const BridgesPane = lazy(() => import("./components/BridgesPane").then((m) => ({ default: m.BridgesPane })));
+const BrowserPane = lazy(() => import("./components/BrowserPane").then((m) => ({ default: m.BrowserPane })));
+const ChatPane = lazy(() => import("./components/ChatPane").then((m) => ({ default: m.ChatPane })));
+const CrmPane = lazy(() => import("./components/CrmPane").then((m) => ({ default: m.CrmPane })));
+const DatabasePane = lazy(() =>
+  import("./components/DatabasePane").then((m) => ({ default: m.DatabasePane })),
+);
+const EditorPane = lazy(() => import("./components/EditorPane").then((m) => ({ default: m.EditorPane })));
+const FilesPane = lazy(() => import("./components/FilesPane").then((m) => ({ default: m.FilesPane })));
+const FileViewerPane = lazy(() =>
+  import("./components/FileViewerPane").then((m) => ({ default: m.FileViewerPane })),
+);
+const MotionPane = lazy(() => import("./components/MotionPane").then((m) => ({ default: m.MotionPane })));
+const NotesPane = lazy(() => import("./components/NotesPane").then((m) => ({ default: m.NotesPane })));
+const PluginsPane = lazy(() => import("./components/PluginsPane").then((m) => ({ default: m.PluginsPane })));
+const PulsePane = lazy(() => import("./components/PulsePane").then((m) => ({ default: m.PulsePane })));
+const Settings = lazy(() => import("./components/Settings").then((m) => ({ default: m.Settings })));
+const StatusPane = lazy(() => import("./components/StatusPane").then((m) => ({ default: m.StatusPane })));
+const TerminalPane = lazy(() =>
+  import("./components/TerminalPane").then((m) => ({ default: m.TerminalPane })),
+);
 
 interface Pane {
   key: string;
@@ -116,8 +173,19 @@ const VIEWER_EXT = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico",
   "md", "markdown",
   "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "key", "numbers", "pages",
-  "zip", "gz", "tar", "dmg", "app", "mp4", "mov", "mp3", "wav", "woff", "woff2", "ttf",
+  "zip", "gz", "tar", "dmg", "app", "mp4", "mov", "webm", "m4v", "avi", "mkv", "mp3", "wav", "woff", "woff2", "ttf",
 ]);
+
+const INTERACTIVE_SELECTOR = [
+  "button",
+  "a",
+  "input",
+  "textarea",
+  "select",
+  "[role='button']",
+  "[role='radio']",
+  "[data-no-window-drag]",
+].join(",");
 
 /** Pick the pane kind for opening a file: viewer for media/binaries, else the
  *  code editor. */
@@ -139,6 +207,22 @@ const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
 // doesn't re-fire its launcher prompt or try to reattach a dead backend id.
 const LAYOUT_KEY = "aios.layout";
 const GRID_TRACK_KEY = "aios.grid.tracks";
+const AGENT_AUDIT_KEY = "aios.agent.audit.v1";
+const AGENT_AUDIT_LIMIT = 200;
+
+function recordAgentAudit(entry: AgentAuditEntry) {
+  try {
+    const raw = localStorage.getItem(AGENT_AUDIT_KEY);
+    const current = raw ? JSON.parse(raw) : [];
+    const list = Array.isArray(current) ? current : [];
+    localStorage.setItem(
+      AGENT_AUDIT_KEY,
+      JSON.stringify([entry, ...list].slice(0, AGENT_AUDIT_LIMIT)),
+    );
+  } catch {
+    /* quota / unavailable — skip */
+  }
+}
 
 /** Strip a pane kind down to its restorable shape (drop one-shot fields). */
 function persistableKind(kind: PaneContent): PaneContent | null {
@@ -173,6 +257,12 @@ function saveLayout(panes: Pane[]) {
   }
 }
 
+function startWindowDrag(e: React.MouseEvent<HTMLElement>) {
+  if (e.button !== 0) return;
+  if ((e.target as HTMLElement | null)?.closest(INTERACTIVE_SELECTOR)) return;
+  void getCurrentWindow().startDragging();
+}
+
 function App() {
   const [panes, setPanes] = useState<Pane[]>(() =>
     loadSettings().reopenLastLayout ? loadLayout() : [],
@@ -181,6 +271,7 @@ function App() {
   const [splash, setSplash] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [notifications, setNotifications] = useState<AiosNotification[]>(listNotifications);
   // mission-control-style pane overview: fan out every open pane to switch.
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -259,11 +350,19 @@ function App() {
     onVideoFullscreen(target.key, !isOn);
     return true;
   }, [panes, activeKey, maximizedKey, onVideoFullscreen]);
-  // backgrounded chat sessions still running after their pane closed.
-  const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
   // personalizable sidebar — items + order live in lib/sidebar (localStorage).
   const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
   useEffect(() => subscribeSidebar(setSidebar), []);
+  useEffect(() => subscribeNotifications(setNotifications), []);
+  const [sidebarMode, setSidebarMode] = useState(() => loadSettings().sidebarMode);
+  const [topBarMode, setTopBarMode] = useState(() => loadSettings().topBarMode);
+  useEffect(() =>
+    subscribeSettings((next) => {
+      setSidebarMode(next.sidebarMode);
+      setTopBarMode(next.topBarMode);
+    }),
+  []);
+  const iconsOnly = sidebarMode === "icons";
   // "pin a site" inline prompt.
   // which space the pin-a-site modal targets (null = closed).
   const [pinSiteSpace, setPinSiteSpace] = useState<string | null>(null);
@@ -292,6 +391,49 @@ function App() {
     setToast(msg);
     setTimeout(() => setToast(null), 2600);
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    getCurrentWindow()
+      .onCloseRequested(async (event) => {
+        const detachedNow = detachBusyChats(true);
+        let alreadyBackgrounded = false;
+        try {
+          alreadyBackgrounded = (await listChatLive()).some((chat) => chat.busy);
+        } catch {
+          alreadyBackgrounded = false;
+        }
+        if (detachedNow === 0 && !alreadyBackgrounded) return;
+
+        event.preventDefault();
+        flash(
+          detachedNow > 0
+            ? `kept ${detachedNow} chat${detachedNow === 1 ? "" : "s"} running in background`
+            : "chat still running in background",
+        );
+        pushNotification({
+          source: "chat",
+          level: "info",
+          title: detachedNow > 0 ? "chat running in background" : "chat still running",
+          body:
+            detachedNow > 0
+              ? `${detachedNow} chat${detachedNow === 1 ? "" : "s"} will keep generating after the shell hides.`
+              : "open status to reattach when it finishes.",
+        });
+        await getCurrentWindow().hide();
+      })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [flash]);
 
   const spawn = useCallback((kind: PaneContent, label: string): string => {
     const key = nextKey();
@@ -460,7 +602,6 @@ function App() {
       listOracles().then((v) => alive && setOracles(v)).catch(() => {});
       listChatSessions(12).then((v) => alive && setChats(v)).catch(() => {});
       listCustomers().then((v) => alive && setCustomers(v)).catch(() => {});
-      listChatLive().then((v) => alive && setLiveChats(v)).catch(() => {});
     };
     load();
     const t = setInterval(load, 30_000);
@@ -473,9 +614,16 @@ function App() {
   // Discover every runnable project under ~/Repo once on mount so each one gets
   // its own ⌘K "run <name>" entry. Cheap (bounded scan), so no polling — a stale
   // list just misses a brand-new repo until next launch.
-  const loadProjects = useCallback(() => {
-    listProjects().then(setScanned).catch(() => {});
-  }, []);
+  const loadProjects = useCallback((announce = false) => {
+    listProjects()
+      .then((next) => {
+        setScanned(next);
+        if (announce) flash(`rescanned ${next.length} project${next.length === 1 ? "" : "s"}`);
+      })
+      .catch((e) => {
+        if (announce) flash(`project rescan failed: ${e}`);
+      });
+  }, [flash]);
   useEffect(() => {
     homeDir().then(setHome).catch(() => {});
     loadProjects();
@@ -487,7 +635,8 @@ function App() {
     (p: ProjectInfo) => {
       const c = p.commands[0];
       if (!c) {
-        flash(`no run command for ${p.name}`);
+        spawn({ type: "shell", cwd: p.root }, `terminal · ${p.name}`);
+        flash(`opened ${p.name}`);
         return;
       }
       spawn({ type: "shell", cmd: c.cmd, cwd: p.root }, `▶ ${p.name}`);
@@ -495,19 +644,6 @@ function App() {
     },
     [spawn, flash],
   );
-
-  // background chat tray refreshes faster so a finished/closed task shows up
-  // (and drops off on reattach) without waiting on the 30s data loop.
-  useEffect(() => {
-    let alive = true;
-    const t = setInterval(() => {
-      listChatLive().then((v) => alive && setLiveChats(v)).catch(() => {});
-    }, 5_000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, []);
 
   const fireAppshot = useCallback(async () => {
     try {
@@ -548,7 +684,7 @@ function App() {
     [flash],
   );
 
-  // Browser annotations / selections → into a chat pane (the superapp loop).
+  // Browser annotations / selections → into a chat pane (the shell loop).
   const routeToChat = useCallback(
     (text: string) => {
       const chatPane = panes.find((p) => p.kind.type === "chat");
@@ -566,8 +702,8 @@ function App() {
   );
 
   // "Send to AI" (notes pane → the configured default AI). Routes by the
-  // `defaultAi` setting: claude-code terminal (firaz's default), a plain
-  // terminal, or the in-app chat. Reuses each pane's SUBMITTER (paneSubmitters)
+  // `defaultAi` setting: codex/claude terminal, a plain terminal, or the
+  // in-app chat. Reuses each pane's SUBMITTER (paneSubmitters)
   // so the text is pasted AND actually sent (terminal: text + Enter; chat: real
   // submit). Restores a minimized target, or spawns a fresh pane and fires once
   // it's live (claude's TUI needs a beat to boot, so a freshly-spawned terminal
@@ -617,22 +753,32 @@ function App() {
         return;
       }
 
-      // claude-code: a shell pane whose command launches claude. terminal: any
-      // plain shell pane (no claude command).
+      // codex-code / claude-code: a shell pane whose command launches that
+      // agent runtime. terminal: any plain shell pane (no agent command).
+      const wantCodex = ai === "codex-code";
       const wantClaude = ai === "claude-code";
       const match = panes.find(
         (p) =>
           p.kind.type === "shell" &&
-          (wantClaude
-            ? (p.kind.cmd ?? "").includes("claude")
-            : !(p.kind.cmd ?? "").includes("claude")),
+          (wantCodex
+            ? (p.kind.cmd ?? "").includes("codex")
+            : wantClaude
+              ? (p.kind.cmd ?? "").includes("claude")
+              : !(p.kind.cmd ?? "").includes("claude") && !(p.kind.cmd ?? "").includes("codex")),
       );
       if (match && fireExisting(match.key)) {
-        flash(wantClaude ? "sent → claude code" : "sent → terminal");
+        flash(wantCodex ? "sent → codex" : wantClaude ? "sent → claude code" : "sent → terminal");
         return;
       }
       // none open → spawn the right one and fire when it's live.
-      if (wantClaude) {
+      if (wantCodex) {
+        spawnAndFire(
+          { type: "shell", cmd: "codex --model gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" },
+          "codex",
+          3200,
+        );
+        flash("opening codex → sending…");
+      } else if (wantClaude) {
         spawnAndFire(
           { type: "shell", cmd: "claude --dangerously-skip-permissions" },
           "claude code",
@@ -723,47 +869,6 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [addShell, fireAppshot, runF5, toggleFullscreenSelected, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
 
-  // ---- trackpad swipe-UP → open the pane overview (mac Mission Control muscle
-  // memory). macOS reserves the LITERAL 3-finger swipe for its own Mission
-  // Control, so a true 3-finger gesture never reaches the webview — all we get
-  // is wheel events from a 2-finger scroll. To keep ordinary scrolling (reading
-  // terminal backlog, a webpage, notes) from popping the overview, we require a
-  // genuine HARD FLICK: a long burst of travel (FLING) that ALSO contains at
-  // least one high-velocity event (FLICK_VEL). Slow/precise reading-scroll never
-  // hits the velocity floor, so it can't trigger no matter how far it travels.
-  // Swipe-DOWN with the same force while open closes it.
-  const wheelAccum = useRef(0);
-  const wheelPeak = useRef(0); // strongest single-event |deltaY| this gesture
-  const wheelLast = useRef(0);
-  useEffect(() => {
-    const onWheel = (e: WheelEvent) => {
-      // ignore pinch-zoom (ctrl) and horizontal-dominant gestures
-      if (e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
-      const now = e.timeStamp || performance.now();
-      if (now - wheelLast.current > 150) {
-        wheelAccum.current = 0; // new gesture
-        wheelPeak.current = 0;
-      }
-      wheelLast.current = now;
-      wheelAccum.current += e.deltaY;
-      wheelPeak.current = Math.max(wheelPeak.current, Math.abs(e.deltaY));
-      const FLING = 600; // px of accumulated travel — a long, decisive throw
-      const FLICK_VEL = 80; // a single fast event must be in the burst (a flick)
-      if (wheelPeak.current < FLICK_VEL) return; // slow scroll → never a gesture
-      if (!overviewOpen && wheelAccum.current < -FLING && panes.length > 0) {
-        wheelAccum.current = 0;
-        wheelPeak.current = 0;
-        setOverviewOpen(true);
-      } else if (overviewOpen && wheelAccum.current > FLING) {
-        wheelAccum.current = 0;
-        wheelPeak.current = 0;
-        setOverviewOpen(false);
-      }
-    };
-    window.addEventListener("wheel", onWheel, { passive: true });
-    return () => window.removeEventListener("wheel", onWheel);
-  }, [overviewOpen, panes.length]);
-
   // Native OS drag-drop (Finder files/folders, e.g. a screenshot) → insert paths
   // into the targeted terminal pane. Because `dragDropEnabled` is true, macOS
   // intercepts file drops natively and the webview's HTML5 drag events never
@@ -845,220 +950,252 @@ function App() {
   }, [visibleCount]);
 
   const commands: Command[] = useMemo(() => {
-    const ctx = { source: "palette" as const, activePaneKey: activeKey };
-    const toPalette = (
-      command: AiosCommand,
-      group: string,
-      actionLabel: string,
-      subtitle?: string,
-    ) =>
-      commandToPaletteCommand(command, {
-        context: ctx,
-        group,
-        actionLabel,
-        subtitle,
-      });
-    const registry = [
-      ...SPAWN.map((s) => ({
-        command: createCommand({
-          id: `pane.open.${s.id}`,
-          label: `new ${s.label}`,
-          scope: "pane",
-          icon: <s.icon size={14} />,
-          keywords: ["open", "pane", "spawn", "launch", "new"],
-          run: () => spawn(s.kind, s.label),
-        }),
-        group: "open",
-        actionLabel: "open",
-      })),
-      ...chats.map((c) => ({
-        command: createCommand({
-          id: `chat.resume.${c.id}`,
-          label: c.title || "untitled chat",
-          description: c.cwd ? c.cwd.split("/").pop() : undefined,
-          scope: "chat",
-          icon: <MessageSquare size={14} />,
-          keywords: ["chat", "session", "continue", "resume", c.cwd ?? ""],
-          run: () => resumeChat(c),
-        }),
-        group: "resume",
-        actionLabel: "resume",
-      })),
-      ...oracles.map((o) => ({
-        command: createCommand({
-          id: `oracle.attach.${o.identity}`,
-          label: `oracle: ${o.display_name}`,
-          description: o.running ? "running" : "idle",
-          scope: "global",
-          icon: <Radio size={14} />,
-          keywords: ["oracle", "agent", "attach", "session", o.identity],
-          run: () => addOracle(o.identity),
-        }),
-        group: "fleet",
-        actionLabel: "attach",
-      })),
-      ...customers.slice(0, 8).map((c) => ({
-        command: createCommand({
-          id: `customer.open.${c.id}`,
-          label: c.name,
-          description: c.lastAgo ? `${c.lastAgo} ago` : undefined,
-          scope: "global",
-          icon: <MessageCircle size={14} />,
-          keywords: ["customer", "message", "whatsapp", "inbox", c.handle],
-          run: () => spawn({ type: "customers" }, "customers"),
-        }),
-        group: "customers",
-        actionLabel: "open inbox",
-      })),
-      ...projects.map((p) => {
-        const rel = home && p.root.startsWith(home)
-          ? p.root.slice(home.length).replace(/^\//, "")
-          : p.root;
-        return {
-          command: createCommand({
-            id: `project.run.${p.root}`,
-            label: `run ${p.name}`,
-            description: `${p.kind} · ${rel}`,
-            scope: "run",
-            icon: <Play size={14} />,
-            keywords: ["run", "start", "launch", "project", p.name, p.kind, rel],
-            run: () => runProject(p),
-          }),
-          group: "run",
-          actionLabel: "run",
-        };
+    return buildAppCommands({
+      activeKey,
+      panesCount: panes.length,
+      home,
+      chats,
+      oracles,
+      customers,
+      projects,
+      spawn,
+      resumeChat,
+      addOracle,
+      runProject,
+      runF5,
+      reloadProjects: () => loadProjects(true),
+      fireAppshot,
+      setSidebarOpen,
+      setTopBarMode: (mode) => {
+        setTopBarMode(mode);
+        saveSettings({ topBarMode: mode });
+      },
+      setOverviewOpen,
+      setSettingsOpen,
+      setHiddenKeys,
+      setMaximizedKey,
+    });
+  }, [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, loadProjects, projects, home, runProject, panes.length, activeKey]);
+
+  const agentController = useMemo(
+    () =>
+      createAgentController({
+        getPanes: () =>
+          panes.map((pane) => ({
+            key: pane.key,
+            label: pane.label,
+            type: pane.kind.type,
+            hidden: hiddenKeys.includes(pane.key),
+            active: pane.key === activeKey,
+          })),
+        focusPane,
+        hidePane: (key) => {
+          setHiddenKeys((cur) => (cur.includes(key) ? cur : [...cur, key]));
+          setMaximizedKey((cur) => (cur === key ? null : cur));
+        },
+        maximizePane: (key) => {
+          setHiddenKeys((cur) => cur.filter((k) => k !== key));
+          setMaximizedKey(key);
+          focusedPane.current = key;
+          setActiveKey(key);
+        },
+        closePane,
+        setSidebarOpen,
+        setOverviewOpen,
+        setSettingsOpen,
+        stopChat: (key) => chatHandles.get(key)?.stop?.(),
+        detachChat: (key) => chatHandles.get(key)?.detach(true),
+        audit: recordAgentAudit,
       }),
-      {
-        command: createCommand({
-          id: "view.sidebar.toggle",
-          label: "toggle sidebar",
-          description: "⌘B",
-          scope: "global",
-          icon: <PanelLeft size={14} />,
-          hotkeys: ["mod+b"],
-          keywords: ["rail", "hide", "show"],
-          run: () => setSidebarOpen((v) => !v),
+    [panes, hiddenKeys, activeKey, focusPane, closePane],
+  );
+
+  useEffect(() => {
+    const dispatchAgentAction = (input: AgentDispatchInput) => agentController.dispatch(input);
+    (window as typeof window & {
+      __aiosAgentControl?: (
+        action: unknown,
+        options?: { source?: AgentDispatchInput["source"]; confirmed?: boolean },
+      ) => Promise<AgentDispatchResult>;
+    }).__aiosAgentControl = (action, options = {}) =>
+      dispatchAgentAction({
+        source: options.source ?? "codex",
+        action,
+        confirmed: options.confirmed,
+      });
+
+    const onAgentAction = (event: Event) => {
+      const detail = (event as CustomEvent).detail as
+        | { requestId?: string; source?: AgentDispatchInput["source"]; action?: unknown; confirmed?: boolean }
+        | undefined;
+      const requestId = detail?.requestId ?? `agent-${Date.now()}`;
+      void dispatchAgentAction({
+        source: detail?.source ?? "codex",
+        action: detail?.action,
+        confirmed: detail?.confirmed,
+      }).then((result) => {
+        window.dispatchEvent(new CustomEvent("aios-agent-action-result", { detail: { requestId, result } }));
+      });
+    };
+
+    window.addEventListener("aios-agent-action", onAgentAction);
+    return () => {
+      window.removeEventListener("aios-agent-action", onAgentAction);
+      delete (window as typeof window & { __aiosAgentControl?: unknown }).__aiosAgentControl;
+    };
+  }, [agentController]);
+
+  const mirrorSnapshot = useMemo(
+    () =>
+      buildMirrorSnapshot({
+        panes,
+        hiddenKeys,
+        activeKey,
+        maximizedKey,
+        sidebarOpen,
+        overviewOpen,
+        settingsOpen,
+      }),
+    [panes, hiddenKeys, activeKey, maximizedKey, sidebarOpen, overviewOpen, settingsOpen],
+  );
+
+  useEffect(() => {
+    const w = window as typeof window & {
+      __aiosMirrorSnapshot?: () => MirrorSnapshot;
+    };
+    w.__aiosMirrorSnapshot = () => mirrorSnapshot;
+
+    const emit = (requestId?: string) => {
+      window.dispatchEvent(
+        new CustomEvent("aios-mirror-snapshot", {
+          detail: { requestId, snapshot: mirrorSnapshot },
         }),
-        group: "view",
-        actionLabel: "toggle",
-      },
-      {
-        command: createCommand({
-          id: "view.overview.open",
-          label: "show all panes",
-          description: "⌘`",
-          scope: "pane",
-          icon: <Layers size={14} />,
-          keywords: ["overview", "mission", "control", "switch", "panes", "windows", "fan", "out"],
-          enabled: () => panes.length > 0,
-          run: () => setOverviewOpen(true),
-        }),
-        group: "view",
-        actionLabel: "open",
-      },
-      {
-        command: createCommand({
-          id: "pane.tile.all",
-          label: "tile all panes",
-          scope: "pane",
-          icon: <Maximize2 size={14} />,
-          keywords: ["show", "all", "restore", "unminimize", "tile", "grid", "every", "pane", "visible"],
-          run: () => {
-            setHiddenKeys([]);
-            setMaximizedKey(null);
-          },
-        }),
-        group: "view",
-        actionLabel: "tile",
-      },
-      {
-        command: createCommand({
-          id: "project.run.focused",
-          label: "run focused project",
-          description: "F5",
-          scope: "run",
-          icon: <Play size={14} />,
-          hotkeys: ["f5"],
-          keywords: ["f5", "run", "debug", "start", "flutter", "npm", "dev", "build", "terminal", "focused", "open", "file"],
-          run: () => runF5(),
-        }),
-        group: "actions",
-        actionLabel: "run",
-      },
-      {
-        command: createCommand({
-          id: "oracle.appshot",
-          label: "appshot — screenshot to oracle",
-          description: "⌘⌘",
-          scope: "global",
-          danger: "external",
-          icon: <Camera size={14} />,
-          keywords: ["screenshot", "capture", "oracle"],
-          run: fireAppshot,
-        }),
-        group: "actions",
-        actionLabel: "run",
-      },
-      {
-        command: createCommand({
-          id: "app.settings.open",
-          label: "settings",
-          description: "⌘,",
-          scope: "global",
-          icon: <SettingsIcon size={14} />,
-          keywords: ["preferences", "theme", "appearance"],
-          run: () => setSettingsOpen(true),
-        }),
-        group: "app",
-        actionLabel: "open",
-      },
-    ];
-    return registry.map((entry) =>
-      toPalette(entry.command, entry.group, entry.actionLabel, entry.command.description),
-    );
-  }, [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, projects, home, runProject, panes.length, activeKey]);
+      );
+    };
+    const onRequest = (event: Event) => {
+      const detail = (event as CustomEvent).detail as { requestId?: string } | undefined;
+      emit(detail?.requestId);
+    };
+
+    window.addEventListener("aios-mirror-request", onRequest);
+    emit();
+    return () => {
+      window.removeEventListener("aios-mirror-request", onRequest);
+      delete w.__aiosMirrorSnapshot;
+    };
+  }, [mirrorSnapshot]);
+
+  const unreadNotifications = notifications.filter((n) => !n.read).length;
+  const notificationsPane = panes.find((pane) => pane.kind.type === "notifications");
+  const notificationsActive = notificationsPane?.key === activeKey;
+  const openNotificationsPane = useCallback(() => {
+    const existing = panes.find((pane) => pane.kind.type === "notifications");
+    if (existing) {
+      focusPane(existing.key);
+      return;
+    }
+    spawn({ type: "notifications" }, "notifications");
+  }, [panes, focusPane, spawn]);
+  const openNotificationTarget = useCallback((item: AiosNotification) => {
+    markNotificationRead(item.id);
+    if (!item.sourceId) return;
+    const pane = panes.find((p) => p.key === item.sourceId);
+    if (pane) focusPane(pane.key);
+  }, [panes, focusPane]);
+  const askFromPalette = useCallback((query: string) => {
+    spawn({ type: "chat", seed: query }, "ask");
+  }, [spawn]);
+  const deepSearchFromPalette = useCallback((query: string) => {
+    spawn({
+      type: "chat",
+      seed: `search the aios shell context for this and answer with the most useful result. use available tools, memory, files, and current panes when relevant.\n\nquery: ${query}`,
+    }, "search");
+  }, [spawn]);
+  const topBarHidden = topBarMode === "hidden";
+  const topBarLeft = (
+    <div className="flex items-center gap-1">
+      <IconBtn title="Toggle sidebar (⌘B)" onClick={() => setSidebarOpen((v) => !v)} active={sidebarOpen}>
+        <PanelLeft size={15} />
+      </IconBtn>
+      <IconBtn title="Command palette (⌘K)" onClick={() => setPaletteOpen(true)}>
+        <Search size={15} />
+      </IconBtn>
+      <IconBtn
+        title="Show all panes"
+        onClick={() => {
+          if (panes.length > 0) setOverviewOpen(true);
+        }}
+        active={overviewOpen}
+      >
+        <Layers size={15} />
+      </IconBtn>
+    </div>
+  );
+  const topBarRight = (
+    <div className="flex items-center gap-1">
+      <VoiceButton onTranscript={handleTranscript} />
+      <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
+        <Camera size={15} />
+      </IconBtn>
+      <div className="relative" data-no-window-drag>
+        <button
+          type="button"
+          onClick={openNotificationsPane}
+          title="notifications"
+          className={`relative rounded-md p-1.5 transition-colors ${
+            notificationsActive
+              ? "bg-[var(--color-panel-2)] text-[var(--color-accent)]"
+              : "text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          }`}
+        >
+          <Bell size={15} />
+          {unreadNotifications > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 grid h-3.5 min-w-3.5 place-items-center rounded-full bg-[var(--color-danger)] px-1 text-[8px] font-bold leading-none text-white">
+              {unreadNotifications > 9 ? "9+" : unreadNotifications}
+            </span>
+          )}
+        </button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-[var(--color-bg)] text-[var(--color-text)]">
       {splash && <Splash />}
 
-      {/* top bar */}
-      <header
-        className="glass flex h-10 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-panel)]/70 pl-20 pr-3"
-        data-tauri-drag-region
-      >
-        <div className="flex items-center gap-1">
-          <IconBtn title="Toggle sidebar (⌘B)" onClick={() => setSidebarOpen((v) => !v)} active={sidebarOpen}>
-            <PanelLeft size={15} />
-          </IconBtn>
-          <IconBtn title="Command palette (⌘K)" onClick={() => setPaletteOpen(true)}>
-            <Search size={15} />
-          </IconBtn>
+      {topBarHidden ? (
+        <div
+          className="group/topbar absolute left-0 right-0 top-0 z-50 h-5"
+          data-tauri-drag-region
+          onMouseDown={startWindowDrag}
+        >
+          <div className="mx-auto mt-1 h-0.5 w-7 rounded-full bg-[var(--color-border-strong)]/45 transition-opacity group-hover/topbar:opacity-0" />
+          <div className="glass pointer-events-auto mx-auto flex h-7 w-fit translate-y-[-30px] items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/90 px-1 opacity-0 shadow-xl transition-all group-hover/topbar:translate-y-[-2px] group-hover/topbar:opacity-100">
+            {topBarLeft}
+            <span className="h-4 w-px bg-[var(--color-border)]" />
+            {topBarRight}
+          </div>
         </div>
-
-        <div className="flex items-center gap-2">
-          <span className="font-mono text-sm font-semibold tracking-tight text-[var(--color-accent)]">
-            aios
-          </span>
-          <span className="text-[9px] font-medium uppercase tracking-[0.2em] text-[var(--color-muted)]">
-            superapp
-          </span>
-        </div>
-
-        <div className="flex items-center gap-1">
-          <ThemeSwitcher />
-          <span className="mx-0.5 h-4 w-px bg-[var(--color-border)]" />
-          <VoiceButton onTranscript={handleTranscript} />
-          <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
-            <Camera size={15} />
-          </IconBtn>
-        </div>
-      </header>
+      ) : (
+        <header
+          className="glass flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-panel)]/45 pl-20 pr-2"
+          data-tauri-drag-region
+          onMouseDown={startWindowDrag}
+        >
+          {topBarLeft}
+          <div className="min-w-4" data-tauri-drag-region />
+          {topBarRight}
+        </header>
+      )}
 
       {/* body: sidebar + pane grid */}
       <div className="flex min-h-0 flex-1">
         {sidebarOpen && (
-          <aside className="flex w-60 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)]">
+          <aside
+            className={`flex shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)] transition-[width] ${
+              iconsOnly ? "w-16" : "w-60"
+            }`}
+          >
             <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-2">
               {panes.length > 0 && (
                 <OpenPanesList
@@ -1066,6 +1203,7 @@ function App() {
                   hiddenKeys={hiddenKeys}
                   maximizedKey={maximizedKey}
                   activeKey={activeKey}
+                  iconsOnly={iconsOnly}
                   onSelect={focusPane}
                   onToggleHide={toggleHide}
                   onClose={requestClose}
@@ -1074,14 +1212,15 @@ function App() {
               )}
               <SidebarRail
                 state={sidebar}
+                iconsOnly={iconsOnly}
                 onSpawn={spawnSidebarItem}
                 onPinSite={(spaceId) => setPinSiteSpace(spaceId)}
               />
-              <OracleRoster onAttachOracle={addOracle} onAttachTmux={addTmux} />
+              <OracleRoster iconsOnly={iconsOnly} onAttachOracle={addOracle} onAttachTmux={addTmux} />
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
-              <NavRow icon={SettingsIcon} label="settings" onClick={() => setSettingsOpen(true)} />
-              <AccountMenu onOpenSettings={() => setSettingsOpen(true)} />
+              <NavRow icon={SettingsIcon} label="settings" iconsOnly={iconsOnly} onClick={() => setSettingsOpen(true)} />
+              <AccountMenu iconsOnly={iconsOnly} onOpenSettings={() => setSettingsOpen(true)} />
             </div>
           </aside>
         )}
@@ -1144,6 +1283,21 @@ function App() {
                   onSendToAi={sendToAi}
                   onOpenFile={openFile}
                   onOpenUrl={openUrl}
+                  notifications={notifications}
+                  onMarkNotificationRead={markNotificationRead}
+                  onOpenNotificationTarget={openNotificationTarget}
+                  onMarkAllNotificationsRead={markAllNotificationsRead}
+                  onClearNotification={clearNotification}
+                  onClearAllNotifications={clearAllNotifications}
+                  onReattachChat={(chat) =>
+                    spawn({ type: "chat", reattach: chat.id }, chat.title || "chat")
+                  }
+                  onAttachApp={(app) =>
+                    spawn(
+                      { type: "app", name: app.name, bundleId: app.bundle_id },
+                      app.name,
+                    )
+                  }
                   onProfileChange={(profile) =>
                     setPanes((ps) =>
                       ps.map((p) =>
@@ -1170,29 +1324,6 @@ function App() {
         </div>
       )}
 
-      {/* background chat sessions — still running after their pane closed */}
-      {liveChats.length > 0 && (
-        <div className="absolute bottom-4 right-4 z-40 flex w-64 flex-col gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/95 p-2 shadow-2xl backdrop-blur">
-          <div className="px-1 text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
-            running in background
-          </div>
-          {liveChats.map((lc) => (
-            <button
-              key={lc.id}
-              onClick={() => spawn({ type: "chat", reattach: lc.id }, lc.title || "chat")}
-              className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left hover:border-[var(--color-accent)]/40"
-              title="reopen — reattach + replay"
-            >
-              <span className={`status-dot shrink-0 ${lc.busy ? "status-dot--active" : "status-dot--cold"}`} />
-              <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--color-text-2)]">
-                {lc.title || "chat"}
-              </span>
-              <span className="shrink-0 text-[9px] text-[var(--color-faint)]">{lc.busy ? "working" : "done"}</span>
-            </button>
-          ))}
-        </div>
-      )}
-
       {/* minimized panes now live in the sidebar "OPEN" list (OpenPanesList) —
           no floating overlay. Restore / hide / close all happen from the rail. */}
 
@@ -1211,6 +1342,12 @@ function App() {
               <button
                 onClick={() => {
                   chatHandles.get(closePrompt)?.detach(true);
+                  pushNotification({
+                    source: "chat",
+                    level: "info",
+                    title: "chat kept running",
+                    body: "you will get a native alert when it finishes, and this event stays in the shell.",
+                  });
                   closePane(closePrompt);
                   setClosePrompt(null);
                 }}
@@ -1242,8 +1379,18 @@ function App() {
         </div>
       )}
 
-      <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} commands={commands} />
+      {settingsOpen && (
+        <Suspense fallback={null}>
+          <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+        </Suspense>
+      )}
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        commands={commands}
+        onAsk={askFromPalette}
+        onDeepSearch={deepSearchFromPalette}
+      />
       <PinSiteModal spaceId={pinSiteSpace} onClose={() => setPinSiteSpace(null)} />
       <PaneOverview
         open={overviewOpen}
@@ -1295,22 +1442,138 @@ function IconBtn({
   );
 }
 
+function NotificationCenter({
+  notifications,
+  onMarkRead,
+  onOpenTarget,
+  onMarkAllRead,
+  onClear,
+  onClearAll,
+}: {
+  notifications: AiosNotification[];
+  onMarkRead: (id: string) => void;
+  onOpenTarget: (item: AiosNotification) => void;
+  onMarkAllRead: () => void;
+  onClear: (id: string) => void;
+  onClearAll: () => void;
+}) {
+  const unread = notifications.filter((n) => !n.read).length;
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-[var(--color-bg)] text-[12px] text-[var(--color-text)]">
+      <div className="flex items-center justify-between border-b border-[var(--color-border)] px-3 py-2">
+        <div>
+          <div className="text-[12px] font-medium">notifications</div>
+          <div className="text-[10px] text-[var(--color-muted)]">
+            {unread > 0 ? `${unread} unread` : "all caught up"}
+          </div>
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={onMarkAllRead}
+            className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+            title="mark all read"
+          >
+            <CheckCheck size={14} />
+          </button>
+          <button
+            type="button"
+            onClick={onClearAll}
+            className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-danger)]"
+            title="clear all"
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        {notifications.length === 0 ? (
+          <div className="grid h-28 place-items-center rounded-md border border-dashed border-[var(--color-border)] text-[11px] text-[var(--color-faint)]">
+            no notifications yet
+          </div>
+        ) : (
+          notifications.map((item) => (
+            <div
+              key={item.id}
+              className={`group flex gap-2 rounded-md px-2 py-2 transition-colors hover:bg-[var(--color-panel-2)] ${
+                item.read ? "opacity-65" : ""
+              }`}
+            >
+              <span
+                className={`mt-1 h-2 w-2 shrink-0 rounded-full ${
+                  item.level === "error"
+                    ? "bg-[var(--color-danger)]"
+                    : item.level === "warning"
+                      ? "bg-[var(--color-warning)]"
+                      : item.level === "success"
+                        ? "bg-[var(--color-success)]"
+                        : "bg-[var(--color-accent)]"
+                }`}
+              />
+              <button
+                type="button"
+                onClick={() => (item.sourceId ? onOpenTarget(item) : onMarkRead(item.id))}
+                className="min-w-0 flex-1 text-left"
+                title={item.sourceId ? "open source pane" : item.read ? "read" : "mark read"}
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate text-[12px] font-medium text-[var(--color-text)]">{item.title}</span>
+                  {!item.read && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-accent)]" />}
+                </div>
+                {item.body && (
+                  <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-[var(--color-muted)]">
+                    {item.body}
+                  </div>
+                )}
+                <div className="mt-1 flex items-center gap-1.5 text-[9px] uppercase tracking-wide text-[var(--color-faint)]">
+                  <span>{item.sourceLabel ?? item.source}</span>
+                  {item.sourceId && (
+                    <>
+                      <span>·</span>
+                      <span>open pane</span>
+                    </>
+                  )}
+                  <span>·</span>
+                  <span>{new Date(item.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => onClear(item.id)}
+                className="grid h-6 w-6 shrink-0 place-items-center rounded text-[var(--color-muted)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-danger)] group-hover:opacity-100"
+                title="clear"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 function NavRow({
   icon: Icon,
   label,
+  iconsOnly = false,
   onClick,
 }: {
   icon: typeof Folder;
   label: string;
+  iconsOnly?: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       onClick={onClick}
-      className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[13px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+      title={label}
+      className={`group flex w-full items-center rounded-md py-1.5 text-[13px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)] ${
+        iconsOnly ? "justify-center px-0" : "gap-2.5 px-2.5 text-left"
+      }`}
     >
       <Icon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
-      {label}
+      {!iconsOnly && label}
     </button>
   );
 }
@@ -1320,7 +1583,15 @@ function NavRow({
 /** A collapsible space header: click the title to fold/unfold; hover reveals a
  *  ⋯ menu (rename always; delete only for custom spaces — the three built-ins
  *  are protected). Inline rename mirrors the row rename UX. */
-function SpaceHeader({ space, count }: { space: SidebarSpace; count: number }) {
+function SpaceHeader({
+  space,
+  count,
+  iconsOnly = false,
+}: {
+  space: SidebarSpace;
+  count: number;
+  iconsOnly?: boolean;
+}) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(space.name);
@@ -1364,19 +1635,21 @@ function SpaceHeader({ space, count }: { space: SidebarSpace; count: number }) {
   }
 
   return (
-    <div className="group/sh relative flex items-center pl-1.5 pr-1">
+    <div className={`group/sh relative flex items-center ${iconsOnly ? "justify-center px-0" : "pl-1.5 pr-1"}`}>
       <button
         onClick={() => toggleSpaceCollapsed(space.id)}
-        className="flex min-w-0 flex-1 items-center gap-1 py-1 text-left text-[10px] font-medium uppercase tracking-wide text-[var(--color-faint)] transition-colors hover:text-[var(--color-muted)]"
-        title={space.collapsed ? "expand" : "collapse"}
+        className={`flex min-w-0 items-center gap-1 py-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-faint)] transition-colors hover:text-[var(--color-muted)] ${
+          iconsOnly ? "justify-center" : "flex-1 text-left"
+        }`}
+        title={`${space.name} · ${space.collapsed ? "expand" : "collapse"}`}
       >
         {space.collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
-        <span className="truncate">{space.name}</span>
-        {space.collapsed && count > 0 && (
+        {!iconsOnly && <span className="truncate">{space.name}</span>}
+        {!iconsOnly && space.collapsed && count > 0 && (
           <span className="text-[var(--color-faint)]">({count})</span>
         )}
       </button>
-      <div ref={menuRef} className="relative shrink-0">
+      {!iconsOnly && <div ref={menuRef} className="relative shrink-0">
         <button
           onClick={() => setMenuOpen((o) => !o)}
           className="grid h-5 w-5 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-text)] group-hover/sh:opacity-100"
@@ -1407,7 +1680,7 @@ function SpaceHeader({ space, count }: { space: SidebarSpace; count: number }) {
             )}
           </div>
         )}
-      </div>
+      </div>}
     </div>
   );
 }
@@ -1418,10 +1691,12 @@ function SpaceHeader({ space, count }: { space: SidebarSpace; count: number }) {
  *  per-space rename / collapse / delete; "+ new space" at the foot. */
 function SidebarRail({
   state,
+  iconsOnly = false,
   onSpawn,
   onPinSite,
 }: {
   state: SidebarState;
+  iconsOnly?: boolean;
   onSpawn: (item: SidebarItem) => void;
   onPinSite: (spaceId: string) => void;
 }) {
@@ -1481,7 +1756,7 @@ function SidebarRail({
             onDrop={() => onDropToSpace(space.id)}
             className={`flex flex-col gap-0.5 ${si > 0 ? "border-t border-[var(--color-border)] pt-1.5" : ""}`}
           >
-            <SpaceHeader space={space} count={rows.length} />
+            <SpaceHeader space={space} count={rows.length} iconsOnly={iconsOnly} />
             {!space.collapsed && (
               <>
                 {rows.map((it) => {
@@ -1502,20 +1777,23 @@ function SidebarRail({
                         setOverIdx(null);
                       }}
                       onDrop={() => onDrop(it.id, space.id)}
+                      iconsOnly={iconsOnly}
                     />
                   );
                 })}
                 {isPinned && (
                   <button
                     onClick={() => onPinSite(space.id)}
-                    className="group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[12px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                    className={`group flex w-full items-center rounded-md py-1.5 text-[12px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)] ${
+                      iconsOnly ? "justify-center px-0" : "gap-2.5 px-2.5 text-left"
+                    }`}
                     title="pin a website to the sidebar"
                   >
                     <Plus size={14} className="shrink-0" />
-                    pin a site
+                    {!iconsOnly && "pin a site"}
                   </button>
                 )}
-                {!isPinned && rows.length === 0 && (
+                {!iconsOnly && !isPinned && rows.length === 0 && (
                   <div className="px-2.5 py-1.5 text-[11px] italic text-[var(--color-faint)]">
                     drag items here
                   </div>
@@ -1527,23 +1805,48 @@ function SidebarRail({
       })}
       <button
         onClick={() => addSpace("new space")}
-        className="group mt-1.5 flex w-full items-center gap-2.5 rounded-md border-t border-[var(--color-border)] px-2.5 pt-2.5 pb-1.5 text-left text-[12px] text-[var(--color-faint)] transition-colors hover:text-[var(--color-text)]"
+        className={`group mt-1.5 flex w-full items-center rounded-md border-t border-[var(--color-border)] pt-2.5 pb-1.5 text-[12px] text-[var(--color-faint)] transition-colors hover:text-[var(--color-text)] ${
+          iconsOnly ? "justify-center px-0" : "gap-2.5 px-2.5 text-left"
+        }`}
         title="create a new space"
       >
         <FolderPlus size={14} className="shrink-0" />
-        new space
+        {!iconsOnly && "new space"}
       </button>
     </>
   );
 }
 
-/** One sidebar row — draggable, resolves to a lucide icon (apps) or a cached
- *  favicon (links), with a hover ⋯ menu (rename / hide / unpin). */
+const SIDEBAR_ICON_CHOICES: { name: string; label: string; icon: typeof Folder }[] = [
+  { name: "chat", label: "chat", icon: MessageSquare },
+  { name: "terminal", label: "terminal", icon: TerminalSquare },
+  { name: "bot", label: "agent", icon: Bot },
+  { name: "notes", label: "notes", icon: NotebookPen },
+  { name: "files", label: "files", icon: Folder },
+  { name: "browser", label: "web", icon: Globe },
+  { name: "database", label: "data", icon: Database },
+  { name: "automations", label: "time", icon: Clock },
+  { name: "contacts", label: "people", icon: MessageCircle },
+  { name: "studio", label: "studio", icon: Wand2 },
+  { name: "notifications", label: "alerts", icon: Bell },
+  { name: "doc", label: "doc", icon: FileText },
+  { name: "pin", label: "pin", icon: Pin },
+  { name: "settings", label: "settings", icon: SettingsIcon },
+  { name: "layers", label: "layers", icon: Layers },
+];
+
+const SIDEBAR_ICON_BY_NAME: Record<string, typeof Folder> = Object.fromEntries(
+  SIDEBAR_ICON_CHOICES.map((choice) => [choice.name, choice.icon]),
+) as Record<string, typeof Folder>;
+
+/** One sidebar row — draggable, resolves to a custom lucide icon or a cached
+ *  favicon (links), with a hover ⋯ menu (rename / icon / hide / unpin). */
 function SidebarRow({
   item,
   spaces,
   dragging,
   over,
+  iconsOnly = false,
   onSpawn,
   onSetSpace,
   onDragStart,
@@ -1555,6 +1858,7 @@ function SidebarRow({
   spaces: { id: string; name: string }[];
   dragging: boolean;
   over: boolean;
+  iconsOnly?: boolean;
   onSpawn: () => void;
   onSetSpace: (spaceId: string) => void;
   onDragStart: () => void;
@@ -1564,6 +1868,7 @@ function SidebarRow({
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
+  const [iconOpen, setIconOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(item.label);
   const [favBroken, setFavBroken] = useState(false);
@@ -1571,7 +1876,7 @@ function SidebarRow({
 
   const isLink = item.kind.type === "link";
   const app = item.kind.type === "app" ? SPAWN_BY_ID[item.kind.appId] : undefined;
-  const Icon = app?.icon ?? Globe;
+  const Icon = SIDEBAR_ICON_BY_NAME[item.iconName] ?? app?.icon ?? Globe;
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -1585,6 +1890,7 @@ function SidebarRow({
   // close the nested move-to submenu whenever the parent menu closes.
   useEffect(() => {
     if (!menuOpen) setMoveOpen(false);
+    if (!menuOpen) setIconOpen(false);
   }, [menuOpen]);
 
   const commitRename = () => {
@@ -1631,33 +1937,41 @@ function SidebarRow({
         onDrop();
       }}
       onDragEnd={onDragEnd}
+      title={item.label}
       className={`group relative flex items-center rounded-md transition-colors ${
         dragging ? "opacity-40" : ""
       } ${over ? "bg-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent)]/40" : "hover:bg-[var(--color-panel-2)]"}`}
     >
-      <span className="grid w-4 shrink-0 cursor-grab place-items-center text-[var(--color-faint)] opacity-0 transition-opacity group-hover:opacity-100 active:cursor-grabbing">
+      <span className={`grid shrink-0 cursor-grab place-items-center text-[var(--color-faint)] opacity-0 transition-opacity group-hover:opacity-100 active:cursor-grabbing ${iconsOnly ? "w-0" : "w-4"}`}>
         <GripVertical size={12} />
       </span>
       <button
         onClick={onSpawn}
-        className="flex min-w-0 flex-1 items-center gap-2.5 py-1.5 pr-1 text-left text-[13px] text-[var(--color-text-2)] transition-colors group-hover:text-[var(--color-text)]"
+        className={`flex min-w-0 flex-1 items-center text-[13px] text-[var(--color-text-2)] transition-colors group-hover:text-[var(--color-text)] ${
+          iconsOnly ? "min-h-11 justify-center px-0 py-2" : "gap-2.5 py-1.5 pr-1 text-left"
+        }`}
       >
-        {isLink && item.faviconUrl && !favBroken ? (
+        {isLink && item.iconName === "favicon" && item.faviconUrl && !favBroken ? (
           <img
             src={item.faviconUrl}
             alt=""
             onError={() => setFavBroken(true)}
-            className="h-[15px] w-[15px] shrink-0 rounded-sm"
+            className={`${iconsOnly ? "h-[22px] w-[22px]" : "h-[15px] w-[15px]"} shrink-0 rounded-sm`}
           />
         ) : (
-          <Icon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
+          <Icon
+            size={iconsOnly ? 23 : 15}
+            className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]"
+          />
         )}
-        <span className="truncate">{item.label}</span>
+        {!iconsOnly && <span className="truncate">{item.label}</span>}
       </button>
-      <div ref={menuRef} className="relative shrink-0">
+      <div ref={menuRef} className={`relative shrink-0 ${iconsOnly ? "absolute right-0 top-0" : ""}`}>
         <button
           onClick={() => setMenuOpen((o) => !o)}
-          className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-text)] group-hover:opacity-100"
+          className={`grid place-items-center rounded text-[var(--color-muted)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-text)] group-hover:opacity-100 ${
+            iconsOnly ? "h-5 w-5" : "h-6 w-6"
+          }`}
           title="options"
         >
           <EllipsisVertical size={13} />
@@ -1673,6 +1987,59 @@ function SidebarRow({
                 setMenuOpen(false);
               }}
             />
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setIconOpen((o) => !o)}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--color-panel)]"
+              >
+                <Wand2 size={13} className="shrink-0 text-[var(--color-muted)]" />
+                <span className="flex-1">change icon</span>
+                <ChevronRight size={12} className="text-[var(--color-faint)]" />
+              </button>
+              {iconOpen && (
+                <div className="grid grid-cols-5 gap-1 border-y border-[var(--color-border)] bg-[var(--color-panel)]/40 p-2">
+                  {isLink && item.faviconUrl && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setItemIcon(item.id, "favicon");
+                        setMenuOpen(false);
+                      }}
+                      title="favicon"
+                      className={`grid h-7 w-7 place-items-center rounded-md border ${
+                        item.iconName === "favicon"
+                          ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)]"
+                          : "border-transparent hover:bg-[var(--color-panel-2)]"
+                      }`}
+                    >
+                      <img src={item.faviconUrl} alt="" className="h-4 w-4 rounded-sm" />
+                    </button>
+                  )}
+                  {SIDEBAR_ICON_CHOICES.map((choice) => {
+                    const ChoiceIcon = choice.icon;
+                    return (
+                      <button
+                        key={choice.name}
+                        type="button"
+                        onClick={() => {
+                          setItemIcon(item.id, choice.name);
+                          setMenuOpen(false);
+                        }}
+                        title={choice.label}
+                        className={`grid h-7 w-7 place-items-center rounded-md border ${
+                          item.iconName === choice.name
+                            ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                            : "border-transparent text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                        }`}
+                      >
+                        <ChoiceIcon size={15} />
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
             <div className="relative">
               <button
                 type="button"
@@ -1839,6 +2206,8 @@ const PANE_GLYPH: Record<string, typeof Folder> = {
   bridges: Radio,
   plugins: Layers,
   pulse: Radio,
+  status: Activity,
+  apps: MonitorUp,
   chat: MessageSquare,
   customers: MessageCircle,
   motion: Wand2,
@@ -2001,12 +2370,25 @@ const DOT: Record<string, string> = {
   automations: "status-dot--cold",
   bridges: "status-dot--cold",
   plugins: "status-dot--cold",
+  pet: "status-dot--active",
   pulse: "status-dot--active",
+  status: "status-dot--active",
+  apps: "status-dot--cold",
   chat: "status-dot--active",
   customers: "status-dot--active",
   motion: "status-dot--cold",
   file: "status-dot--cold",
 };
+
+function PaneLoading() {
+  return (
+    <div className="grid h-full place-items-center bg-[var(--color-bg)]">
+      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--color-faint)]">
+        loading pane
+      </span>
+    </div>
+  );
+}
 
 /** The "OPEN" rail section — a live, CRUD-able list of every open pane (replaces
  *  the old floating "hidden" overlay). Click a row to focus it (restoring it from
@@ -2017,6 +2399,7 @@ function OpenPanesList({
   hiddenKeys,
   maximizedKey,
   activeKey,
+  iconsOnly = false,
   onSelect,
   onToggleHide,
   onClose,
@@ -2026,6 +2409,7 @@ function OpenPanesList({
   hiddenKeys: string[];
   maximizedKey: string | null;
   activeKey: string | null;
+  iconsOnly?: boolean;
   onSelect: (key: string) => void;
   onToggleHide: (key: string) => void;
   onClose: (key: string) => void;
@@ -2040,10 +2424,15 @@ function OpenPanesList({
   };
   return (
     <div className="flex flex-col gap-0.5">
-      <div className="flex items-center gap-1.5 px-1.5 py-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-faint)]">
+      <div
+        className={`flex items-center py-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-faint)] ${
+          iconsOnly ? "justify-center px-0" : "gap-1.5 px-1.5"
+        }`}
+        title={`open panes (${panes.length})`}
+      >
         <Layers size={11} />
-        <span>open</span>
-        <span className="text-[var(--color-faint)]">({panes.length})</span>
+        {!iconsOnly && <span>open</span>}
+        {!iconsOnly && <span className="text-[var(--color-faint)]">({panes.length})</span>}
       </div>
       {panes.map((p) => {
         const hidden = hiddenKeys.includes(p.key);
@@ -2085,14 +2474,14 @@ function OpenPanesList({
               }}
               className={`flex min-w-0 flex-1 items-center gap-2.5 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
                 hidden ? "text-[var(--color-faint)]" : "text-[var(--color-text-2)] group-hover:text-[var(--color-text)]"
-              }`}
-              title={hidden ? "restore pane" : "focus pane · double-click to rename"}
+              } ${iconsOnly ? "justify-center gap-0 px-0 text-center" : ""}`}
+              title={hidden ? `restore pane: ${p.label}` : `focus pane: ${p.label} · double-click to rename`}
             >
               <span className={`status-dot shrink-0 ${hidden ? "status-dot--cold" : DOT[p.kind.type] ?? "status-dot--cold"}`} />
-              <span className="truncate">{p.label}</span>
-              {maximized && <Maximize2 size={10} className="shrink-0 text-[var(--color-accent)]" />}
+              {!iconsOnly && <span className="truncate">{p.label}</span>}
+              {!iconsOnly && maximized && <Maximize2 size={10} className="shrink-0 text-[var(--color-accent)]" />}
             </button>
-            <div className="flex shrink-0 items-center pr-1 opacity-0 transition-opacity group-hover:opacity-100">
+            {!iconsOnly && <div className="flex shrink-0 items-center pr-1 opacity-0 transition-opacity group-hover:opacity-100">
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -2118,7 +2507,7 @@ function OpenPanesList({
               >
                 <X size={12} />
               </button>
-            </div>
+            </div>}
           </div>
         );
       })}
@@ -2143,6 +2532,14 @@ function PaneCard({
   onSendToAi,
   onOpenFile,
   onOpenUrl,
+  notifications,
+  onMarkNotificationRead,
+  onOpenNotificationTarget,
+  onMarkAllNotificationsRead,
+  onClearNotification,
+  onClearAllNotifications,
+  onReattachChat,
+  onAttachApp,
   onProfileChange,
   onVideoFullscreen,
 }: {
@@ -2162,6 +2559,14 @@ function PaneCard({
   onSendToAi: (text: string) => void;
   onOpenFile: (path: string, name: string) => void;
   onOpenUrl?: (url: string) => void;
+  notifications: AiosNotification[];
+  onMarkNotificationRead: (id: string) => void;
+  onOpenNotificationTarget: (item: AiosNotification) => void;
+  onMarkAllNotificationsRead: () => void;
+  onClearNotification: (id: string) => void;
+  onClearAllNotifications: () => void;
+  onReattachChat: (chat: LiveChat) => void;
+  onAttachApp: (app: { name: string; bundle_id: string | null }) => void;
   onProfileChange: (profile: string) => void;
   onVideoFullscreen?: (on: boolean) => void;
 }) {
@@ -2270,50 +2675,69 @@ function PaneCard({
         </div>
       </div>
       <div className="min-h-0 flex-1">
-        {isTerminal(pane.kind) ? (
-          <TerminalPane kind={pane.kind} paneKey={pane.key} />
-        ) : pane.kind.type === "files" ? (
-          <FilesPane onOpenFile={onOpenFile} />
-        ) : pane.kind.type === "browser" ? (
-          <BrowserPane
-            label={pane.key}
-            active={active}
-            initialUrl={pane.kind.url}
-            initialProfile={pane.kind.profile}
-            memKey={pane.kind.memKey}
-            onAnnotate={onAnnotate}
-            onProfileChange={onProfileChange}
-            onVideoFullscreen={onVideoFullscreen}
-          />
-        ) : pane.kind.type === "memory" ? (
-          <DatabasePane onOpenUrl={onOpenUrl} />
-        ) : pane.kind.type === "notes" ? (
-          <NotesPane onSend={onSendToAi} />
-        ) : pane.kind.type === "automations" ? (
-          <AutomationsPane />
-        ) : pane.kind.type === "bridges" ? (
-          <BridgesPane />
-        ) : pane.kind.type === "plugins" ? (
-          <PluginsPane />
-        ) : pane.kind.type === "pulse" ? (
-          <PulsePane />
-        ) : pane.kind.type === "customers" ? (
-          <CrmPane />
-        ) : pane.kind.type === "motion" ? (
-          <MotionPane />
-        ) : pane.kind.type === "file" ? (
-          <FileViewerPane path={pane.kind.path} />
-        ) : pane.kind.type === "editor" ? (
-          <EditorPane path={pane.kind.path} name={pane.kind.name} />
-        ) : (
-          <ChatPane
-            paneKey={pane.key}
-            seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
-            resume={pane.kind.type === "chat" ? pane.kind.resume : undefined}
-            reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}
-            onOpenUrl={onOpenUrl}
-          />
-        )}
+        <Suspense fallback={<PaneLoading />}>
+          {isTerminal(pane.kind) ? (
+            <TerminalPane kind={pane.kind} paneKey={pane.key} />
+          ) : pane.kind.type === "files" ? (
+            <FilesPane onOpenFile={onOpenFile} />
+          ) : pane.kind.type === "browser" ? (
+            <BrowserPane
+              label={pane.key}
+              active={active}
+              initialUrl={pane.kind.url}
+              initialProfile={pane.kind.profile}
+              memKey={pane.kind.memKey}
+              onAnnotate={onAnnotate}
+              onProfileChange={onProfileChange}
+              onVideoFullscreen={onVideoFullscreen}
+            />
+          ) : pane.kind.type === "pet" ? (
+            <PetPane />
+          ) : pane.kind.type === "memory" ? (
+            <DatabasePane onOpenUrl={onOpenUrl} />
+          ) : pane.kind.type === "notes" ? (
+            <NotesPane onSend={onSendToAi} />
+          ) : pane.kind.type === "automations" ? (
+            <AutomationsPane />
+          ) : pane.kind.type === "bridges" ? (
+            <BridgesPane />
+          ) : pane.kind.type === "plugins" ? (
+            <PluginsPane />
+          ) : pane.kind.type === "pulse" ? (
+            <PulsePane />
+          ) : pane.kind.type === "notifications" ? (
+            <NotificationCenter
+              notifications={notifications}
+              onMarkRead={onMarkNotificationRead}
+              onOpenTarget={onOpenNotificationTarget}
+              onMarkAllRead={onMarkAllNotificationsRead}
+              onClear={onClearNotification}
+              onClearAll={onClearAllNotifications}
+            />
+          ) : pane.kind.type === "status" ? (
+            <StatusPane onReattachChat={onReattachChat} />
+          ) : pane.kind.type === "apps" ? (
+            <AttachAppsPane onAttachApp={onAttachApp} />
+          ) : pane.kind.type === "app" ? (
+            <AppAttachPane name={pane.kind.name} bundleId={pane.kind.bundleId} />
+          ) : pane.kind.type === "customers" ? (
+            <CrmPane />
+          ) : pane.kind.type === "motion" ? (
+            <MotionPane />
+          ) : pane.kind.type === "file" ? (
+            <FileViewerPane path={pane.kind.path} />
+          ) : pane.kind.type === "editor" ? (
+            <EditorPane path={pane.kind.path} name={pane.kind.name} />
+          ) : (
+            <ChatPane
+              paneKey={pane.key}
+              seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
+              resume={pane.kind.type === "chat" ? pane.kind.resume : undefined}
+              reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}
+              onOpenUrl={onOpenUrl}
+            />
+          )}
+        </Suspense>
       </div>
       {dropTarget && isTerminal(pane.kind) && (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center border-2 border-dashed border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10">

@@ -43,6 +43,9 @@ export interface ChatStartOpts {
   permissionMode?: string | null;
   /** reasoning effort: low | medium | high | xhigh | max. */
   effort?: string | null;
+  /** Use the low-context startup profile where supported. Codex strips MCP
+   *  servers from its chat home; other engines currently ignore this. */
+  fast?: boolean | null;
   /** resume a prior claude session id (continues that conversation). */
   resume?: string | null;
 }
@@ -209,20 +212,20 @@ export interface ChatModel {
  * opencode/openrouter catalog on top of these.
  */
 export const CHAT_MODELS: ChatModel[] = [
-  { id: "claude-opus-4-8", label: "opus 4.8", engine: "claude" },
-  { id: "claude-sonnet-4-6", label: "sonnet 4.6", engine: "claude" },
-  { id: "claude-haiku-4-5", label: "haiku 4.5", engine: "claude" },
   // ChatGPT-subscription models via Codex — no API key, no per-token billing.
   // The whole gpt-5.x family Codex serves on the sub (verified each returns a
   // turn over `codex exec -m <id>`): 5.5 (flagship), 5.4 + a fast mini, the
   // 5.3 codex-tuned build, and 5.2. NOT gpt-4o/o3/image — those are raw-API
   // only (need a key), so they're intentionally absent.
+  { id: "gpt-5.3-codex-spark", label: "gpt-5.3 codex spark", engine: "codex" },
+  { id: "gpt-5.3-codex", label: "gpt-5.3 codex", engine: "codex" },
   { id: "gpt-5.5", label: "gpt-5.5 · codex", engine: "codex" },
   { id: "gpt-5.4", label: "gpt-5.4 · codex", engine: "codex" },
   { id: "gpt-5.4-mini", label: "gpt-5.4 mini · codex", engine: "codex" },
-  { id: "gpt-5.3-codex", label: "gpt-5.3 codex", engine: "codex" },
-  { id: "gpt-5.3-codex-spark", label: "gpt-5.3 codex spark", engine: "codex" },
   { id: "gpt-5.2", label: "gpt-5.2 · codex", engine: "codex" },
+  { id: "claude-opus-4-8", label: "opus 4.8", engine: "claude" },
+  { id: "claude-sonnet-4-6", label: "sonnet 4.6", engine: "claude" },
+  { id: "claude-haiku-4-5", label: "haiku 4.5", engine: "claude" },
   // ONE free fallback for when the ChatGPT sub hits its rate window:
   // NVIDIA Nemotron (Llama-based, US) via opencode — best free non-Chinese
   // model in the catalog. Deliberately the only free entry; no model sprawl.
@@ -261,6 +264,7 @@ export async function chatStart(
     model: opts.model ?? null,
     permissionMode: opts.permissionMode ?? null,
     effort: opts.effort ?? null,
+    fast: opts.fast ?? null,
     resume: opts.resume ?? null,
   });
 }
@@ -291,10 +295,14 @@ export async function chatDetach(id: number, notify: boolean): Promise<void> {
   return invoke("chat_detach", { sessionId: id, notify });
 }
 
+export interface ChatReattachInfo {
+  busy: boolean;
+}
+
 /** Reattaches a reopened pane to a live/backgrounded session; replays the
  *  buffered output through the channel, then goes live. */
-export async function chatReattach(id: number, onEvent: Channel<string>): Promise<void> {
-  return invoke("chat_reattach", { sessionId: id, onEvent });
+export async function chatReattach(id: number, onEvent: Channel<string>): Promise<ChatReattachInfo> {
+  return invoke<ChatReattachInfo>("chat_reattach", { sessionId: id, onEvent });
 }
 
 /** Sets the label used by the background tray + done-notification. */

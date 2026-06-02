@@ -10,6 +10,7 @@ mod db;
 mod device;
 mod files;
 mod inbox;
+mod mac_apps;
 mod memory;
 mod monitor;
 mod motion;
@@ -20,6 +21,8 @@ mod stats;
 mod telemetry;
 mod usage;
 mod voice;
+
+use tauri::Manager;
 
 #[tauri::command]
 fn read_telemetry() -> telemetry::Telemetry {
@@ -69,6 +72,7 @@ pub fn run() {
             files::read_dir_tree,
             files::git_status,
             files::git_pulse,
+            files::shell_source_status,
             files::detect_project,
             files::list_projects,
             files::home_dir,
@@ -120,6 +124,9 @@ pub fn run() {
             inbox::list_customers,
             inbox::customer_thread,
             inbox::send_message,
+            mac_apps::mac_list_apps,
+            mac_apps::mac_focus_app,
+            mac_apps::mac_capture_app,
             motion::motion_models,
             motion::motion_boards,
             motion::motion_board_save,
@@ -157,6 +164,24 @@ pub fn run() {
             browser::browser_hide,
             browser::browser_close,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } if chat::has_busy_sessions() => {
+                api.prevent_exit();
+                show_main_window(app);
+            }
+            tauri::RunEvent::Reopen { .. } => {
+                show_main_window(app);
+            }
+            _ => {}
+        });
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }

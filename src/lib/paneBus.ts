@@ -17,10 +17,25 @@ export interface ChatHandle {
   /** Detach: keep the claude process running in the background, optionally
    *  arming a done-notification. Marks the pane so its unmount won't kill it. */
   detach: (notify: boolean) => void;
+  /** Stop the current turn while keeping the pane alive. */
+  stop?: () => void;
 }
 
 /** Live ChatPanes keyed by pane key — lets App intercept close on a busy chat. */
 export const chatHandles = new Map<string, ChatHandle>();
+
+/** Detach every chat pane that is actively generating. Returns how many were
+ *  moved to the background. Used by native window-close handling so closing the
+ *  cockpit hides the shell instead of killing in-flight ai work. */
+export function detachBusyChats(notify: boolean): number {
+  let detached = 0;
+  for (const handle of chatHandles.values()) {
+    if (!handle.busy()) continue;
+    handle.detach(notify);
+    detached += 1;
+  }
+  return detached;
+}
 
 /** Image-drop sink a pane registers (keyed by pane key). When an OS file drop
  *  (Finder/desktop screenshot) lands on a pane, App routes IMAGE paths here so

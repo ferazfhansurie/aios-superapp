@@ -51,6 +51,7 @@ import {
 import { addLink } from "../lib/sidebar";
 import { DEFAULT_PROFILE, addProfile, loadProfiles } from "../lib/profiles";
 import { rememberUrl } from "../lib/browser-mem";
+import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
 
 const ANNOT_SENTINEL = "AIOS_ANNOT:";
 const ANNOT_POLL_MS = 700;
@@ -269,6 +270,19 @@ export function BrowserPane({
     if (shownRef.current) browserNavigate(label, url).catch(() => {});
   }, [input, label]);
 
+  const showToast = useCallback((msg: string, level: NotificationLevel = "info", body?: string) => {
+    setToast(msg);
+    emitPaneNotification({
+      paneId: label,
+      paneLabel: "browser",
+      title: msg,
+      body,
+      level,
+    });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2500);
+  }, [label]);
+
   // Pin the current site to the sidebar (favicon resolved by the store from the
   // host). Label defaults to the hostname; the user can rename it in the rail.
   const pinSite = useCallback(() => {
@@ -281,16 +295,8 @@ export function BrowserPane({
     } catch {
       /* keep raw */
     }
-    setToast(`pinned ${host} to sidebar`);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 2500);
-  }, [current, input]);
-
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 2500);
-  }, []);
+    showToast(`pinned ${host} to sidebar`, "success", url);
+  }, [current, input, showToast]);
 
   useEffect(() => {
     return () => {
@@ -316,9 +322,9 @@ export function BrowserPane({
     browserScreenshot(label, r)
       .then((path) => {
         const file = path.split("/").pop() ?? path;
-        showToast(`saved ${file}`);
+        showToast(`saved ${file}`, "success", path);
       })
-      .catch((e) => showToast(typeof e === "string" ? e : "screenshot failed"));
+      .catch((e) => showToast(typeof e === "string" ? e : "screenshot failed", "error"));
   }, [label, rect, showToast]);
 
   const applyZoom = useCallback(
@@ -339,7 +345,7 @@ export function BrowserPane({
   const clearCookies = useCallback(() => {
     browserClearCookies(label).catch(() => {});
     setMenuOpen(false);
-    showToast("cleared cookies + storage");
+    showToast("cleared cookies + storage", "success", "browser profile data was cleared for this pane.");
   }, [label, showToast]);
 
   // Turn a captured annotation/selection into one chat-ready line.
@@ -395,7 +401,7 @@ export function BrowserPane({
           .then(() => showToast("annotate: click an element on the page"))
           .catch((e) => {
             setAnnotating(false);
-            showToast(typeof e === "string" ? e : "annotate failed");
+            showToast(typeof e === "string" ? e : "annotate failed", "error");
           });
       });
   }, [annotating, exitAnnotate, label, showToast]);
@@ -406,8 +412,8 @@ export function BrowserPane({
     browserCopySelection(label)
       .then(() => new Promise((r) => setTimeout(r, 120))) // let clipboard settle
       .then(() => consumeAnnotation())
-      .then((ok) => showToast(ok ? "selection sent to chat" : "no text selected"))
-      .catch((e) => showToast(typeof e === "string" ? e : "selection failed"));
+      .then((ok) => showToast(ok ? "selection sent to chat" : "no text selected", ok ? "success" : "warning"))
+      .catch((e) => showToast(typeof e === "string" ? e : "selection failed", "error"));
   }, [consumeAnnotation, label, showToast]);
 
   // While annotating, poll the clipboard for a submitted annotation, then exit.

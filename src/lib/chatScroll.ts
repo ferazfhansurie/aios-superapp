@@ -21,3 +21,16 @@ export function shouldAutoscroll(
   if (metrics.previousScrollHeight == null) return false;
   return metrics.previousScrollHeight - metrics.scrollTop - metrics.clientHeight < thresholdPx;
 }
+
+export type ScrollIntent = "up" | "down" | "unknown";
+
+export function nextAutoscrollPaused(
+  paused: boolean,
+  metrics: ScrollMetrics,
+  intent: ScrollIntent,
+  thresholdPx: number = BOTTOM_STICKY_THRESHOLD_PX,
+): boolean {
+  if (intent === "up") return true;
+  if (distanceFromBottom(metrics) < thresholdPx) return false;
+  return paused || intent !== "down";
+}

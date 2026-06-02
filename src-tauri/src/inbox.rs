@@ -23,8 +23,6 @@
 //! to the channels view. No new deps: `serde_json` + `chrono` only, both already
 //! in `Cargo.toml`.
 
-use std::path::PathBuf;
-
 use serde_json::{json, Value};
 
 // ════════════════════════════════════════════════════════════════════════

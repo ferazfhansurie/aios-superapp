@@ -14,6 +14,7 @@ import {
   Pencil,
   Play,
   Plus,
+  Radio,
   RefreshCw,
   Terminal,
   Trash2,
@@ -33,6 +34,7 @@ import {
 import { SidebarUsage } from "./SidebarUsage";
 
 interface Props {
+  iconsOnly?: boolean;
   onAttachOracle: (identity: string) => void;
   onAttachTmux: (socket: string, session: string) => void;
 }
@@ -56,7 +58,7 @@ const loadHidden = (): Set<string> => {
 
 const COLLAPSE_KEY = "aios.agentsCollapsed";
 
-export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
+export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }: Props) {
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -127,6 +129,56 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
       setSpawning(false);
     }
   };
+
+  if (iconsOnly) {
+    return (
+      <div className="flex flex-col items-center gap-1 border-t border-[var(--color-border)] pt-2">
+        <button
+          onClick={toggleCollapsed}
+          className="grid h-8 w-8 place-items-center rounded-md text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          title={`agents (${oracles.length})`}
+        >
+          <Radio size={14} />
+        </button>
+        {!collapsed && !primaryRunning && (
+          <button
+            onClick={spawnPrimary}
+            disabled={spawning}
+            className="grid h-8 w-8 place-items-center rounded-md border border-dashed border-[var(--color-border)] text-[var(--color-accent)] transition-colors hover:border-[var(--color-accent)]/60 hover:bg-[var(--color-panel-2)] disabled:opacity-60"
+            title="spawn my oracle"
+          >
+            {spawning ? <RefreshCw size={13} className="animate-spin" /> : <Play size={13} />}
+          </button>
+        )}
+        {!collapsed &&
+          visibleOracles.slice(0, 8).map((o) => (
+            <button
+              key={o.session}
+              onClick={() => onAttachOracle(o.identity)}
+              className="grid h-8 w-8 place-items-center rounded-md transition-colors hover:bg-[var(--color-panel-2)]"
+              title={`attach ${o.display_name}`}
+            >
+              <span
+                className={`status-dot ${
+                  o.attached ? "status-dot--active" : o.running ? "status-dot--idle" : "status-dot--cold"
+                }`}
+              />
+            </button>
+          ))}
+        {!collapsed &&
+          otherSessions.slice(0, 4).map((s) => (
+            <button
+              key={`${s.socket}/${s.name}`}
+              onClick={() => onAttachTmux(s.socket, s.name)}
+              className="grid h-8 w-8 place-items-center rounded-md text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              title={`attach ${s.socket}:${s.name}`}
+            >
+              <Terminal size={13} />
+            </button>
+          ))}
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-3">

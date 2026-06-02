@@ -276,18 +276,24 @@ fn opencode_bin() -> String {
     resolve_bin("opencode", "AIOS_OPENCODE_BIN", &[extra.as_str()])
 }
 
-/// Builds (and refreshes) a dedicated *stripped* `CODEX_HOME` for the chat path,
-/// returning its dir. The user's real `~/.codex/config.toml` defines 8+ MCP
-/// servers (figma, vercel, atlassian, motion …); codex loads + auth-probes ALL
-/// of them on every turn, and the `-c mcp_servers={}` CLI override is
-/// *merged*, not *replaced*, so it doesn't stop them — that auth stall is the
-/// bulk of per-turn latency (measured ~40s → ~2s once removed). A separate
-/// CODEX_HOME with an MCP-free config sidesteps it entirely, and also drops the
-/// per-turn skill-parse churn (plugins load relative to CODEX_HOME). We symlink
-/// `auth.json` back to the real home so the ChatGPT login stays shared — a
-/// re-login propagates with nothing to keep in sync. Returns `None` on any IO
-/// failure, so the caller just spawns without it (slow but still works).
-fn codex_chat_home() -> Option<String> {
+/// Optional fast-mode Codex home for the chat path. By default the chat pane
+/// deliberately uses the user's real `~/.codex` so it has the same model,
+/// reasoning, plugins, hooks, MCP servers, memory, browser/computer-use tools,
+/// and AGENTS.md behavior as typing `codex` in a terminal.
+///
+/// Set `fast=true` (or `AIOS_CODEX_FAST_HOME=1`) to opt into the old low-latency
+/// profile that mirrors config into `~/.codex-chat` while stripping MCP servers.
+/// Fast mode is useful when startup latency matters more than terminal-grade
+/// capability, but it should not be the product default.
+fn codex_chat_home(fast_requested: bool) -> Option<String> {
+    let fast_env = std::env::var("AIOS_CODEX_FAST_HOME")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let fast = fast_requested || fast_env;
+    if !fast {
+        return None;
+    }
+
     let home = std::env::var("HOME").ok()?;
     let real = std::env::var("CODEX_HOME")
         .ok()
@@ -307,8 +313,8 @@ fn codex_chat_home() -> Option<String> {
     let _ = std::fs::write(
         format!("{chat}/config.toml"),
         format!(
-            "# managed by AIOS shell — mirrors ~/.codex/config.toml with mcp_servers stripped.\n\
-             # keep terminal-grade model/reasoning/plugins/hooks; avoid MCP auth stalls.\n{config}"
+            "# managed by AIOS shell fast mode — mirrors ~/.codex/config.toml with mcp_servers stripped.\n\
+             # terminal-grade mode leaves CODEX_HOME unset and uses ~/.codex directly.\n{config}"
         ),
     );
     // Symlink auth.json → real home so the ChatGPT login stays shared.
@@ -439,7 +445,15 @@ pub fn chat_start(
     let eng = Engine::parse(engine.as_deref());
     // codex (ChatGPT sub) → persistent codex app-server process (JSON-RPC).
     if matches!(eng, Engine::Codex) {
-        return start_codex_appserver(app, on_event, cwd, model, permission_mode, resume);
+        return start_codex_appserver(
+            app,
+            on_event,
+            cwd,
+            model,
+            permission_mode,
+            resume,
+            fast.unwrap_or(false),
+        );
     }
     // opencode (openrouter/everything) is spawn-per-turn — register the session
     // here, spawn nothing; chat_send runs each turn.
@@ -693,7 +707,7 @@ fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<
             // so it doesn't actually stop them — the real fix is a dedicated
             // stripped CODEX_HOME with no servers defined (turns drop to ~2s).
             // Keep the override too as belt-and-suspenders for other codex builds.
-            if let Some(ch) = codex_chat_home() {
+            if let Some(ch) = codex_chat_home(false) {
                 cmd.env("CODEX_HOME", ch);
             }
             cmd.arg("-c").arg("mcp_servers={}");
@@ -942,10 +956,11 @@ fn start_codex_appserver(
     model: Option<String>,
     permission_mode: Option<String>,
     resume: Option<String>,
+    fast: bool,
 ) -> Result<u32, String> {
     let mut cmd = Command::new(codex_appserver_bin());
     cmd.arg("app-server");
-    if let Some(ch) = codex_chat_home() {
+    if let Some(ch) = codex_chat_home(fast) {
         cmd.env("CODEX_HOME", ch);
     }
     let dir = cwd.filter(|s| !s.is_empty());
@@ -1784,11 +1799,16 @@ pub fn chat_detach(session_id: u32, notify: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+pub struct ChatReattachInfo {
+    pub busy: bool,
+}
+
 /// Reattaches a reopened pane to a live (possibly backgrounded) session: rebinds
 /// the channel, replays the buffered lines so the pane reconstructs the whole
 /// run and catches up to live, and clears the detached/notify flags.
 #[tauri::command]
-pub fn chat_reattach(session_id: u32, on_event: Channel<String>) -> Result<(), String> {
+pub fn chat_reattach(session_id: u32, on_event: Channel<String>) -> Result<ChatReattachInfo, String> {
     let s = with_sessions(|m| m.get(&session_id).cloned())
         .ok_or_else(|| format!("chat session {session_id} not found"))?;
     // Replay buffer first, then go live — order matters so the pane sees history
@@ -1799,7 +1819,9 @@ pub fn chat_reattach(session_id: u32, on_event: Channel<String>) -> Result<(), S
     *s.sink.lock() = Some(on_event);
     s.detached.store(false, Ordering::SeqCst);
     s.notify_on_done.store(false, Ordering::SeqCst);
-    Ok(())
+    Ok(ChatReattachInfo {
+        busy: s.busy.load(Ordering::SeqCst),
+    })
 }
 
 /// Sets the human label used by the tray + done-notification.
@@ -1821,13 +1843,16 @@ pub struct LiveChat {
     pub detached: bool,
 }
 
-/// Lists currently-detached (background) chat sessions so the UI can show + let
-/// the user reopen them.
+/// Lists chat sessions that need user control: detached background runs and any
+/// still-busy attached run. This powers the status pane's task center so a user
+/// can stop a run without first sending another message in that chatpane.
 #[tauri::command]
 pub fn list_chat_live() -> Vec<LiveChat> {
     with_sessions(|m| {
         m.iter()
-            .filter(|(_, s)| s.detached.load(Ordering::SeqCst))
+            .filter(|(_, s)| {
+                s.detached.load(Ordering::SeqCst) || s.busy.load(Ordering::SeqCst)
+            })
             .map(|(id, s)| LiveChat {
                 id: *id,
                 claude_id: s.claude_id.lock().clone(),
@@ -1837,6 +1862,12 @@ pub fn list_chat_live() -> Vec<LiveChat> {
             })
             .collect()
     })
+}
+
+/// True while any chat backend has an in-flight turn. Used by the app lifecycle
+/// guard so app-level quit (cmd+q/menu quit) cannot silently kill generation.
+pub fn has_busy_sessions() -> bool {
+    with_sessions(|m| m.values().any(|s| s.busy.load(Ordering::SeqCst)))
 }
 
 /// Interrupts the in-flight turn of a live chat session.
@@ -1912,10 +1943,19 @@ pub fn chat_send_raw(session_id: u32, line: String) -> Result<(), String> {
 pub fn chat_stop(session_id: u32) -> Result<(), String> {
     let removed = with_sessions(|m| m.remove(&session_id));
     if let Some(s) = removed {
+        s.busy.store(false, Ordering::SeqCst);
+        s.detached.store(false, Ordering::SeqCst);
+        s.notify_on_done.store(false, Ordering::SeqCst);
+        fan_out(
+            &s,
+            "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"text\":\"stopped by user\",\"total_cost_usd\":0}",
+        );
         if let Some(child) = s.child.lock().as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
+        *s.stdin.lock() = None;
+        *s.sink.lock() = None;
     }
     Ok(())
 }

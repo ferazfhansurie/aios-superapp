@@ -21,8 +21,6 @@ use serde::{Deserialize, Serialize};
 ///   - `AIOS_MASTER_SESSION` — name of the master session (default `aios`)
 /// On machines with no tmux / no AIOS sessions, every list command simply
 /// returns empty — the graceful path for non-AIOS users.
-const MASTER_LABEL: &str = "master";
-
 /// Reads an env var, falling back to a default. Resolved per-call (cheap) so a
 /// running cockpit can be retargeted without a rebuild.
 fn env_or(key: &str, default: &str) -> String {
@@ -152,33 +150,6 @@ fn tmux_oracle(args: &[&str]) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-/// Checks the master session on its socket: `Some(attached)` if it exists,
-/// `None` if not running.
-fn master_state() -> Option<bool> {
-    let master_socket = master_socket();
-    let master_session = master_session();
-    let out = std::process::Command::new(tmux_bin())
-        .args([
-            "-L",
-            master_socket.as_str(),
-            "list-sessions",
-            "-F",
-            "#{session_name}|#{session_attached}",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut p = line.splitn(2, '|');
-        if p.next().map(|s| s.trim()) == Some(master_session.as_str()) {
-            return Some(p.next().unwrap_or("0").trim() != "0");
-        }
-    }
-    None
 }
 
 /// Resolves an `aios-*` session's display name from the instance registry.

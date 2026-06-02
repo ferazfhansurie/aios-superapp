@@ -161,15 +161,3 @@ pub fn crm_save_contact(contact: Value) -> Result<String, String> {
 pub fn crm_delete_contact(id: String) -> Result<(), String> {
     delete_by_id("contacts", &id)
 }
-
-/// Upserts a deal by `id` (minted if absent). Returns the id written.
-#[tauri::command]
-pub fn crm_save_deal(deal: Value) -> Result<String, String> {
-    upsert("deals", deal)
-}
-
-/// Deletes a deal by id (no-op if absent).
-#[tauri::command]
-pub fn crm_delete_deal(id: String) -> Result<(), String> {
-    delete_by_id("deals", &id)
-}

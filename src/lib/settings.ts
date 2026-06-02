@@ -6,6 +6,9 @@
 const STORAGE_KEY = "aios.settings";
 
 export type PaneType = "terminal" | "files" | "browser";
+export type SidebarMode = "full" | "icons";
+export type TopBarMode = "full" | "compact" | "hidden";
+export type NotificationNativeMode = "off" | "important" | "all";
 
 export interface AppSettings {
   // general
@@ -25,6 +28,14 @@ export interface AppSettings {
   // Drives `data-flash` on <html>; gated entirely in App.css (zero JS cost).
   flashLevel: FlashLevel;
 
+  // sidebar
+  sidebarMode: SidebarMode;
+  topBarMode: TopBarMode;
+
+  // notifications
+  notificationNativeMode: NotificationNativeMode;
+  notificationQuietMode: boolean;
+
   // oracles
   defaultSocketName: string;
   autoRefreshSeconds: number;
@@ -34,20 +45,21 @@ export interface AppSettings {
   graphPhysicsStrength: number; // 0..100
 
   // chat provider (model-agnostic) — provider ids live in lib/providers.ts.
-  // Default "claude-cli" preserves existing behavior. chatModel is the last
+  // Default "codex-cli" keeps new chats aligned with the WA oracle. chatModel is the last
   // picked model id (null = provider default).
   chatProvider: string;
   chatModel: string | null;
 
   // where "send to AI" actions route (notes pane "send", future quick-sends):
-  //   "claude-code" → a terminal pane running `claude` (firaz's default)
+  //   "codex-code"  → a terminal pane running `codex`
+  //   "claude-code" → a terminal pane running `claude`
   //   "terminal"    → a plain shell pane (paste + run)
   //   "chat"        → the in-app chat pane (uses chatProvider/chatModel)
   defaultAi: DefaultAi;
 }
 
 /** Routing target for "send to AI" actions. */
-export type DefaultAi = "claude-code" | "terminal" | "chat";
+export type DefaultAi = "codex-code" | "claude-code" | "terminal" | "chat";
 
 /** Composer flash intensity. */
 export type FlashLevel = "calm" | "lush" | "max";
@@ -69,6 +81,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   splashOnLaunch: true,
   reduceMotion: false,
   flashLevel: "lush",
+  sidebarMode: "full",
+  topBarMode: "hidden",
+  notificationNativeMode: "important",
+  notificationQuietMode: false,
 
   defaultSocketName: "adletic",
   autoRefreshSeconds: 15,
@@ -76,10 +92,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   graphPhysicsStrength: 50,
 
-  chatProvider: "claude-cli",
+  chatProvider: "codex-cli",
   chatModel: null,
 
-  defaultAi: "claude-code",
+  defaultAi: "codex-code",
 };
 
 /** Read-only display value — the memory vault lives here on this machine. */
@@ -96,9 +112,26 @@ export function loadSettings(): AppSettings {
   if (cache) return cache;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    cache = raw
-      ? { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<AppSettings>) }
-      : { ...DEFAULT_SETTINGS };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<AppSettings>;
+      if (
+        parsed.chatProvider === "claude-cli" &&
+        parsed.chatModel == null &&
+        parsed.defaultAi === "claude-code"
+      ) {
+        parsed.chatProvider = "codex-cli";
+        parsed.defaultAi = "codex-code";
+      }
+      // Old installs defaulted to a branded visible titlebar. The shell now
+      // treats hidden chrome as the product default; existing localStorage should
+      // not keep users stuck on loud topbar modes after reinstall.
+      if (parsed.topBarMode === "full" || parsed.topBarMode === "compact") {
+        parsed.topBarMode = "hidden";
+      }
+      cache = { ...DEFAULT_SETTINGS, ...parsed };
+    } else {
+      cache = { ...DEFAULT_SETTINGS };
+    }
   } catch {
     cache = { ...DEFAULT_SETTINGS };
   }

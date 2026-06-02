@@ -47,8 +47,10 @@ function fileToAvatar(file: File, size = 128): Promise<string> {
 }
 
 export function AccountMenu({
+  iconsOnly = false,
   onOpenSettings,
 }: {
+  iconsOnly?: boolean;
   onOpenSettings?: () => void;
   /** kept for call-site compatibility; the popover is gone so it's unused. */
   onOpenChange?: (open: boolean) => void;
@@ -82,7 +84,11 @@ export function AccountMenu({
   }, []);
 
   return (
-    <div className="flex w-full items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-border-strong)]">
+    <div
+      className={`flex w-full items-center rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 py-1.5 text-left transition-colors hover:border-[var(--color-border-strong)] ${
+        iconsOnly ? "justify-center px-1" : "gap-2 px-2"
+      }`}
+    >
       {/* avatar = profile-picture picker (own control so it doesn't open settings) */}
       <button
         type="button"
@@ -102,7 +108,7 @@ export function AccountMenu({
       <input ref={fileRef} type="file" accept="image/*" onChange={onPick} className="hidden" />
 
       {/* identity → settings */}
-      <button
+      {!iconsOnly && <button
         type="button"
         onClick={() => onOpenSettings?.()}
         title="Account · settings"
@@ -113,7 +119,7 @@ export function AccountMenu({
           <div className="truncate text-[10px] text-[var(--color-muted)]">adletic · owner</div>
         </div>
         <SettingsIcon size={13} className="text-[var(--color-muted)]" />
-      </button>
+      </button>}
     </div>
   );
 }

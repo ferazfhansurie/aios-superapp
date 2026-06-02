@@ -5,7 +5,7 @@
  *  passes a `commands` array — see the usage snippet in the PR notes. */
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { CornerDownLeft, Search } from "lucide-react";
+import { Brain, CornerDownLeft, MessageSquare, Search } from "lucide-react";
 
 export interface Command {
   id: string;
@@ -105,10 +105,14 @@ export function CommandPalette({
   open,
   onClose,
   commands,
+  onAsk,
+  onDeepSearch,
 }: {
   open: boolean;
   onClose: () => void;
   commands: Command[];
+  onAsk?: (query: string) => void;
+  onDeepSearch?: (query: string) => void;
 }) {
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
@@ -127,8 +131,37 @@ export function CommandPalette({
 
   // flat, ranked, group-ordered list. Stable order when query is empty.
   const results = useMemo<Scored[]>(() => {
+    const q = query.trim();
+    const intentCommands: Command[] = q.length >= 2
+      ? [
+          ...(onAsk
+            ? [{
+                id: `ai.ask.${q}`,
+                title: `ask aios: ${q}`,
+                subtitle: "open chatpane with this as the prompt",
+                group: "ai",
+                icon: <MessageSquare size={14} />,
+                keywords: `ask ai chatpane answer prompt ${q}`,
+                actionLabel: "ask",
+                run: () => onAsk(q),
+              }]
+            : []),
+          ...(onDeepSearch
+            ? [{
+                id: `ai.search.${q}`,
+                title: `deep search: ${q}`,
+                subtitle: "use chatpane intelligence to inspect memory, panes, and files",
+                group: "ai",
+                icon: <Brain size={14} />,
+                keywords: `search find memory files panes chat history intelligence ${q}`,
+                actionLabel: "search",
+                run: () => onDeepSearch(q),
+              }]
+            : []),
+        ]
+      : [];
     const scored: Scored[] = [];
-    for (const c of commands) {
+    for (const c of [...intentCommands, ...commands]) {
       const m = scoreCommand(query, c);
       if (m) scored.push({ ...c, _idx: m.idx, _score: m.score });
     }
@@ -149,7 +182,7 @@ export function CommandPalette({
     const flat: Scored[] = [];
     for (const g of order) flat.push(...byGroup.get(g)!);
     return flat;
-  }, [commands, query]);
+  }, [commands, onAsk, onDeepSearch, query]);
 
   // clamp selection when results shrink
   useEffect(() => {
@@ -313,7 +346,6 @@ export function CommandPalette({
             <CornerDownLeft size={10} /> {selAction}
           </span>
           <span>esc close</span>
-          <span className="ml-auto text-[var(--color-faint)]">aios</span>
         </div>
       </div>
     </div>

@@ -109,6 +109,14 @@ pub struct GitStatus {
     entries: Vec<GitEntry>,
 }
 
+#[derive(Serialize)]
+pub struct ShellSourceStatus {
+    root: Option<String>,
+    branch: String,
+    dirty: u32,
+    changed: Vec<GitEntry>,
+}
+
 /// Git status for the repo containing `path`, as absolute-path → status-letter,
 /// so the Files tree can decorate changed files + their parent folders. Returns
 /// `{ root: null, entries: [] }` (never errors) when not in a repo.
@@ -148,6 +156,69 @@ pub fn git_status(path: String) -> Result<GitStatus, String> {
         entries.push(GitEntry { path: abs, status });
     }
     Ok(GitStatus { root: Some(root), entries })
+}
+
+#[tauri::command]
+pub fn shell_source_status() -> Result<ShellSourceStatus, String> {
+    let Some(root) = find_shell_source_root() else {
+        return Ok(ShellSourceStatus {
+            root: None,
+            branch: String::new(),
+            dirty: 0,
+            changed: Vec::new(),
+        });
+    };
+
+    let branch = std::process::Command::new("git")
+        .args(["-C", &root, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let status = git_status(root.clone())?;
+    let dirty = status.entries.len() as u32;
+    let changed = status.entries.into_iter().take(18).collect();
+
+    Ok(ShellSourceStatus {
+        root: Some(root),
+        branch,
+        dirty,
+        changed,
+    })
+}
+
+fn find_shell_source_root() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("AIOS_SHELL_SOURCE_ROOT") {
+        candidates.push(path);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.to_string_lossy().to_string());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!("{home}/Repo/firaz/aios/shell"));
+        candidates.push(format!("{home}/Repo/firaz/adletic/aios/shell"));
+    }
+
+    candidates.into_iter().find_map(|path| {
+        let root = std::process::Command::new("git")
+            .args(["-C", &path, "rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+        let has_tauri = std::path::Path::new(&root)
+            .join("src-tauri/tauri.conf.json")
+            .exists();
+        let has_package = std::path::Path::new(&root).join("package.json").exists();
+        if has_tauri && has_package {
+            Some(root)
+        } else {
+            None
+        }
+    })
 }
 
 /// Collapse a 2-char porcelain XY code to one display letter.
@@ -418,7 +489,9 @@ pub fn list_projects() -> Vec<ProjectInfo> {
         if out.len() >= CAP {
             break;
         }
-        // If this dir is a project root, record it and don't descend further.
+        // If this dir is a project root, record it. Still descend afterward:
+        // many AIOS workspaces are monorepos with runnable nested apps, and the
+        // command palette must surface the actual app, not only the parent.
         if let Some((kind, commands)) = project_at(&dir) {
             let name = dir
                 .file_name()
@@ -437,7 +510,6 @@ pub fn list_projects() -> Vec<ProjectInfo> {
                 commands,
                 mtime,
             });
-            continue;
         }
         if depth >= MAX_DEPTH {
             continue;
@@ -641,6 +713,18 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
     let truncated = bytes.len() > PREVIEW_TEXT_CAP;
     if truncated {
         bytes.truncate(PREVIEW_TEXT_CAP);
+    }
+
+    // Quick media detection: route common video formats directly into the in-pane
+    // player instead of generic binary rendering.
+    if matches!(ext.as_str(), "mp4" | "mov" | "webm" | "m4v" | "avi" | "mkv") {
+        return Ok(json!({
+            "kind": "video",
+            "text": serde_json::Value::Null,
+            "size": size,
+            "name": name,
+            "truncated": false,
+        }));
     }
 
     // Known text/code extensions, OR anything that decodes cleanly as UTF-8.

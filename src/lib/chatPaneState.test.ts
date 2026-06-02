@@ -4,12 +4,14 @@ import test from "node:test";
 
 import {
   composerContextChips,
+  contextLedger,
   cycleQueueSelection,
   moveQueuedMessage,
   queueMessage,
   removeQueuedMessage,
   resumeTitle,
   sendContract,
+  stopStrategy,
   updateQueuedMessage,
   usageStack,
 } from "./chatPaneState.ts";
@@ -155,14 +157,21 @@ test("sendContract makes streaming send behavior explicit", () => {
   );
 });
 
+test("stopStrategy hard-stops process-backed gpt engines", () => {
+  assert.equal(stopStrategy("codex"), "kill-and-restart");
+  assert.equal(stopStrategy("opencode"), "kill-and-restart");
+  assert.equal(stopStrategy("claude"), "interrupt");
+});
+
 test("composerContextChips exposes the control contract at a glance", () => {
   assert.deepEqual(
     composerContextChips({
       cwd: "/Users/firaz/Repo/firaz/aios/shell",
-      modelLabel: "gpt-5.5 · codex",
+      modelLabel: "gpt-5.3 codex spark",
       effortLabel: "low",
       permissionLabel: "full access",
       engine: "codex",
+      contextBudget: "lean",
       queuedCount: 2,
       imageCount: 1,
       planMode: true,
@@ -171,15 +180,47 @@ test("composerContextChips exposes the control contract at a glance", () => {
     [
       { id: "cwd", label: "shell" },
       { id: "engine", label: "codex" },
-      { id: "model", label: "gpt-5.5 · codex" },
+      { id: "model", label: "gpt-5.3 codex spark" },
       { id: "effort", label: "low" },
       { id: "permission", label: "full access" },
+      { id: "budget", label: "lean" },
       { id: "attachments", label: "1 image" },
       { id: "queue", label: "2 queued" },
       { id: "plan", label: "plan" },
       { id: "goal", label: "goal" },
     ],
   );
+});
+
+test("contextLedger estimates pre-send context buckets and warns on expensive modes", () => {
+  const lean = contextLedger({
+    draft: "ship the status pane",
+    goal: "",
+    planMode: false,
+    memoryCount: 0,
+    imageCount: 0,
+    queuedCount: 0,
+    contextBudget: "lean",
+  });
+  assert.deepEqual(
+    lean.map((b) => [b.id, b.level]),
+    [["budget", "quiet"], ["draft", "normal"]],
+  );
+
+  const heavy = contextLedger({
+    draft: "x".repeat(6000),
+    goal: "keep improving aios",
+    planMode: true,
+    memoryCount: 4,
+    imageCount: 2,
+    queuedCount: 5,
+    contextBudget: "ultracode",
+  });
+  assert.equal(heavy.find((b) => b.id === "budget")?.level, "warning");
+  assert.equal(heavy.find((b) => b.id === "draft")?.level, "warning");
+  assert.equal(heavy.find((b) => b.id === "memory")?.level, "warning");
+  assert.equal(heavy.find((b) => b.id === "images")?.level, "warning");
+  assert.equal(heavy.find((b) => b.id === "queue")?.level, "warning");
 });
 
 test("resumeTitle keeps claude's first-message title behavior unchanged", () => {

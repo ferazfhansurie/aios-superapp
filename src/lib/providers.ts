@@ -91,6 +91,17 @@ export interface Provider {
 
 export const PROVIDERS: Provider[] = [
 	{
+		id: "codex-cli",
+		label: "Codex",
+		kind: "cli",
+		tier: 1,
+		// codex is agentic but has no claude-style effort/permission flags.
+		capabilities: { ...FULL_AGENT, effort: false, permissionModes: false },
+		bin: "codex",
+		models: [{ id: "gpt-5.3-codex-spark", label: "gpt-5.3 spark" }],
+		note: "OpenAI's coding agent CLI",
+	},
+	{
 		id: "claude-cli",
 		label: "Claude Code",
 		kind: "cli",
@@ -103,17 +114,6 @@ export const PROVIDERS: Provider[] = [
 			{ id: "claude-haiku-4-5", label: "haiku 4.5" },
 		],
 		note: "your Claude sub — full agent power",
-	},
-	{
-		id: "codex-cli",
-		label: "Codex",
-		kind: "cli",
-		tier: 1,
-		// codex is agentic but has no claude-style effort/permission flags.
-		capabilities: { ...FULL_AGENT, effort: false, permissionModes: false },
-		bin: "codex",
-		models: [{ id: "gpt-5-codex", label: "codex" }],
-		note: "OpenAI's coding agent CLI",
 	},
 	{
 		id: "gemini-cli",
@@ -195,8 +195,8 @@ export const PROVIDER_BY_ID: Record<string, Provider> = Object.fromEntries(
 	PROVIDERS.map((p) => [p.id, p]),
 );
 
-/** Default provider id — claude-cli keeps today's behavior for existing users. */
-export const DEFAULT_PROVIDER_ID: ProviderId = "claude-cli";
+/** Default provider id for new chats. */
+export const DEFAULT_PROVIDER_ID: ProviderId = "codex-cli";
 
 export function getProvider(id: string | null | undefined): Provider {
 	return (id && PROVIDER_BY_ID[id]) || PROVIDER_BY_ID[DEFAULT_PROVIDER_ID];

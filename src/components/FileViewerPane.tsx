@@ -52,6 +52,13 @@ export function FileViewerPane({ path }: { path: string }) {
           <iframe src={fileSrc(path)} title={preview.name} className="h-full w-full border-0" />
         ) : preview?.kind === "office" ? (
           <OfficePreview path={path} name={preview.name} />
+        ) : preview?.kind === "video" ? (
+          <video
+            src={fileSrc(path)}
+            controls
+            className="h-full w-full bg-black"
+            controlsList="nodownload"
+          />
         ) : preview?.kind === "text" ? (
           isMarkdown(path) ? (
             <MarkdownDoc text={preview.text ?? ""} path={path} truncated={preview.truncated} />

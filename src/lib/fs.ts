@@ -8,7 +8,7 @@ export interface DirEntry {
   mtime: number;
 }
 
-export type FilePreviewKind = "text" | "image" | "pdf" | "office" | "binary";
+export type FilePreviewKind = "text" | "image" | "pdf" | "office" | "video" | "binary";
 
 export interface FilePreview {
   kind: FilePreviewKind;
@@ -40,9 +40,20 @@ export interface GitStatus {
   entries: GitEntry[];
 }
 
+export interface ShellSourceStatus {
+  root: string | null;
+  branch: string;
+  dirty: number;
+  changed: GitEntry[];
+}
+
 /** Git status for the repo containing `path` (absolute path → status letter). */
 export async function gitStatus(path: string): Promise<GitStatus> {
   return invoke<GitStatus>("git_status", { path });
+}
+
+export async function shellSourceStatus(): Promise<ShellSourceStatus> {
+  return invoke<ShellSourceStatus>("shell_source_status");
 }
 
 /** Compact per-repo git summary for the homescreen "dev pulse" tile. */

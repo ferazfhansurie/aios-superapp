@@ -187,12 +187,18 @@ pub async fn browser_fullscreen_state(app: AppHandle, label: String) -> i64 {
     0
 }
 
-/// Puts the main OS window into (or out of) native fullscreen — the second half
+/// Puts the main OS window into (or out of) screen-fill mode — the second half
 /// of true video fullscreen (the pane-maximize covers the window, this covers the
-/// screen). Driven from the frontend's fullscreen-state poll.
+/// screen). On macOS we use simple fullscreen instead of native fullscreen so
+/// YouTube/WebKit element fullscreen does not race the OS space transition.
 #[tauri::command]
 pub fn set_window_fullscreen(app: AppHandle, on: bool) -> Result<(), String> {
     if let Some(win) = app.get_window("main") {
+        #[cfg(target_os = "macos")]
+        win.set_simple_fullscreen(on)
+            .or_else(|_| win.set_fullscreen(on))
+            .map_err(|e| e.to_string())?;
+        #[cfg(not(target_os = "macos"))]
         win.set_fullscreen(on).map_err(|e| e.to_string())?;
     }
     Ok(())

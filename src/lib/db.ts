@@ -55,8 +55,8 @@ export async function dbTableRows(
   return invoke<QueryResult>("db_table_rows", { id, schema, table, limit, offset });
 }
 
-export async function dbQuery(id: string, sql: string): Promise<QueryResult> {
-  return invoke<QueryResult>("db_query", { id, sql });
+export async function dbQuery(id: string, sql: string, allowWrite = false): Promise<QueryResult> {
+  return invoke<QueryResult>("db_query", { id, sql, allowWrite });
 }
 
 // ── row-level CRUD (postgres / neon) ─────────────────────────────────────────

@@ -79,6 +79,8 @@ export interface RunEventOptions {
   now?: number;
 }
 
+const DEFAULT_PERSISTED_EVENT_LIMIT = 500;
+
 let eventSeq = 0;
 
 const nextId = (prefix: string): string => `${prefix}${++eventSeq}`;
@@ -270,4 +272,63 @@ export function reduceRunEvents(
   }
 
   return state;
+}
+
+export function serializeRunEventState(
+  state: RunEventState,
+  limit = DEFAULT_PERSISTED_EVENT_LIMIT,
+): string {
+  const safeLimit = Math.max(0, limit);
+  const events = safeLimit === 0 ? [] : state.events.slice(-safeLimit);
+  return JSON.stringify({
+    events,
+    phase: state.phase,
+    activeActionId: state.activeActionId,
+  });
+}
+
+export function parseRunEventState(raw: string | null | undefined): RunEventState | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<RunEventState>;
+    if (!Array.isArray(parsed.events)) return null;
+    const phase = isRunPhase(parsed.phase) ? parsed.phase : "completed";
+    return {
+      events: parsed.events.filter(isRunEvent),
+      phase,
+      activeActionId:
+        typeof parsed.activeActionId === "string" ? parsed.activeActionId : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isRunPhase(value: unknown): value is RunPhase {
+  return (
+    value === "thinking" ||
+    value === "writing" ||
+    value === "acting" ||
+    value === "waiting" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "interrupted"
+  );
+}
+
+function isRunEvent(value: unknown): value is RunEvent {
+  if (!value || typeof value !== "object") return false;
+  const event = value as { type?: unknown; id?: unknown; at?: unknown };
+  if (typeof event.type !== "string" || typeof event.id !== "string") return false;
+  if (typeof event.at !== "number") return false;
+  return (
+    event.type === "reasoning" ||
+    event.type === "message.delta" ||
+    event.type === "action.started" ||
+    event.type === "action.completed" ||
+    event.type === "permission.requested" ||
+    event.type === "run.completed" ||
+    event.type === "run.failed" ||
+    event.type === "run.interrupted"
+  );
 }
