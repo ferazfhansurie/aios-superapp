@@ -50,6 +50,9 @@ export const paneImageDrop = new Map<string, (paths: string[]) => void>();
 // its opener once; callers use openFileInPane and fall back to the OS only if
 // nothing is registered.
 let openFileImpl: ((path: string, name: string) => void) | null = null;
+let openEditorFileImpl: ((path: string, name: string) => void) | null = null;
+let openViewerFileImpl: ((path: string, name: string) => void) | null = null;
+let revealFileImpl: ((path: string, name: string) => void) | null = null;
 
 /** App registers how to open a file as an in-app pane. Returns an unregister fn. */
 export function registerOpenFile(
@@ -66,6 +69,51 @@ export function registerOpenFile(
 export function openFileInPane(path: string, name: string): boolean {
   if (!openFileImpl) return false;
   openFileImpl(path, name);
+  return true;
+}
+
+export function registerOpenEditorFile(
+  fn: (path: string, name: string) => void,
+): () => void {
+  openEditorFileImpl = fn;
+  return () => {
+    if (openEditorFileImpl === fn) openEditorFileImpl = null;
+  };
+}
+
+export function registerOpenViewerFile(
+  fn: (path: string, name: string) => void,
+): () => void {
+  openViewerFileImpl = fn;
+  return () => {
+    if (openViewerFileImpl === fn) openViewerFileImpl = null;
+  };
+}
+
+export function registerRevealFile(
+  fn: (path: string, name: string) => void,
+): () => void {
+  revealFileImpl = fn;
+  return () => {
+    if (revealFileImpl === fn) revealFileImpl = null;
+  };
+}
+
+export function openEditorFileInPane(path: string, name: string): boolean {
+  if (!openEditorFileImpl) return false;
+  openEditorFileImpl(path, name);
+  return true;
+}
+
+export function openViewerFileInPane(path: string, name: string): boolean {
+  if (!openViewerFileImpl) return false;
+  openViewerFileImpl(path, name);
+  return true;
+}
+
+export function revealFileInPane(path: string, name: string): boolean {
+  if (!revealFileImpl) return false;
+  revealFileImpl(path, name);
   return true;
 }
 

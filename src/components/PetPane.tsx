@@ -539,3 +539,94 @@ export function PetPane() {
     </div>
   );
 }
+
+export function PetDashboardCompanion({
+  onOpenPet,
+  onTalkToJarvis,
+}: {
+  onOpenPet: () => void;
+  onTalkToJarvis: (seed: string) => void;
+}) {
+  const [state, setState] = useState(() => getPetState());
+  const [variant] = useState(readVariant);
+
+  useEffect(() => {
+    const unsub = subscribePetState((next) => setState(next));
+    return unsub;
+  }, []);
+
+  const breatheSpeed = state.mood === "critical" ? "1.7s" : "3.6s";
+  const visualMood = state.mood === "happy" ? "happy" : state.mood === "content" ? "content" : state.mood;
+  const activity = ACTIVITY_BY_MOOD[state.mood];
+  const spriteStyle = makeSpriteStyle(variant, breatheSpeed);
+  const needsCare = state.mood === "critical" || state.mood === "overloaded" || state.mood === "bloated";
+
+  return (
+    <section className="pet-dashboard">
+      <div className="pet-dashboard-head">
+        <div>
+          <div className="pet-dashboard-kicker">pet system</div>
+          <div className="pet-dashboard-title">{state.label}</div>
+          <div className="pet-dashboard-sub">{activity.label} · health {Math.round(state.health)} · stress {Math.round(state.stress)}</div>
+        </div>
+        <button type="button" className="pet-action-btn" onClick={onOpenPet}>
+          inspect
+        </button>
+      </div>
+
+      <div className={`pet-dashboard-canvas pet-canvas pet-canvas--${variant.environment}`} style={spriteStyle}>
+        <div className="pet-world" aria-label={`aios pet dashboard companion: ${activity.label}`}>
+          <div className="pet-world-sky">
+            <span className="pet-world-star pet-world-star-a" />
+            <span className="pet-world-star pet-world-star-b" />
+            <span className="pet-world-orb" />
+          </div>
+          <div className="pet-world-backdrop">
+            <span className="pet-prop pet-prop--shelf" />
+            <span className="pet-prop pet-prop--console" />
+            <span className="pet-prop pet-prop--beacon" />
+          </div>
+          <div className={`pet-job pet-job--${activity.activity}`}>
+            <span className="pet-job-screen" />
+            <span className="pet-job-block pet-job-block-a" />
+            <span className="pet-job-block pet-job-block-b" />
+            <span className="pet-job-pellet" />
+            <span className="pet-job-z pet-job-z-a" />
+            <span className="pet-job-z pet-job-z-b" />
+          </div>
+          <div className={`pet-world-avatar pet-world-avatar--${activity.activity}`}>
+            <PetSprite variant={variant} visualMood={visualMood} style={spriteStyle} />
+          </div>
+          <div className="pet-world-floor">
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+          </div>
+        </div>
+      </div>
+
+      <div className="pet-dashboard-actions">
+        <button type="button" className="pet-action-btn" onClick={feedPet}>
+          feed
+        </button>
+        <button type="button" className="pet-action-btn" onClick={flushPet}>
+          flush memory
+        </button>
+        <button type="button" className="pet-action-btn" onClick={calmPet}>
+          cool down
+        </button>
+        {needsCare && (
+          <button
+            type="button"
+            className="pet-action-btn"
+            onClick={() => onTalkToJarvis(`pet system is ${state.label}. diagnose what changed in recent chat, token, error, and agent pressure.`)}
+          >
+            ask jarvis
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}

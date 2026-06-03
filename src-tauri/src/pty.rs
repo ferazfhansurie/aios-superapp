@@ -243,13 +243,20 @@ pub fn pty_spawn_terminal(
     // `-A` the session is GUARANTEED to exist before we attach, so that error
     // class is gone.
     let create = if startup.is_empty() {
-        format!("{tmux} -L adletic new-session -A -d -s {session}{cdir}")
+        let login_shell = "exec ${SHELL:-/bin/zsh} -l";
+        format!(
+            "{tmux} -L adletic new-session -A -d -s {session}{cdir} {}",
+            sq(login_shell)
+        )
     } else {
         // Run the command, then drop to an interactive shell so the pane STAYS
         // ALIVE after the command finishes or errors (a VS Code-style run
         // terminal: logs remain, you can re-run) instead of the tmux session
         // dying the instant the command exits.
-        let keepalive = format!("{startup}; exec ${{SHELL:-/bin/zsh}}");
+        let keepalive = format!(
+            "exec ${{SHELL:-/bin/zsh}} -lc {}",
+            sq(&format!("{startup}; exec ${{SHELL:-/bin/zsh}} -l"))
+        );
         format!(
             "{tmux} -L adletic new-session -A -d -s {session}{cdir} {}",
             sq(&keepalive)

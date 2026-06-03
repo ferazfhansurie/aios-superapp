@@ -553,10 +553,18 @@ fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
     let mut out = Vec::new();
     if let Ok(text) = std::fs::read_to_string(dir.join("package.json")) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let is_react_native = json
+                .get("dependencies")
+                .and_then(|d| d.as_object())
+                .is_some_and(|d| d.contains_key("react-native"));
             if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
                 let mut names: Vec<&String> = scripts.keys().collect();
                 // priority order first, then the rest alphabetically
-                let prio = ["dev", "start", "serve", "build", "test"];
+                let prio: &[&str] = if is_react_native {
+                    &["android", "ios", "start", "test", "lint"]
+                } else {
+                    &["dev", "start", "serve", "build", "test"]
+                };
                 names.sort_by_key(|n| {
                     prio.iter().position(|p| *p == n.as_str()).unwrap_or(prio.len() + 1)
                 });

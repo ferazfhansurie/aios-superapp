@@ -21,6 +21,7 @@ test("normalizeIdleWidgets preserves valid custom order and backfills new defaul
   assert.equal(widgets[0].id, "apps");
   assert.equal(widgets[0].visible, false);
   assert.equal(widgets[1].id, "pulse");
+  assert.equal(widgets.some((w) => w.id === "money"), true);
   assert.deepEqual(
     widgets.map((w) => w.id).sort(),
     DEFAULT_IDLE_WIDGETS.map((w) => w.id).sort(),

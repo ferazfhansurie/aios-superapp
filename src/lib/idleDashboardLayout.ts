@@ -1,4 +1,5 @@
 export type IdleWidgetId =
+  | "money"
   | "pulse"
   | "projects"
   | "quick"
@@ -17,6 +18,7 @@ export interface IdleWidgetConfig {
 }
 
 export const DEFAULT_IDLE_WIDGETS: IdleWidgetConfig[] = [
+  { id: "money", visible: true, size: "hero" },
   { id: "pulse", visible: true, size: "hero" },
   { id: "projects", visible: true, size: "standard" },
   { id: "quick", visible: true, size: "compact" },
@@ -28,6 +30,7 @@ export const DEFAULT_IDLE_WIDGETS: IdleWidgetConfig[] = [
 ];
 
 export const IDLE_WIDGET_LABELS: Record<IdleWidgetId, string> = {
+  money: "sales agents",
   pulse: "pulse",
   projects: "projects",
   quick: "quick actions",

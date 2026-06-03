@@ -37,6 +37,79 @@ fn browser_new_pane(url: &Url, profile: &Option<String>) -> BrowserNewPane {
     }
 }
 
+fn standard_adblock_content_rules_json() -> String {
+    let cosmetic_selectors = [
+        "[id*=\"ad-\"]",
+        "[id^=\"ad_\"]",
+        "[class*=\" ad-\"]",
+        "[class^=\"ad-\"]",
+        "[class*=\" ads-\"]",
+        "[class*=\"advert\"]",
+        "[class*=\"sponsor\"]",
+        ".google-auto-placed",
+        "ins.adsbygoogle",
+        "iframe[src*=\"doubleclick\"]",
+        "iframe[src*=\"googlesyndication\"]",
+    ]
+    .join(",");
+
+    serde_json::json!([
+        {
+            "trigger": {
+                "url-filter": r".*://([^/]+\.)?(acscdn|adcash|adform|adkernel|admaven|adnxs|adservice|adsterra|adsystem|adskeeper|clickadu|clickaine|connect\.facebook|doubleclick|exoclick|facebook|googleadservices|googleads|googlesyndication|googletagmanager|googletagservices|hilltopads|mgid|onclickads|outbrain|popads|popcash|propellerads|revcontent|scorecardresearch|taboola|trafficjunky)\.",
+                "resource-type": ["document", "image", "script", "style-sheet", "font", "raw", "popup"]
+            },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": {
+                "url-filter": r".*(/ads?|/adserver|/pagead/|/gampad/|/advertising/|/banner(ad)?/|/sponsor(ed)?/|/tracking/|/track/|/pixel\b|/beacon\b|utm_source=|utm_campaign=).*",
+                "resource-type": ["document", "image", "script", "style-sheet", "font", "raw", "popup"]
+            },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*" },
+            "action": {
+                "type": "css-display-none",
+                "selector": cosmetic_selectors
+            }
+        }
+    ])
+    .to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn install_standard_adblock(wk: &objc2_web_kit::WKWebView) {
+    use block2::RcBlock;
+    use objc2::MainThreadMarker;
+    use objc2_foundation::NSString;
+    use objc2_web_kit::WKContentRuleListStore;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else {
+        return;
+    };
+    let controller = unsafe { wk.configuration().userContentController() };
+    let identifier = NSString::from_str("aios-standard-adblock-v1");
+    let rules = NSString::from_str(&standard_adblock_content_rules_json());
+    let block = RcBlock::new(move |rule_list: *mut objc2_web_kit::WKContentRuleList, _err: *mut objc2_foundation::NSError| {
+        if let Some(rule_list) = unsafe { rule_list.as_ref() } {
+            unsafe { controller.addContentRuleList(rule_list) };
+        }
+    });
+
+    unsafe {
+        store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+            Some(&identifier),
+            Some(&rules),
+            Some(&block),
+        );
+    }
+}
+
 /// Derive a stable 16-byte WKWebsiteDataStore identifier from a profile name.
 /// Each distinct profile gets its OWN persistent cookie jar — so two Google
 /// accounts can be logged in simultaneously (each is a *fresh first login* in
@@ -117,6 +190,7 @@ pub fn browser_show(
                     wk.configuration()
                         .preferences()
                         .setElementFullscreenEnabled(true);
+                    install_standard_adblock(wk);
                 }
             }
         });
@@ -577,5 +651,43 @@ mod tests {
                 profile: Some("work".into()),
             }
         );
+    }
+
+    #[test]
+    fn standard_adblock_rules_are_valid_webkit_content_rules() {
+        let rules = standard_adblock_content_rules_json();
+        let parsed: serde_json::Value = serde_json::from_str(&rules).unwrap();
+        let rules = parsed.as_array().unwrap();
+
+        assert!(rules.iter().any(|rule| {
+            rule.pointer("/trigger/url-filter")
+                .and_then(|v| v.as_str())
+                .is_some_and(|filter| {
+                    filter.contains("doubleclick")
+                        && filter.contains("googlesyndication")
+                        && filter.contains("googletagmanager")
+                        && filter.contains("taboola")
+                })
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule.pointer("/action/type") == Some(&serde_json::Value::String("css-display-none".into()))
+                && rule.pointer("/action/selector").and_then(|v| v.as_str()).is_some_and(|selector| {
+                    selector.contains("[id*=\"ad-\"]") && selector.contains(".google-auto-placed")
+                })
+        }));
+    }
+
+    #[test]
+    fn standard_adblock_rules_block_watchseries_pop_ad_network() {
+        let rules = standard_adblock_content_rules_json();
+        let parsed: serde_json::Value = serde_json::from_str(&rules).unwrap();
+        let rules = parsed.as_array().unwrap();
+
+        assert!(rules.iter().any(|rule| {
+            rule.pointer("/trigger/url-filter")
+                .and_then(|v| v.as_str())
+                .is_some_and(|filter| filter.contains("acscdn"))
+                && rule.pointer("/action/type") == Some(&serde_json::Value::String("block".into()))
+        }));
     }
 }

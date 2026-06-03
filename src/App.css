@@ -1768,6 +1768,53 @@ html, body, #root {
   box-shadow: none;
 }
 
+.pet-dashboard {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.pet-dashboard-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.pet-dashboard-kicker {
+  color: var(--color-muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.pet-dashboard-title {
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.pet-dashboard-sub {
+  color: var(--color-faint);
+  font-size: 11px;
+}
+
+.pet-dashboard-canvas {
+  min-height: 220px;
+  max-height: 260px;
+}
+
+.pet-dashboard-canvas .pet-world {
+  min-height: 220px;
+}
+
+.pet-dashboard-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .pet-meters {
   display: grid;
   gap: 10px;

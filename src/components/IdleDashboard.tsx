@@ -47,6 +47,7 @@ import {
   RotateCcw,
   Search,
   SlidersHorizontal,
+  Target,
   Zap,
 } from "lucide-react";
 
@@ -57,6 +58,7 @@ import type { SidebarState, SidebarItem } from "../lib/sidebar";
 import { gitPulse, type RepoPulse } from "../lib/fs";
 import { deviceStats, type DeviceStats } from "../lib/device";
 import { usageExtras, type UsageExtras } from "../lib/stats";
+import { loadMoneyAgentSummaries, type MoneyAgentSummary } from "../lib/moneyAgents";
 import {
   idleRate,
   memoryFocus,
@@ -75,6 +77,8 @@ import {
   type IdleWidgetId,
   type IdleWidgetSize,
 } from "../lib/idleDashboardLayout";
+import type { AiosNotification } from "../lib/notifications";
+import { IdleControlCenter } from "./IdleControlCenter";
 
 interface IdleDashboardProps {
   apps: AppDef[];
@@ -86,7 +90,14 @@ interface IdleDashboardProps {
   onOpenProject: (p: ProjectInfo) => void;
   onOpenSidebarItem: (item: SidebarItem) => void;
   onRevealSidebar: () => void;
+  onOpenMoneyAgents: () => void;
+  onOpenPet: () => void;
+  onOpenMoneyAgentChat: (id: string, label: string, command?: string) => void;
   onOpenPalette: () => void;
+  notifications: AiosNotification[];
+  onTalkToJarvis: (seed: string) => void;
+  onOpenNotificationTarget: (item: AiosNotification) => void;
+  onClearNotification: (id: string) => void;
 }
 
 const IDLE_LAYOUT_KEY = "aios.idleDashboard.widgets";
@@ -108,13 +119,21 @@ export function IdleDashboard({
   onOpenProject,
   onOpenSidebarItem,
   onRevealSidebar,
+  onOpenMoneyAgents,
+  onOpenPet,
+  onOpenMoneyAgentChat,
   onOpenPalette,
+  notifications,
+  onTalkToJarvis,
+  onOpenNotificationTarget,
+  onClearNotification,
 }: IdleDashboardProps) {
   const [extras, setExtras] = useState<UsageExtras | null>(null);
   const [rate, setRate] = useState<IdleRate | null>(null);
   const [focus, setFocus] = useState<MemoryFocus | null>(null);
   const [device, setDevice] = useState<DeviceStats | null>(null);
   const [pulse, setPulse] = useState<RepoPulse[]>([]);
+  const [moneyAgents, setMoneyAgents] = useState<MoneyAgentSummary[]>([]);
   const [customizing, setCustomizing] = useState(false);
   const [widgets, setWidgets] = useState<IdleWidgetConfig[]>(() => {
     try {
@@ -134,6 +153,7 @@ export function IdleDashboard({
       idleRate().then((v) => alive && setRate(v)).catch(() => {});
       memoryFocus().then((v) => alive && setFocus(v)).catch(() => {});
       deviceStats().then((v) => alive && setDevice(v)).catch(() => {});
+      loadMoneyAgentSummaries().then((v) => alive && setMoneyAgents(v)).catch(() => {});
     };
     load();
     const t = setInterval(load, 30_000);
@@ -160,6 +180,32 @@ export function IdleDashboard({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recent.map((p) => p.root).join("|")]);
+
+  return (
+    <IdleControlCenter
+      apps={apps}
+      oracles={oracles}
+      projects={projects}
+      sidebar={sidebar}
+      extras={extras}
+      rate={rate}
+      focus={focus}
+      pulse={pulse}
+      moneyAgents={moneyAgents}
+      notifications={notifications}
+      onSpawn={onSpawn}
+      onOpenProject={onOpenProject}
+      onOpenSidebarItem={onOpenSidebarItem}
+      onRevealSidebar={onRevealSidebar}
+      onOpenMoneyAgents={onOpenMoneyAgents}
+      onOpenPet={onOpenPet}
+      onOpenMoneyAgentChat={onOpenMoneyAgentChat}
+      onOpenPalette={onOpenPalette}
+      onTalkToJarvis={onTalkToJarvis}
+      onOpenNotificationTarget={onOpenNotificationTarget}
+      onClearNotification={onClearNotification}
+    />
+  );
 
   const awake = oracles.filter((o) => o.running).length;
   const visibleWidgets = widgets.filter((widget) => widget.visible);
@@ -194,6 +240,22 @@ export function IdleDashboard({
     ) : null;
     const className = widgetSizeClasses[widget.size] ?? widgetSizeClasses.standard;
 
+    if (widget.id === "money") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          hero
+          icon={<Target size={12} className="text-[var(--color-success)]" />}
+          label="sales agents"
+          right={controls}
+          onClick={customizing ? undefined : onOpenMoneyAgents}
+        >
+          <MoneyAgentsBoard agents={moneyAgents} onOpenOverview={onOpenMoneyAgents} onOpenAgent={onOpenMoneyAgentChat} />
+        </Tile>
+      );
+    }
     if (widget.id === "pulse") {
       return (
         <Tile
@@ -595,6 +657,82 @@ function QuickActions({
           <span className="hidden shrink-0 font-mono text-[9px] text-[var(--color-faint)] xl:inline">{action.hint}</span>
         </button>
       ))}
+    </div>
+  );
+}
+
+// ── MONEY AGENTS ─────────────────────────────────────────────────────────────
+
+function moneyHealthColor(health: MoneyAgentSummary["health"]): string {
+  if (health === "running") return "var(--color-success)";
+  if (health === "scheduled") return "var(--color-info)";
+  if (health === "needs-steer") return "var(--color-warning)";
+  if (health === "failed") return "var(--color-danger)";
+  return "var(--color-faint)";
+}
+
+function MoneyAgentsBoard({
+  agents,
+  onOpenOverview,
+  onOpenAgent,
+}: {
+  agents: MoneyAgentSummary[];
+  onOpenOverview: () => void;
+  onOpenAgent: (id: string, label: string, command?: string) => void;
+}) {
+  if (!agents.length) {
+    return (
+      <button
+        onClick={onOpenOverview}
+        className="flex h-full w-full items-center justify-center rounded-md text-[11.5px] text-[var(--color-faint)] hover:text-[var(--color-text)]"
+      >
+        open agent monitor
+      </button>
+    );
+  }
+  const running = agents.filter((agent) => agent.health === "running" || agent.health === "scheduled").length;
+  const needsSteer = agents.filter((agent) => agent.health === "needs-steer" || agent.health === "failed").length;
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-2">
+      <div className="grid grid-cols-3 gap-2">
+        <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-2">
+          <b className="block text-[18px] text-[var(--color-text)]">{running}</b>
+          <span className="font-mono text-[9.5px] uppercase tracking-wider text-[var(--color-muted)]">active loops</span>
+        </div>
+        <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-2">
+          <b className="block text-[18px] text-[var(--color-text)]">{needsSteer}</b>
+          <span className="font-mono text-[9.5px] uppercase tracking-wider text-[var(--color-muted)]">needs steer</span>
+        </div>
+        <button
+          type="button"
+          onClick={onOpenOverview}
+          className="rounded-md border border-[var(--color-accent)]/30 bg-[var(--color-accent-soft)] px-2 py-2 text-left text-[11px] text-[var(--color-text)] hover:border-[var(--color-accent)]/60"
+        >
+          monitor all
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {agents.map((agent) => (
+          <button
+            key={agent.id}
+            type="button"
+            onClick={() => onOpenAgent(agent.id, agent.label)}
+            className="group flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-[var(--color-panel-2)]"
+            title={`open ${agent.label} chatpane · ${agent.nextAction}`}
+          >
+            <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: moneyHealthColor(agent.health) }} />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-[12.5px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+                {agent.label}
+              </span>
+              <span className="block truncate font-mono text-[9.5px] text-[var(--color-faint)]">
+                {agent.currentJob}
+              </span>
+            </span>
+            <span className="shrink-0 font-mono text-[10px] text-[var(--color-muted)]">{agent.primaryMetric}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

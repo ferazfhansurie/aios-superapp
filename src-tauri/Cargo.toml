@@ -43,5 +43,7 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # so YouTube/video fullscreen works inside browser panes. Pinned to the same
 # objc2-web-kit version tauri 2.11 uses so the WKWebView types unify.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKWebViewConfiguration", "WKPreferences"] }
-
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "block2"] }

@@ -21,7 +21,10 @@ dependencies = [
 name = "aios-shell"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "chrono",
+ "objc2",
+ "objc2-foundation",
  "objc2-web-kit",
  "parking_lot",
  "portable-pty",

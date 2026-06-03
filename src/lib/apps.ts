@@ -24,7 +24,7 @@ import type { PaneKind } from "../components/TerminalPane";
 /** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
 export type PaneContent =
   | PaneKind
-  | { type: "files" }
+  | { type: "files"; root?: string }
   | { type: "browser"; url?: string; profile?: string; memKey?: string }
   | { type: "memory" }
   | { type: "notes" }
@@ -33,10 +33,19 @@ export type PaneContent =
   | { type: "plugins" }
   | { type: "pulse" }
   | { type: "notifications" }
+  | { type: "money-agents" }
   | { type: "status" }
   | { type: "apps" }
   | { type: "app"; name: string; bundleId?: string | null }
-  | { type: "chat"; seed?: string; resume?: { id: string; title: string }; reattach?: number }
+  | {
+      type: "chat";
+      seed?: string;
+      resume?: { id: string; title: string };
+      reattach?: number;
+      modelId?: string;
+      agentId?: string;
+      agentLabel?: string;
+    }
   | { type: "customers" }
   | { type: "pet" }
   | { type: "motion" }

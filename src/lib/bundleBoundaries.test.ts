@@ -66,6 +66,7 @@ test("memory pane keeps three.js graph behind graph runtime", () => {
 
 test("pet pane uses a seeded code-drawn 8-bit game pet", () => {
   const pane = read("src/components/PetPane.tsx");
+  const idle = read("src/components/IdleControlCenter.tsx");
   const css = read("src/App.css");
 
   assert.match(pane, /PET_VARIANT_KEY/);
@@ -100,12 +101,19 @@ test("pet pane uses a seeded code-drawn 8-bit game pet", () => {
   assert.match(pane, /pet-world/);
   assert.match(pane, /pet-job/);
   assert.match(pane, /hatch roll/);
+  assert.match(pane, /PetDashboardCompanion/);
+  assert.match(pane, /pet-dashboard/);
+  assert.match(pane, /ask jarvis/);
+  assert.match(idle, /PetDashboardCompanion/);
+  assert.match(idle, /onOpenPet/);
   assert.match(pane, /disabled=\{rerollsLeft <= 0\}/);
   assert.doesNotMatch(pane, /pet-antenna/);
   assert.doesNotMatch(pane, /<img/);
   assert.match(css, /seeded code-drawn 8-bit game pet/);
   assert.match(css, /\.pet-reroll-bank/);
   assert.match(css, /\.pet-action-btn:disabled/);
+  assert.match(css, /\.pet-dashboard/);
+  assert.match(css, /\.pet-dashboard-canvas/);
   assert.match(css, /\.pet-hatch-onboarding/);
   assert.match(css, /\.pet-hatch-swatch/);
   assert.match(css, /\.pet-starter-card/);
@@ -247,6 +255,95 @@ test("shell exposes a shared notification center and controls", () => {
   assert.match(app, /focusPane\(pane\.key\)/);
   assert.match(settings, /notificationNativeMode: NotificationNativeMode/);
   assert.match(settingsPane, /native alerts/);
+});
+
+test("money agents open as chatpane-backed agents", () => {
+  const app = read("src/App.tsx");
+  const pane = read("src/components/MoneyAgentsPane.tsx");
+  const section = read("src/components/MoneyAgentsSection.tsx");
+  const idle = read("src/components/IdleDashboard.tsx");
+  const apps = read("src/lib/apps.ts");
+  const agents = read("src/lib/moneyAgents.ts");
+
+  assert.match(apps, /\| \{ type: "money-agents" \}/);
+  assert.match(apps, /agentId\?: string/);
+  assert.match(apps, /modelId\?: string/);
+  assert.match(app, /import\("\.\/components\/MoneyAgentsPane"\)/);
+  assert.match(app, /pane\.kind\.type === "money-agents"/);
+  assert.match(app, /<MoneyAgentsPane onOpenAgentChat=\{onOpenMoneyAgentChat\} \/>/);
+  assert.match(app, /moneyAgentsSlot=/);
+  assert.match(app, /chatpaneAgentsOnly/);
+  assert.match(app, /embedded/);
+  assert.match(app, /moneyAgentChatStates/);
+  assert.match(app, /AGENT_CHAT_MODEL/);
+  assert.match(app, /modelId=\{pane\.kind\.type === "chat" \? pane\.kind\.modelId : undefined\}/);
+  assert.match(app, /focusPane\(existingPane\.key\)/);
+  assert.match(app, /reattach: live\.id/);
+  assert.match(app, /moneyAgentBootstrapRef/);
+  assert.match(app, /setHiddenKeys\(\(current\)/);
+  assert.match(app, /if \(command\) submitWhenReady\(existingPane\.key, command\);\s*else focusPane\(existingPane\.key\)/);
+  assert.match(app, /if \(command\) \{\s*setHiddenKeys\(\(current\) => \(current\.includes\(key\) \? current : \[\.\.\.current, key\]\)\);/);
+  assert.match(app, /buildMoneyAgentChatSeed/);
+  assert.match(app, /loadMoneyAgentChatSession/);
+  assert.match(app, /resume: \{ id: saved\.sessionId, title: saved\.title \}/);
+  assert.match(section, /embedded/);
+  assert.match(section, /createMoneyAgent/);
+  assert.match(section, /new chatpane agent/);
+  assert.match(section, /chatStateLabel/);
+  assert.match(section, /onOpenAgentChat/);
+  assert.doesNotMatch(section, /Terminal/);
+  assert.match(pane, /aios sales agents/);
+  assert.match(pane, /open chatpane/);
+  assert.match(pane, /run sales pulse/);
+  assert.match(pane, /control update for all agents/);
+  assert.match(pane, /state and evidence/);
+  assert.match(idle, /onOpenMoneyAgentChat/);
+  assert.match(idle, /onOpenAgent\(agent\.id, agent\.label\)/);
+  assert.match(agents, /buildMoneyAgentChatSeed/);
+  assert.match(agents, /buildMoneyAgentRunCommand/);
+  assert.match(agents, /shell control plane/);
+  assert.match(agents, /saveMoneyAgentChatSession/);
+  assert.match(agents, /AGENT_CHAT_MODEL = "gpt-5\.3-codex-spark"/);
+  assert.match(agents, /loadConfiguredMoneyAgents/);
+  assert.match(agents, /createMoneyAgent/);
+});
+
+test("idle dashboard is a jarvis control center, not launcher widgets", () => {
+  const app = read("src/App.tsx");
+  const idle = read("src/components/IdleDashboard.tsx");
+  const controlCenter = read("src/components/IdleControlCenter.tsx");
+  const pulseBand = read("src/components/dashboard/PulseIdentityBand.tsx");
+  const agentLane = read("src/components/dashboard/AgentOperationsLane.tsx");
+  const notificationLane = read("src/components/dashboard/NotificationCommandLane.tsx");
+  const briefingLane = read("src/components/dashboard/JarvisBriefingLane.tsx");
+  const charts = read("src/components/dashboard/ControlCenterCharts.tsx");
+
+  assert.match(idle, /<IdleControlCenter/);
+  assert.match(idle, /notifications=\{notifications\}/);
+  assert.match(controlCenter, /PulseIdentityBand/);
+  assert.match(controlCenter, /AgentOperationsLane/);
+  assert.match(controlCenter, /NotificationCommandLane/);
+  assert.match(controlCenter, /JarvisBriefingLane/);
+  assert.match(controlCenter, /talk to jarvis/);
+  assert.match(pulseBand, /day streak/);
+  assert.match(pulseBand, /sessions/);
+  assert.match(pulseBand, /messages/);
+  assert.match(pulseBand, /tokens/);
+  assert.match(pulseBand, /top model/);
+  assert.match(pulseBand, /active since/);
+  assert.match(pulseBand, /70-day activity/);
+  assert.match(pulseBand, /focus/);
+  assert.match(agentLane, /inspect/);
+  assert.match(agentLane, /run pulse/);
+  assert.match(agentLane, /agentRunLabel/);
+  assert.match(notificationLane, /talk to jarvis/);
+  assert.match(notificationLane, /open context/);
+  assert.match(briefingLane, /buildJarvisBriefing/);
+  assert.match(charts, /ActivityHeatmap/);
+  assert.match(charts, /TrendBars/);
+  assert.match(charts, /AgentRunTimeline/);
+  assert.match(charts, /ApprovalAgingBars/);
+  assert.match(app, /notifications=\{notifications\}/);
 });
 
 test("pane overview is button driven, not a global scroll gesture", () => {

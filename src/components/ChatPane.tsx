@@ -22,7 +22,7 @@
  *   7. `/` slash menu (clear / plan / model / help)
  *   8. `@` file-mention picker sourced from cwd
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
@@ -89,6 +89,7 @@ import {
   type ChatTurnInfo,
   type WebChatTurn,
 } from "../lib/chat";
+import { saveMoneyAgentChatSession } from "../lib/moneyAgents";
 import { fileSrc, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
 import { idleRate, codexRate, resetIn } from "../lib/dashboard";
@@ -109,7 +110,17 @@ import {
 } from "../lib/chatPaneState";
 import { usagePaceRisk } from "../lib/usagePace";
 import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
-import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, openFileInPane, openUrlInPane } from "../lib/paneBus";
+import {
+  chatHandles,
+  paneWriters,
+  paneSubmitters,
+  paneImageDrop,
+  openEditorFileInPane,
+  openFileInPane,
+  openUrlInPane,
+  openViewerFileInPane,
+  revealFileInPane,
+} from "../lib/paneBus";
 import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import {
   emptyRunEventState,
@@ -544,11 +555,17 @@ export function ChatPane({
   seed,
   resume,
   reattach,
+  modelId,
+  agentId,
+  agentLabel,
   onOpenUrl,
 }: {
   cwd?: string;
   paneKey?: string;
   seed?: string;
+  modelId?: string;
+  agentId?: string;
+  agentLabel?: string;
   /** Resume a prior chat session on mount (from the idle "continue" rail). */
   resume?: { id: string; title: string };
   /** Reattach to a still-live backgrounded session by its backend id (from the
@@ -629,8 +646,8 @@ export function ChatPane({
   // The model the user last picked in the composer IS their default; persisted
   // so codex / opus / whatever sticks across panes + restarts.
   const [model, setModel] = useState<ChatModel>(() => {
-    const saved = loadSettings().chatModel;
-    return CHAT_MODELS.find((m) => m.id === saved) ?? CHAT_MODELS[0];
+    const preferred = modelId ?? loadSettings().chatModel;
+    return CHAT_MODELS.find((m) => m.id === preferred) ?? CHAT_MODELS[0];
   });
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(EFFORTS[1]);
@@ -1698,6 +1715,7 @@ export function ChatPane({
       // request into a compact stable topic.
       const engine = model.engine ?? "claude";
       const suggested = resumeTitle(text, engine);
+      const stableTitle = agentLabel ?? suggested.title;
       const firstRecord = !recordedRef.current;
       const promoteCodex =
         engine === "codex" && !codexTitleLockedRef.current && suggested.meaningful;
@@ -1705,14 +1723,21 @@ export function ChatPane({
       if (sid && (firstRecord || promoteCodex)) {
         if (firstRecord) recordedRef.current = true;
         if (promoteCodex) codexTitleLockedRef.current = true;
-        recordChatSession(sid, suggested.title, cwd ?? null, engine, model.id).catch(() => {
+        recordChatSession(sid, stableTitle, cwd ?? null, engine, model.id).catch(() => {
           // failed to persist → allow a later send to retry
           if (firstRecord) recordedRef.current = false;
           if (promoteCodex) codexTitleLockedRef.current = false;
         });
+        if (agentId) {
+          saveMoneyAgentChatSession(agentId, {
+            sessionId: sid,
+            title: stableTitle,
+            updatedAt: Date.now(),
+          });
+        }
         // Label the backend session for the background tray + done-notification.
         if (sessionIdRef.current != null)
-          chatSetTitle(sessionIdRef.current, suggested.title).catch(() => {});
+          chatSetTitle(sessionIdRef.current, stableTitle).catch(() => {});
       }
       setInput("");
       setImages((prev) => {
@@ -3709,6 +3734,20 @@ function FileCard({ artifact }: { artifact: Artifact }) {
   // surface failures instead of swallowing them — a denied scope or missing
   // file briefly flips the label to the reason so it's debuggable, not silent.
   const [err, setErr] = useState<string | null>(null);
+  const openWith = (mode: "editor" | "viewer" | "files") => {
+    setErr(null);
+    const ok =
+      mode === "editor"
+        ? openEditorFileInPane(artifact.path, artifact.name)
+        : mode === "viewer"
+          ? openViewerFileInPane(artifact.path, artifact.name)
+          : revealFileInPane(artifact.path, artifact.name);
+    if (ok) return;
+    openPath(artifact.path).catch((e) => {
+      setErr(String(e));
+      console.error("openPath failed:", artifact.path, e);
+    });
+  };
   const open = () => {
     setErr(null);
     // prefer an in-app viewer pane; only hand off to the OS if none is wired.
@@ -3719,9 +3758,7 @@ function FileCard({ artifact }: { artifact: Artifact }) {
     });
   };
   return (
-    <button
-      type="button"
-      onClick={open}
+    <div
       title={err ? `${err} — ${artifact.path}` : `open ${artifact.path}`}
       className={`group/file flex max-w-full items-center gap-2.5 rounded-lg border bg-[var(--color-panel-2)] px-3 py-2 text-left transition-colors ${
         err
@@ -3729,23 +3766,54 @@ function FileCard({ artifact }: { artifact: Artifact }) {
           : "border-[var(--color-border)] hover:border-[var(--color-accent)]/50"
       }`}
     >
-      <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
-        <Icon size={14} />
-      </span>
-      <span className="min-w-0 flex flex-col">
-        <span className="truncate font-mono text-[12px] text-[var(--color-text)]">
-          {artifact.name}
+      <button type="button" onClick={open} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
+        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
+          <Icon size={14} />
         </span>
-        <span
-          className={`font-sans text-[10.5px] ${
-            err
-              ? "text-[var(--color-danger)]"
-              : "text-[var(--color-faint)] group-hover/file:text-[var(--color-muted)]"
-          }`}
-        >
-          {err ? "couldn’t open — see tooltip" : "open"}
+        <span className="min-w-0 flex flex-col">
+          <span className="truncate font-mono text-[12px] text-[var(--color-text)]">
+            {artifact.name}
+          </span>
+          <span
+            className={`font-sans text-[10.5px] ${
+              err
+                ? "text-[var(--color-danger)]"
+                : "text-[var(--color-faint)] group-hover/file:text-[var(--color-muted)]"
+            }`}
+          >
+            {err ? "couldn’t open — see tooltip" : "open"}
+          </span>
         </span>
+      </button>
+      <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/file:opacity-100">
+        <ArtifactActionButton label="editor" icon={<Pencil size={12} />} onClick={() => openWith("editor")} />
+        <ArtifactActionButton label="viewer" icon={<FileType size={12} />} onClick={() => openWith("viewer")} />
+        <ArtifactActionButton label="files" icon={<Folder size={12} />} onClick={() => openWith("files")} />
       </span>
+    </div>
+  );
+}
+
+function ArtifactActionButton({
+  label,
+  icon,
+  onClick,
+}: {
+  label: string;
+  icon: ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+    >
+      {icon}
     </button>
   );
 }
