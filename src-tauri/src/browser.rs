@@ -6,7 +6,8 @@
 //!
 //! Requires the tauri `unstable` feature (child webviews via `Window::add_child`).
 
-use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl};
 
 /// The webview UA, matched to the host engine so the fingerprint is honest.
 ///
@@ -30,6 +31,92 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 
 fn parse(url: &str) -> Result<Url, String> {
     Url::parse(url).map_err(|e| format!("bad url: {e}"))
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct BrowserNewPane {
+    url: String,
+    profile: Option<String>,
+}
+
+fn browser_new_pane(url: &Url, profile: &Option<String>) -> BrowserNewPane {
+    BrowserNewPane {
+        url: url.to_string(),
+        profile: profile.clone(),
+    }
+}
+
+fn standard_adblock_content_rules_json() -> String {
+    let cosmetic_selectors = [
+        "[id*=\"ad-\"]",
+        "[id^=\"ad_\"]",
+        "[class*=\" ad-\"]",
+        "[class^=\"ad-\"]",
+        "[class*=\" ads-\"]",
+        "[class*=\"advert\"]",
+        "[class*=\"sponsor\"]",
+        ".google-auto-placed",
+        "ins.adsbygoogle",
+        "iframe[src*=\"doubleclick\"]",
+        "iframe[src*=\"googlesyndication\"]",
+    ]
+    .join(",");
+
+    serde_json::json!([
+        {
+            "trigger": {
+                "url-filter": r".*://([^/]+\.)?(acscdn|adcash|adform|adkernel|admaven|adnxs|adservice|adsterra|adsystem|adskeeper|clickadu|clickaine|connect\.facebook|doubleclick|exoclick|facebook|googleadservices|googleads|googlesyndication|googletagmanager|googletagservices|hilltopads|mgid|onclickads|outbrain|popads|popcash|propellerads|revcontent|scorecardresearch|taboola|trafficjunky)\.",
+                "resource-type": ["document", "image", "script", "style-sheet", "font", "raw", "popup"]
+            },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": {
+                "url-filter": r".*(/ads?|/adserver|/pagead/|/gampad/|/advertising/|/banner(ad)?/|/sponsor(ed)?/|/tracking/|/track/|/pixel\b|/beacon\b|utm_source=|utm_campaign=).*",
+                "resource-type": ["document", "image", "script", "style-sheet", "font", "raw", "popup"]
+            },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*" },
+            "action": {
+                "type": "css-display-none",
+                "selector": cosmetic_selectors
+            }
+        }
+    ])
+    .to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn install_standard_adblock(wk: &objc2_web_kit::WKWebView) {
+    use block2::RcBlock;
+    use objc2::MainThreadMarker;
+    use objc2_foundation::NSString;
+    use objc2_web_kit::WKContentRuleListStore;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else {
+        return;
+    };
+    let controller = unsafe { wk.configuration().userContentController() };
+    let identifier = NSString::from_str("aios-standard-adblock-v1");
+    let rules = NSString::from_str(&standard_adblock_content_rules_json());
+    let block = RcBlock::new(move |rule_list: *mut objc2_web_kit::WKContentRuleList, _err: *mut objc2_foundation::NSError| {
+        if let Some(rule_list) = unsafe { rule_list.as_ref() } {
+            unsafe { controller.addContentRuleList(rule_list) };
+        }
+    });
+
+    unsafe {
+        store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+            Some(&identifier),
+            Some(&rules),
+            Some(&block),
+        );
+    }
 }
 
 /// Derive a stable 16-byte WKWebsiteDataStore identifier from a profile name.
@@ -102,35 +189,50 @@ pub async fn browser_show(
             }
         }
     };
+    let popup_app = app.clone();
+    let popup_profile = profile.clone();
     #[allow(unused_mut)]
-    let mut builder =
-        tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed)).user_agent(UA);
-    // A named profile gets its own persistent cookie partition so multiple
-    // accounts (personal / noobx29 / fathopes work) stay logged in at once.
-    // The unnamed/"default" profile keeps the shared default store (preserves
-    // any existing login). macOS only — `data_store_identifier` is a WKWebView
-    // API; on Windows (WebView2) the browser shares one cookie store, so multiple
-    // simultaneous Google logins aren't partitioned (graceful degradation).
+    let mut builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+        .user_agent(UA)
+        .on_new_window(move |url, _features| {
+            let _ = popup_app.emit("browser-new-pane", browser_new_pane(&url, &popup_profile));
+            tauri::webview::NewWindowResponse::Deny
+        });
+    // A named profile gets its own persistent cookie partition on macOS. Other
+    // platforms keep the default store for now: Windows WebView2 profile
+    // partitioning needs a separate implementation, so don't make pulls fail.
     #[cfg(target_os = "macos")]
     if let Some(name) = profile.as_deref().filter(|p| !p.is_empty() && *p != "default") {
         builder = builder.data_store_identifier(profile_store_id(name));
     }
     #[cfg(not(target_os = "macos"))]
     let _ = &profile;
-    eprintln!(
-        "[aios browser] add_child label='{label}' at ({x},{y}) {width}x{height} url-ok",
-    );
     window
         .add_child(
             builder,
             LogicalPosition::new(x, y),
             LogicalSize::new(width.max(1.0), height.max(1.0)),
         )
-        .map_err(|e| {
-            eprintln!("[aios browser] add_child FAILED: {e}");
-            e.to_string()
-        })?;
-    eprintln!("[aios browser] add_child OK for '{label}'");
+        .map_err(|e| e.to_string())?;
+    // WKWebView ships with element (HTML) fullscreen DISABLED, so YouTube etc.
+    // show "your browser doesn't support full screen". Flip the preference on the
+    // freshly-created native webview. macOS-only; best-effort.
+    #[cfg(target_os = "macos")]
+    if let Some(wv) = app.get_webview(&label) {
+        let _ = wv.with_webview(|pw| {
+            // PlatformWebview::inner() is the raw WKWebView pointer — cast to the
+            // objc2-web-kit type (same crate version tauri uses) and flip the pref.
+            let ptr = pw.inner() as *mut objc2_web_kit::WKWebView;
+            unsafe {
+                if let Some(wk) = ptr.as_ref() {
+                    wk.configuration()
+                        .preferences()
+                        .setElementFullscreenEnabled(true);
+                    install_standard_adblock(wk);
+                }
+            }
+        });
+    }
     Ok(())
 }
 
@@ -164,6 +266,53 @@ pub fn browser_navigate(app: AppHandle, label: String, url: String) -> Result<()
     let parsed = parse(&url)?;
     let wv = app.get_webview(&label).ok_or("browser not open")?;
     wv.navigate(parsed).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Reads the WKWebView element-fullscreen state (0 = not, 1 = entering, 2 = in,
+/// 3 = exiting). A child webview's HTML fullscreen only fills the webview's own
+/// rect, so the frontend polls this to drive TRUE fullscreen: when a video goes
+/// fullscreen we maximize the pane (webview → full window) + put the OS window
+/// in fullscreen (window → full screen). macOS-only; 0 elsewhere.
+#[tauri::command]
+pub async fn browser_fullscreen_state(app: AppHandle, label: String) -> i64 {
+    // `with_webview` needs a Send + 'static closure (dispatched to the main
+    // thread), so we ship the read back over a channel. async → this runs off
+    // the main thread, so the brief blocking recv can't deadlock the dispatch.
+    #[cfg(target_os = "macos")]
+    if let Some(wv) = app.get_webview(&label) {
+        let (tx, rx) = std::sync::mpsc::channel::<i64>();
+        let _ = wv.with_webview(move |pw| {
+            let ptr = pw.inner() as *mut objc2_web_kit::WKWebView;
+            let s = unsafe {
+                ptr.as_ref()
+                    .map(|wk| wk.fullscreenState().0 as i64)
+                    .unwrap_or(0)
+            };
+            let _ = tx.send(s);
+        });
+        return rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .unwrap_or(0);
+    }
+    let _ = (&app, &label);
+    0
+}
+
+/// Puts the main OS window into (or out of) screen-fill mode — the second half
+/// of true video fullscreen (the pane-maximize covers the window, this covers the
+/// screen). On macOS we use simple fullscreen instead of native fullscreen so
+/// YouTube/WebKit element fullscreen does not race the OS space transition.
+#[tauri::command]
+pub fn set_window_fullscreen(app: AppHandle, on: bool) -> Result<(), String> {
+    if let Some(win) = app.get_window("main") {
+        #[cfg(target_os = "macos")]
+        win.set_simple_fullscreen(on)
+            .or_else(|_| win.set_fullscreen(on))
+            .map_err(|e| e.to_string())?;
+        #[cfg(not(target_os = "macos"))]
+        win.set_fullscreen(on).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -305,7 +454,7 @@ pub fn browser_screenshot(
 
     // macOS: screencapture region grab. Windows: a tiny PowerShell .NET capture
     // of the same on-screen rect to a temp PNG (no extra crates).
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
         let path = format!("/tmp/cockpit-shot-{epoch}.png");
         let status = std::process::Command::new("/usr/sbin/screencapture")
@@ -354,6 +503,11 @@ pub fn browser_screenshot(
             ));
         }
         Ok(path)
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        Err("browser screenshots are macos/windows-only right now".into())
     }
 }
 
@@ -522,46 +676,100 @@ pub fn browser_copy_selection(app: AppHandle, label: String) -> Result<(), Strin
 }
 
 /// Reads the system clipboard as text — the receive end of the clipboard-bridge.
-/// macOS: `pbpaste`. The frontend polls this and filters for the `AIOS_ANNOT:`
-/// sentinel, so unrelated clipboard contents are ignored.
-///
-/// Windows fallback (not compiled here — macOS-only build): run
-/// `powershell -NoProfile -Command Get-Clipboard` and read its stdout instead.
-/// Linux fallback: `xclip -selection clipboard -o` (or `wl-paste`).
+/// The frontend polls this and filters for the `AIOS_ANNOT:` sentinel, so
+/// unrelated clipboard contents are ignored.
 #[tauri::command]
 pub fn read_clipboard() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("/usr/bin/pbpaste");
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("powershell.exe");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"]);
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c
+    };
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.args([
+            "-c",
+            "command -v wl-paste >/dev/null 2>&1 && wl-paste || xclip -selection clipboard -o",
+        ]);
+        c
+    };
+    let out = cmd
+        .output()
+        .map_err(|e| format!("clipboard read failed to launch: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "clipboard read exited with {}",
+            out.status.code().unwrap_or(-1)
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    #[cfg(windows)]
+    return Ok(text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text)
+        .to_string());
     #[cfg(not(windows))]
-    {
-        let out = std::process::Command::new("/usr/bin/pbpaste")
-            .output()
-            .map_err(|e| format!("pbpaste failed to launch: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("pbpaste exited with {}", out.status.code().unwrap_or(-1)));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(text.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_browser_pane_keeps_the_source_profile() {
+        let url = Url::parse("https://example.com/path").unwrap();
+        assert_eq!(
+            browser_new_pane(&url, &Some("work".into())),
+            BrowserNewPane {
+                url: "https://example.com/path".into(),
+                profile: Some("work".into()),
+            }
+        );
     }
 
-    #[cfg(windows)]
-    {
-        // `Get-Clipboard -Raw` returns the clipboard text verbatim. PowerShell
-        // appends a trailing CRLF; strip one so the `AIOS_ANNOT:` sentinel match
-        // (and any exact comparisons) behave like pbpaste.
-        let mut cmd = std::process::Command::new("powershell.exe");
-        cmd.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-Clipboard -Raw",
-        ]);
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let out = cmd
-            .output()
-            .map_err(|e| format!("Get-Clipboard failed to launch: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("Get-Clipboard exited with {}", out.status.code().unwrap_or(-1)));
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        Ok(text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(&text).to_string())
+    #[test]
+    fn standard_adblock_rules_are_valid_webkit_content_rules() {
+        let rules = standard_adblock_content_rules_json();
+        let parsed: serde_json::Value = serde_json::from_str(&rules).unwrap();
+        let rules = parsed.as_array().unwrap();
+
+        assert!(rules.iter().any(|rule| {
+            rule.pointer("/trigger/url-filter")
+                .and_then(|v| v.as_str())
+                .is_some_and(|filter| {
+                    filter.contains("doubleclick")
+                        && filter.contains("googlesyndication")
+                        && filter.contains("googletagmanager")
+                        && filter.contains("taboola")
+                })
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule.pointer("/action/type") == Some(&serde_json::Value::String("css-display-none".into()))
+                && rule.pointer("/action/selector").and_then(|v| v.as_str()).is_some_and(|selector| {
+                    selector.contains("[id*=\"ad-\"]") && selector.contains(".google-auto-placed")
+                })
+        }));
+    }
+
+    #[test]
+    fn standard_adblock_rules_block_watchseries_pop_ad_network() {
+        let rules = standard_adblock_content_rules_json();
+        let parsed: serde_json::Value = serde_json::from_str(&rules).unwrap();
+        let rules = parsed.as_array().unwrap();
+
+        assert!(rules.iter().any(|rule| {
+            rule.pointer("/trigger/url-filter")
+                .and_then(|v| v.as_str())
+                .is_some_and(|filter| filter.contains("acscdn"))
+                && rule.pointer("/action/type") == Some(&serde_json::Value::String("block".into()))
+        }));
     }
 }

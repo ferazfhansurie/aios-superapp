@@ -4,7 +4,7 @@
  *  (schema → table → rows + ad-hoc SQL) right alongside it.
  *
  *  Layout: connections rail (left) | active source (right). */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   Brain,
@@ -38,11 +38,10 @@ import {
   type QueryResult,
   type TableInfo,
 } from "../lib/db";
-import { MemoryView } from "./MemoryPane";
-
 const MEMORY_ID = "__memory__";
+const MemoryView = lazy(() => import("./MemoryPane").then((m) => ({ default: m.MemoryView })));
 
-export function DatabasePane() {
+export function DatabasePane({ onOpenUrl }: { onOpenUrl?: (url: string) => void } = {}) {
   const [conns, setConns] = useState<ConnMeta[]>([]);
   const [activeId, setActiveId] = useState<string>(MEMORY_ID);
   const [adding, setAdding] = useState(false);
@@ -112,7 +111,13 @@ export function DatabasePane() {
 
       {/* active source */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {activeId === MEMORY_ID ? <MemoryView /> : active ? <SqlView conn={active} /> : null}
+        {activeId === MEMORY_ID ? (
+          <Suspense fallback={<PaneLoadState label="loading memory graph" />}>
+            <MemoryView onOpenUrl={onOpenUrl} />
+          </Suspense>
+        ) : active ? (
+          <SqlView conn={active} />
+        ) : null}
       </div>
 
       {adding && (
@@ -125,6 +130,16 @@ export function DatabasePane() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+function PaneLoadState({ label }: { label: string }) {
+  return (
+    <div className="grid h-full place-items-center bg-[var(--color-bg)]">
+      <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--color-faint)]">
+        {label}
+      </span>
     </div>
   );
 }
@@ -184,6 +199,19 @@ interface RowDraft {
   values: Record<string, string | null>;
 }
 
+function firstSqlWord(sql: string): string {
+  return sql
+    .trimStart()
+    .replace(/^\uFEFF/, "")
+    .replace(/^[\s(]+/, "")
+    .match(/^[a-z]+/i)?.[0]
+    ?.toLowerCase() ?? "";
+}
+
+function isReadonlySql(sql: string): boolean {
+  return ["select", "with", "show", "table", "explain", "describe", "desc"].includes(firstSqlWord(sql));
+}
+
 function SqlView({ conn }: { conn: ConnMeta }) {
   const [tables, setTables] = useState<TableInfo[] | null>(null);
   const [tablesErr, setTablesErr] = useState<string | null>(null);
@@ -197,8 +225,10 @@ function SqlView({ conn }: { conn: ConnMeta }) {
   const [draft, setDraft] = useState<RowDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [writeMode, setWriteMode] = useState(false);
 
   const canEdit = conn.kind === "postgres";
+  const canWrite = canEdit && writeMode;
   const pkCols = useMemo(() => cols.filter((c) => c.is_pk).map((c) => c.name), [cols]);
 
   const loadTables = useCallback(async () => {
@@ -218,6 +248,7 @@ function SqlView({ conn }: { conn: ConnMeta }) {
     setSql("");
     setDraft(null);
     setCols([]);
+    setWriteMode(false);
     loadTables();
   }, [conn.id, loadTables]);
 
@@ -252,10 +283,16 @@ function SqlView({ conn }: { conn: ConnMeta }) {
 
   const runSql = async () => {
     if (!sql.trim()) return;
+    const mutating = !isReadonlySql(sql);
+    if (mutating && !writeMode) {
+      setResultErr("write query blocked: enable write mode to run mutating SQL");
+      return;
+    }
+    if (mutating && !confirm(`run write query on ${conn.name}?\n\n${sql.trim().slice(0, 240)}`)) return;
     setLoading(true);
     setResultErr(null);
     try {
-      setResult(await dbQuery(conn.id, sql));
+      setResult(await dbQuery(conn.id, sql, writeMode));
     } catch (e) {
       setResultErr(e instanceof Error ? e.message : String(e));
       setResult(null);
@@ -268,7 +305,7 @@ function SqlView({ conn }: { conn: ConnMeta }) {
     v === null || v === undefined ? null : typeof v === "object" ? JSON.stringify(v) : String(v);
 
   const startEdit = (row: Record<string, unknown>) => {
-    if (!canEdit || pkCols.length === 0) return;
+    if (!canWrite || pkCols.length === 0) return;
     const pk: Record<string, unknown> = {};
     pkCols.forEach((c) => (pk[c] = row[c]));
     const values: Record<string, string | null> = {};
@@ -277,7 +314,7 @@ function SqlView({ conn }: { conn: ConnMeta }) {
   };
 
   const startInsert = () => {
-    if (!canEdit || !sel) return;
+    if (!canWrite || !sel) return;
     const values: Record<string, string | null> = {};
     cols.forEach((c) => (values[c.name] = null));
     setDraft({ pk: null, values });
@@ -285,6 +322,10 @@ function SqlView({ conn }: { conn: ConnMeta }) {
 
   const saveDraft = async () => {
     if (!draft || !sel) return;
+    if (!writeMode) {
+      setNotice("write mode is off");
+      return;
+    }
     setBusy(true);
     setNotice(null);
     try {
@@ -317,7 +358,7 @@ function SqlView({ conn }: { conn: ConnMeta }) {
   };
 
   const deleteRow = async (row: Record<string, unknown>) => {
-    if (!canEdit || !sel || pkCols.length === 0) return;
+    if (!canWrite || !sel || pkCols.length === 0) return;
     const pk: Record<string, unknown> = {};
     pkCols.forEach((c) => (pk[c] = row[c]));
     if (!confirm(`delete this row from ${sel.name}?\n${JSON.stringify(pk)}`)) return;
@@ -339,7 +380,7 @@ function SqlView({ conn }: { conn: ConnMeta }) {
     return (tables ?? []).filter((t) => !f || `${t.schema}.${t.name}`.toLowerCase().includes(f));
   }, [tables, filter]);
 
-  const editable = canEdit && pkCols.length > 0;
+  const editable = canWrite && pkCols.length > 0;
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -403,6 +444,18 @@ function SqlView({ conn }: { conn: ConnMeta }) {
           />
           <div className="flex shrink-0 flex-col gap-1">
             <button
+              onClick={() => setWriteMode((v) => !v)}
+              disabled={!canEdit}
+              className={`rounded border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                writeMode
+                  ? "border-[var(--color-warning)]/70 bg-[var(--color-warning)]/10 text-[var(--color-warning)]"
+                  : "border-[var(--color-border)] text-[var(--color-muted)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+              } disabled:opacity-40`}
+              title={canEdit ? "toggle database write mode" : "row writes are postgres-only"}
+            >
+              {writeMode ? "write on" : "readonly"}
+            </button>
+            <button
               onClick={runSql}
               disabled={loading}
               className="flex items-center justify-center gap-1 rounded bg-[var(--color-accent)] px-2.5 py-1 text-[11px] font-medium text-white disabled:opacity-50"
@@ -410,7 +463,7 @@ function SqlView({ conn }: { conn: ConnMeta }) {
             >
               <Play size={12} /> run
             </button>
-            {sel && editable && (
+            {sel && canWrite && pkCols.length > 0 && (
               <button
                 onClick={startInsert}
                 className="flex items-center justify-center gap-1 rounded border border-[var(--color-border)] px-2.5 py-1 text-[11px] hover:border-[var(--color-accent)]/50"
@@ -426,7 +479,12 @@ function SqlView({ conn }: { conn: ConnMeta }) {
             {notice}
           </div>
         )}
-        {sel && canEdit && pkCols.length === 0 && cols.length > 0 && (
+        {sel && canEdit && !writeMode && (
+          <div className="shrink-0 px-3 py-1 text-[10px] text-[var(--color-faint)]">
+            readonly mode — enable write mode to insert, edit, delete, or run mutating SQL
+          </div>
+        )}
+        {sel && canEdit && writeMode && pkCols.length === 0 && cols.length > 0 && (
           <div className="shrink-0 px-3 py-1 text-[10px] text-[var(--color-faint)]">
             no primary key on this table — rows are read-only
           </div>

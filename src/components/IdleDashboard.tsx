@@ -32,23 +32,33 @@ import {
   ArrowRight,
   Battery,
   BatteryCharging,
+  ChevronDown,
+  ChevronUp,
   Cpu,
+  Eye,
+  EyeOff,
   Flame,
-  MessageCircle,
-  MessageSquare,
+  FolderGit2,
+  GitBranch,
+  Globe,
+  Layers,
+  Maximize2,
   Radio,
+  RotateCcw,
   Search,
+  SlidersHorizontal,
   Target,
   Zap,
 } from "lucide-react";
 
 import type { AppDef } from "../App";
 import type { OracleInfo } from "../lib/pty";
-import type { ChatSessionInfo } from "../lib/chat";
-import type { Customer } from "../lib/inbox";
+import type { ProjectInfo } from "../lib/run";
+import type { SidebarState, SidebarItem } from "../lib/sidebar";
+import { gitPulse, type RepoPulse } from "../lib/fs";
 import { deviceStats, type DeviceStats } from "../lib/device";
 import { usageExtras, type UsageExtras } from "../lib/stats";
-import { getSetting } from "../lib/settings";
+import { loadMoneyAgentSummaries, type MoneyAgentSummary } from "../lib/moneyAgents";
 import {
   idleRate,
   memoryFocus,
@@ -56,32 +66,85 @@ import {
   type IdleRate,
   type MemoryFocus,
 } from "../lib/dashboard";
+import {
+  DEFAULT_IDLE_WIDGETS,
+  IDLE_WIDGET_LABELS,
+  cycleIdleWidgetSize,
+  moveIdleWidget,
+  normalizeIdleWidgets,
+  toggleIdleWidget,
+  type IdleWidgetConfig,
+  type IdleWidgetId,
+  type IdleWidgetSize,
+} from "../lib/idleDashboardLayout";
+import type { AiosNotification } from "../lib/notifications";
+import { IdleControlCenter } from "./IdleControlCenter";
 
 interface IdleDashboardProps {
   apps: AppDef[];
   oracles: OracleInfo[];
-  chats: ChatSessionInfo[];
-  customers: Customer[];
+  projects: ProjectInfo[];
+  sidebar: SidebarState;
   onSpawn: (kind: AppDef["kind"], label: string) => void;
   onAttachOracle: (identity: string) => void;
-  onResumeChat: (s: ChatSessionInfo) => void;
+  onOpenProject: (p: ProjectInfo) => void;
+  onOpenSidebarItem: (item: SidebarItem) => void;
+  onRevealSidebar: () => void;
+  onOpenMoneyAgents: () => void;
+  onOpenPet: () => void;
+  onOpenMoneyAgentChat: (id: string, label: string, command?: string) => void;
   onOpenPalette: () => void;
+  notifications: AiosNotification[];
+  onTalkToJarvis: (seed: string) => void;
+  onOpenNotificationTarget: (item: AiosNotification) => void;
+  onClearNotification: (id: string) => void;
 }
+
+const IDLE_LAYOUT_KEY = "aios.idleDashboard.widgets";
+
+const widgetSizeClasses: Record<IdleWidgetSize, string> = {
+  compact: "col-span-1 row-span-1",
+  standard: "col-span-2 row-span-1",
+  wide: "col-span-3 row-span-1",
+  hero: "col-span-3 row-span-2",
+};
 
 export function IdleDashboard({
   apps,
   oracles,
-  chats,
-  customers,
+  projects,
+  sidebar,
   onSpawn,
   onAttachOracle,
-  onResumeChat,
+  onOpenProject,
+  onOpenSidebarItem,
+  onRevealSidebar,
+  onOpenMoneyAgents,
+  onOpenPet,
+  onOpenMoneyAgentChat,
   onOpenPalette,
+  notifications,
+  onTalkToJarvis,
+  onOpenNotificationTarget,
+  onClearNotification,
 }: IdleDashboardProps) {
   const [extras, setExtras] = useState<UsageExtras | null>(null);
   const [rate, setRate] = useState<IdleRate | null>(null);
   const [focus, setFocus] = useState<MemoryFocus | null>(null);
   const [device, setDevice] = useState<DeviceStats | null>(null);
+  const [pulse, setPulse] = useState<RepoPulse[]>([]);
+  const [moneyAgents, setMoneyAgents] = useState<MoneyAgentSummary[]>([]);
+  const [customizing, setCustomizing] = useState(false);
+  const [widgets, setWidgets] = useState<IdleWidgetConfig[]>(() => {
+    try {
+      return normalizeIdleWidgets(JSON.parse(localStorage.getItem(IDLE_LAYOUT_KEY) ?? "null"));
+    } catch {
+      return DEFAULT_IDLE_WIDGETS;
+    }
+  });
+
+  // top recent projects by dir mtime — also the set the dev-pulse tile reports on.
+  const recent = [...projects].sort((a, b) => b.mtime - a.mtime).slice(0, 6);
 
   useEffect(() => {
     let alive = true;
@@ -90,6 +153,7 @@ export function IdleDashboard({
       idleRate().then((v) => alive && setRate(v)).catch(() => {});
       memoryFocus().then((v) => alive && setFocus(v)).catch(() => {});
       deviceStats().then((v) => alive && setDevice(v)).catch(() => {});
+      loadMoneyAgentSummaries().then((v) => alive && setMoneyAgents(v)).catch(() => {});
     };
     load();
     const t = setInterval(load, 30_000);
@@ -99,7 +163,223 @@ export function IdleDashboard({
     };
   }, []);
 
+  // dev-pulse: git summary for the recent projects (refreshes on the set + 30s).
+  useEffect(() => {
+    let alive = true;
+    const roots = recent.map((p) => p.root);
+    if (!roots.length) {
+      setPulse([]);
+      return;
+    }
+    const load = () => gitPulse(roots).then((v) => alive && setPulse(v)).catch(() => {});
+    load();
+    const t = setInterval(load, 30_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recent.map((p) => p.root).join("|")]);
+
+  return (
+    <IdleControlCenter
+      apps={apps}
+      oracles={oracles}
+      projects={projects}
+      sidebar={sidebar}
+      extras={extras}
+      rate={rate}
+      focus={focus}
+      pulse={pulse}
+      moneyAgents={moneyAgents}
+      notifications={notifications}
+      onSpawn={onSpawn}
+      onOpenProject={onOpenProject}
+      onOpenSidebarItem={onOpenSidebarItem}
+      onRevealSidebar={onRevealSidebar}
+      onOpenMoneyAgents={onOpenMoneyAgents}
+      onOpenPet={onOpenPet}
+      onOpenMoneyAgentChat={onOpenMoneyAgentChat}
+      onOpenPalette={onOpenPalette}
+      onTalkToJarvis={onTalkToJarvis}
+      onOpenNotificationTarget={onOpenNotificationTarget}
+      onClearNotification={onClearNotification}
+    />
+  );
+
   const awake = oracles.filter((o) => o.running).length;
+  const visibleWidgets = widgets.filter((widget) => widget.visible);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(IDLE_LAYOUT_KEY, JSON.stringify(widgets));
+    } catch {
+      /* ignore */
+    }
+  }, [widgets]);
+
+  const moveWidget = (id: IdleWidgetId, delta: -1 | 1) =>
+    setWidgets((cur) => moveIdleWidget(cur, id, delta));
+  const toggleWidget = (id: IdleWidgetId) =>
+    setWidgets((cur) => toggleIdleWidget(cur, id));
+  const cycleWidgetSize = (id: IdleWidgetId) =>
+    setWidgets((cur) => cycleIdleWidgetSize(cur, id));
+  const resetWidgets = () => setWidgets(DEFAULT_IDLE_WIDGETS);
+
+  const renderWidget = (widget: IdleWidgetConfig, index: number) => {
+    const delay = 40 + index * 40;
+    const controls = customizing ? (
+      <WidgetControls
+        id={widget.id}
+        visible={widget.visible}
+        size={widget.size}
+        onMove={moveWidget}
+        onToggle={toggleWidget}
+        onCycleSize={cycleWidgetSize}
+      />
+    ) : null;
+    const className = widgetSizeClasses[widget.size] ?? widgetSizeClasses.standard;
+
+    if (widget.id === "money") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          hero
+          icon={<Target size={12} className="text-[var(--color-success)]" />}
+          label="sales agents"
+          right={controls}
+          onClick={customizing ? undefined : onOpenMoneyAgents}
+        >
+          <MoneyAgentsBoard agents={moneyAgents} onOpenOverview={onOpenMoneyAgents} onOpenAgent={onOpenMoneyAgentChat} />
+        </Tile>
+      );
+    }
+    if (widget.id === "pulse") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          hero
+          icon={<Zap size={12} className="text-[var(--color-highlight)]" />}
+          label="pulse"
+          right={controls}
+          onClick={customizing ? undefined : () => onSpawn({ type: "pulse" }, "pulse")}
+        >
+          <Pulse extras={extras} rate={rate} focus={focus} />
+        </Tile>
+      );
+    }
+    if (widget.id === "projects") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          hero
+          icon={<FolderGit2 size={12} className="text-[var(--color-highlight)]" />}
+          label="projects"
+          right={controls}
+        >
+          <RecentProjects projects={recent} onOpen={onOpenProject} />
+        </Tile>
+      );
+    }
+    if (widget.id === "quick") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          icon={<Zap size={12} className="text-[var(--color-accent)]" />}
+          label="quick"
+          right={controls}
+        >
+          <QuickActions onSpawn={onSpawn} onOpenPalette={onOpenPalette} onRevealSidebar={onRevealSidebar} />
+        </Tile>
+      );
+    }
+    if (widget.id === "dev") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          icon={<GitBranch size={12} className="text-[var(--color-info)]" />}
+          label="dev pulse"
+          right={controls}
+        >
+          <DevPulse pulse={pulse} onOpen={(root) => {
+            const p = projects.find((x) => x.root === root);
+            if (p) onOpenProject(p);
+          }} />
+        </Tile>
+      );
+    }
+    if (widget.id === "pinned") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          icon={<Globe size={12} className="text-[var(--color-accent)]" />}
+          label="pinned"
+          right={controls}
+          onClick={customizing ? undefined : onRevealSidebar}
+        >
+          <PinnedSpaces sidebar={sidebar} onOpenItem={onOpenSidebarItem} onReveal={onRevealSidebar} />
+        </Tile>
+      );
+    }
+    if (widget.id === "apps") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          icon={<ArrowRight size={12} className="text-[var(--color-muted)]" />}
+          label="apps"
+          right={controls}
+        >
+          <AppDock apps={apps} onSpawn={onSpawn} />
+        </Tile>
+      );
+    }
+    if (widget.id === "device") {
+      return (
+        <Tile
+          key={widget.id}
+          className={className}
+          delay={delay}
+          icon={<Cpu size={12} className="text-[var(--color-info)]" />}
+          label="device"
+          right={controls}
+        >
+          <DeviceTile dev={device} />
+        </Tile>
+      );
+    }
+    return (
+      <Tile
+        key={widget.id}
+        className={className}
+        delay={delay}
+        icon={<Radio size={12} className="text-[var(--color-accent)]" />}
+        label="fleet"
+        right={
+          controls ?? (
+            <span className="font-mono text-[10px] text-[var(--color-muted)]">
+              <span className="text-[var(--color-accent)]">{awake}</span>/{oracles.length}
+            </span>
+          )
+        }
+      >
+        <FleetBoard oracles={oracles} onAttach={onAttachOracle} />
+      </Tile>
+    );
+  };
 
   return (
     <div className="relative flex h-full flex-col overflow-hidden p-4">
@@ -119,77 +399,61 @@ export function IdleDashboard({
       <div className="relative mb-4 flex shrink-0 items-center gap-4">
         <Greeting />
         <OmniInput onClick={onOpenPalette} />
+        <button
+          type="button"
+          onClick={() => setCustomizing((v) => !v)}
+          className={`aios-fade-in flex h-11 shrink-0 items-center gap-2 rounded-[var(--aios-radius-pill)] border px-3 text-[12px] transition-colors ${
+            customizing
+              ? "border-[var(--color-accent)]/50 bg-[var(--color-accent)]/10 text-[var(--color-text)]"
+              : "border-[var(--color-border)] bg-[var(--color-panel)]/60 text-[var(--color-muted)] hover:border-[var(--color-accent)]/40 hover:text-[var(--color-text)]"
+          }`}
+          title="customize idle dashboard"
+        >
+          <SlidersHorizontal size={14} />
+          customize
+        </button>
       </div>
 
+      {customizing && (
+        <div className="aios-fade-in relative mb-3 flex shrink-0 items-center gap-2 rounded-[var(--aios-radius-lg)] border border-[var(--color-border)] bg-[var(--color-panel)]/60 px-3 py-2 backdrop-blur">
+          <span className="text-[11px] text-[var(--color-muted)]">dashboard layout</span>
+          <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
+            {widgets.map((widget) => (
+              <button
+                key={widget.id}
+                onClick={() => toggleWidget(widget.id)}
+                className={`flex shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-[10px] transition-colors ${
+                  widget.visible
+                    ? "border-[var(--color-accent)]/35 bg-[var(--color-accent)]/10 text-[var(--color-text-2)]"
+                    : "border-[var(--color-border)] text-[var(--color-faint)]"
+                }`}
+              >
+                {widget.visible ? <Eye size={10} /> : <EyeOff size={10} />}
+                {IDLE_WIDGET_LABELS[widget.id]}
+                <span className="font-mono text-[9px] text-[var(--color-faint)]">{widget.size}</span>
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={resetWidgets}
+            className="flex shrink-0 items-center gap-1 rounded-md border border-[var(--color-border)] px-2 py-1 text-[10px] text-[var(--color-muted)] hover:border-[var(--color-accent)]/40 hover:text-[var(--color-text)]"
+          >
+            <RotateCcw size={11} />
+            reset
+          </button>
+        </div>
+      )}
+
       {/* ── bento grid ───────────────────────────────────────────────────── */}
-      <div className="relative grid min-h-0 flex-1 grid-cols-6 grid-rows-3 gap-3">
-        {/* PULSE — hero (c1-3, r1-2) — click opens the full pulse detail pane */}
-        <Tile
-          className="col-span-3 row-span-2"
-          delay={40}
-          icon={<Zap size={12} className="text-[var(--color-highlight)]" />}
-          label="pulse"
-          onClick={() => onSpawn({ type: "pulse" }, "pulse")}
-        >
-          <Pulse extras={extras} rate={rate} focus={focus} />
-        </Tile>
-
-        {/* CONTINUE — hero (c4-6, r1) */}
-        <Tile
-          className="col-span-3"
-          delay={80}
-          icon={<MessageSquare size={12} className="text-[var(--color-highlight)]" />}
-          label="continue"
-        >
-          <ContinueRail chats={chats} onResume={onResumeChat} onNew={() => onSpawn({ type: "chat" }, "chat")} />
-        </Tile>
-
-        {/* INBOX (c4-5, r2) */}
-        <Tile
-          className="col-span-2"
-          delay={120}
-          icon={<MessageCircle size={12} className="text-[var(--color-info)]" />}
-          label="inbox"
-          right={customers.length ? <span className="font-mono text-[10px] text-[var(--color-muted)]">{customers.length}</span> : undefined}
-          onClick={() => onSpawn({ type: "customers" }, "customers")}
-        >
-          <InboxGlance customers={customers} />
-        </Tile>
-
-        {/* FOCUS (c6, r2) */}
-        <Tile
-          className="col-span-1"
-          delay={160}
-          icon={<Target size={12} className="text-[var(--color-accent)]" />}
-          label="focus"
-        >
-          <FocusGlance focus={focus} />
-        </Tile>
-
-        {/* APPS — launch dock (c1-3, r3) */}
-        <Tile className="col-span-3" delay={200} icon={<ArrowRight size={12} className="text-[var(--color-muted)]" />} label="apps">
-          <AppDock apps={apps} onSpawn={onSpawn} />
-        </Tile>
-
-        {/* DEVICE — laptop monitor (c4-5, r3) */}
-        <Tile className="col-span-2" delay={240} icon={<Cpu size={12} className="text-[var(--color-info)]" />} label="device">
-          <DeviceTile dev={device} />
-        </Tile>
-
-        {/* FLEET — oracle roster (c6, r3) */}
-        <Tile
-          className="col-span-1"
-          delay={280}
-          icon={<Radio size={12} className="text-[var(--color-accent)]" />}
-          label="fleet"
-          right={
-            <span className="font-mono text-[10px] text-[var(--color-muted)]">
-              <span className="text-[var(--color-accent)]">{awake}</span>/{oracles.length}
-            </span>
-          }
-        >
-          <FleetBoard oracles={oracles} onAttach={onAttachOracle} />
-        </Tile>
+      <div className="relative grid min-h-0 flex-1 grid-cols-6 auto-rows-[minmax(128px,1fr)] gap-3 overflow-y-auto pr-1">
+        {visibleWidgets.length > 0 ? (
+          visibleWidgets.map(renderWidget)
+        ) : (
+          <Tile className="col-span-6 row-span-3" label="dashboard" delay={40}>
+            <Empty>all widgets hidden · use customize to bring one back</Empty>
+          </Tile>
+        )}
       </div>
 
       <span className="pointer-events-none absolute bottom-1.5 right-4 font-mono text-[10px] tracking-wide text-[var(--color-faint)]">
@@ -209,6 +473,7 @@ function Tile({
   children,
   className,
   delay = 0,
+  hero = false,
 }: {
   label: string;
   icon?: ReactNode;
@@ -217,6 +482,7 @@ function Tile({
   children: ReactNode;
   className?: string;
   delay?: number;
+  hero?: boolean;
 }) {
   const interactive = !!onClick;
   return (
@@ -226,17 +492,70 @@ function Tile({
       onClick={onClick}
       onKeyDown={interactive ? (e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onClick!()) : undefined}
       style={{ animationDelay: `${delay}ms` }}
-      className={`aios-fade-in flex min-h-0 min-w-0 flex-col rounded-[var(--aios-radius-lg)] border border-[var(--color-border)] bg-[var(--color-panel)]/45 p-3 backdrop-blur-sm ${
-        interactive ? "cursor-pointer transition-all hover:-translate-y-0.5 hover:border-[var(--color-border-strong)] hover:bg-[var(--color-panel)]/75" : ""
-      } ${className ?? ""}`}
+      className={`aios-tile aios-fade-in flex min-h-0 min-w-0 flex-col p-3.5 backdrop-blur-md ${
+        hero ? "aios-tile--hero" : ""
+      } ${interactive ? "aios-tile--int" : ""} ${className ?? ""}`}
     >
-      <div className="mb-2 flex shrink-0 items-center gap-1.5">
+      <div className="relative mb-2.5 flex shrink-0 items-center gap-1.5">
         {icon}
-        <span className="text-[10px] font-medium uppercase tracking-[0.16em] text-[var(--color-muted)]">{label}</span>
+        <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--color-muted)]">{label}</span>
         {right != null && <span className="ml-auto">{right}</span>}
       </div>
-      <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
+      <div className="relative min-h-0 flex-1 overflow-hidden">{children}</div>
     </div>
+  );
+}
+
+function WidgetControls({
+  id,
+  visible,
+  size,
+  onMove,
+  onToggle,
+  onCycleSize,
+}: {
+  id: IdleWidgetId;
+  visible: boolean;
+  size: IdleWidgetSize;
+  onMove: (id: IdleWidgetId, delta: -1 | 1) => void;
+  onToggle: (id: IdleWidgetId) => void;
+  onCycleSize: (id: IdleWidgetId) => void;
+}) {
+  return (
+    <span className="ml-auto flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        onClick={() => onMove(id, -1)}
+        className="rounded p-0.5 text-[var(--color-faint)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+        title={`move ${IDLE_WIDGET_LABELS[id]} earlier`}
+      >
+        <ChevronUp size={12} />
+      </button>
+      <button
+        type="button"
+        onClick={() => onCycleSize(id)}
+        className="rounded p-0.5 text-[var(--color-faint)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+        title={`${IDLE_WIDGET_LABELS[id]} size · ${size}`}
+      >
+        <Maximize2 size={12} />
+      </button>
+      <button
+        type="button"
+        onClick={() => onMove(id, 1)}
+        className="rounded p-0.5 text-[var(--color-faint)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+        title={`move ${IDLE_WIDGET_LABELS[id]} later`}
+      >
+        <ChevronDown size={12} />
+      </button>
+      <button
+        type="button"
+        onClick={() => onToggle(id)}
+        className="rounded p-0.5 text-[var(--color-faint)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+        title={`${visible ? "hide" : "show"} ${IDLE_WIDGET_LABELS[id]}`}
+      >
+        {visible ? <Eye size={12} /> : <EyeOff size={12} />}
+      </button>
+    </span>
   );
 }
 
@@ -250,11 +569,12 @@ function Greeting() {
   }, []);
   const h = now.getHours();
   const part = h < 5 ? "still up" : h < 12 ? "good morning" : h < 18 ? "good afternoon" : "good evening";
-  const name = (getSetting("userName") || "").trim() || "there";
   return (
     <div className="aios-fade-in flex shrink-0 flex-col">
-      <span className="text-[18px] font-medium leading-tight tracking-tight text-[var(--color-text)]">{part}, {name}</span>
-      <span className="font-mono text-[11px] text-[var(--color-muted)]">
+      <span className="text-[22px] font-semibold leading-tight tracking-tight text-[var(--color-text)]">
+        {part}, <span className="aios-greet-name">firaz</span>
+      </span>
+      <span className="mt-0.5 font-mono text-[11px] tracking-wide text-[var(--color-muted)]">
         {now.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }).toLowerCase()}
       </span>
     </div>
@@ -266,13 +586,154 @@ function OmniInput({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="aios-fade-in group flex h-10 flex-1 items-center gap-2.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-4 text-left backdrop-blur-sm transition-colors hover:border-[var(--color-border-strong)] hover:bg-[var(--color-panel)]/80"
+      className="aios-omni aios-fade-in group flex h-11 flex-1 items-center gap-3 rounded-[var(--aios-radius-pill)] px-4 text-left backdrop-blur-md"
       style={{ animationDelay: "20ms" }}
     >
-      <Search size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
+      <Search size={16} className="shrink-0 text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]" />
       <span className="flex-1 truncate text-[13px] text-[var(--color-faint)]">launch, ask, or resume anything…</span>
       <kbd className="shrink-0 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-muted)]">⌘K</kbd>
     </button>
+  );
+}
+
+function QuickActions({
+  onSpawn,
+  onOpenPalette,
+  onRevealSidebar,
+}: {
+  onSpawn: (kind: AppDef["kind"], label: string) => void;
+  onOpenPalette: () => void;
+  onRevealSidebar: () => void;
+}) {
+  const actions: Array<{
+    label: string;
+    hint: string;
+    icon: ReactNode;
+    run: () => void;
+  }> = [
+    {
+      label: "new chat",
+      hint: "ask aios",
+      icon: <Zap size={13} />,
+      run: () => onSpawn({ type: "chat" }, "chat"),
+    },
+    {
+      label: "terminal",
+      hint: "shell pane",
+      icon: <GitBranch size={13} />,
+      run: () => onSpawn({ type: "shell" }, "terminal"),
+    },
+    {
+      label: "browser",
+      hint: "web pane",
+      icon: <Globe size={13} />,
+      run: () => onSpawn({ type: "browser" }, "browser"),
+    },
+    {
+      label: "palette",
+      hint: "all commands",
+      icon: <Search size={13} />,
+      run: onOpenPalette,
+    },
+    {
+      label: "rail",
+      hint: "spaces",
+      icon: <Layers size={13} />,
+      run: onRevealSidebar,
+    },
+  ];
+
+  return (
+    <div className="grid h-full grid-cols-1 content-start gap-1 overflow-y-auto">
+      {actions.map((action) => (
+        <button
+          key={action.label}
+          type="button"
+          onClick={action.run}
+          className="group flex items-center gap-2 rounded-md border border-transparent bg-[var(--color-panel-2)]/30 px-2 py-1.5 text-left transition-colors hover:border-[var(--color-accent)]/30 hover:bg-[var(--color-panel-2)]"
+        >
+          <span className="text-[var(--color-muted)] group-hover:text-[var(--color-accent)]">{action.icon}</span>
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--color-text-2)]">{action.label}</span>
+          <span className="hidden shrink-0 font-mono text-[9px] text-[var(--color-faint)] xl:inline">{action.hint}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── MONEY AGENTS ─────────────────────────────────────────────────────────────
+
+function moneyHealthColor(health: MoneyAgentSummary["health"]): string {
+  if (health === "running") return "var(--color-success)";
+  if (health === "scheduled") return "var(--color-info)";
+  if (health === "needs-steer") return "var(--color-warning)";
+  if (health === "failed") return "var(--color-danger)";
+  return "var(--color-faint)";
+}
+
+function MoneyAgentsBoard({
+  agents,
+  onOpenOverview,
+  onOpenAgent,
+}: {
+  agents: MoneyAgentSummary[];
+  onOpenOverview: () => void;
+  onOpenAgent: (id: string, label: string, command?: string) => void;
+}) {
+  if (!agents.length) {
+    return (
+      <button
+        onClick={onOpenOverview}
+        className="flex h-full w-full items-center justify-center rounded-md text-[11.5px] text-[var(--color-faint)] hover:text-[var(--color-text)]"
+      >
+        open agent monitor
+      </button>
+    );
+  }
+  const running = agents.filter((agent) => agent.health === "running" || agent.health === "scheduled").length;
+  const needsSteer = agents.filter((agent) => agent.health === "needs-steer" || agent.health === "failed").length;
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-2">
+      <div className="grid grid-cols-3 gap-2">
+        <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-2">
+          <b className="block text-[18px] text-[var(--color-text)]">{running}</b>
+          <span className="font-mono text-[9.5px] uppercase tracking-wider text-[var(--color-muted)]">active loops</span>
+        </div>
+        <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-2">
+          <b className="block text-[18px] text-[var(--color-text)]">{needsSteer}</b>
+          <span className="font-mono text-[9.5px] uppercase tracking-wider text-[var(--color-muted)]">needs steer</span>
+        </div>
+        <button
+          type="button"
+          onClick={onOpenOverview}
+          className="rounded-md border border-[var(--color-accent)]/30 bg-[var(--color-accent-soft)] px-2 py-2 text-left text-[11px] text-[var(--color-text)] hover:border-[var(--color-accent)]/60"
+        >
+          monitor all
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {agents.map((agent) => (
+          <button
+            key={agent.id}
+            type="button"
+            onClick={() => onOpenAgent(agent.id, agent.label)}
+            className="group flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-[var(--color-panel-2)]"
+            title={`open ${agent.label} chatpane · ${agent.nextAction}`}
+          >
+            <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: moneyHealthColor(agent.health) }} />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-[12.5px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+                {agent.label}
+              </span>
+              <span className="block truncate font-mono text-[9.5px] text-[var(--color-faint)]">
+                {agent.currentJob}
+              </span>
+            </span>
+            <span className="shrink-0 font-mono text-[10px] text-[var(--color-muted)]">{agent.primaryMetric}</span>
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -314,8 +775,7 @@ function FleetBoard({ oracles, onAttach }: { oracles: OracleInfo[]; onAttach: (i
   );
 }
 
-// ── CONTINUE ──────────────────────────────────────────────────────────────────
-
+// ── relative-time helper ────────────────────────────────────────────────────
 function ago(ts: number): string {
   if (!ts) return "";
   const ms = ts > 1e12 ? ts : ts * 1000;
@@ -328,76 +788,122 @@ function ago(ts: number): string {
   return `${Math.floor(hh / 24)}d`;
 }
 
-function ContinueRail({
-  chats,
-  onResume,
-  onNew,
-}: {
-  chats: ChatSessionInfo[];
-  onResume: (s: ChatSessionInfo) => void;
-  onNew: () => void;
-}) {
-  if (!chats.length) {
-    return (
-      <button onClick={onNew} className="flex h-full w-full items-center justify-center rounded-md text-[12px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]">
-        no recent chats · start one →
-      </button>
-    );
-  }
+// ── PROJECTS (recent repos) ───────────────────────────────────────────────────
+
+function RecentProjects({ projects, onOpen }: { projects: ProjectInfo[]; onOpen: (p: ProjectInfo) => void }) {
+  if (!projects.length) return <Empty>no projects under ~/Repo</Empty>;
   return (
     <div className="flex h-full flex-col gap-0.5 overflow-y-auto pr-0.5">
-      {chats.slice(0, 6).map((c) => (
+      {projects.map((p) => (
         <button
-          key={c.id}
-          onClick={() => onResume(c)}
-          title={`resume · ${c.cwd}`}
+          key={p.root}
+          onClick={() => onOpen(p)}
+          title={`open terminal in ${p.root}`}
           className="group flex items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--color-panel-2)]"
         >
+          <FolderGit2 size={13} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-accent)]" />
           <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
-            {c.title || "untitled chat"}
+            {p.name}
           </span>
-          {c.cwd && (
-            <span className="hidden shrink-0 truncate font-mono text-[10px] text-[var(--color-faint)] sm:inline">
-              {c.cwd.split("/").pop()}
-            </span>
-          )}
-          <span className="shrink-0 font-mono text-[10px] text-[var(--color-muted)]">{ago(c.mtime)}</span>
+          <span className="shrink-0 font-mono text-[9px] uppercase tracking-wider text-[var(--color-faint)]">{p.kind}</span>
+          <span className="shrink-0 font-mono text-[10px] text-[var(--color-muted)]">{ago(p.mtime)}</span>
         </button>
       ))}
     </div>
   );
 }
 
-// ── INBOX ─────────────────────────────────────────────────────────────────────
+// ── DEV PULSE (git state across recent repos) ─────────────────────────────────
 
-function InboxGlance({ customers }: { customers: Customer[] }) {
-  if (!customers.length) return <Empty>inbox clear</Empty>;
+function DevPulse({ pulse, onOpen }: { pulse: RepoPulse[]; onOpen: (root: string) => void }) {
+  if (!pulse.length) return <Empty>no repos to track</Empty>;
   return (
-    <div className="flex h-full flex-col gap-0.5 overflow-hidden">
-      {customers.slice(0, 4).map((c) => (
-        <div key={c.id} className="flex items-center gap-2 rounded-md px-1.5 py-1">
-          <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--color-text-2)]">{c.name}</span>
-          {c.lastAgo && <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">{c.lastAgo}</span>}
-        </div>
+    <div className="flex h-full flex-col gap-0.5 overflow-y-auto pr-0.5">
+      {pulse.map((r) => (
+        <button
+          key={r.root}
+          onClick={() => onOpen(r.root)}
+          title={`${r.dirty} change${r.dirty === 1 ? "" : "s"} · ${r.branch || "—"}`}
+          className="group flex items-center gap-2 rounded-md px-2 py-1 text-left transition-colors hover:bg-[var(--color-panel-2)]"
+        >
+          <span
+            className={`h-1.5 w-1.5 shrink-0 rounded-full`}
+            style={{ background: r.dirty > 0 ? "var(--color-warning)" : "var(--color-success)" }}
+          />
+          <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+            {r.name}
+          </span>
+          {r.branch && (
+            <span className="hidden shrink-0 truncate font-mono text-[9.5px] text-[var(--color-faint)] sm:inline" style={{ maxWidth: 90 }}>
+              {r.branch}
+            </span>
+          )}
+          <span className="shrink-0 font-mono text-[10px]" style={{ color: r.dirty > 0 ? "var(--color-warning)" : "var(--color-faint)" }}>
+            {r.dirty > 0 ? `${r.dirty}∆` : "clean"}
+            {(r.ahead > 0 || r.behind > 0) && (
+              <span className="ml-1 text-[var(--color-muted)]">
+                {r.ahead > 0 ? `↑${r.ahead}` : ""}
+                {r.behind > 0 ? `↓${r.behind}` : ""}
+              </span>
+            )}
+          </span>
+        </button>
       ))}
     </div>
   );
 }
 
-// ── FOCUS ─────────────────────────────────────────────────────────────────────
+// ── PINNED + SPACES ───────────────────────────────────────────────────────────
 
-function FocusGlance({ focus }: { focus: MemoryFocus | null }) {
-  if (!focus?.title) return <Empty>no recent memory</Empty>;
+function PinnedSpaces({
+  sidebar,
+  onOpenItem,
+  onReveal,
+}: {
+  sidebar: SidebarState;
+  onOpenItem: (item: SidebarItem) => void;
+  onReveal: () => void;
+}) {
+  const links = sidebar.items.filter((it) => it.kind.type === "link" && !it.hidden);
+  // custom spaces (exclude the built-in tools/pinned) with their item counts.
+  const customSpaces = sidebar.spaces.filter((s) => !s.system);
+  const countFor = (id: string) => sidebar.items.filter((it) => it.group === id && !it.hidden).length;
+  if (!links.length && !customSpaces.length) {
+    return (
+      <button onClick={onReveal} className="flex h-full w-full items-center justify-center rounded-md text-[11.5px] text-[var(--color-faint)] hover:text-[var(--color-text)]">
+        pin sites in the rail →
+      </button>
+    );
+  }
   return (
-    <div className="flex h-full flex-col justify-center gap-1">
-      {focus.tag && (
-        <span className="truncate text-[9px] uppercase tracking-[0.16em] text-[var(--color-accent)]" title={focus.tag}>
-          {focus.tag}
-        </span>
+    <div className="flex h-full flex-col gap-1 overflow-y-auto pr-0.5">
+      {links.slice(0, 4).map((it) => (
+        <button
+          key={it.id}
+          onClick={(e) => (e.stopPropagation(), onOpenItem(it))}
+          title={it.label}
+          className="group flex items-center gap-2 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-[var(--color-panel-2)]"
+        >
+          <Globe size={12} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-accent)]" />
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">{it.label}</span>
+        </button>
+      ))}
+      {customSpaces.length > 0 && (
+        <div className="mt-0.5 flex flex-wrap gap-1 border-t border-[var(--color-border)] pt-1.5">
+          {customSpaces.map((s) => (
+            <button
+              key={s.id}
+              onClick={(e) => (e.stopPropagation(), onReveal())}
+              title={`${s.name} space`}
+              className="flex items-center gap-1 rounded-full border border-[var(--color-border)] px-1.5 py-0.5 text-[9px] text-[var(--color-muted)] transition-colors hover:border-[var(--color-accent)]/40 hover:text-[var(--color-text)]"
+            >
+              <Layers size={9} className="shrink-0" />
+              <span className="truncate" style={{ maxWidth: 56 }}>{s.name}</span>
+              <span className="text-[var(--color-faint)]">{countFor(s.id)}</span>
+            </button>
+          ))}
+        </div>
       )}
-      <span className="line-clamp-4 text-[12px] leading-snug text-[var(--color-text-2)]" title={focus.title}>
-        {focus.title}
-      </span>
     </div>
   );
 }
@@ -483,6 +989,7 @@ function Ring({
 
 /** Compact number formatter for the pulse stat row: 1234 → 1.2k, 3.4M. */
 function fmtNum(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(n >= 10_000_000_000 ? 0 : 1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`;
   return String(n);
@@ -740,9 +1247,9 @@ function AppDock({ apps, onSpawn }: { apps: AppDef[]; onSpawn: (kind: AppDef["ki
           key={a.label}
           onClick={() => onSpawn(a.kind, a.label)}
           title={`new ${a.label}`}
-          className="group flex min-w-[68px] flex-1 flex-col items-center justify-center gap-1.5 rounded-[var(--aios-radius-md)] border border-transparent bg-[var(--color-panel-2)]/40 px-2 py-2 transition-all hover:-translate-y-0.5 hover:border-[var(--color-border)] hover:bg-[var(--color-panel-2)]"
+          className="group flex min-w-[68px] flex-1 flex-col items-center justify-center gap-1.5 rounded-[var(--aios-radius-lg)] border border-transparent bg-[var(--color-panel-2)]/35 px-2 py-2.5 transition-all duration-200 hover:-translate-y-0.5 hover:border-[color-mix(in_srgb,var(--color-accent)_30%,var(--color-border))] hover:bg-[var(--color-panel-2)] hover:shadow-[0_6px_18px_-8px_color-mix(in_srgb,var(--color-accent)_30%,transparent)]"
         >
-          <a.icon size={18} className="text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]" />
+          <a.icon size={19} className="text-[var(--color-muted)] transition-colors group-hover:text-[var(--color-accent)]" />
           <span className="text-[10.5px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">{a.label}</span>
         </button>
       ))}

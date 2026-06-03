@@ -5,6 +5,7 @@
  * Self-polls so spawns/kills elsewhere reflect automatically.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
 import {
   Check,
@@ -14,6 +15,7 @@ import {
   Pencil,
   Play,
   Plus,
+  Radio,
   RefreshCw,
   Terminal,
   Trash2,
@@ -30,11 +32,15 @@ import {
   type OracleInfo,
   type TmuxSession,
 } from "../lib/pty";
+import { isTauriRuntime } from "../lib/tauri";
 import { SidebarUsage } from "./SidebarUsage";
 
 interface Props {
+  iconsOnly?: boolean;
   onAttachOracle: (identity: string) => void;
   onAttachTmux: (socket: string, session: string) => void;
+  moneyAgentsSlot?: ReactNode;
+  chatpaneAgentsOnly?: boolean;
 }
 
 /**
@@ -56,7 +62,14 @@ const loadHidden = (): Set<string> => {
 
 const COLLAPSE_KEY = "aios.agentsCollapsed";
 
-export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
+export function OracleRoster({
+  iconsOnly = false,
+  onAttachOracle,
+  onAttachTmux,
+  moneyAgentsSlot,
+  chatpaneAgentsOnly = false,
+}: Props) {
+  const nativeReady = isTauriRuntime();
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -88,6 +101,12 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
 
   const refresh = useCallback(async () => {
     setError(null);
+    if (!nativeReady) {
+      setOracles([]);
+      setSessions([]);
+      setLoading(false);
+      return;
+    }
     try {
       const [o, s] = await Promise.all([listOracles(), listTmuxSessions()]);
       setOracles(o);
@@ -97,7 +116,7 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [nativeReady]);
 
   useEffect(() => {
     refresh();
@@ -128,6 +147,57 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
     }
   };
 
+  if (iconsOnly) {
+    if (chatpaneAgentsOnly) return <>{moneyAgentsSlot}</>;
+    return (
+      <div className="flex flex-col items-center gap-1 border-t border-[var(--color-border)] pt-2">
+        <button
+          onClick={toggleCollapsed}
+          className="grid h-8 w-8 place-items-center rounded-md text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          title={`agents (${oracles.length})`}
+        >
+          <Radio size={14} />
+        </button>
+        {!collapsed && nativeReady && !primaryRunning && (
+          <button
+            onClick={spawnPrimary}
+            disabled={spawning}
+            className="grid h-8 w-8 place-items-center rounded-md border border-dashed border-[var(--color-border)] text-[var(--color-accent)] transition-colors hover:border-[var(--color-accent)]/60 hover:bg-[var(--color-panel-2)] disabled:opacity-60"
+            title="spawn my oracle"
+          >
+            {spawning ? <RefreshCw size={13} className="animate-spin" /> : <Play size={13} />}
+          </button>
+        )}
+        {!collapsed &&
+          visibleOracles.slice(0, 8).map((o) => (
+            <button
+              key={o.session}
+              onClick={() => onAttachOracle(o.identity)}
+              className="grid h-8 w-8 place-items-center rounded-md transition-colors hover:bg-[var(--color-panel-2)]"
+              title={`attach ${o.display_name}`}
+            >
+              <span
+                className={`status-dot ${
+                  o.attached ? "status-dot--active" : o.running ? "status-dot--idle" : "status-dot--cold"
+                }`}
+              />
+            </button>
+          ))}
+        {!collapsed &&
+          otherSessions.slice(0, 4).map((s) => (
+            <button
+              key={`${s.socket}/${s.name}`}
+              onClick={() => onAttachTmux(s.socket, s.name)}
+              className="grid h-8 w-8 place-items-center rounded-md text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              title={`attach ${s.socket}:${s.name}`}
+            >
+              <Terminal size={13} />
+            </button>
+          ))}
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-3">
       {/* ---- oracles ---- */}
@@ -144,7 +214,7 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
               <span className="text-[var(--color-faint)]">({oracles.length})</span>
             )}
           </button>
-          {!collapsed && (
+          {!collapsed && nativeReady && !chatpaneAgentsOnly && (
             <div className="flex items-center gap-0.5">
               <button
                 onClick={() => setCreating((v) => !v)}
@@ -185,7 +255,7 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
 
         {!collapsed && (
         <div className="flex flex-col gap-1">
-          {!primaryRunning && (
+          {nativeReady && !primaryRunning && !chatpaneAgentsOnly && (
             <button
               onClick={spawnPrimary}
               disabled={spawning}
@@ -207,34 +277,36 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
               </div>
             </button>
           )}
-          {visibleOracles.map((o) => (
-            <OracleRow
-              key={o.session}
-              oracle={o}
-              onAttach={() => onAttachOracle(o.identity)}
-              onHide={() => toggleHidden(o.identity, true)}
-              onRename={async (to) => {
-                try {
-                  await renameOracle(o.identity, to);
-                  await refresh();
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
-                }
-              }}
-              onDelete={async (force) => {
-                try {
-                  await deleteOracle(o.identity, force);
-                  await refresh();
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
-                }
-              }}
-            />
-          ))}
+          {!chatpaneAgentsOnly &&
+            visibleOracles.map((o) => (
+              <OracleRow
+                key={o.session}
+                oracle={o}
+                onAttach={() => onAttachOracle(o.identity)}
+                onHide={() => toggleHidden(o.identity, true)}
+                onRename={async (to) => {
+                  try {
+                    await renameOracle(o.identity, to);
+                    await refresh();
+                  } catch (e) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  }
+                }}
+                onDelete={async (force) => {
+                  try {
+                    await deleteOracle(o.identity, force);
+                    await refresh();
+                  } catch (e) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  }
+                }}
+              />
+            ))}
+          {moneyAgentsSlot}
         </div>
         )}
 
-        {!collapsed && hiddenOracles.length > 0 && (
+        {!collapsed && hiddenOracles.length > 0 && !chatpaneAgentsOnly && (
           <div className="flex flex-col gap-1">
             <button
               onClick={() => setShowHidden((v) => !v)}
@@ -270,7 +342,7 @@ export function OracleRoster({ onAttachOracle, onAttachTmux }: Props) {
       </div>
 
       {/* ---- all tmux sessions ---- */}
-      {!collapsed && otherSessions.length > 0 && (
+      {!collapsed && otherSessions.length > 0 && !chatpaneAgentsOnly && (
         <div className="flex flex-col gap-1">
           <button
             onClick={() => setShowAll((v) => !v)}

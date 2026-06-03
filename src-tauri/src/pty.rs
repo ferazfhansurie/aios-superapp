@@ -186,17 +186,25 @@ pub fn pty_spawn_oracle(
     cols: u16,
     rows: u16,
 ) -> Result<u32, String> {
-    let tmux = tmux_bin();
-    let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.arg("-c");
-    // enable mouse so the wheel scrolls inside tmux (it owns the alt-screen, so
-    // xterm's own scrollback is bypassed), then attach.
-    cmd.arg(format!(
+    #[cfg(windows)]
+    {
+        let _ = (app, state, on_data, identity, cols, rows);
+        return Err("oracle tmux attach is not supported on windows yet".into());
+    }
+    #[cfg(not(windows))]
+    {
+        let tmux = tmux_bin();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        // enable mouse so the wheel scrolls inside tmux (it owns the alt-screen, so
+        // xterm's own scrollback is bypassed), then attach.
+        cmd.arg(format!(
         "{tmux} -L adletic set -g mouse on 2>/dev/null; exec {tmux} -L adletic attach -t aios-{identity}"
     ));
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    spawn_internal(app, &state, on_data, cmd, cols, rows)
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        spawn_internal(app, &state, on_data, cmd, cols, rows)
+    }
 }
 
 /// Attaches a pane to a PERSISTENT terminal tmux session (`aios-term-<name>` on
@@ -264,36 +272,73 @@ pub fn pty_spawn_terminal(
     on_data: Channel<String>,
     name: String,
     cmd: Option<String>,
+    cwd: Option<String>,
     cols: u16,
     rows: u16,
 ) -> Result<u32, String> {
     // Guard against shell-injection via the pane-derived session name.
-    let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    let safe = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
     if name.is_empty() || !safe(&name) {
         return Err("invalid terminal name".into());
     }
     let tmux = tmux_bin();
     let session = format!("aios-term-{name}");
+    // Single-quote for the outer `sh -c` so spaces/args survive.
+    let sq = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    // Optional start directory — `new-session -c <dir>`. Drives "run project"
+    // (the command MUST execute in the project root, else `npm run`/`flutter run`
+    // fail in $HOME and the pane exits). Only applied when the dir exists.
+    let cdir = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && std::path::Path::new(c).is_dir())
+        .map(|c| format!(" -c {}", sq(c)))
+        .unwrap_or_default();
     // Build the optional startup command for `new-session`. tmux runs it via its
     // own default-shell, so a bare string like `claude` is fine; empty → login shell.
     let startup = cmd
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .unwrap_or_default();
-    let new_session = if startup.is_empty() {
-        format!("{tmux} -L adletic new-session -d -s {session}")
+    // `new-session -A -d` is atomic create-or-noop: it creates the session
+    // detached if absent and is a harmless no-op (NOT a re-launch of `cmd`) if it
+    // already exists. This replaces the old `has-session || new-session` pair,
+    // whose gap before `attach` was a TOCTOU race — if the session wasn't present
+    // at attach time tmux printed `can't find session: aios-term-<name>`. With
+    // `-A` the session is GUARANTEED to exist before we attach, so that error
+    // class is gone.
+    let create = if startup.is_empty() {
+        let login_shell = "exec ${SHELL:-/bin/zsh} -l";
+        format!(
+            "{tmux} -L adletic new-session -A -d -s {session}{cdir} {}",
+            sq(login_shell)
+        )
     } else {
-        // Single-quote the command so spaces/args survive the outer `sh -c`.
-        let quoted = format!("'{}'", startup.replace('\'', "'\\''"));
-        format!("{tmux} -L adletic new-session -d -s {session} {quoted}")
+        // Run the command, then drop to an interactive shell so the pane STAYS
+        // ALIVE after the command finishes or errors (a VS Code-style run
+        // terminal: logs remain, you can re-run) instead of the tmux session
+        // dying the instant the command exits.
+        let keepalive = format!(
+            "exec ${{SHELL:-/bin/zsh}} -lc {}",
+            sq(&format!("{startup}; exec ${{SHELL:-/bin/zsh}} -l"))
+        );
+        format!(
+            "{tmux} -L adletic new-session -A -d -s {session}{cdir} {}",
+            sq(&keepalive)
+        )
     };
     let mut cmdb = CommandBuilder::new("/bin/sh");
     cmdb.arg("-c");
-    // Create the session if absent, enable mouse so the wheel scrolls inside tmux
-    // (it owns the alt-screen, bypassing xterm's scrollback), then attach. `exec`
-    // replaces the shell so closing the pane detaches the client — see pty_kill.
+    // Ensure the session exists (atomic), enable mouse so the wheel scrolls inside
+    // tmux (it owns the alt-screen, bypassing xterm's scrollback), then attach.
+    // `exec` replaces the shell so closing the pane detaches the client — see
+    // pty_kill. mouse is also set globally in ~/.config/adletic/tmux.conf; this
+    // inline set is a belt-and-braces fallback for a server started without it.
     cmdb.arg(format!(
-        "{tmux} -L adletic has-session -t {session} 2>/dev/null || {new_session}; \
+        "{create} 2>/dev/null; \
          {tmux} -L adletic set -g mouse on 2>/dev/null; \
          exec {tmux} -L adletic attach -t {session}"
     ));
@@ -316,20 +361,31 @@ pub fn pty_spawn_tmux(
     cols: u16,
     rows: u16,
 ) -> Result<u32, String> {
-    // Guard against shell-injection via socket/session names.
-    let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
-    if !safe(&socket) || !safe(&session) {
-        return Err("invalid socket or session name".into());
+    #[cfg(windows)]
+    {
+        let _ = (app, state, on_data, socket, session, cols, rows);
+        return Err("tmux attach is not supported on windows yet".into());
     }
-    let tmux = tmux_bin();
-    let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.arg("-c");
-    cmd.arg(format!(
+    #[cfg(not(windows))]
+    {
+        // Guard against shell-injection via socket/session names.
+        let safe = |s: &str| {
+            s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        };
+        if !safe(&socket) || !safe(&session) {
+            return Err("invalid socket or session name".into());
+        }
+        let tmux = tmux_bin();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg(format!(
         "{tmux} -L {socket} set -g mouse on 2>/dev/null; exec {tmux} -L {socket} attach -t {session}"
     ));
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    spawn_internal(app, &state, on_data, cmd, cols, rows)
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        spawn_internal(app, &state, on_data, cmd, cols, rows)
+    }
 }
 
 /// Writes raw input bytes to a session's PTY stdin.

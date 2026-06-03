@@ -8,22 +8,33 @@ mod chat;
 mod crm;
 mod db;
 mod device;
-mod inbox;
 mod files;
+mod inbox;
+mod mac_apps;
 mod memory;
 mod monitor;
 mod motion;
-mod plugins;
-mod voice;
 mod oracles;
+mod plugins;
 mod pty;
 mod stats;
 mod telemetry;
 mod usage;
+mod voice;
+
+use tauri::Manager;
 
 #[tauri::command]
 fn read_telemetry() -> telemetry::Telemetry {
     telemetry::collect()
+}
+
+#[tauri::command]
+fn startup_open_pane() -> Option<String> {
+    std::env::var("AIOS_OPEN_PANE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -46,6 +57,7 @@ pub fn run() {
         .manage(pty::PtyState::new())
         .invoke_handler(tauri::generate_handler![
             read_telemetry,
+            startup_open_pane,
             pty::pty_spawn,
             pty::pty_spawn_oracle,
             pty::pty_spawn_tmux,
@@ -65,12 +77,15 @@ pub fn run() {
             files::read_dir,
             files::read_dir_tree,
             files::git_status,
+            files::git_pulse,
+            files::shell_source_status,
             files::detect_project,
             files::list_projects,
             files::home_dir,
             files::read_file_preview,
             files::read_text_file,
             files::write_text_file,
+            files::delete_path,
             files::convert_office_to_pdf,
             files::save_image_temp,
             plugins::list_plugins,
@@ -83,8 +98,10 @@ pub fn run() {
             browser::browser_copy_selection,
             browser::read_clipboard,
             usage::usage_stats,
+            usage::codex_usage,
             memory::memory_graph,
             memory::memory_file,
+            memory::memory_search,
             memory::memory_save,
             memory::memory_delete,
             memory::memory_focus,
@@ -114,6 +131,9 @@ pub fn run() {
             inbox::list_customers,
             inbox::customer_thread,
             inbox::send_message,
+            mac_apps::mac_list_apps,
+            mac_apps::mac_focus_app,
+            mac_apps::mac_capture_app,
             motion::motion_models,
             motion::motion_boards,
             motion::motion_board_save,
@@ -128,6 +148,7 @@ pub fn run() {
             voice::dictate_cancel,
             chat::chat_start,
             chat::chat_send,
+            chat::chat_steer,
             chat::chat_interrupt,
             chat::chat_send_raw,
             chat::chat_stop,
@@ -141,6 +162,8 @@ pub fn run() {
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,
+            browser::browser_fullscreen_state,
+            browser::set_window_fullscreen,
             browser::browser_navigate,
             browser::browser_back,
             browser::browser_forward,
@@ -148,6 +171,25 @@ pub fn run() {
             browser::browser_hide,
             browser::browser_close,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } if chat::has_busy_sessions() => {
+                api.prevent_exit();
+                show_main_window(app);
+            }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => {
+                show_main_window(app);
+            }
+            _ => {}
+        });
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }

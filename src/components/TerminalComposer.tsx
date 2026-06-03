@@ -69,8 +69,10 @@ import {
   ListChecks,
   Loader2,
   Mic,
+  PackageOpen,
   Plus,
   RefreshCw,
+  Rocket,
   ShieldCheck,
   Sparkles,
   Square,
@@ -140,6 +142,9 @@ export function TerminalComposer({
   onClose,
   register,
   cwd,
+  liveMode,
+  liveModel,
+  liveCtxPct,
 }: {
   /** Write the composed text to the PTY (the pane appends the CR). */
   onSend: (text: string) => void;
@@ -163,11 +168,42 @@ export function TerminalComposer({
   register?: (append: (text: string) => void) => void;
   /** Working directory for this pane — drives the context bar + @-mention picker. */
   cwd?: string;
+  /** claude-code's live mode, parsed from its TUI by TerminalPane (e.g. "full
+   *  access" / "plan" / "accept edits"). Reflects the pill instead of a generic
+   *  label; undefined until first parsed. */
+  liveMode?: string;
+  /** claude-code's live model, parsed from its TUI (e.g. "Opus 4.8"). */
+  liveModel?: string;
+  /** claude-code's "% context left", parsed from its TUI (0–100). */
+  liveCtxPct?: number;
 }) {
   const [value, setValue] = useState("");
   const [images, setImages] = useState<ImageChip[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [plusOpen, setPlusOpen] = useState(false);
+  // armed after /handoff fires — shows the one-tap "clear + start fresh" banner.
+  const [handoffArmed, setHandoffArmed] = useState(false);
+
+  // Tap-2 of the handoff flow: clear claude's context, then seed it to read the
+  // freshly-written handoff doc and continue — a clean fresh session in-place.
+  const finishHandoff = useCallback(() => {
+    const raw = onRaw;
+    raw?.("\x15");
+    raw?.("/clear\r");
+    // after /clear settles, drop in the resume prompt, THEN submit with a
+    // SEPARATE \r on its own tick. claude code's TUI buffers a \r that arrives
+    // in the same chunk as a long paste as a newline (multiline composer mode)
+    // instead of Enter — so it sits in the box unsent. Writing the body first,
+    // then \r on a later tick, registers as the submit key (the dual-enter
+    // gotcha; see the relay-to-oracle skill).
+    setTimeout(() => {
+      raw?.(
+        "read HANDOFF-SESSION.md (this repo, else ~/.aios/state/handoffs/ newest) and continue exactly where the last session left off",
+      );
+      setTimeout(() => raw?.("\r"), 150);
+    }, 600);
+    setHandoffArmed(false);
+  }, [onRaw]);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const plusWrapRef = useRef<HTMLDivElement>(null);
@@ -424,6 +460,11 @@ export function TerminalComposer({
   const phaseRef = useRef<Phase>("idle");
   phaseRef.current = phase;
 
+  // hands-free: when a dictation finishes we set this, then an effect on `value`
+  // fires submit() once the appended transcript has actually landed in state
+  // (can't submit in micStop's tick — `value` is still stale there).
+  const autoSendRef = useRef(false);
+
   useEffect(() => {
     if (phase !== "recording") return;
     setElapsed(0);
@@ -447,7 +488,11 @@ export function TerminalComposer({
     setPhase("transcribing");
     try {
       const text = await dictateStop();
-      if (text) append(text);
+      if (text) {
+        append(text);
+        // hands-free: send as soon as the transcript lands (see autoSendRef).
+        autoSendRef.current = true;
+      }
     } catch {
       /* swallow — best-effort dictation */
     } finally {
@@ -455,6 +500,16 @@ export function TerminalComposer({
       taRef.current?.focus();
     }
   }, [append]);
+
+  // auto-send the dictated transcript once `value` reflects the append. Guarded
+  // by autoSendRef so ordinary typing never triggers it; cleared before submit
+  // so it fires exactly once per dictation.
+  useEffect(() => {
+    if (!autoSendRef.current) return;
+    if (!value.trim()) return;
+    autoSendRef.current = false;
+    submit();
+  }, [value, submit]);
 
   const micCancel = useCallback(async () => {
     if (phaseRef.current !== "recording") return;
@@ -495,6 +550,12 @@ export function TerminalComposer({
         icon: <Sparkles size={14} />,
       },
       {
+        id: "handoff",
+        label: "/handoff",
+        desc: "package session → then one tap to clear + start fresh",
+        icon: <PackageOpen size={14} />,
+      },
+      {
         id: "help",
         label: "/help",
         desc: "claude code help (sends /help)",
@@ -532,6 +593,14 @@ export function TerminalComposer({
           // claude code has no literal "/plan" command — Shift+Tab cycles its
           // mode (incl. plan mode). Send that escape sequence.
           raw?.("\x1b[Z");
+          break;
+        case "handoff":
+          // fire the AIOS /handoff skill in claude code's TUI to package the
+          // session, then ARM the two-tap "clear + start fresh" affordance (we
+          // can't detect when handoff finishes, so the user taps once it's done).
+          raw?.("\x15");
+          raw?.("/handoff\r");
+          setHandoffArmed(true);
           break;
       }
       setValue("");
@@ -617,6 +686,31 @@ export function TerminalComposer({
   // ── keyboard ───────────────────────────────────────────────────────────────
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // ── TUI driver (P0) ────────────────────────────────────────────────────
+    // When the box is EMPTY and no overlay is open, route navigation keys
+    // straight to the PTY so you can drive a TUI (claude code's model picker, a
+    // menu, vim, less, fzf …) from the composer instead of having to click into
+    // the terminal. Arrows → CSI sequences, Enter → CR, Tab → HT, Esc handled
+    // below. The moment there's text in the box, this yields to normal editing +
+    // history recall, so composing a message is never hijacked.
+    if (!overlay && value.length === 0 && onRaw) {
+      const seq: Record<string, string> = {
+        ArrowUp: "\x1b[A",
+        ArrowDown: "\x1b[B",
+        ArrowRight: "\x1b[C",
+        ArrowLeft: "\x1b[D",
+        Tab: "\t",
+        Enter: "\r",
+      };
+      const bytes = seq[e.key];
+      // don't steal modified combos (⌘/⌥/^) or Shift+Enter (newline in box).
+      if (bytes && !e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey) {
+        e.preventDefault();
+        onRaw(bytes);
+        return;
+      }
+    }
+
     // overlay navigation takes priority (slash + @ menus).
     if (overlay) {
       const list = overlay === "slash" ? slashFiltered : mentionFiltered;
@@ -759,6 +853,33 @@ export function TerminalComposer({
           stays self-contained (no global stylesheet edit). */}
       <style>{WAVE_KEYFRAMES}</style>
 
+      {/* handoff two-tap banner: appears after /handoff fires; one tap clears +
+          starts the fresh session in-place (reads the new handoff doc). */}
+      {handoffArmed && (
+        <div className="mb-2 flex items-center gap-2 rounded-xl border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-2">
+          <PackageOpen size={15} className="shrink-0 text-[var(--color-accent)]" />
+          <span className="min-w-0 flex-1 text-[12px] text-[var(--color-text-2)]">
+            handoff packaged? clear context + start the fresh session
+          </span>
+          <button
+            type="button"
+            onClick={finishHandoff}
+            className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:brightness-110 active:scale-95"
+          >
+            <Rocket size={13} />
+            clear + start fresh
+          </button>
+          <button
+            type="button"
+            onClick={() => setHandoffArmed(false)}
+            title="dismiss"
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
       {/* slash / @-mention overlay — sits just above the box, ChatPane styling */}
       {overlay === "slash" && slashFiltered.length > 0 && (
         <OverlayPanel>
@@ -808,7 +929,9 @@ export function TerminalComposer({
         </OverlayPanel>
       )}
 
-      <div className="relative rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
+      <div className="flash-composer group/composer relative overflow-hidden rounded-2xl border border-[var(--color-border-strong)] bg-gradient-to-b from-[var(--color-panel-2)]/80 to-[var(--color-panel-2)]/55 shadow-2xl shadow-black/40 backdrop-blur transition-all duration-300 focus-within:border-[var(--color-accent)]/60 focus-within:shadow-[0_0_0_1px_color-mix(in_srgb,var(--color-accent)_50%,transparent),0_18px_50px_-12px_color-mix(in_srgb,var(--color-accent)_45%,transparent)]">
+        {/* accent sheen sweeping the top edge when focused */}
+        <span className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px bg-gradient-to-r from-transparent via-[var(--color-accent)] to-transparent opacity-0 transition-opacity duration-500 group-focus-within/composer:opacity-80" />
         {/* hidden file input driving the "+" → Add photos & files */}
         <input
           ref={fileInputRef}
@@ -896,9 +1019,9 @@ export function TerminalComposer({
           />
         )}
 
-        <div className="flex items-center gap-1.5 px-3 pb-2.5 pt-1">
+        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2.5 pt-1">
           {/* "+" → add photos & files */}
-          <div ref={plusWrapRef} className="relative">
+          <div ref={plusWrapRef} className="relative shrink-0">
             <button
               type="button"
               onClick={() => setPlusOpen((o) => !o)}
@@ -936,10 +1059,21 @@ export function TerminalComposer({
             type="button"
             onClick={() => onRaw?.("\x1b[Z")}
             title="cycle claude permission mode (Shift+Tab)"
-            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
+              liveMode && liveMode !== "ask each time"
+                ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
+                : "border-[var(--color-border)] bg-[var(--color-panel)]/50 text-[var(--color-text-2)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            }`}
           >
-            <ShieldCheck size={13} className="text-[var(--color-muted)]" />
-            <span>permissions</span>
+            <ShieldCheck
+              size={13}
+              className={
+                liveMode && liveMode !== "ask each time"
+                  ? "text-[var(--color-accent)]"
+                  : "text-[var(--color-muted)]"
+              }
+            />
+            <span>{liveMode ?? "permissions"}</span>
             <ChevronDown size={12} className="text-[var(--color-faint)]" />
           </button>
 
@@ -949,7 +1083,7 @@ export function TerminalComposer({
             type="button"
             onClick={() => onRaw?.("\x1b[Z")}
             title="toggle plan mode (Shift+Tab)"
-            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
           >
             <ListChecks size={13} />
             <span>plan</span>
@@ -965,19 +1099,33 @@ export function TerminalComposer({
               onRaw?.("/model\r");
             }}
             title="switch model (opens claude's picker)"
-            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+            className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
           >
             <Sparkles size={13} className="text-[var(--color-muted)]" />
-            <span>model</span>
+            <span>{liveModel ?? "model"}</span>
             <ChevronDown size={12} className="text-[var(--color-faint)]" />
           </button>
+
+          {/* live context-left meter, parsed from claude code's TUI */}
+          {liveCtxPct != null && (
+            <span
+              title="context remaining (from claude code)"
+              className={`hidden shrink-0 items-center gap-1 font-mono text-[10.5px] tabular-nums sm:flex ${
+                liveCtxPct <= 15
+                  ? "text-[var(--color-danger)]"
+                  : "text-[var(--color-faint)]"
+              }`}
+            >
+              {liveCtxPct}% ctx
+            </span>
+          )}
 
           {/* interrupt the running CLI (^C) */}
           <button
             type="button"
             onClick={onInterrupt}
             title="interrupt (send Ctrl-C)"
-            className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-danger)]/50 hover:text-[var(--color-danger)]"
+            className="flex shrink-0 items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-danger)]/50 hover:text-[var(--color-danger)]"
           >
             <Square size={11} />
             <span>stop</span>
@@ -989,8 +1137,10 @@ export function TerminalComposer({
             </span>
           )}
 
-          <div className="flex-1" />
-
+          {/* action cluster — pinned right (ml-auto) and kept together so the
+              send button is ALWAYS visible no matter how narrow the pane: the
+              left pills wrap to a new line instead of shoving these off-screen. */}
+          <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {/* dismiss the composer */}
           <button
             type="button"
@@ -1013,7 +1163,7 @@ export function TerminalComposer({
               type="button"
               onClick={() => void micStart()}
               title="dictate (⌘J)"
-              className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+              className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-all duration-200 hover:scale-110 hover:bg-[var(--color-accent-soft)] hover:text-[var(--color-accent)] hover:shadow-[0_0_14px_-3px_var(--color-accent)]"
             >
               <Mic size={16} />
             </button>
@@ -1027,11 +1177,12 @@ export function TerminalComposer({
               onClick={submit}
               disabled={!hasContent}
               title="send to terminal (↵)"
-              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
+              className="group/send grid h-8 w-8 place-items-center rounded-full bg-gradient-to-br from-[var(--color-accent)] to-[color-mix(in_srgb,var(--color-accent)_62%,#000)] text-[var(--color-bg)] shadow-[0_2px_12px_-2px_color-mix(in_srgb,var(--color-accent)_70%,transparent)] transition-all duration-200 enabled:hover:scale-110 enabled:hover:shadow-[0_4px_22px_-2px_var(--color-accent)] enabled:active:scale-90 disabled:cursor-not-allowed disabled:bg-none disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)] disabled:shadow-none"
             >
-              <ArrowUp size={16} />
+              <ArrowUp size={16} className="transition-transform duration-200 group-hover/send:-translate-y-0.5" />
             </button>
           )}
+          </div>
         </div>
 
         {dragOver && (

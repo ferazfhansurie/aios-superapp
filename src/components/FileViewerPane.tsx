@@ -1,12 +1,14 @@
 /** A single file rendered in its own pane — images & PDFs via the asset
  *  protocol, text/code/markdown inline. Spawned from the Files pane's
  *  "open in pane" action so any file can live as a standalone pane. */
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ExternalLink, FileText } from "lucide-react";
 
 import { fileSrc, readFilePreview, type FilePreview } from "../lib/fs";
+import { openFileInPane, openUrlInPane } from "../lib/paneBus";
+import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import { OfficePreview } from "./OfficePreview";
 
 export function FileViewerPane({ path }: { path: string }) {
@@ -50,11 +52,22 @@ export function FileViewerPane({ path }: { path: string }) {
           <iframe src={fileSrc(path)} title={preview.name} className="h-full w-full border-0" />
         ) : preview?.kind === "office" ? (
           <OfficePreview path={path} name={preview.name} />
+        ) : preview?.kind === "video" ? (
+          <video
+            src={fileSrc(path)}
+            controls
+            className="h-full w-full bg-black"
+            controlsList="nodownload"
+          />
         ) : preview?.kind === "text" ? (
-          <pre className="whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-relaxed text-[var(--color-text-2)]">
-            {preview.text}
-            {preview.truncated && <span className="text-[var(--color-faint)]">{"\n\n… (truncated)"}</span>}
-          </pre>
+          isMarkdown(path) ? (
+            <MarkdownDoc text={preview.text ?? ""} path={path} truncated={preview.truncated} />
+          ) : (
+            <pre className="whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-relaxed text-[var(--color-text-2)]">
+              {preview.text}
+              {preview.truncated && <span className="text-[var(--color-faint)]">{"\n\n… (truncated)"}</span>}
+            </pre>
+          )
         ) : (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-[var(--color-muted)]">
             <FileText size={28} />
@@ -70,4 +83,93 @@ export function FileViewerPane({ path }: { path: string }) {
       </div>
     </div>
   );
+}
+
+function isMarkdown(path: string): boolean {
+  return /\.(md|markdown)$/i.test(path);
+}
+
+function MarkdownDoc({ text, path, truncated }: { text: string; path: string; truncated: boolean }) {
+  return (
+    <div className="mx-auto max-w-3xl px-5 py-4 font-sans text-[13px] leading-relaxed text-[var(--color-text-2)]">
+      {text.split("\n").map((line, i) => {
+        const heading = line.match(/^(#{1,4})\s+(.*)$/);
+        if (heading) {
+          const level = heading[1].length;
+          return (
+            <div
+              key={i}
+              className={`mt-3 mb-1 font-semibold text-[var(--color-text)] ${
+                level === 1 ? "text-[20px]" : level === 2 ? "text-[17px]" : "text-[14px]"
+              }`}
+            >
+              <InlineDoc text={heading[2]} basePath={path} />
+            </div>
+          );
+        }
+        const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+        if (bullet) {
+          return (
+            <div key={i} className="flex gap-2 pl-2">
+              <span className="select-none text-[var(--color-accent)]">•</span>
+              <span className="min-w-0 flex-1">
+                <InlineDoc text={bullet[1]} basePath={path} />
+              </span>
+            </div>
+          );
+        }
+        if (!line.trim()) return <div key={i} className="h-2" />;
+        return (
+          <p key={i} className="whitespace-pre-wrap break-words">
+            <InlineDoc text={line} basePath={path} />
+          </p>
+        );
+      })}
+      {truncated && <div className="mt-4 text-[12px] text-[var(--color-faint)]">… truncated</div>}
+    </div>
+  );
+}
+
+function InlineDoc({ text, basePath }: { text: string; basePath: string }) {
+  const nodes: ReactNode[] = [];
+  const re = /\[([^\]]+)\]\(([^)]+)\)|`([^`]+)`/g;
+  let last = 0;
+  let k = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    if (match.index > last) nodes.push(<span key={`s${k++}`}>{text.slice(last, match.index)}</span>);
+    const label = match[1] ?? match[3] ?? "";
+    const target = match[2] ?? match[3] ?? "";
+    const clickable = isHttpPaneTarget(target) || isPaneFileTarget(target);
+    if (clickable) {
+      nodes.push(
+        <button
+          key={`l${k++}`}
+          type="button"
+          onClick={() => {
+            if (isHttpPaneTarget(target)) {
+              openUrlInPane(target, label || "browser");
+              return;
+            }
+            const resolved = resolvePaneFileTarget(target, basePath);
+            openFileInPane(resolved, targetLabel(resolved));
+          }}
+          className="font-mono text-[0.95em] text-[var(--color-accent)] underline decoration-[var(--color-accent)]/35 underline-offset-2 hover:decoration-[var(--color-accent)]"
+        >
+          {label}
+        </button>,
+      );
+    } else if (match[3]) {
+      nodes.push(
+        <code key={`c${k++}`} className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.9em] text-[var(--color-text)]">
+          {label}
+        </code>,
+      );
+    } else {
+      nodes.push(<span key={`p${k++}`}>{label}</span>);
+    }
+    last = re.lastIndex;
+  }
+  if (last < text.length) nodes.push(<span key={`s${k++}`}>{text.slice(last)}</span>);
+  return <>{nodes}</>;
 }

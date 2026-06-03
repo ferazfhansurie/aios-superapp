@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /**
  * Typed wrappers over the Rust INBOX commands (see `src-tauri/src/inbox.rs`).

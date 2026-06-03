@@ -2,7 +2,8 @@
  * Thin wrappers over the Rust PTY commands. Output streams per-session over a
  * Tauri `Channel<string>` (passed into the spawn call), not the global event bus.
  */
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /** An AIOS oracle session discovered by the backend (tmux + instances.json). */
 export interface OracleInfo {
@@ -84,10 +85,11 @@ export async function spawnTerminal(
   onData: Channel<string>,
   name: string,
   cmd: string | null,
+  cwd: string | null,
   cols: number,
   rows: number,
 ): Promise<number> {
-  return invoke<number>("pty_spawn_terminal", { onData, name, cmd: cmd ?? null, cols, rows });
+  return invoke<number>("pty_spawn_terminal", { onData, name, cmd: cmd ?? null, cwd: cwd ?? null, cols, rows });
 }
 
 /** Spawns a pane attached to the oracle tmux session `aios-<identity>`. */

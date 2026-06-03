@@ -3,6 +3,12 @@
  *  a writer keyed by its pane key; App tracks which pane is focused. */
 export const paneWriters = new Map<string, (text: string) => void>();
 
+/** Like paneWriters, but a SUBMIT: inserts the text AND fires it (terminal →
+ *  paste + Enter via composerSend; chat → set input + send). Lets "send to AI"
+ *  actions (notes pane) hand a whole buffer to a pane and have it actually run,
+ *  not just sit in the prompt. Keyed by pane key, same lifecycle as paneWriters. */
+export const paneSubmitters = new Map<string, (text: string) => void>();
+
 /** Handle a ChatPane publishes so App can decide what to do when its pane is
  *  closed: is a task in flight, and how to detach (keep running) vs kill. */
 export interface ChatHandle {
@@ -11,10 +17,125 @@ export interface ChatHandle {
   /** Detach: keep the claude process running in the background, optionally
    *  arming a done-notification. Marks the pane so its unmount won't kill it. */
   detach: (notify: boolean) => void;
+  /** Stop the current turn while keeping the pane alive. */
+  stop?: () => void;
 }
 
 /** Live ChatPanes keyed by pane key — lets App intercept close on a busy chat. */
 export const chatHandles = new Map<string, ChatHandle>();
+
+/** Detach every chat pane that is actively generating. Returns how many were
+ *  moved to the background. Used by native window-close handling so closing the
+ *  cockpit hides the shell instead of killing in-flight ai work. */
+export function detachBusyChats(notify: boolean): number {
+  let detached = 0;
+  for (const handle of chatHandles.values()) {
+    if (!handle.busy()) continue;
+    handle.detach(notify);
+    detached += 1;
+  }
+  return detached;
+}
+
+/** Image-drop sink a pane registers (keyed by pane key). When an OS file drop
+ *  (Finder/desktop screenshot) lands on a pane, App routes IMAGE paths here so
+ *  they become proper attachments (chat → thumbnail chips; terminal → quoted
+ *  path) instead of raw text. Falls back to paneWriters when a pane registers no
+ *  image sink. Each path is absolute on disk; the sink reads + attaches it. */
+export const paneImageDrop = new Map<string, (paths: string[]) => void>();
+
+// ── open-file-in-pane channel ────────────────────────────────────────────────
+// App owns pane creation; deep children (e.g. a chat artifact card) need to open
+// a file as an in-app viewer pane rather than handing it to the OS. App registers
+// its opener once; callers use openFileInPane and fall back to the OS only if
+// nothing is registered.
+let openFileImpl: ((path: string, name: string) => void) | null = null;
+let openEditorFileImpl: ((path: string, name: string) => void) | null = null;
+let openViewerFileImpl: ((path: string, name: string) => void) | null = null;
+let revealFileImpl: ((path: string, name: string) => void) | null = null;
+
+/** App registers how to open a file as an in-app pane. Returns an unregister fn. */
+export function registerOpenFile(
+  fn: (path: string, name: string) => void,
+): () => void {
+  openFileImpl = fn;
+  return () => {
+    if (openFileImpl === fn) openFileImpl = null;
+  };
+}
+
+/** Open a file in an in-app viewer pane. Returns false if no opener is wired
+ *  (caller should then fall back to the OS). */
+export function openFileInPane(path: string, name: string): boolean {
+  if (!openFileImpl) return false;
+  openFileImpl(path, name);
+  return true;
+}
+
+export function registerOpenEditorFile(
+  fn: (path: string, name: string) => void,
+): () => void {
+  openEditorFileImpl = fn;
+  return () => {
+    if (openEditorFileImpl === fn) openEditorFileImpl = null;
+  };
+}
+
+export function registerOpenViewerFile(
+  fn: (path: string, name: string) => void,
+): () => void {
+  openViewerFileImpl = fn;
+  return () => {
+    if (openViewerFileImpl === fn) openViewerFileImpl = null;
+  };
+}
+
+export function registerRevealFile(
+  fn: (path: string, name: string) => void,
+): () => void {
+  revealFileImpl = fn;
+  return () => {
+    if (revealFileImpl === fn) revealFileImpl = null;
+  };
+}
+
+export function openEditorFileInPane(path: string, name: string): boolean {
+  if (!openEditorFileImpl) return false;
+  openEditorFileImpl(path, name);
+  return true;
+}
+
+export function openViewerFileInPane(path: string, name: string): boolean {
+  if (!openViewerFileImpl) return false;
+  openViewerFileImpl(path, name);
+  return true;
+}
+
+export function revealFileInPane(path: string, name: string): boolean {
+  if (!revealFileImpl) return false;
+  revealFileImpl(path, name);
+  return true;
+}
+
+// ── open-url-in-pane channel ─────────────────────────────────────────────────
+// Same shape as file opening: App owns pane creation, deep markdown renderers can
+// ask for an in-app browser pane without knowing the layout machinery.
+let openUrlImpl: ((url: string, label?: string) => void) | null = null;
+
+export function registerOpenUrl(
+  fn: (url: string, label?: string) => void,
+): () => void {
+  openUrlImpl = fn;
+  return () => {
+    if (openUrlImpl === fn) openUrlImpl = null;
+  };
+}
+
+export function openUrlInPane(url: string, label?: string): boolean {
+  if (!openUrlImpl) return false;
+  openUrlImpl(url, label);
+  return true;
+}
 
 // ── cross-pane drag signal ───────────────────────────────────────────────────
 // When an item carrying our `application/x-aios-path` payload is dragged

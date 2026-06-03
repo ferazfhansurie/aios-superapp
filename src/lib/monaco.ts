@@ -11,6 +11,8 @@ import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
 import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
 
+export { languageForPath } from "./editorLanguage";
+
 let initialized = false;
 
 export function initMonaco(): typeof monaco {
@@ -42,28 +44,6 @@ export function initMonaco(): typeof monaco {
   registerDart(monaco);
   defineTheme(monaco);
   return monaco;
-}
-
-/** Map a file extension to a Monaco language id. Defaults to plaintext. */
-export function languageForPath(path: string): string {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  const map: Record<string, string> = {
-    ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript",
-    js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
-    json: "json", jsonc: "json",
-    css: "css", scss: "scss", less: "less",
-    html: "html", htm: "html", vue: "html", svelte: "html",
-    md: "markdown", markdown: "markdown",
-    yaml: "yaml", yml: "yaml",
-    toml: "ini", ini: "ini", env: "ini",
-    sh: "shell", bash: "shell", zsh: "shell",
-    rs: "rust", py: "python", go: "go", rb: "ruby", php: "php",
-    java: "java", kt: "kotlin", swift: "swift", c: "c", h: "c",
-    cpp: "cpp", cc: "cpp", hpp: "cpp", cs: "csharp",
-    sql: "sql", lua: "lua", xml: "xml", dockerfile: "dockerfile",
-    dart: "dart",
-  };
-  return map[ext] ?? "plaintext";
 }
 
 /** A compact Monarch grammar for Dart — keywords, types, strings (incl. interp),

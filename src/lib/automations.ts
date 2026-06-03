@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /** One launchd job (com.firaz.aios-* / com.aios.*). */
 export interface Job {

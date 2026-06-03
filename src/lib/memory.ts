@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /** One memory note in the vault graph. */
 export interface MemoryNode {
@@ -30,6 +30,17 @@ export interface MemoryGraph {
   count: number;
 }
 
+export interface MemoryHit {
+  id: string;
+  title: string;
+  type: string;
+  description: string;
+  path: string;
+  score: number;
+  reasons: string[];
+  preview: string;
+}
+
 /** Reads + parses the whole memory vault into a graph. */
 export async function memoryGraph(): Promise<MemoryGraph> {
   return invoke<MemoryGraph>("memory_graph");
@@ -38,4 +49,13 @@ export async function memoryGraph(): Promise<MemoryGraph> {
 /** Returns the raw markdown for a single vault file (vault-scoped guard). */
 export async function memoryFile(path: string): Promise<string> {
   return invoke<string>("memory_file", { path });
+}
+
+/** Ranked memory retrieval with reason strings for visible chat context. */
+export async function memorySearch(
+  query: string,
+  cwd?: string | null,
+  limit = 8,
+): Promise<MemoryHit[]> {
+  return invoke<MemoryHit[]>("memory_search", { query, cwd: cwd ?? null, limit });
 }

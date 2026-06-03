@@ -2,6 +2,8 @@
  *  AIOS cockpit. Left nav rail + scrollable right panel. Esc / backdrop close.
  *  Every control persists through src/lib/settings.ts. lowercase, terse. */
 import {
+  lazy,
+  Suspense,
   type ComponentType,
   type ReactNode,
   useEffect,
@@ -10,10 +12,12 @@ import {
 } from "react";
 
 import {
+  Bell,
   Blocks,
   Brain,
   Check,
   Cpu,
+  FolderGit2,
   Info,
   Keyboard,
   Minus,
@@ -23,6 +27,7 @@ import {
   Moon,
   PanelLeft,
   Palette,
+  Pencil,
   Plus,
   Radio,
   RotateCcw,
@@ -33,14 +38,26 @@ import {
   X,
 } from "lucide-react";
 
-import { BridgesPane } from "./BridgesPane";
-import { PluginsPane } from "./PluginsPane";
+import { listProjects, type ProjectInfo } from "../lib/run";
+import {
+  loadProjectsStore,
+  subscribeProjects,
+  addCustomProject,
+  removeCustomProject,
+  setHidden as setProjectHidden,
+  setOverride as setProjectOverride,
+} from "../lib/projects";
 
 import {
   type AppSettings,
   type PaneType,
+  type FlashLevel,
+  type NotificationNativeMode,
+  type SidebarMode,
+  type TopBarMode,
   loadSettings,
   saveSettings,
+  applyFlashLevel,
   MEMORY_VAULT_PATH,
 } from "../lib/settings";
 
@@ -70,6 +87,9 @@ import {
   subscribe as subscribeTheme,
   subscribeAccent,
 } from "../lib/theme";
+
+const BridgesPane = lazy(() => import("./BridgesPane").then((m) => ({ default: m.BridgesPane })));
+const PluginsPane = lazy(() => import("./PluginsPane").then((m) => ({ default: m.PluginsPane })));
 
 /* ── control primitives ─────────────────────────────────────────────── */
 
@@ -290,7 +310,7 @@ function applyReduceMotion(on: boolean) {
 
 /** Codex-style theme picker — segmented, icon + label, with a preview hint
  *  swatch under each option. Wired through theme.ts so it stays in sync with
- *  the header ThemeSwitcher. */
+ *  the settings surface. */
 function ThemePicker({
   value,
   onChange,
@@ -553,7 +573,7 @@ function AppearancePreview({ fontPx }: { fontPx: number }) {
             className="font-mono leading-relaxed text-[var(--color-text)]"
             style={{ fontSize: fontPx }}
           >
-            <span style={{ color: "var(--color-accent)" }}>aios</span>
+            <span style={{ color: "var(--color-accent)" }}>prompt</span>
             <span className="text-[var(--color-muted)]"> ❯ </span>
             ship it.
             <span
@@ -600,6 +620,8 @@ type SectionId =
   | "general"
   | "appearance"
   | "sidebar"
+  | "notifications"
+  | "projects"
   | "oracles"
   | "channels"
   | "plugins"
@@ -611,6 +633,8 @@ const NAV: { id: SectionId; label: string; icon: ComponentType<{ size?: number }
   { id: "general", label: "general", icon: SettingsIcon },
   { id: "appearance", label: "appearance", icon: Palette },
   { id: "sidebar", label: "sidebar", icon: PanelLeft },
+  { id: "notifications", label: "notifications", icon: Bell },
+  { id: "projects", label: "projects", icon: FolderGit2 },
   { id: "oracles", label: "oracles", icon: Cpu },
   { id: "channels", label: "channels", icon: Radio },
   { id: "plugins", label: "plugins", icon: Blocks },
@@ -636,6 +660,130 @@ const SHORTCUTS: { keys: string[]; action: string }[] = [
   { keys: ["⌘", "W"], action: "close pane" },
   { keys: ["⌘", ","], action: "open settings" },
 ];
+
+/* ── projects CRUD section ──────────────────────────────────────────── */
+
+type ProjRow = ProjectInfo & { hidden: boolean; custom: boolean };
+
+function ProjectsSection() {
+  const [scanned, setScanned] = useState<ProjectInfo[]>([]);
+  const [store, setStore] = useState(loadProjectsStore);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [dName, setDName] = useState("");
+  const [dCmd, setDCmd] = useState("");
+  const [addOpen, setAddOpen] = useState(false);
+  const [nName, setNName] = useState("");
+  const [nPath, setNPath] = useState("");
+  const [nCmd, setNCmd] = useState("");
+
+  useEffect(() => {
+    listProjects().then(setScanned).catch(() => {});
+  }, []);
+  useEffect(() => subscribeProjects(() => setStore(loadProjectsStore())), []);
+
+  const customRoots = new Set(store.custom.map((c) => c.root));
+  const rows: ProjRow[] = [
+    ...scanned
+      .filter((p) => !customRoots.has(p.root))
+      .map((p) => ({ ...p, hidden: store.hidden.includes(p.root), custom: false })),
+    ...store.custom.map((c) => ({ ...c, hidden: false, custom: true })),
+  ].sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+
+  const effName = (p: ProjRow) => store.overrides[p.root]?.name?.trim() || p.name;
+  const effCmd = (p: ProjRow) => store.overrides[p.root]?.cmd?.trim() || p.commands[0]?.cmd || "";
+
+  const beginEdit = (p: ProjRow) => {
+    setEditing(p.root);
+    setDName(effName(p));
+    setDCmd(effCmd(p));
+  };
+  const saveEdit = (p: ProjRow) => {
+    if (p.custom) addCustomProject({ name: dName, root: p.root, cmd: dCmd });
+    else setProjectOverride(p.root, { name: dName, cmd: dCmd });
+    setEditing(null);
+  };
+  const submitAdd = () => {
+    if (!nPath.trim()) return;
+    addCustomProject({ name: nName, root: nPath, cmd: nCmd });
+    setNName("");
+    setNPath("");
+    setNCmd("");
+    setAddOpen(false);
+  };
+
+  const inputCls =
+    "w-full rounded-md border border-[var(--color-border)] bg-[var(--color-pane)] px-2 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]";
+  const iconBtn =
+    "grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]";
+
+  return (
+    <div className="-mt-1">
+      <div className="flex items-center justify-between pb-3 pt-1">
+        <p className="text-[12px] leading-snug text-[var(--color-muted)]">
+          projects under ~/Repo are auto-found. add your own, hide ones you don't
+          use, or override a name / run command. click a project on the homescreen
+          to open a terminal there.
+        </p>
+        <button
+          onClick={() => setAddOpen((v) => !v)}
+          className="ml-3 flex shrink-0 items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1.5 text-[12px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+        >
+          <Plus size={13} /> add
+        </button>
+      </div>
+
+      {addOpen && (
+        <div className="mb-3 flex flex-col gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-pane)]/50 p-3">
+          <input className={inputCls} placeholder="name (e.g. my-app)" value={nName} onChange={(e) => setNName(e.target.value)} />
+          <input className={inputCls} placeholder="absolute path (e.g. /Users/firazfhansurie/Repo/...)" value={nPath} onChange={(e) => setNPath(e.target.value)} />
+          <input className={inputCls} placeholder="run command (optional, e.g. npm run dev)" value={nCmd} onChange={(e) => setNCmd(e.target.value)} />
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setAddOpen(false)} className="rounded-md px-2.5 py-1 text-[12px] text-[var(--color-muted)] hover:text-[var(--color-text)]">cancel</button>
+            <button onClick={submitAdd} disabled={!nPath.trim()} className="rounded-md bg-[var(--color-accent)] px-3 py-1 text-[12px] font-medium text-[var(--color-accent-fg)] disabled:opacity-40">add project</button>
+          </div>
+        </div>
+      )}
+
+      <div className="max-h-[330px] overflow-y-auto">
+        {rows.length === 0 && <p className="py-6 text-center text-[12px] text-[var(--color-faint)]">no projects found</p>}
+        {rows.map((p) => (
+          <div key={p.root} className="border-b border-[var(--color-border)] py-2 last:border-0">
+            {editing === p.root ? (
+              <div className="flex flex-col gap-2">
+                <input className={inputCls} placeholder="name" value={dName} onChange={(e) => setDName(e.target.value)} />
+                <input className={inputCls} placeholder="run command" value={dCmd} onChange={(e) => setDCmd(e.target.value)} />
+                <div className="flex justify-end gap-2">
+                  <button onClick={() => setEditing(null)} className="rounded-md px-2.5 py-1 text-[12px] text-[var(--color-muted)] hover:text-[var(--color-text)]">cancel</button>
+                  <button onClick={() => saveEdit(p)} className="rounded-md bg-[var(--color-accent)] px-3 py-1 text-[12px] font-medium text-[var(--color-accent-fg)]">save</button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-col">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-[13px]" style={{ color: p.hidden ? "var(--color-faint)" : "var(--color-text-2)" }}>{effName(p)}</span>
+                    <span className="shrink-0 text-[9px] uppercase tracking-wide text-[var(--color-faint)]">{p.kind}</span>
+                    {p.custom && <span className="shrink-0 rounded-sm bg-[var(--color-accent-soft)] px-1 text-[9px] text-[var(--color-accent)]">custom</span>}
+                  </div>
+                  <span className="truncate font-mono text-[10px] text-[var(--color-faint)]">{p.root}</span>
+                  {effCmd(p) && <span className="truncate font-mono text-[10px] text-[var(--color-muted)]">▶ {effCmd(p)}</span>}
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button onClick={() => beginEdit(p)} title="edit name / run command" className={iconBtn}><Pencil size={13} /></button>
+                  {p.custom ? (
+                    <button onClick={() => removeCustomProject(p.root)} title="delete" className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-danger)]"><Trash2 size={13} /></button>
+                  ) : (
+                    <button onClick={() => setProjectHidden(p.root, !p.hidden)} title={p.hidden ? "show" : "hide"} className={iconBtn}>{p.hidden ? <EyeOff size={14} /> : <Eye size={14} />}</button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 /* ── main component ─────────────────────────────────────────────────── */
 
@@ -681,6 +829,7 @@ export function Settings({
     const init = loadSettings();
     applyFontScale(init.terminalFontSize);
     applyReduceMotion(init.reduceMotion);
+    applyFlashLevel(init.flashLevel);
     applyDensity(getDensity());
   }, []);
 
@@ -750,7 +899,9 @@ export function Settings({
             // Channels + plugins are full panes (own header + scroll) — render
             // them full-bleed instead of inside the padded settings rows.
             <div className="min-h-0 flex-1">
-              {section === "channels" ? <BridgesPane /> : <PluginsPane />}
+              <Suspense fallback={<div className="grid h-full place-items-center font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--color-faint)]">loading pane</div>}>
+                {section === "channels" ? <BridgesPane /> : <PluginsPane />}
+              </Suspense>
             </div>
           ) : (
           <div className="flex-1 overflow-y-auto px-6 py-5">
@@ -898,6 +1049,34 @@ export function Settings({
                       onChange={(v) => patch({ splashOnLaunch: v })}
                     />
                   </Row>
+                  <Row
+                    label="composer flash"
+                    sub="ambient motion on the prompt box — calm is minimal, max adds a rotating rim + aurora"
+                  >
+                    <Segmented<FlashLevel>
+                      value={s.flashLevel}
+                      onChange={(v) => {
+                        patch({ flashLevel: v });
+                        applyFlashLevel(v);
+                      }}
+                      options={[
+                        { value: "calm", label: "calm" },
+                        { value: "lush", label: "lush" },
+                        { value: "max", label: "max" },
+                      ]}
+                    />
+                  </Row>
+                  <Row label="top bar" sub="show brand chrome, compact controls, or hide it">
+                    <Segmented<TopBarMode>
+                      value={s.topBarMode}
+                      onChange={(v) => patch({ topBarMode: v })}
+                      options={[
+                        { value: "full", label: "full" },
+                        { value: "compact", label: "compact" },
+                        { value: "hidden", label: "hidden" },
+                      ]}
+                    />
+                  </Row>
                   <Row label="reduce motion" sub="cut animations + transitions">
                     <Toggle
                       checked={s.reduceMotion}
@@ -916,6 +1095,18 @@ export function Settings({
                     show or hide rail items. drag to reorder them right in the
                     sidebar. pinned sites can be unpinned here or via their ⋯ menu.
                   </p>
+                  <div className="mb-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/25 p-3">
+                    <Row label="rail style" sub="full labels or compact icons only">
+                      <Segmented<SidebarMode>
+                        value={s.sidebarMode}
+                        onChange={(v) => patch({ sidebarMode: v })}
+                        options={[
+                          { value: "full", label: "full" },
+                          { value: "icons", label: "icons" },
+                        ]}
+                      />
+                    </Row>
+                  </div>
                   {sidebar.items.map((it) => {
                     const isLink = it.kind.type === "link";
                     const app = it.kind.type === "app" ? SPAWN_BY_ID[it.kind.appId] : undefined;
@@ -976,6 +1167,39 @@ export function Settings({
                   </div>
                 </div>
               )}
+
+              {section === "notifications" && (
+                <div className="-mt-1">
+                  <p className="pb-3 pt-1 text-[12px] leading-snug text-[var(--color-muted)]">
+                    control how panes and background runs interrupt you. the shell notification center always keeps a local history.
+                  </p>
+                  <Row label="native alerts" sub="macos notifications outside the shell">
+                    <Segmented<NotificationNativeMode>
+                      value={s.notificationNativeMode}
+                      onChange={(v) => patch({ notificationNativeMode: v })}
+                      options={[
+                        { value: "important", label: "important" },
+                        { value: "all", label: "all" },
+                        { value: "off", label: "off" },
+                      ]}
+                    />
+                  </Row>
+                  <Row label="quiet mode" sub="keep events in the bell without interrupting">
+                    <Toggle
+                      checked={s.notificationQuietMode}
+                      onChange={(v) => patch({ notificationQuietMode: v })}
+                    />
+                  </Row>
+                  <div className="mt-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/25 p-3">
+                    <div className="text-[11px] font-medium text-[var(--color-text)]">next control layer</div>
+                    <p className="mt-1 text-[11px] leading-snug text-[var(--color-muted)]">
+                      per-pane mute, importance, quiet hours, and action buttons will plug into the same notification center.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {section === "projects" && <ProjectsSection />}
 
               {section === "oracles" && (
                 <>

@@ -33,7 +33,13 @@ const GIT_COLOR: Record<GitCode, string> = {
   R: "#6cb6ff", // renamed — blue
 };
 
-export function FilesPane({ onOpenFile }: { onOpenFile?: (path: string, name: string) => void }) {
+export function FilesPane({
+  initialRoot,
+  onOpenFile,
+}: {
+  initialRoot?: string;
+  onOpenFile?: (path: string, name: string) => void;
+}) {
   const [root, setRoot] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [children, setChildren] = useState<Map<string, DirEntry[]>>(new Map());
@@ -89,16 +95,24 @@ export function FilesPane({ onOpenFile }: { onOpenFile?: (path: string, name: st
     }
   }, []);
 
-  // initial: open the user's home as the root
+  const setRootTo = useCallback(
+    (path: string) => {
+      setRoot(path);
+      setChildren(new Map());
+      setExpanded(new Set([path]));
+      setSelected(null);
+      loadDir(path);
+      refreshGit(path);
+    },
+    [loadDir, refreshGit],
+  );
+
+  // initial: open the requested directory, falling back to the user's home
   useEffect(() => {
     (async () => {
-      const home = await homeDir();
-      setRoot(home);
-      setExpanded(new Set([home]));
-      await loadDir(home);
-      refreshGit(home);
+      setRootTo(initialRoot || (await homeDir()));
     })();
-  }, [loadDir, refreshGit]);
+  }, [initialRoot, setRootTo]);
 
   const toggle = useCallback(
     (path: string) => {
@@ -120,18 +134,6 @@ export function FilesPane({ onOpenFile }: { onOpenFile?: (path: string, name: st
     setSelected(e.path);
     onOpenFile?.(e.path, e.name);
   };
-
-  const setRootTo = useCallback(
-    (path: string) => {
-      setRoot(path);
-      setChildren(new Map());
-      setExpanded(new Set([path]));
-      setSelected(null);
-      loadDir(path);
-      refreshGit(path);
-    },
-    [loadDir, refreshGit],
-  );
 
   const refreshAll = useCallback(() => {
     for (const p of expanded) loadDir(p);

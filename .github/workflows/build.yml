@@ -18,12 +18,12 @@ jobs:
           - platform: windows-latest
           - platform: macos-latest
     runs-on: ${{ matrix.platform }}
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
@@ -38,6 +38,11 @@ jobs:
 
       - name: install frontend deps
         run: pnpm install --frozen-lockfile
+
+      - name: use ad-hoc mac signing in ci
+        if: runner.os == 'macOS'
+        run: |
+          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.bundle.macOS.signingIdentity='-';fs.writeFileSync(p,JSON.stringify(c,null,2));"
 
       - name: build (tauri)
         uses: tauri-apps/tauri-action@v0

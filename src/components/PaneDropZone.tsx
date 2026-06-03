@@ -35,10 +35,14 @@ function extractPath(dt: DataTransfer): string | null {
 
 export function PaneDropZone({
   onPath,
+  onFiles,
   label = "drop to insert path",
   children,
 }: {
   onPath: (path: string) => void;
+  /** First crack at the drop's actual File objects (e.g. a screenshot). Return
+   *  true if consumed — then the path-insert fallback is skipped. */
+  onFiles?: (files: FileList) => boolean;
   label?: string;
   children: React.ReactNode;
 }) {
@@ -70,6 +74,15 @@ export function PaneDropZone({
           onDrop={(e) => {
             e.preventDefault();
             setOver(false);
+            // real files (a dropped screenshot) get first crack — so they
+            // attach as images instead of inserting a bare path string.
+            if (
+              onFiles &&
+              e.dataTransfer.files?.length &&
+              onFiles(e.dataTransfer.files)
+            ) {
+              return;
+            }
             const path = extractPath(e.dataTransfer);
             if (path) onPath(path);
           }}

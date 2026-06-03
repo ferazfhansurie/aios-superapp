@@ -3,7 +3,7 @@
  *  F5 to spawn a terminal pane running `commands[0]` in `root`, which streams
  *  logs exactly like VS Code's run terminal (and flutter's own `r` hot-reload
  *  works right in it). */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 export interface RunCommand {
   label: string;
@@ -37,6 +37,8 @@ export interface ProjectInfo {
   root: string;
   kind: ProjectKind;
   commands: RunCommand[];
+  /** unix epoch seconds of the project dir's last modification */
+  mtime: number;
 }
 
 /** Scan `~/Repo` (bounded depth, heavy dirs pruned) for every runnable project

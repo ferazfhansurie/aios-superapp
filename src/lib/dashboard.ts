@@ -12,7 +12,7 @@
  * Every getter is defensive: a missing file / unparseable JSON / absent command
  * yields a graceful empty shape, never a throw that blanks the idle page.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 export interface IdleFocus {
   phaseTitle: string | null;
@@ -91,6 +91,10 @@ export interface RateWindow {
   pct: number | null;
   resetsAt: number | null;
 }
+export interface CodexModelRate {
+  fiveHour: RateWindow;
+  sevenDay: RateWindow;
+}
 export interface IdleRate {
   fiveHour: RateWindow;
   sevenDay: RateWindow;
@@ -123,6 +127,77 @@ export async function idleRate(): Promise<IdleRate> {
         resetsAt: u.rate_limits?.seven_day?.resets_at ?? null,
       },
       contextPct: u.context_window?.used_percentage ?? null,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/**
+ * Live Codex (ChatGPT-sub) usage, parsed from `~/.codex/logs_2.sqlite` by the
+ * `codex_usage` Rust command. Codex's `primary` window = 5h, `secondary` = 7d,
+ * mirroring Claude — so the sidebar renders both with the same component.
+ * Returns the empty shape when Codex hasn't logged a rate-limit event yet (the
+ * `codex exec` path the chat pane uses logs null; the desktop app/TUI populate
+ * it). `plan` is the ChatGPT plan tier (e.g. "plus") when known.
+ */
+export interface CodexRate {
+  fiveHour: RateWindow;
+  sevenDay: RateWindow;
+  plan: string | null;
+  models: Record<string, CodexModelRate>;
+}
+export async function codexRate(): Promise<CodexRate> {
+  const empty: CodexRate = {
+    fiveHour: { pct: null, resetsAt: null },
+    sevenDay: { pct: null, resetsAt: null },
+    plan: null,
+    models: {},
+  };
+  try {
+    const u = await invoke<{
+      five_hour?: { pct?: number | null; resets_at?: number | null };
+      seven_day?: { pct?: number | null; resets_at?: number | null };
+      plan?: string | null;
+      models?: Record<
+        string,
+        {
+          five_hour?: { pct?: number | null; resets_at?: number | null };
+          seven_day?: { pct?: number | null; resets_at?: number | null };
+        }
+      >;
+    } | null>("codex_usage");
+    if (!u) return empty;
+    const models = u.models ?? {};
+    const parsedModels: Record<string, CodexModelRate> = {};
+    for (const [name, m] of Object.entries(models)) {
+      if (!m || typeof m !== "object") continue;
+      const mAny = m as {
+        five_hour?: { pct?: number | null; resets_at?: number | null };
+        seven_day?: { pct?: number | null; resets_at?: number | null };
+      };
+      parsedModels[name] = {
+        fiveHour: {
+          pct: mAny.five_hour?.pct ?? null,
+          resetsAt: mAny.five_hour?.resets_at ?? null,
+        },
+        sevenDay: {
+          pct: mAny.seven_day?.pct ?? null,
+          resetsAt: mAny.seven_day?.resets_at ?? null,
+        },
+      };
+    }
+    return {
+      fiveHour: {
+        pct: u.five_hour?.pct ?? null,
+        resetsAt: u.five_hour?.resets_at ?? null,
+      },
+      sevenDay: {
+        pct: u.seven_day?.pct ?? null,
+        resetsAt: u.seven_day?.resets_at ?? null,
+      },
+      plan: u.plan ?? null,
+      models: parsedModels,
     };
   } catch {
     return empty;

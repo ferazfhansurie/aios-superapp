@@ -1,4 +1,5 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { invoke, isTauriRuntime } from "./tauri";
 
 export interface DirEntry {
   name: string;
@@ -8,7 +9,7 @@ export interface DirEntry {
   mtime: number;
 }
 
-export type FilePreviewKind = "text" | "image" | "pdf" | "office" | "binary";
+export type FilePreviewKind = "text" | "image" | "pdf" | "office" | "video" | "binary";
 
 export interface FilePreview {
   kind: FilePreviewKind;
@@ -40,13 +41,43 @@ export interface GitStatus {
   entries: GitEntry[];
 }
 
+export interface ShellSourceStatus {
+  root: string | null;
+  branch: string;
+  dirty: number;
+  changed: GitEntry[];
+}
+
 /** Git status for the repo containing `path` (absolute path → status letter). */
 export async function gitStatus(path: string): Promise<GitStatus> {
   return invoke<GitStatus>("git_status", { path });
 }
 
+export async function shellSourceStatus(): Promise<ShellSourceStatus> {
+  return invoke<ShellSourceStatus>("shell_source_status");
+}
+
+/** Compact per-repo git summary for the homescreen "dev pulse" tile. */
+export interface RepoPulse {
+  root: string;
+  name: string;
+  branch: string;
+  dirty: number;
+  ahead: number;
+  behind: number;
+}
+
+/** Branch + dirty-count + ahead/behind for each repo path (best-effort). */
+export async function gitPulse(paths: string[]): Promise<RepoPulse[]> {
+  return invoke<RepoPulse[]>("git_pulse", { paths });
+}
+
 export async function homeDir(): Promise<string> {
   return invoke<string>("home_dir");
+}
+
+export async function startupOpenPane(): Promise<string | null> {
+  return invoke<string | null>("startup_open_pane");
 }
 
 export async function readFilePreview(path: string): Promise<FilePreview> {
@@ -55,6 +86,7 @@ export async function readFilePreview(path: string): Promise<FilePreview> {
 
 /** Asset-protocol URL for rendering a local file (images/pdf) in the webview. */
 export function fileSrc(path: string): string {
+  if (!isTauriRuntime()) return path;
   return convertFileSrc(path);
 }
 
@@ -66,6 +98,11 @@ export async function readTextFile(path: string): Promise<string> {
 /** Writes UTF-8 contents back to a file (editor save, atomic via temp+rename). */
 export async function writeTextFile(path: string, content: string): Promise<void> {
   return invoke<void>("write_text_file", { path, content });
+}
+
+/** Deletes a single file (notes CRUD). No-op if it's already gone; refuses dirs. */
+export async function deletePath(path: string): Promise<void> {
+  return invoke<void>("delete_path", { path });
 }
 
 /** Converts an office doc (docx/xlsx/pptx/…) to a cached PDF via headless

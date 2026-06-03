@@ -21,8 +21,6 @@ use serde::{Deserialize, Serialize};
 ///   - `AIOS_MASTER_SESSION` — name of the master session (default `aios`)
 /// On machines with no tmux / no AIOS sessions, every list command simply
 /// returns empty — the graceful path for non-AIOS users.
-const MASTER_LABEL: &str = "master";
-
 /// Reads an env var, falling back to a default. Resolved per-call (cheap) so a
 /// running cockpit can be retargeted without a rebuild.
 fn env_or(key: &str, default: &str) -> String {
@@ -154,33 +152,6 @@ fn tmux_oracle(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Checks the master session on its socket: `Some(attached)` if it exists,
-/// `None` if not running.
-fn master_state() -> Option<bool> {
-    let master_socket = master_socket();
-    let master_session = master_session();
-    let out = std::process::Command::new(tmux_bin())
-        .args([
-            "-L",
-            master_socket.as_str(),
-            "list-sessions",
-            "-F",
-            "#{session_name}|#{session_attached}",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut p = line.splitn(2, '|');
-        if p.next().map(|s| s.trim()) == Some(master_session.as_str()) {
-            return Some(p.next().unwrap_or("0").trim() != "0");
-        }
-    }
-    None
-}
-
 /// Resolves an `aios-*` session's display name from the instance registry.
 fn display_name_for(identity: &str, session: &str, instances: &[Instance]) -> String {
     instances
@@ -211,7 +182,10 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
             let mut parts = line.splitn(2, '|');
             let session = parts.next().unwrap_or("").trim().to_string();
             let attached = parts.next().unwrap_or("0").trim() != "0";
-            if !session.starts_with("aios-") {
+            // Real oracles are `aios-<identity>`. EXCLUDE `aios-term-*` — those are
+            // the shell's own persistent terminal panes, not oracles; they were
+            // leaking into the roster as cryptic "oracle: term-k3-…" entries.
+            if !session.starts_with("aios-") || session.starts_with("aios-term-") {
                 continue;
             }
             let identity = session.trim_start_matches("aios-").to_string();

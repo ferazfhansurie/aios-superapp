@@ -40,6 +40,19 @@ struct MemoryNode {
     links: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryHit {
+    id: String,
+    title: String,
+    #[serde(rename = "type")]
+    node_type: String,
+    description: String,
+    path: String,
+    score: i32,
+    reasons: Vec<String>,
+    preview: String,
+}
+
 /// Resolves the memory vault directory in a portable, env-overridable way.
 /// See the module header for the full precedence. Returns whatever path we
 /// settle on — callers tolerate it being absent (empty graph).
@@ -208,16 +221,9 @@ fn type_from_id(id: &str) -> String {
     "reference".to_string()
 }
 
-/// Builds the full memory graph: nodes (one per `*.md`) and edges (one per
-/// resolvable `[[link]]`). Returns `{ nodes, edges, vault_path, count }`.
-/// Always succeeds — an unreadable/empty vault yields an empty graph.
-#[tauri::command]
-pub fn memory_graph() -> Value {
-    let dir = vault_dir();
-    let mut nodes: Vec<MemoryNode> = Vec::new();
-
-    // Walk only the top level (the vault is flat) but be tolerant of nesting.
-    for entry in WalkDir::new(&dir)
+fn memory_nodes_from_dir(dir: &std::path::Path) -> Vec<(MemoryNode, String)> {
+    let mut nodes: Vec<(MemoryNode, String)> = Vec::new();
+    for entry in WalkDir::new(dir)
         .max_depth(2)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -243,18 +249,130 @@ pub fn memory_graph() -> Value {
         let description = frontmatter_field(fm, "description").unwrap_or_default();
         let node_type = metadata_type(fm).unwrap_or_else(|| type_from_id(&id));
         let links = extract_links(body);
+        nodes.push((
+            MemoryNode {
+                id,
+                title,
+                node_type,
+                description,
+                path: path.to_string_lossy().to_string(),
+                links,
+            },
+            body.to_string(),
+        ));
+    }
+    nodes.sort_by(|a, b| a.0.id.to_lowercase().cmp(&b.0.id.to_lowercase()));
+    nodes
+}
 
-        nodes.push(MemoryNode {
-            id,
-            title,
-            node_type,
-            description,
-            path: path.to_string_lossy().to_string(),
-            links,
-        });
+fn compact_preview(body: &str) -> String {
+    let text = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.chars().count() > 180 {
+        format!("{}…", text.chars().take(180).collect::<String>())
+    } else {
+        text
+    }
+}
+
+fn score_memory(
+    node: &MemoryNode,
+    body: &str,
+    query: &str,
+    cwd: Option<&str>,
+) -> Option<MemoryHit> {
+    let q = query.trim().to_lowercase();
+    let cwd = cwd.unwrap_or("").to_lowercase();
+    let id = node.id.to_lowercase();
+    let title = node.title.to_lowercase();
+    let description = node.description.to_lowercase();
+    let body_l = body.to_lowercase();
+    let path = node.path.to_lowercase();
+    let mut score = 0;
+    let mut reasons = Vec::new();
+
+    if !q.is_empty() {
+        for token in q.split_whitespace() {
+            if token.len() < 2 {
+                continue;
+            }
+            if id.contains(token) {
+                score += 18;
+                reasons.push(format!("id matches `{token}`"));
+            }
+            if title.contains(token) {
+                score += 24;
+                reasons.push(format!("title matches `{token}`"));
+            }
+            if description.contains(token) {
+                score += 14;
+                reasons.push(format!("description matches `{token}`"));
+            }
+            if body_l.contains(token) {
+                score += 6;
+                reasons.push(format!("body mentions `{token}`"));
+            }
+        }
     }
 
-    nodes.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
+    if !cwd.is_empty() && (path.contains(&cwd) || body_l.contains(&cwd)) {
+        score += 16;
+        reasons.push("matches current project path".to_string());
+    }
+
+    match node.node_type.as_str() {
+        "user" | "identity" | "preference" => score += 5,
+        "project" | "plan" | "workflow" => score += 4,
+        _ => {}
+    }
+    score += (node.links.len() as i32).min(8);
+
+    if score <= 0 {
+        return None;
+    }
+    reasons.sort();
+    reasons.dedup();
+    Some(MemoryHit {
+        id: node.id.clone(),
+        title: node.title.clone(),
+        node_type: node.node_type.clone(),
+        description: node.description.clone(),
+        path: node.path.clone(),
+        score,
+        reasons,
+        preview: compact_preview(body),
+    })
+}
+
+fn search_memory_dir(
+    dir: &std::path::Path,
+    query: String,
+    cwd: Option<String>,
+    limit: Option<u32>,
+) -> Vec<MemoryHit> {
+    let mut hits: Vec<MemoryHit> = memory_nodes_from_dir(dir)
+        .into_iter()
+        .filter_map(|(node, body)| score_memory(&node, &body, &query, cwd.as_deref()))
+        .collect();
+    hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
+    hits.truncate(limit.unwrap_or(8).clamp(1, 30) as usize);
+    hits
+}
+
+/// Builds the full memory graph: nodes (one per `*.md`) and edges (one per
+/// resolvable `[[link]]`). Returns `{ nodes, edges, vault_path, count }`.
+/// Always succeeds — an unreadable/empty vault yields an empty graph.
+#[tauri::command]
+pub fn memory_graph() -> Value {
+    let dir = vault_dir();
+    let nodes: Vec<MemoryNode> = memory_nodes_from_dir(&dir)
+        .into_iter()
+        .map(|(node, _)| node)
+        .collect();
 
     // Edges only connect to nodes that actually exist in the vault.
     let known: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
@@ -274,6 +392,11 @@ pub fn memory_graph() -> Value {
         "vault_path": dir.to_string_lossy(),
         "count": count,
     })
+}
+
+#[tauri::command]
+pub fn memory_search(query: String, cwd: Option<String>, limit: Option<u32>) -> Vec<MemoryHit> {
+    search_memory_dir(&vault_dir(), query, cwd, limit)
 }
 
 /// Returns the raw contents of a memory file. Guarded: `path` must resolve to a
@@ -356,7 +479,8 @@ pub fn memory_focus() -> Value {
 fn safe_slug(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 120
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Creates or updates a memory note, writing `<vault>/<name>.md` with standard
@@ -389,7 +513,10 @@ pub fn memory_save(
     let mut out = String::new();
     out.push_str("---\n");
     out.push_str(&format!("name: {name}\n"));
-    out.push_str(&format!("description: {}\n", description.replace('\n', " ").trim()));
+    out.push_str(&format!(
+        "description: {}\n",
+        description.replace('\n', " ").trim()
+    ));
     out.push_str("metadata:\n");
     out.push_str(&format!("  type: {ntype}\n"));
     out.push_str("---\n\n");
@@ -461,4 +588,60 @@ fn update_index_remove(dir: &std::path::Path, name: &str) {
     };
     let kept: Vec<&str> = existing.lines().filter(|l| !l.contains(&marker)).collect();
     let _ = std::fs::write(&index, kept.join("\n") + "\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_memory_dir;
+
+    #[test]
+    fn memory_search_ranks_title_and_project_matches() {
+        let root = std::env::temp_dir().join(format!("aios-memory-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("project_aios_shell.md"),
+            r#"---
+name: aios shell architecture
+description: pane-native tauri superapp memory for firaz
+metadata:
+  type: project
+---
+
+repo: /Users/firazfhansurie/Repo/firaz/aios/shell
+the shell uses panes, command registry, and memory context.
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("random_reference.md"),
+            r#"---
+name: unrelated browser note
+description: generic reference
+metadata:
+  type: reference
+---
+
+browser note that mentions shell once.
+"#,
+        )
+        .unwrap();
+
+        let hits = search_memory_dir(
+            &root,
+            "aios shell".to_string(),
+            Some("/Users/firazfhansurie/Repo/firaz/aios/shell".to_string()),
+            Some(5),
+        );
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "project_aios_shell");
+        assert!(hits[0].score > hits[1].score);
+        assert!(hits[0].reasons.iter().any(|r| r.contains("title")));
+        assert!(hits[0]
+            .reasons
+            .iter()
+            .any(|r| r == "matches current project path"));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./tauri";
 
 /**
  * Pane monitor — watch a tmux session (an oracle's work surface) and push

@@ -1,0 +1,20 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "aios-mirror-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-02",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AIOS_MIRROR",
+        "class_name": "MirrorRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MirrorRoom"]
+    }
+  ]
+}

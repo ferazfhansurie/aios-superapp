@@ -6,6 +6,9 @@
 const STORAGE_KEY = "aios.settings";
 
 export type PaneType = "terminal" | "files" | "browser";
+export type SidebarMode = "full" | "icons";
+export type TopBarMode = "full" | "compact" | "hidden";
+export type NotificationNativeMode = "off" | "important" | "all";
 
 export interface AppSettings {
   // general
@@ -19,6 +22,20 @@ export interface AppSettings {
   terminalFontSize: number; // 10..18
   splashOnLaunch: boolean;
   reduceMotion: boolean;
+  // composer "flash" level — how much ambient motion/wow the prompt box has.
+  //   "calm" → minimal (current baseline, respects reduce-motion)
+  //   "lush" → + rotating conic-gradient rim + idle breathing glow
+  //   "max"  → + aurora mesh-gradient behind the box
+  // Drives `data-flash` on <html>; gated entirely in App.css (zero JS cost).
+  flashLevel: FlashLevel;
+
+  // sidebar
+  sidebarMode: SidebarMode;
+  topBarMode: TopBarMode;
+
+  // notifications
+  notificationNativeMode: NotificationNativeMode;
+  notificationQuietMode: boolean;
 
   // oracles
   defaultSocketName: string;
@@ -27,6 +44,32 @@ export interface AppSettings {
 
   // memory
   graphPhysicsStrength: number; // 0..100
+
+  // chat provider (model-agnostic) — provider ids live in lib/providers.ts.
+  // Default "codex-cli" keeps new chats aligned with the WA oracle. chatModel is the last
+  // picked model id (null = provider default).
+  chatProvider: string;
+  chatModel: string | null;
+
+  // where "send to AI" actions route (notes pane "send", future quick-sends):
+  //   "codex-code"  → a terminal pane running `codex`
+  //   "claude-code" → a terminal pane running `claude`
+  //   "terminal"    → a plain shell pane (paste + run)
+  //   "chat"        → the in-app chat pane (uses chatProvider/chatModel)
+  defaultAi: DefaultAi;
+}
+
+/** Routing target for "send to AI" actions. */
+export type DefaultAi = "codex-code" | "claude-code" | "terminal" | "chat";
+
+/** Composer flash intensity. */
+export type FlashLevel = "calm" | "lush" | "max";
+
+/** Reflect the flash level as `data-flash` on <html> so App.css can gate the
+ *  ambient composer effects. Mirrors how theme/accent drive `data-theme`. */
+export function applyFlashLevel(level: FlashLevel = loadSettings().flashLevel): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.dataset.flash = level;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -39,12 +82,22 @@ export const DEFAULT_SETTINGS: AppSettings = {
   terminalFontSize: 13,
   splashOnLaunch: true,
   reduceMotion: false,
+  flashLevel: "lush",
+  sidebarMode: "full",
+  topBarMode: "hidden",
+  notificationNativeMode: "important",
+  notificationQuietMode: false,
 
   defaultSocketName: "adletic",
   autoRefreshSeconds: 15,
   showNonAiosSessions: false,
 
   graphPhysicsStrength: 50,
+
+  chatProvider: "codex-cli",
+  chatModel: null,
+
+  defaultAi: "codex-code",
 };
 
 /** Read-only display value — the vault is auto-resolved from your home dir. */
@@ -61,9 +114,26 @@ export function loadSettings(): AppSettings {
   if (cache) return cache;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    cache = raw
-      ? { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<AppSettings>) }
-      : { ...DEFAULT_SETTINGS };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<AppSettings>;
+      if (
+        parsed.chatProvider === "claude-cli" &&
+        parsed.chatModel == null &&
+        parsed.defaultAi === "claude-code"
+      ) {
+        parsed.chatProvider = "codex-cli";
+        parsed.defaultAi = "codex-code";
+      }
+      // Old installs defaulted to a branded visible titlebar. The shell now
+      // treats hidden chrome as the product default; existing localStorage should
+      // not keep users stuck on loud topbar modes after reinstall.
+      if (parsed.topBarMode === "full" || parsed.topBarMode === "compact") {
+        parsed.topBarMode = "hidden";
+      }
+      cache = { ...DEFAULT_SETTINGS, ...parsed };
+    } else {
+      cache = { ...DEFAULT_SETTINGS };
+    }
   } catch {
     cache = { ...DEFAULT_SETTINGS };
   }

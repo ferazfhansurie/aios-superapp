@@ -125,18 +125,6 @@ fn slice_after_key_array<'a>(xml: &'a str, key: &str) -> Option<&'a str> {
     Some(&body[..arr_end])
 }
 
-/// Returns the slice of `xml` BETWEEN the `<dict>`…`</dict>` that immediately
-/// follows `<key>NAME</key>` — the dict body for that key.
-fn slice_after_key_dict<'a>(xml: &'a str, key: &str) -> Option<&'a str> {
-    let key_tag = format!("<key>{key}</key>");
-    let key_pos = xml.find(&key_tag)?;
-    let after = &xml[key_pos + key_tag.len()..];
-    let d_start = after.find("<dict>")?;
-    let body = &after[d_start + "<dict>".len()..];
-    let d_end = body.find("</dict>")?;
-    Some(&body[..d_end])
-}
-
 /// Reads the `<integer>` value that immediately follows `<key>NAME</key>`.
 fn integer_for_key(xml: &str, key: &str) -> Option<i64> {
     let key_tag = format!("<key>{key}</key>");

@@ -1,0 +1,43 @@
+name: cloudflare pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: build web shell
+        run: pnpm build
+
+      - name: cloudflare credentials missing
+        if: env.CLOUDFLARE_ACCOUNT_ID == '' || env.CLOUDFLARE_API_TOKEN == ''
+        run: echo "::warning::cloudflare deploy skipped; add CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN repo secrets"
+
+      - name: deploy to cloudflare pages
+        if: env.CLOUDFLARE_ACCOUNT_ID != '' && env.CLOUDFLARE_API_TOKEN != ''
+        run: |
+          npx --yes wrangler@latest deploy --config workers/mirror/wrangler.jsonc || echo "::warning::mirror worker deploy failed; token needs Workers Scripts + Durable Objects edit permissions"
+          npx --yes wrangler@latest pages project create aios-superapp --production-branch=master || true
+          npx --yes wrangler@latest pages deploy dist --project-name=aios-superapp --branch=${{ github.ref_name }}

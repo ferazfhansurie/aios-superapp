@@ -109,6 +109,14 @@ pub struct GitStatus {
     entries: Vec<GitEntry>,
 }
 
+#[derive(Serialize)]
+pub struct ShellSourceStatus {
+    root: Option<String>,
+    branch: String,
+    dirty: u32,
+    changed: Vec<GitEntry>,
+}
+
 /// Git status for the repo containing `path`, as absolute-path → status-letter,
 /// so the Files tree can decorate changed files + their parent folders. Returns
 /// `{ root: null, entries: [] }` (never errors) when not in a repo.
@@ -150,6 +158,69 @@ pub fn git_status(path: String) -> Result<GitStatus, String> {
     Ok(GitStatus { root: Some(root), entries })
 }
 
+#[tauri::command]
+pub fn shell_source_status() -> Result<ShellSourceStatus, String> {
+    let Some(root) = find_shell_source_root() else {
+        return Ok(ShellSourceStatus {
+            root: None,
+            branch: String::new(),
+            dirty: 0,
+            changed: Vec::new(),
+        });
+    };
+
+    let branch = std::process::Command::new("git")
+        .args(["-C", &root, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let status = git_status(root.clone())?;
+    let dirty = status.entries.len() as u32;
+    let changed = status.entries.into_iter().take(18).collect();
+
+    Ok(ShellSourceStatus {
+        root: Some(root),
+        branch,
+        dirty,
+        changed,
+    })
+}
+
+fn find_shell_source_root() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("AIOS_SHELL_SOURCE_ROOT") {
+        candidates.push(path);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.to_string_lossy().to_string());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!("{home}/Repo/firaz/aios/shell"));
+        candidates.push(format!("{home}/Repo/firaz/adletic/aios/shell"));
+    }
+
+    candidates.into_iter().find_map(|path| {
+        let root = std::process::Command::new("git")
+            .args(["-C", &path, "rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+        let has_tauri = std::path::Path::new(&root)
+            .join("src-tauri/tauri.conf.json")
+            .exists();
+        let has_package = std::path::Path::new(&root).join("package.json").exists();
+        if has_tauri && has_package {
+            Some(root)
+        } else {
+            None
+        }
+    })
+}
+
 /// Collapse a 2-char porcelain XY code to one display letter.
 fn simplify_status(xy: &str) -> &'static str {
     if xy == "??" {
@@ -166,6 +237,96 @@ fn simplify_status(xy: &str) -> &'static str {
     } else {
         "M"
     }
+}
+
+#[derive(Serialize)]
+pub struct RepoPulse {
+    /// The input path, echoed back so the frontend can map results.
+    root: String,
+    /// Final path component of root.
+    name: String,
+    /// Current branch; "" if detached / not a repo.
+    branch: String,
+    /// Count of porcelain status lines (working-tree changes).
+    dirty: u32,
+    /// Commits ahead of upstream; 0 if no upstream / error.
+    ahead: u32,
+    /// Commits behind upstream; 0 if no upstream / error.
+    behind: u32,
+}
+
+/// Best-effort dev-pulse for a set of repo paths (the "dev pulse" dashboard tile).
+/// For each path: current branch, working-tree dirty count, and ahead/behind vs
+/// upstream. Never errors — a non-repo (or any git failure) yields a zeroed
+/// RepoPulse for that path. Results preserve input order, one per path. Frontend
+/// passes only a handful of paths so the git calls run sequentially.
+#[tauri::command]
+pub fn git_pulse(paths: Vec<String>) -> Vec<RepoPulse> {
+    let mut out: Vec<RepoPulse> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        // branch — "" if detached / not a repo
+        let branch = match std::process::Command::new("git")
+            .args(["-C", &path, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => String::new(),
+        };
+
+        // dirty — count of porcelain status lines
+        let dirty = match std::process::Command::new("git")
+            .args(["-C", &path, "status", "--porcelain", "--ignored=no"])
+            .output()
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count() as u32,
+            _ => 0,
+        };
+
+        // ahead/behind vs upstream — output is "<behind>\t<ahead>"
+        let (mut ahead, mut behind) = (0u32, 0u32);
+        if let Ok(o) = std::process::Command::new("git")
+            .args([
+                "-C",
+                &path,
+                "rev-list",
+                "--count",
+                "--left-right",
+                "@{upstream}...HEAD",
+            ])
+            .output()
+        {
+            if o.status.success() {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let mut parts = text.split_whitespace();
+                if let Some(b) = parts.next() {
+                    behind = b.parse().unwrap_or(0);
+                }
+                if let Some(a) = parts.next() {
+                    ahead = a.parse().unwrap_or(0);
+                }
+            }
+        }
+
+        out.push(RepoPulse {
+            root: path,
+            name,
+            branch,
+            dirty,
+            ahead,
+            behind,
+        });
+    }
+    out
 }
 
 #[derive(Serialize)]
@@ -280,6 +441,8 @@ pub struct ProjectInfo {
     kind: String,
     /// Candidate run commands; the first is the primary (default for the palette).
     commands: Vec<RunCommand>,
+    /// Unix epoch seconds of the project dir's last modification.
+    mtime: u64,
 }
 
 /// Directory names we never descend into — heavy build/dep/vcs dirs that would
@@ -326,19 +489,27 @@ pub fn list_projects() -> Vec<ProjectInfo> {
         if out.len() >= CAP {
             break;
         }
-        // If this dir is a project root, record it and don't descend further.
+        // If this dir is a project root, record it. Still descend afterward:
+        // many AIOS workspaces are monorepos with runnable nested apps, and the
+        // command palette must surface the actual app, not only the parent.
         if let Some((kind, commands)) = project_at(&dir) {
             let name = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| dir.to_string_lossy().to_string());
+            let mtime = std::fs::metadata(&dir)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             out.push(ProjectInfo {
                 name,
                 root: dir.to_string_lossy().to_string(),
                 kind,
                 commands,
+                mtime,
             });
-            continue;
         }
         if depth >= MAX_DEPTH {
             continue;
@@ -382,10 +553,18 @@ fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
     let mut out = Vec::new();
     if let Ok(text) = std::fs::read_to_string(dir.join("package.json")) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let is_react_native = json
+                .get("dependencies")
+                .and_then(|d| d.as_object())
+                .is_some_and(|d| d.contains_key("react-native"));
             if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
                 let mut names: Vec<&String> = scripts.keys().collect();
                 // priority order first, then the rest alphabetically
-                let prio = ["dev", "start", "serve", "build", "test"];
+                let prio: &[&str] = if is_react_native {
+                    &["android", "ios", "start", "test", "lint"]
+                } else {
+                    &["dev", "start", "serve", "build", "test"]
+                };
                 names.sort_by_key(|n| {
                     prio.iter().position(|p| *p == n.as_str()).unwrap_or(prio.len() + 1)
                 });
@@ -459,6 +638,22 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     ));
     std::fs::write(&tmp, content.as_bytes()).map_err(|e| format!("{e}"))?;
     std::fs::rename(&tmp, p).map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+/// Delete a single file (used by the notes pane — full CRUD). Refuses to touch
+/// directories so a bad path can't nuke a tree; a missing file is a no-op (the
+/// note is already gone, which is the caller's intent).
+#[tauri::command]
+pub fn delete_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Ok(());
+    }
+    if p.is_dir() {
+        return Err("refusing to delete a directory".into());
+    }
+    std::fs::remove_file(p).map_err(|e| format!("{e}"))?;
     Ok(())
 }
 
@@ -539,6 +734,18 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
     let truncated = bytes.len() > PREVIEW_TEXT_CAP;
     if truncated {
         bytes.truncate(PREVIEW_TEXT_CAP);
+    }
+
+    // Quick media detection: route common video formats directly into the in-pane
+    // player instead of generic binary rendering.
+    if matches!(ext.as_str(), "mp4" | "mov" | "webm" | "m4v" | "avi" | "mkv") {
+        return Ok(json!({
+            "kind": "video",
+            "text": serde_json::Value::Null,
+            "size": size,
+            "name": name,
+            "truncated": false,
+        }));
     }
 
     // Known text/code extensions, OR anything that decodes cleanly as UTF-8.

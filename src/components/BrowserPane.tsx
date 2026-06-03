@@ -32,6 +32,7 @@ import {
   browserClose,
   browserCopySelection,
   browserCurrentUrl,
+  browserFullscreenState,
   browserDeviceMode,
   browserEnterAnnotate,
   browserExitAnnotate,
@@ -50,6 +51,7 @@ import {
 import { addLink } from "../lib/sidebar";
 import { DEFAULT_PROFILE, addProfile, loadProfiles } from "../lib/profiles";
 import { rememberUrl } from "../lib/browser-mem";
+import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
 
 const ANNOT_SENTINEL = "AIOS_ANNOT:";
 const ANNOT_POLL_MS = 700;
@@ -76,6 +78,7 @@ export function BrowserPane({
   memKey,
   onAnnotate,
   onProfileChange,
+  onVideoFullscreen,
 }: {
   label: string;
   active?: boolean;
@@ -84,6 +87,9 @@ export function BrowserPane({
   /** Stable id (pinned-site sidebar id) under which to remember this pane's last
    *  location, so reopening returns where it left off. Omit = no memory. */
   memKey?: string;
+  /** Fired when an in-page video enters/exits HTML fullscreen, so the app can
+   *  drive TRUE fullscreen (maximize pane + fullscreen the OS window). */
+  onVideoFullscreen?: (on: boolean) => void;
   /** Cookie-partition profile this pane opens in (lets a second/third Google
    *  account stay logged in alongside the first). Defaults to the shared store. */
   initialProfile?: string;
@@ -125,6 +131,11 @@ export function BrowserPane({
   // Latest `onAnnotate` without making it a poll-effect dependency.
   const onAnnotateRef = useRef(onAnnotate);
   onAnnotateRef.current = onAnnotate;
+  // Latest video-fullscreen callback + whether we're currently reporting "on",
+  // so the fullscreen poll only fires on real enter/exit transitions.
+  const onVideoFullscreenRef = useRef(onVideoFullscreen);
+  onVideoFullscreenRef.current = onVideoFullscreen;
+  const fsOnRef = useRef(false);
 
   const rect = useCallback((): Rect | null => {
     const el = slotRef.current;
@@ -191,6 +202,27 @@ export function BrowserPane({
     return () => clearInterval(poll);
   }, [active, label, memKey]);
 
+  // Poll WKWebView element-fullscreen state. A child webview's HTML fullscreen
+  // only fills its own rect, so on enter we ask the app for TRUE fullscreen
+  // (maximize pane + fullscreen OS window) and undo it on exit. 1/2 = entering/in,
+  // 0/3 = exiting/none.
+  useEffect(() => {
+    if (!active) return;
+    const tick = () => {
+      if (!shownRef.current) return;
+      browserFullscreenState(label)
+        .then((s) => {
+          const on = s === 1 || s === 2;
+          if (on === fsOnRef.current) return;
+          fsOnRef.current = on;
+          onVideoFullscreenRef.current?.(on);
+        })
+        .catch(() => {});
+    };
+    const poll = setInterval(tick, 350);
+    return () => clearInterval(poll);
+  }, [active, label]);
+
   // Switch the pane to another cookie partition. The data store is fixed at
   // webview creation, so switching = destroy the current webview + let the show
   // effect recreate it in the new profile's jar (profile is in its deps).
@@ -246,6 +278,19 @@ export function BrowserPane({
     if (shownRef.current) browserNavigate(label, url).catch(() => {});
   }, [input, label]);
 
+  const showToast = useCallback((msg: string, level: NotificationLevel = "info", body?: string) => {
+    setToast(msg);
+    emitPaneNotification({
+      paneId: label,
+      paneLabel: "browser",
+      title: msg,
+      body,
+      level,
+    });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2500);
+  }, [label]);
+
   // Pin the current site to the sidebar (favicon resolved by the store from the
   // host). Label defaults to the hostname; the user can rename it in the rail.
   const pinSite = useCallback(() => {
@@ -258,16 +303,8 @@ export function BrowserPane({
     } catch {
       /* keep raw */
     }
-    setToast(`pinned ${host} to sidebar`);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 2500);
-  }, [current, input]);
-
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 2500);
-  }, []);
+    showToast(`pinned ${host} to sidebar`, "success", url);
+  }, [current, input, showToast]);
 
   useEffect(() => {
     return () => {
@@ -293,9 +330,9 @@ export function BrowserPane({
     browserScreenshot(label, r)
       .then((path) => {
         const file = path.split("/").pop() ?? path;
-        showToast(`saved ${file}`);
+        showToast(`saved ${file}`, "success", path);
       })
-      .catch((e) => showToast(typeof e === "string" ? e : "screenshot failed"));
+      .catch((e) => showToast(typeof e === "string" ? e : "screenshot failed", "error"));
   }, [label, rect, showToast]);
 
   const applyZoom = useCallback(
@@ -316,7 +353,7 @@ export function BrowserPane({
   const clearCookies = useCallback(() => {
     browserClearCookies(label).catch(() => {});
     setMenuOpen(false);
-    showToast("cleared cookies + storage");
+    showToast("cleared cookies + storage", "success", "browser profile data was cleared for this pane.");
   }, [label, showToast]);
 
   // Turn a captured annotation/selection into one chat-ready line.
@@ -372,7 +409,7 @@ export function BrowserPane({
           .then(() => showToast("annotate: click an element on the page"))
           .catch((e) => {
             setAnnotating(false);
-            showToast(typeof e === "string" ? e : "annotate failed");
+            showToast(typeof e === "string" ? e : "annotate failed", "error");
           });
       });
   }, [annotating, exitAnnotate, label, showToast]);
@@ -383,8 +420,8 @@ export function BrowserPane({
     browserCopySelection(label)
       .then(() => new Promise((r) => setTimeout(r, 120))) // let clipboard settle
       .then(() => consumeAnnotation())
-      .then((ok) => showToast(ok ? "selection sent to chat" : "no text selected"))
-      .catch((e) => showToast(typeof e === "string" ? e : "selection failed"));
+      .then((ok) => showToast(ok ? "selection sent to chat" : "no text selected", ok ? "success" : "warning"))
+      .catch((e) => showToast(typeof e === "string" ? e : "selection failed", "error"));
   }, [consumeAnnotation, label, showToast]);
 
   // While annotating, poll the clipboard for a submitted annotation, then exit.

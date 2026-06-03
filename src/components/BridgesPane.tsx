@@ -39,6 +39,7 @@ import {
   type BridgeMessage,
   type Bridges,
 } from "../lib/bridges";
+import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
 
 /** Brand-ish icon per channel id (falls back to a generic plug). lucide only. */
 function channelIcon(id: string, size = 13, className = "") {
@@ -131,8 +132,15 @@ export function BridgesPane() {
   // lightweight self-contained toast (connect button is an honest no-op).
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showToast = useCallback((msg: string) => {
+  const showToast = useCallback((msg: string, level: NotificationLevel = "info", body?: string) => {
     setToast(msg);
+    emitPaneNotification({
+      paneId: "channels",
+      paneLabel: "channels",
+      title: msg,
+      body,
+      level,
+    });
     if (toastTimer.current) clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(null), 2500);
   }, []);

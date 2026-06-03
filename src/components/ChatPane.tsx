@@ -22,12 +22,15 @@
  *   7. `/` slash menu (clear / plan / model / help)
  *   8. `@` file-mention picker sourced from cwd
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
   ArrowUp,
+  ArrowDown,
+  PackageOpen,
   AtSign,
+  Brain,
   Check,
   CheckCheck,
   ChevronDown,
@@ -39,6 +42,7 @@ import {
   FileText,
   FileType,
   Folder,
+  Gauge,
   Globe,
   HelpCircle,
   History,
@@ -46,9 +50,7 @@ import {
   ListChecks,
   Loader2,
   Mic,
-  Paperclip,
   Pencil,
-  Plus,
   RefreshCw,
   RotateCcw,
   Search,
@@ -58,6 +60,7 @@ import {
   Square,
   Target,
   Terminal,
+  Waypoints,
   Wrench,
   X,
 } from "lucide-react";
@@ -67,10 +70,12 @@ import {
   chatDetach,
   chatReattach,
   chatSend,
+  chatSteer,
   chatSendRaw,
   chatSetTitle,
   chatStart,
   chatStop,
+  webChatSend,
   listChatSessions,
   readChatTranscript,
   recordChatSession,
@@ -82,48 +87,73 @@ import {
   type ChatModel,
   type ChatSessionInfo,
   type ChatTurnInfo,
+  type WebChatTurn,
 } from "../lib/chat";
-import { readDir, saveImageTemp, type DirEntry } from "../lib/fs";
-import { chatHandles, paneWriters } from "../lib/paneBus";
+import { saveMoneyAgentChatSession } from "../lib/moneyAgents";
+import { fileSrc, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
+import { loadSettings, saveSettings } from "../lib/settings";
+import { idleRate, codexRate, resetIn } from "../lib/dashboard";
+import {
+  composerContextChips,
+  contextLedger,
+  cycleQueueSelection,
+  moveQueuedMessage,
+  queueMessage,
+  removeQueuedMessage,
+  resumeTitle,
+  sendContract,
+  stopStrategy,
+  updateQueuedMessage,
+  usageStack,
+  type ContextBudgetMode,
+  type QueuedMessage,
+} from "../lib/chatPaneState";
+import { usagePaceRisk } from "../lib/usagePace";
+import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
+import {
+  chatHandles,
+  paneWriters,
+  paneSubmitters,
+  paneImageDrop,
+  openEditorFileInPane,
+  openFileInPane,
+  openUrlInPane,
+  openViewerFileInPane,
+  revealFileInPane,
+} from "../lib/paneBus";
+import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
+import {
+  emptyRunEventState,
+  parseRunEventState,
+  reduceRunEvents,
+  serializeRunEventState,
+  type RunEventState,
+} from "../lib/runEvents";
+import {
+  finalizeStreamingTurns,
+  reduceChatStreamEvent,
+  type ChatTurn,
+} from "../lib/chatStream";
+import { memorySearch, type MemoryHit } from "../lib/memory";
+import { buildAiosShellContext } from "../lib/aiosContext";
+import {
+  onPetResult,
+  onPetError,
+  onPetUsage,
+  onPetUserMessage,
+} from "../lib/pet";
+import {
+  distanceFromBottom,
+  nextAutoscrollPaused,
+  shouldAutoscroll,
+  type ScrollIntent,
+} from "../lib/chatScroll";
+import { isTauriRuntime } from "../lib/tauri";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
 
-type Turn =
-  | { kind: "user"; id: string; text: string }
-  | { kind: "assistant"; id: string; text: string; streaming: boolean }
-  | {
-      kind: "thinking";
-      id: string;
-      text: string;
-      streaming: boolean;
-      startedAt?: number;
-      durationMs?: number;
-    }
-  | {
-      kind: "tool";
-      id: string; // tool_use id from claude
-      name: string;
-      input: Record<string, unknown>;
-      result?: string;
-      isError?: boolean;
-    }
-  | {
-      kind: "approval";
-      id: string; // synthetic; keyed off the control request_id
-      requestId: string;
-      toolName: string;
-      input: Record<string, unknown>;
-      decision?: ApprovalDecision; // set once the user picks → card becomes resolved
-    }
-  | {
-      kind: "result";
-      id: string;
-      text: string;
-      cost?: number;
-      tokens?: number;
-      durationMs?: number; // claude's reported turn duration (for the activity timer)
-    };
+type Turn = ChatTurn;
 
 /**
  * A display block — the rendered grouping of `Turn`s. Runs of consecutive tool
@@ -141,6 +171,98 @@ type RenderBlock =
 
 let _uid = 0;
 const uid = () => `t${++_uid}`;
+type ChatUsageRate = Awaited<ReturnType<typeof codexRate>>;
+type UsageWin = { pct: number | null; resetsAt: number | null };
+type UsageSnapshot = { fiveHour: UsageWin; sevenDay: UsageWin };
+
+function isSparkModel(modelId: string): boolean {
+  return /^gpt-5\.3-codex-spark$/i.test(modelId);
+}
+
+function usageProviderKey(model: ChatModel): string {
+  if ((model.engine ?? "claude") === "codex" && isSparkModel(model.id)) {
+    return "codex:gpt-5.3-spark";
+  }
+  return model.engine ?? "claude";
+}
+
+function usageProviderLabel(model: ChatModel): string {
+  if ((model.engine ?? "claude") === "codex" && isSparkModel(model.id)) {
+    return "gpt-5.3 spark";
+  }
+  return model.engine ?? "claude";
+}
+
+function codexUsageForModel(r: ChatUsageRate, model: ChatModel): UsageSnapshot | null {
+  if ((model.engine ?? "claude") !== "codex") return null;
+  if (!isSparkModel(model.id)) {
+    return { fiveHour: r.fiveHour, sevenDay: r.sevenDay };
+  }
+  const sparkEntry =
+    r.models[model.id] ??
+    Object.entries(r.models).find(([id]) => /^gpt-5\.3-codex-spark$/i.test(id))?.[1];
+  return sparkEntry ?? { fiveHour: r.fiveHour, sevenDay: r.sevenDay };
+}
+
+function hasUsageData(snapshot: UsageSnapshot | null): snapshot is UsageSnapshot {
+  if (!snapshot) return false;
+  return snapshot.fiveHour.pct != null || snapshot.sevenDay.pct != null;
+}
+
+function normalizeUsage(
+  raw: Awaited<ReturnType<typeof idleRate>> | ChatUsageRate,
+  provider: string,
+  model: ChatModel,
+): UsageSnapshot {
+  if (provider === "codex" || provider === "codex:gpt-5.3-spark") {
+    return codexUsageForModel(raw as ChatUsageRate, model) ?? {
+      fiveHour: { pct: null, resetsAt: null },
+      sevenDay: { pct: null, resetsAt: null },
+    };
+  }
+  const normalized = raw as Awaited<ReturnType<typeof idleRate>>;
+  return {
+    fiveHour: normalized.fiveHour,
+    sevenDay: normalized.sevenDay,
+  };
+}
+
+/** A pasted/attached image: live thumbnail + its saved temp path (null while saving). */
+interface ImageChip {
+  id: string;
+  url: string;
+  path: string | null;
+}
+let _imgSeq = 0;
+/** Shell-quote a path for embedding in a message (single-quote, escape inner '). */
+function quotePath(path: string): string {
+  return `'${path.replace(/'/g, "'\\''")}'`;
+}
+/** "0:05" from elapsed seconds (dictation timer). */
+function fmtElapsed(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+/** Precomputed equalizer bars for the inline dictation waveform (time-keyed). */
+const WAVEFORM_BARS: { h: number; delay: number }[] = Array.from(
+  { length: 40 },
+  (_, i) => ({ h: 28 + ((i * 37) % 60), delay: (i * 70) % 900 }),
+);
+const WAVE_KEYFRAMES = `@keyframes aios-wave {
+  0%, 100% { transform: scaleY(0.32); opacity: 0.55; }
+  50% { transform: scaleY(1); opacity: 1; }
+}`;
+
+/** File extension for a clipboard/file image mime. */
+function extFromMime(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("png")) return "png";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("webp")) return "webp";
+  return "png";
+}
 
 // instruction prefixes for the composer modes
 const PLAN_PREFIX =
@@ -152,6 +274,22 @@ const GOAL_PREFIX = (goal: string) =>
 // orchestrate, fan out, verify — be maximally thorough.
 const ULTRA_PREFIX =
   "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel sub-agents (Task tool) to cover it, then adversarially verify findings before concluding. Prefer orchestrated multi-agent execution over a single pass; only handle trivially small tasks inline.\n\n";
+
+const CONTEXT_BUDGETS: Array<{ id: ContextBudgetMode; label: string; sub: string }> = [
+  { id: "lean", label: "lean", sub: "stripped codex home, explicit context only" },
+  { id: "agent", label: "agent", sub: "terminal-grade tools and instructions" },
+  { id: "ultracode", label: "ultracode", sub: "xhigh + fanout, expensive by design" },
+];
+
+function memoryContextBlock(memories: MemoryHit[]): string {
+  if (memories.length === 0) return "";
+  return `Relevant AIOS memory context:\n${memories
+    .map((m, i) => {
+      const reasons = m.reasons.length ? ` reasons: ${m.reasons.join("; ")}` : "";
+      return `${i + 1}. ${m.title} [${m.type}] — ${m.description || m.preview}${reasons}`;
+    })
+    .join("\n")}\n\n`;
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -167,21 +305,6 @@ function previewArgs(input: Record<string, unknown>): string {
       return `${k}: ${s}`;
     })
     .join("  ");
-}
-
-/** Stringifies a claude tool_result payload (string | content blocks | json). */
-function resultToText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((b) =>
-        b && typeof b === "object" && "text" in b
-          ? String((b as { text: unknown }).text)
-          : JSON.stringify(b),
-      )
-      .join("\n");
-  }
-  return JSON.stringify(content, null, 2);
 }
 
 /** Pulls a total token count out of the loose result `usage` object. */
@@ -233,8 +356,8 @@ function toolTarget(turn: ToolTurn): { label: string; full: string } {
   if (path) return { label: ellipsizeMid(baseName(path)), full: path };
 
   // shell → the command (first line)
-  if (name === "bash" || name === "bashoutput") {
-    const cmd = str("command") ?? "";
+  if (name === "bash" || name === "bashoutput" || name === "exec_command" || name === "write_stdin") {
+    const cmd = str("command") ?? str("cmd") ?? str("chars") ?? "";
     const firstLine = cmd.split("\n")[0] ?? cmd;
     return { label: ellipsizeMid(firstLine, 60), full: cmd };
   }
@@ -281,8 +404,10 @@ function toolVerb(name: string): string {
     case "notebookedit":
       return "Edited";
     case "bash":
+    case "exec_command":
       return "Ran";
     case "bashoutput":
+    case "write_stdin":
       return "Output";
     case "grep":
     case "search":
@@ -296,6 +421,9 @@ function toolVerb(name: string): string {
       return "Web search";
     case "task":
       return "Agent";
+    case "mcp":
+    case "mcp_tool_call":
+      return "MCP";
     case "todowrite":
       return "Planned";
     default:
@@ -316,6 +444,8 @@ function toolIcon(name: string) {
       return Pencil;
     case "bash":
     case "bashoutput":
+    case "exec_command":
+    case "write_stdin":
       return Terminal;
     case "grep":
     case "glob":
@@ -325,6 +455,9 @@ function toolIcon(name: string) {
     case "webfetch_tool":
     case "websearch":
       return Globe;
+    case "mcp":
+    case "mcp_tool_call":
+      return Wrench;
     default:
       return Wrench;
   }
@@ -414,40 +547,194 @@ function fmtRelativeTime(unixSeconds: number): string {
 
 // ── component ────────────────────────────────────────────────────────────────
 
+const runEventsStorageKey = (sessionId: string) => `aios.chat.run-events:${sessionId}`;
+
 export function ChatPane({
   cwd,
   paneKey,
   seed,
   resume,
   reattach,
+  modelId,
+  agentId,
+  agentLabel,
+  onOpenUrl,
 }: {
   cwd?: string;
   paneKey?: string;
   seed?: string;
+  modelId?: string;
+  agentId?: string;
+  agentLabel?: string;
   /** Resume a prior chat session on mount (from the idle "continue" rail). */
   resume?: { id: string; title: string };
   /** Reattach to a still-live backgrounded session by its backend id (from the
    *  "running" tray) — replays its buffer and continues live instead of spawning. */
   reattach?: number;
+  /** Open an http(s) link from rendered markdown in an in-app browser pane. */
+  onOpenUrl?: (url: string) => void;
 }) {
+  const nativeRuntime = useMemo(() => isTauriRuntime(), []);
+  const webChatRuntime = !nativeRuntime;
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [input, setInput] = useState(seed ?? "");
+  const turnsRef = useRef<Turn[]>([]);
+  turnsRef.current = turns;
+  const [runEventState, setRunEventState] = useState<RunEventState>(() =>
+    emptyRunEventState(),
+  );
+  const [runEventsKey, setRunEventsKey] = useState<string | null>(() =>
+    resume?.id ? runEventsStorageKey(resume.id) : null,
+  );
+  useEffect(() => {
+    if (!runEventsKey) return;
+    try {
+      const restored = parseRunEventState(localStorage.getItem(runEventsKey));
+      if (!restored) return;
+      setRunEventState((current) =>
+        current.events.length > 0 ? current : restored,
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [runEventsKey]);
+  useEffect(() => {
+    if (!runEventsKey) return;
+    try {
+      if (runEventState.events.length > 0) {
+        localStorage.setItem(runEventsKey, serializeRunEventState(runEventState));
+      } else {
+        localStorage.removeItem(runEventsKey);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [runEventsKey, runEventState]);
+  // composer draft persists per pane so /clear, a restart, or a remount never
+  // loses what you were typing. Keyed by paneKey; seed (e.g. notes "send to AI")
+  // still wins on first mount.
+  const draftKey = paneKey ? `aios-chat-draft:${paneKey}` : null;
+  const [input, setInput] = useState<string>(() => {
+    if (seed) return seed;
+    if (draftKey) {
+      try {
+        return localStorage.getItem(draftKey) ?? "";
+      } catch {
+        /* ignore */
+      }
+    }
+    return "";
+  });
+  // persist the draft as it changes (cleared on send).
+  useEffect(() => {
+    if (!draftKey) return;
+    try {
+      if (input) localStorage.setItem(draftKey, input);
+      else localStorage.removeItem(draftKey);
+    } catch {
+      /* ignore */
+    }
+  }, [input, draftKey]);
+  const [isComposerCollapsed, setComposerCollapsed] = useState(false);
+
   const [streaming, setStreaming] = useState(false);
+  const [backendBusy, setBackendBusy] = useState(false);
   const [started, setStarted] = useState(false);
   // claude's init event arrived (session_id known) — gates the seed auto-send
   const [claudeReady, setClaudeReady] = useState(false);
 
-  // composer settings
-  const [model, setModel] = useState<ChatModel>(CHAT_MODELS[0]);
+  // composer settings — boot from the saved default (settings.chatModel).
+  // The model the user last picked in the composer IS their default; persisted
+  // so codex / opus / whatever sticks across panes + restarts.
+  const [model, setModel] = useState<ChatModel>(() => {
+    const preferred = modelId ?? loadSettings().chatModel;
+    return CHAT_MODELS.find((m) => m.id === preferred) ?? CHAT_MODELS[0];
+  });
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(EFFORTS[1]);
+  const [contextBudget, setContextBudget] = useState<ContextBudgetMode>("lean");
+  const effectiveBudget: ContextBudgetMode =
+    contextBudget === "ultracode" || effort.ultra ? "ultracode" : contextBudget;
+  // running context size (prompt tokens of the latest turn) → composer indicator
+  const [ctxTokens, setCtxTokens] = useState<number | null>(null);
+  const activeModelRef = useRef(model);
+  useEffect(() => {
+    activeModelRef.current = model;
+  }, [model.id, model.engine]);
+
+  // ── live usage bar (Phase 1) ───────────────────────────────────────────────
+  // The active engine's 5h/7d rate-limit windows, ticked as you talk: codex
+  // pushes account/rateLimits/updated, claude re-reads usage.json after each turn
+  // (both arrive as synthetic `usage` events from chat.rs). Seeded once on mount.
+  type UsageWindow = keyof UsageSnapshot;
+  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>("fiveHour");
+  // Snapshot each provider the first time it appears in this chat. The strip
+  // paints that baseline separately from usage added while this pane is alive.
+  const usageBaselineRef = useRef<Record<string, UsageSnapshot>>({});
+  const rememberUsage = useCallback((provider: string, next: UsageSnapshot) => {
+    if (!usageBaselineRef.current[provider]) {
+      usageBaselineRef.current[provider] = next;
+    }
+    setUsage(next);
+  }, []);
+  // cumulative $ spent this chat session (summed across result events).
+  const [sessionCost, setSessionCost] = useState(0);
+
+  // ── message queue / steering (Phase 2) ─────────────────────────────────────
+  // Type-ahead while a turn is in flight: submitting queues the message instead
+  // of dropping it; queued messages fire one-by-one as each turn completes
+  // (codex-style). Held in a ref too so the flush effect reads the latest list.
+  const [queued, setQueued] = useState<QueuedMessage[]>([]);
+  const [queuedIdx, setQueuedIdx] = useState(0);
+  const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
+  const [editingQueuedText, setEditingQueuedText] = useState("");
+  const queuedRef = useRef<QueuedMessage[]>([]);
+  queuedRef.current = queued;
 
   // mode chips
   const [planMode, setPlanMode] = useState(false);
   const [goal, setGoal] = useState<string>("");
+  const [memoryPanelOpen, setMemoryPanelOpen] = useState(false);
+  const [handoffPanelOpen, setHandoffPanelOpen] = useState(false);
+  const [memoryHits, setMemoryHits] = useState<MemoryHit[]>([]);
+  const [attachedMemoryIds, setAttachedMemoryIds] = useState<string[]>([]);
+  const attachedMemories = useMemo(
+    () => attachedMemoryIds
+      .map((id) => memoryHits.find((hit) => hit.id === id))
+      .filter((hit): hit is MemoryHit => Boolean(hit)),
+    [attachedMemoryIds, memoryHits],
+  );
+
+  useEffect(() => {
+    if (!memoryPanelOpen) {
+      setMemoryHits([]);
+      return;
+    }
+    const q = input.trim();
+    if (q.length < 2) {
+      setMemoryHits([]);
+      return;
+    }
+    let cancelled = false;
+    const t = window.setTimeout(() => {
+      memorySearch(q, cwd ?? null, 5)
+        .then((hits) => {
+          if (cancelled) return;
+          setMemoryHits(hits);
+          setAttachedMemoryIds((ids) => ids.filter((id) => hits.some((h) => h.id === id)));
+        })
+        .catch(() => {
+          if (!cancelled) setMemoryHits([]);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+  }, [input, cwd, memoryPanelOpen]);
 
   // open-dropdown tracking (single source so only one is open)
-  const [openMenu, setOpenMenu] = useState<null | "model" | "perm" | "effort">(
+  const [openMenu, setOpenMenu] = useState<null | "model" | "perm" | "effort" | "advanced">(
     null,
   );
 
@@ -473,9 +760,10 @@ export function ChatPane({
   const [resumedTitle, setResumedTitle] = useState<string | null>(resume?.title ?? null);
 
   const sessionIdRef = useRef<number | null>(null);
+  const webAbortRef = useRef<AbortController | null>(null);
   // live mirror of `streaming` for the close-handle closure (a turn in flight).
-  const streamingRef = useRef(false);
-  streamingRef.current = streaming;
+  const activeRunRef = useRef(false);
+  activeRunRef.current = streaming || backendBusy;
   // set true when the pane is intentionally detached (kept running) — tells the
   // unmount cleanup NOT to kill the claude process.
   const detachedRef = useRef(false);
@@ -487,6 +775,20 @@ export function ChatPane({
   const thinkingTurnId = useRef<string | null>(null);
   // last user prompt text actually sent to claude (for regenerate)
   const lastSentRef = useRef<string | null>(null);
+  const stopChatRef = useRef<() => void>(() => {});
+  // ── composer autocomplete (copilot-style) ──────────────────────────────────
+  // Past sent messages, newest first — the source for inline ghost completion.
+  // Persisted across sessions so the suggestions are useful from the first keypress.
+  const HISTORY_KEY = "aios.chat.history";
+  const historyRef = useRef<string[]>([]);
+  useEffect(() => {
+    try {
+      const h = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+      if (Array.isArray(h)) historyRef.current = h.filter((x) => typeof x === "string");
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   // ── chat-session recording (for the /resume list) ─────────────────────────
   // claude's own session id, parsed from the `system`/init event each (re)start.
@@ -495,6 +797,9 @@ export function ChatPane({
   // true once we've recorded this chat (on the first user send of the session),
   // so subsequent sends don't re-upsert. Reset on /clear and on resume.
   const recordedRef = useRef(false);
+  // Codex openers are often just "hi". Keep its title promotable until the
+  // first meaningful prompt lands, then leave the topic stable.
+  const codexTitleLockedRef = useRef(Boolean(resume));
   // true once the launcher seed has been auto-sent as the first turn, so it
   // fires exactly once and never re-fires on /clear or a session restart.
   const seedSentRef = useRef(false);
@@ -512,6 +817,8 @@ export function ChatPane({
   inputRef.current = input;
 
   const empty = turns.length === 0;
+  const usageProvider = usageProviderKey(model);
+  const usageLabel = usageProviderLabel(model);
 
   // ── voice dictation bridge (P0) ────────────────────────────────────────────
   // App registers each pane's writer here; ⌘J dictation pushes text to the
@@ -521,8 +828,16 @@ export function ChatPane({
     paneWriters.set(paneKey, (t) =>
       setInput((v) => (v ? v.trimEnd() + " " + t : t)),
     );
+    // SUBMIT path ("send to AI" → chat): fire the text straight through the
+    // kept-fresh sendText ref so it actually sends (no input-state race). Mirror
+    // it into the box first so the user sees what went out.
+    paneSubmitters.set(paneKey, (t) => {
+      setInput(t);
+      sendTextRef.current?.(t);
+    });
     return () => {
       paneWriters.delete(paneKey);
+      paneSubmitters.delete(paneKey);
     };
   }, [paneKey]);
 
@@ -532,37 +847,166 @@ export function ChatPane({
     taRef.current?.focus();
   }, []);
 
-  // Attach a file via a native picker. OS file-DROP doesn't fire in the webview
-  // on Windows (tauri #9448), so the reliable path is a hidden <input type=file>:
-  // read the picked file's bytes, persist to a temp file (save_image_temp stores
-  // ANY bytes), and append its quoted path to the composer — claude reads it as a
-  // real file reference. Works identically on macOS.
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const onAttachFiles = useCallback(async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
-    for (const file of Array.from(files)) {
-      try {
-        const buf = new Uint8Array(await file.arrayBuffer());
-        // chunked base64 (avoids call-stack blowups on large files)
-        let bin = "";
-        const CHUNK = 0x8000;
-        for (let i = 0; i < buf.length; i += CHUNK) {
-          bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
-        }
-        const b64 = btoa(bin);
-        const ext = file.name.includes(".") ? file.name.split(".").pop()! : "bin";
-        const path = await saveImageTemp(b64, ext);
-        const quoted = /[\s'"]/.test(path) ? `"${path}"` : path;
-        insertPath(quoted);
-      } catch {
-        /* skip a file we couldn't read */
+  // ── image attach: paste a screenshot / pick a file → temp file + thumbnail ──
+  const [images, setImages] = useState<ImageChip[]>([]);
+  const imgInputRef = useRef<HTMLInputElement>(null);
+  const addImage = useCallback(async (file: Blob, mime: string) => {
+    const id = `img${++_imgSeq}`;
+    const url = URL.createObjectURL(file);
+    setImages((prev) => [...prev, { id, url, path: null }]);
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
       }
+      const path = await saveImageTemp(btoa(bin), extFromMime(mime));
+      setImages((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
+    } catch {
+      setImages((prev) => {
+        const gone = prev.find((im) => im.id === id);
+        if (gone) URL.revokeObjectURL(gone.url);
+        return prev.filter((im) => im.id !== id);
+      });
     }
-  }, [insertPath]);
+  }, []);
+  const removeImage = useCallback((id: string) => {
+    setImages((prev) => {
+      const gone = prev.find((im) => im.id === id);
+      if (gone) URL.revokeObjectURL(gone.url);
+      return prev.filter((im) => im.id !== id);
+    });
+  }, []);
+
+  // Attach an image that already lives on disk (an OS file drop from Finder /
+  // the desktop). Tauri's native drag-drop hands us a path, not a Blob, so we
+  // skip the saveImageTemp round-trip: the chip's thumbnail renders straight off
+  // the asset-protocol URL, and `path` is set immediately (already on disk).
+  const addImageByPath = useCallback((path: string) => {
+    const id = `img${++_imgSeq}`;
+    setImages((prev) => [...prev, { id, url: fileSrc(path), path }]);
+  }, []);
+
+  // Register this chat pane's IMAGE-drop sink so App's native OS drag-drop
+  // handler routes dropped image files here as thumbnail chips (instead of
+  // appending their raw paths as text via paneWriters). Non-image drops still
+  // fall through to the path-insert writer.
+  useEffect(() => {
+    if (!paneKey) return;
+    paneImageDrop.set(paneKey, (paths) => {
+      for (const p of paths) addImageByPath(p);
+    });
+    return () => {
+      paneImageDrop.delete(paneKey);
+    };
+  }, [paneKey, addImageByPath]);
+  // paste an image off the clipboard → thumbnail chip (temp file saved in bg)
+  const onPasteImage = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const it of items) {
+        if (it.kind === "file" && it.type.startsWith("image/")) {
+          const file = it.getAsFile();
+          if (file) {
+            e.preventDefault();
+            void addImage(file, it.type);
+            return;
+          }
+        }
+      }
+    },
+    [addImage],
+  );
+  // dropped files (a screenshot dragged from Finder / desktop) → attach any
+  // image as a thumbnail chip. Returns true if it consumed ≥1 image, so the
+  // drop zone skips inserting a bare path for those.
+  const onDropFiles = useCallback(
+    (files: FileList): boolean => {
+      let took = false;
+      for (const f of Array.from(files)) {
+        if (f.type.startsWith("image/")) {
+          void addImage(f, f.type);
+          took = true;
+        }
+      }
+      return took;
+    },
+    [addImage],
+  );
+  // ── voice dictation: click mic → inline waveform + timer → transcript ───────
+  // Ported from TerminalComposer (the polished one). Records via lib/voice, swaps
+  // the textarea for a live equalizer while recording, drops the transcript into
+  // the box on stop. Esc cancels.
+  type VoicePhase = "idle" | "recording" | "transcribing";
+  const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
+  const [voiceElapsed, setVoiceElapsed] = useState(0);
+  const voicePhaseRef = useRef<VoicePhase>("idle");
+  voicePhaseRef.current = voicePhase;
+  useEffect(() => {
+    if (voicePhase !== "recording") return;
+    setVoiceElapsed(0);
+    const base = Date.now();
+    const t = setInterval(
+      () => setVoiceElapsed(Math.floor((Date.now() - base) / 1000)),
+      250,
+    );
+    return () => clearInterval(t);
+  }, [voicePhase]);
+  const micStart = useCallback(async () => {
+    if (voicePhaseRef.current !== "idle") return;
+    try {
+      await dictateStart();
+      setVoicePhase("recording");
+    } catch {
+      setVoicePhase("idle");
+    }
+  }, []);
+  const micStop = useCallback(async () => {
+    if (voicePhaseRef.current !== "recording") return;
+    setVoicePhase("transcribing");
+    try {
+      const text = await dictateStop();
+      if (text) {
+        setInput((v) => (v ? v.trimEnd() + " " + text : text));
+      }
+    } catch {
+      /* best-effort dictation */
+    } finally {
+      setVoicePhase("idle");
+      taRef.current?.focus();
+    }
+  }, []);
+  const micCancel = useCallback(async () => {
+    if (voicePhaseRef.current !== "recording") return;
+    setVoicePhase("idle");
+    try {
+      await dictateCancel();
+    } catch {
+      /* best-effort */
+    }
+  }, []);
+  const recording = voicePhase === "recording";
+  // Esc cancels an in-progress recording (the textarea is swapped out then, so a
+  // window listener catches it).
+  useEffect(() => {
+    if (!recording) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        void micCancel();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [recording, micCancel]);
 
   // ── event ingestion ───────────────────────────────────────────────────────
 
   const handleEvent = useCallback((ev: ChatEvent) => {
+    setRunEventState((state) => reduceRunEvents(state, ev));
     // ---- control protocol: tool approval requests + acks --------------------
     // claude → us, non-bypass modes: a `control_request` whose request.subtype
     // is `can_use_tool`. We surface an inline approval card; the reply goes back
@@ -598,158 +1042,46 @@ export function ChatPane({
       return;
     }
 
+    const reduced = (() => {
+      let handled = false;
+      setTurns((prev) => {
+        const result = reduceChatStreamEvent(
+          {
+            turns: prev,
+            streamingTurnId: streamingTurnId.current,
+            thinkingTurnId: thinkingTurnId.current,
+          },
+          ev,
+          { now: Date.now(), uid },
+        );
+        if (!result.handled) return prev;
+        handled = true;
+        streamingTurnId.current = result.state.streamingTurnId;
+        thinkingTurnId.current = result.state.thinkingTurnId;
+        return result.state.turns;
+      });
+      return handled;
+    })();
+    if (reduced) return;
+
     switch (ev.type) {
-      // token-by-token streaming via --include-partial-messages
-      case "stream_event": {
-        const e = ev.event;
-        if (!e) return;
-        // extended-thinking tokens stream as their own block, ahead of text
-        if (e.type === "content_block_delta" && e.delta?.type === "thinking_delta") {
-          const tok = e.delta.thinking ?? "";
-          if (!tok) return;
-          setTurns((prev) => {
-            const next = [...prev];
-            const id = thinkingTurnId.current;
-            const idx = id ? next.findIndex((t) => t.id === id) : -1;
-            if (idx >= 0 && next[idx].kind === "thinking") {
-              const t = next[idx] as Extract<Turn, { kind: "thinking" }>;
-              next[idx] = { ...t, text: t.text + tok, streaming: true };
-            } else {
-              const nid = uid();
-              thinkingTurnId.current = nid;
-              next.push({
-                kind: "thinking",
-                id: nid,
-                text: tok,
-                streaming: true,
-                startedAt: Date.now(),
-              });
-            }
-            return next;
-          });
-          return;
-        }
-        if (e.type === "content_block_delta" && e.delta?.type === "text_delta") {
-          const tok = e.delta.text ?? "";
-          if (!tok) return;
-          setTurns((prev) => {
-            const next = [...prev];
-            const id = streamingTurnId.current;
-            const idx = id ? next.findIndex((t) => t.id === id) : -1;
-            if (idx >= 0 && next[idx].kind === "assistant") {
-              const t = next[idx] as Extract<Turn, { kind: "assistant" }>;
-              next[idx] = { ...t, text: t.text + tok, streaming: true };
-            } else {
-              const nid = uid();
-              streamingTurnId.current = nid;
-              next.push({
-                kind: "assistant",
-                id: nid,
-                text: tok,
-                streaming: true,
-              });
-            }
-            return next;
-          });
-        }
-        return;
-      }
-
-      // full assistant message — finalize text + thinking, spawn tool cards
-      case "assistant": {
-        const blocks = ev.message?.content ?? [];
-        // mark any in-flight thinking block as settled (its tokens are complete)
-        const tid = thinkingTurnId.current;
-        if (tid) {
-          setTurns((prev) =>
-            prev.map((t) =>
-              t.id === tid && t.kind === "thinking"
-                ? {
-                    ...t,
-                    streaming: false,
-                    durationMs:
-                      t.startedAt != null ? Date.now() - t.startedAt : undefined,
-                  }
-                : t,
-            ),
-          );
-        }
-        for (const b of blocks) {
-          // thinking fallback: if partial-message deltas didn't build a block
-          // (e.g. replay or thinking arriving whole), synthesize one from text.
-          if (b.type === "thinking") {
-            const full = (b.thinking ?? "").trim();
-            if (full && thinkingTurnId.current == null) {
-              setTurns((prev) => [
-                ...prev,
-                { kind: "thinking", id: uid(), text: full, streaming: false },
-              ]);
-            }
-          }
-          if (b.type === "tool_use") {
-            const toolId = b.id ?? uid();
-            setTurns((prev) => {
-              if (prev.some((t) => t.kind === "tool" && t.id === toolId)) {
-                return prev;
-              }
-              return [
-                ...prev,
-                {
-                  kind: "tool",
-                  id: toolId,
-                  name: b.name ?? "tool",
-                  input: (b.input as Record<string, unknown>) ?? {},
-                },
-              ];
-            });
-          }
-        }
-        // step boundary: the next streamed text/thinking belongs to a fresh
-        // block (so post-tool reasoning doesn't merge into the prior bubble).
-        streamingTurnId.current = null;
-        thinkingTurnId.current = null;
-        return;
-      }
-
-      // tool_result arrives as a user message block referencing the tool_use id
-      case "user": {
-        const blocks = ev.message?.content ?? [];
-        for (const b of blocks) {
-          if (b.type === "tool_result") {
-            const ref = b.tool_use_id;
-            const text = resultToText(b.content);
-            setTurns((prev) =>
-              prev.map((t) =>
-                t.kind === "tool" && t.id === ref
-                  ? { ...t, result: text, isError: b.is_error }
-                  : t,
-              ),
-            );
-          }
-        }
-        return;
-      }
-
       // final result for the turn → faint footer + close the streaming bubble
       case "result": {
-        // mark the live assistant bubble done
-        setTurns((prev) =>
-          prev.map((t) => {
-            if (t.kind === "assistant" && t.streaming)
-              return { ...t, streaming: false };
-            if (t.kind === "thinking" && t.streaming)
-              return {
-                ...t,
-                streaming: false,
-                durationMs:
-                  t.startedAt != null ? Date.now() - t.startedAt : t.durationMs,
-              };
-            return t;
-          }),
-        );
+        setTurns((prev) => {
+          const finalized = finalizeStreamingTurns(
+            {
+              turns: prev,
+              streamingTurnId: streamingTurnId.current,
+              thinkingTurnId: thinkingTurnId.current,
+            },
+            Date.now(),
+          );
+          return finalized.turns;
+        });
         streamingTurnId.current = null;
         thinkingTurnId.current = null;
         setStreaming(false);
+        setBackendBusy(false);
         // prefer claude's reported duration; fall back to our wall-clock measure
         const wall =
           turnStartRef.current != null ? Date.now() - turnStartRef.current : undefined;
@@ -760,13 +1092,32 @@ export function ChatPane({
         const dur = durationMs != null ? fmtDuration(durationMs) : "";
         const costNum =
           typeof ev.total_cost_usd === "number" ? ev.total_cost_usd : undefined;
+        if (costNum != null && costNum > 0) setSessionCost((c) => c + costNum);
         const cost = costNum != null ? `$${costNum.toFixed(4)}` : "";
         const tokens = tokensFromUsage(ev.usage);
         const tokStr =
           tokens != null ? `${tokens.toLocaleString()} tok` : "";
-        const foot = [dur, tokStr, cost].filter(Boolean).join(" · ");
+        // context size = the prompt the model saw this turn (input + cached
+        // input). Drives the composer's running "Nk ctx" indicator, TUI-style.
+        const u = (ev.usage ?? {}) as Record<string, unknown>;
+        const ctx =
+          (typeof u.input_tokens === "number" ? u.input_tokens : 0) +
+          (typeof u.cache_read_input_tokens === "number"
+            ? u.cache_read_input_tokens
+            : 0) +
+          (typeof u.cache_creation_input_tokens === "number"
+            ? u.cache_creation_input_tokens
+            : 0);
+        if (ctx > 0) setCtxTokens(ctx);
+        const resultText = typeof ev.text === "string" ? ev.text.trim() : "";
+        const foot = [resultText, dur, tokStr, cost].filter(Boolean).join(" · ");
         // always emit a result turn (carries durationMs for the activity line),
         // even if the human-readable footer would be empty.
+        onPetResult({
+          tokens,
+          durationMs,
+          ok: !Boolean(ev.is_error),
+        });
         setTurns((prev) => [
           ...prev,
           { kind: "result", id: uid(), text: foot, cost: costNum, tokens, durationMs },
@@ -776,6 +1127,7 @@ export function ChatPane({
 
       // surface a backend stderr line (missing binary / not logged in / bad flag)
       case "aios_stderr": {
+        if (ev.text) onPetError(ev.text);
         if (ev.text) {
           setTurns((prev) => [
             ...prev,
@@ -785,13 +1137,54 @@ export function ChatPane({
         turnStartRef.current = null;
         setLiveStart(null);
         setStreaming(false);
+        setBackendBusy(false);
+        return;
+      }
+
+      // live usage tick (synthetic, from chat.rs) → move the composer's usage bar
+      case "usage": {
+        // Codex's app-server push can describe a model-specific CLI bucket. The
+        // desktop usage panel uses /backend-api/wham/usage, so re-read that exact
+        // account source instead of letting the push overwrite the visible meter.
+        if ((ev.provider ?? "claude") === "codex") {
+          const current = activeModelRef.current;
+          void codexRate().then((r) => {
+            const snap = codexUsageForModel(r, current);
+            if (hasUsageData(snap)) {
+              onPetUsage({
+                provider: "codex",
+                pct: snap.fiveHour.pct,
+              });
+              rememberUsage(usageProviderKey(current), snap);
+            }
+          });
+          return;
+        }
+        const fh = ev.five_hour ?? {};
+        const sd = ev.seven_day ?? {};
+        onPetUsage({
+          provider: ev.provider ?? "claude",
+          pct:
+            typeof fh.pct === "number"
+              ? fh.pct
+              : typeof sd.pct === "number"
+                ? sd.pct
+                : null,
+        });
+        rememberUsage(ev.provider ?? "claude", {
+          fiveHour: { pct: fh.pct ?? null, resetsAt: fh.resets_at ?? null },
+          sevenDay: { pct: sd.pct ?? null, resetsAt: sd.resets_at ?? null },
+        });
         return;
       }
 
       // system init: not rendered, but carries claude's session_id — capture it
       // so the first user send can recordChatSession() into the /resume list.
       case "system": {
-        if (ev.session_id) claudeSessionIdRef.current = ev.session_id;
+        if (ev.session_id) {
+          claudeSessionIdRef.current = ev.session_id;
+          setRunEventsKey(runEventsStorageKey(ev.session_id));
+        }
         setClaudeReady(true);
         return;
       }
@@ -800,7 +1193,7 @@ export function ChatPane({
       default:
         return;
     }
-  }, []);
+  }, [rememberUsage]);
 
   // ── session lifecycle: one channel + one session per mount ─────────────────
   // `restartKey` lets `/clear` tear down + re-spin the session without changing
@@ -811,6 +1204,19 @@ export function ChatPane({
     let disposed = false;
     setStarted(false);
     setClaudeReady(false);
+    setCtxTokens(null);
+    if (webChatRuntime) {
+      sessionIdRef.current = 0;
+      claudeSessionIdRef.current = `web-${paneKey ?? "chat"}`;
+      setRunEventsKey(runEventsStorageKey(claudeSessionIdRef.current));
+      setStarted(true);
+      setClaudeReady(true);
+      return () => {
+        webAbortRef.current?.abort();
+        webAbortRef.current = null;
+        sessionIdRef.current = null;
+      };
+    }
     const chan = new Channel<string>();
     chan.onmessage = (line) => {
       if (disposed) return;
@@ -826,25 +1232,34 @@ export function ChatPane({
     // Reattach to a live backgrounded session (replays its buffer) vs spawn fresh.
     const startup =
       reattach != null
-        ? chatReattach(reattach, chan).then(() => reattach)
+        ? chatReattach(reattach, chan).then((info) => ({ id: reattach, busy: info.busy }))
         : chatStart(chan, {
+            engine: model.engine ?? "claude",
             cwd: cwd ?? null,
             model: model.disabled ? null : model.id,
             permissionMode: permission.id,
             // ultracode isn't a real --effort value; run it as xhigh (the
             // "+ workflows" half is applied per-message via ULTRA_PREFIX).
-            effort: effort.ultra ? "xhigh" : effort.id,
+            effort: effectiveBudget === "ultracode" ? "xhigh" : effort.id,
+            fast: effectiveBudget === "lean",
             resume: resumeId,
-          });
+          }).then((id) => ({ id, busy: false }));
 
     startup
-      .then((id) => {
+      .then(({ id, busy }) => {
         if (disposed) {
           // only kill a freshly-spawned session we're abandoning; never a reattach.
           if (reattach == null) chatStop(id).catch(() => {});
           return;
         }
         sessionIdRef.current = id;
+        setBackendBusy(busy);
+        if (busy && turnStartRef.current == null) {
+          const t0 = Date.now();
+          turnStartRef.current = t0;
+          setLiveStart(t0);
+          setNow(t0);
+        }
         setStarted(true);
       })
       .catch((err) => {
@@ -866,13 +1281,14 @@ export function ChatPane({
     };
     // model/permission/effort/resumeId are captured at start; changing them restarts the session
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model.id, permission.id, effort.id, cwd, restartKey, resumeId, reattach]);
+  }, [model.id, permission.id, effort.id, effectiveBudget, cwd, restartKey, resumeId, reattach, webChatRuntime, paneKey]);
 
   // Publish a close-handle so App can detach (keep running) vs kill a busy chat.
   useEffect(() => {
     if (!paneKey) return;
     chatHandles.set(paneKey, {
-      busy: () => streamingRef.current,
+      busy: () => activeRunRef.current,
+      stop: () => stopChatRef.current(),
       detach: (notify: boolean) => {
         const id = sessionIdRef.current;
         if (id != null) {
@@ -886,11 +1302,149 @@ export function ChatPane({
     };
   }, [paneKey]);
 
-  // autoscroll on new content
+  // Seed the usage bar once on mount (and on engine switch) so it shows BEFORE
+  // the first turn ticks it — claude reads usage.json, codex reads logs_2.sqlite.
+  // After this, live `usage` events keep it moving as you talk.
+  useEffect(() => {
+    let alive = true;
+    const provider = usageProviderKey(model);
+    const label = model.engine ?? "claude";
+    const fn = label === "codex" ? codexRate : idleRate;
+    fn()
+      .then((r) => {
+        const next = normalizeUsage(r, provider, model);
+        if (alive && hasUsageData(next)) {
+          rememberUsage(provider, next);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [model.engine, model.id, rememberUsage]);
+
+  // Queue flush: when a turn finishes (streaming → false) and messages are
+  // queued, fire the next one. dispatch via a ref so this effect isn't a dep of
+  // the (changing) dispatch closure. One per turn → the queue drains in order.
+  const dispatchRef = useRef<(text: string) => void>(() => {});
+  useEffect(() => {
+    if (streaming) return;
+    if (!started) return;
+    if (queuedRef.current.length === 0) return;
+    if (sessionIdRef.current == null) return;
+    const [next, ...rest] = queuedRef.current;
+    setQueued(rest);
+    setQueuedIdx((idx) => (rest.length === 0 ? 0 : Math.min(idx, rest.length - 1)));
+    dispatchRef.current(next.text);
+  }, [streaming]);
+
+  // autoscroll on new content — but with a STICKY pause. The moment you scroll
+  // up (wheel, scrollbar, touch) we stop yanking you down and hold there until
+  // you ride back to the very bottom OR tap the "jump to latest" pill. Sticky is
+  // the fix for the old behavior: a small up-scroll fell back inside the bottom
+  // threshold and the next token re-pinned, so it felt like it ignored you.
+  const pausedRef = useRef(false);
+  // set just before we programmatically pin, so the scroll event our own pin
+  // fires isn't misread as the user moving the viewport.
+  const programmaticRef = useRef(false);
+  const lastScrollHeightRef = useRef(0);
+  const lastScrollTopRef = useRef(0);
+  const lastArrowDownRef = useRef(0);
+  const [showJump, setShowJump] = useState(false);
+  const syncJumpVisibility = useCallback((el: HTMLDivElement | null, paused = pausedRef.current) => {
+    if (!el) {
+      setShowJump(paused);
+      return;
+    }
+    setShowJump(
+      paused ||
+        distanceFromBottom({
+          scrollHeight: el.scrollHeight,
+          scrollTop: el.scrollTop,
+          clientHeight: el.clientHeight,
+        }) > 24,
+    );
+  }, []);
+  const setPaused = useCallback((p: boolean) => {
+    pausedRef.current = p;
+    syncJumpVisibility(scrollRef.current, p);
+  }, [syncJumpVisibility]);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (
+      el &&
+      shouldAutoscroll(
+        {
+          scrollHeight: el.scrollHeight,
+          scrollTop: el.scrollTop,
+          clientHeight: el.clientHeight,
+          previousScrollHeight: lastScrollHeightRef.current || undefined,
+        },
+        pausedRef.current,
+      )
+    ) {
+      programmaticRef.current = true;
+      el.scrollTop = el.scrollHeight;
+    }
+    if (el) {
+      lastScrollHeightRef.current = el.scrollHeight;
+      lastScrollTopRef.current = el.scrollTop;
+      syncJumpVisibility(el);
+    } else {
+      lastScrollHeightRef.current = 0;
+      lastScrollTopRef.current = 0;
+      syncJumpVisibility(null);
+    }
+  }, [turns, streaming, liveStart, now, syncJumpVisibility]);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [turns]);
+    if (!el) return;
+    const onScroll = () => {
+      // swallow the one scroll event our own pin just emitted
+      if (programmaticRef.current) {
+        programmaticRef.current = false;
+        lastScrollTopRef.current = el.scrollTop;
+        return;
+      }
+      const intent: ScrollIntent =
+        el.scrollTop < lastScrollTopRef.current ? "up" : el.scrollTop > lastScrollTopRef.current ? "down" : "unknown";
+      const nextPaused = nextAutoscrollPaused(
+        pausedRef.current,
+        {
+          scrollHeight: el.scrollHeight,
+          scrollTop: el.scrollTop,
+          clientHeight: el.clientHeight,
+        },
+        intent,
+      );
+      setPaused(nextPaused);
+      lastScrollHeightRef.current = el.scrollHeight;
+      lastScrollTopRef.current = el.scrollTop;
+      syncJumpVisibility(el, nextPaused);
+    };
+    // scrolling up = user taking the wheel → pause immediately, even before the
+    // distance math catches up (mid-stream the content keeps growing below).
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) setPaused(true);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    el.addEventListener("wheel", onWheel, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("wheel", onWheel);
+    };
+  }, [setPaused, syncJumpVisibility]);
+  const jumpToLatest = useCallback(() => {
+    const el = scrollRef.current;
+    if (el) {
+      programmaticRef.current = true;
+      el.scrollTop = el.scrollHeight;
+      lastScrollHeightRef.current = el.scrollHeight;
+      lastScrollTopRef.current = el.scrollTop;
+    }
+    setPaused(false);
+    syncJumpVisibility(el ?? null, false);
+  }, [setPaused, syncJumpVisibility]);
 
   // autosize textarea
   useEffect(() => {
@@ -935,18 +1489,39 @@ export function ChatPane({
   // the transcript (the raw text the user typed); `wire` is what claude receives
   // (display + any plan / goal prefixes). Regenerate replays the same display.
   const dispatch = useCallback(
-    (display: string, opts?: { skipUserBubble?: boolean }) => {
+    (display: string, opts?: { skipUserBubble?: boolean; wirePrefix?: string }) => {
       const id = sessionIdRef.current;
       if (id == null) return;
-      let wire = display;
+      const shellContext = buildAiosShellContext({
+        cwd,
+        paneKey,
+        attachedMemoryCount: attachedMemories.length,
+      });
+      let wire = shellContext + (opts?.wirePrefix ?? "") + display;
       if (goal.trim()) wire = GOAL_PREFIX(goal.trim()) + wire;
       if (planMode) wire = PLAN_PREFIX + wire;
-      if (effort.ultra) wire = ULTRA_PREFIX + wire;
+      if (effectiveBudget === "ultracode") wire = ULTRA_PREFIX + wire;
       lastSentRef.current = display;
+      // feed the autocomplete history (dedup, newest first, capped).
+      if (display.trim()) {
+        onPetUserMessage({
+          textLength: display.trim().length,
+          memoryCount: attachedMemories.length,
+          imageCount: images.length,
+        });
+        try {
+          const h = [display, ...historyRef.current.filter((x) => x !== display)].slice(0, 200);
+          historyRef.current = h;
+          localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+        } catch {
+          /* ignore */
+        }
+      }
       if (!opts?.skipUserBubble) {
         setTurns((prev) => [...prev, { kind: "user", id: uid(), text: display }]);
       }
       setStreaming(true);
+      setBackendBusy(true);
       streamingTurnId.current = null;
       thinkingTurnId.current = null;
       // start the turn timer (drives "Working… m:ss" → "Worked for Xs")
@@ -956,40 +1531,250 @@ export function ChatPane({
       setNow(t0);
       // plan-mode is a per-message instruction; clear it after firing
       if (planMode) setPlanMode(false);
+      if (webChatRuntime) {
+        webAbortRef.current?.abort();
+        const controller = new AbortController();
+        webAbortRef.current = controller;
+        const messages: WebChatTurn[] = turnsRef.current.flatMap((turn): WebChatTurn[] => {
+          if (turn.kind === "user") return [{ role: "user" as const, text: turn.text }];
+          if (turn.kind === "assistant") return [{ role: "assistant" as const, text: turn.text }];
+          return [];
+        });
+        webChatSend(wire, {
+          model: model.disabled ? null : model.id,
+          messages,
+          signal: controller.signal,
+        })
+          .then((reply) => {
+            if (controller.signal.aborted) return;
+            handleEvent({
+              type: "assistant",
+              model: reply.model,
+              message: {
+                role: "assistant",
+                model: reply.model,
+                content: [{ type: "text", text: reply.text }],
+              },
+            });
+            handleEvent({
+              type: "result",
+              duration_ms: Date.now() - t0,
+              usage: reply.usage,
+            });
+          })
+          .catch((err) => {
+            if (controller.signal.aborted) return;
+            setTurns((prev) => [
+              ...prev,
+              { kind: "result", id: uid(), text: `send failed: ${err}` },
+            ]);
+            setStreaming(false);
+            setBackendBusy(false);
+          })
+          .finally(() => {
+            if (webAbortRef.current === controller) webAbortRef.current = null;
+          });
+        return;
+      }
       chatSend(id, wire).catch((err) => {
         setTurns((prev) => [
           ...prev,
           { kind: "result", id: uid(), text: `send failed: ${err}` },
         ]);
         setStreaming(false);
+        setBackendBusy(false);
       });
     },
-    [goal, planMode, effort.ultra],
+    [
+      goal,
+      planMode,
+      effectiveBudget,
+      cwd,
+      paneKey,
+      attachedMemories.length,
+      webChatRuntime,
+      model.id,
+      model.disabled,
+      handleEvent,
+    ],
   );
+  // keep the flush effect calling the latest dispatch closure
+  dispatchRef.current = dispatch;
 
-  const send = useCallback(() => {
-    const text = input.trim();
-    if (!text || streaming || sessionIdRef.current == null) return;
-    // Record this chat into the /resume list on its FIRST user send, titled by
-    // that first message. claude's session_id (from the init event) is the key
-    // used later to resume + repaint. Fire-and-forget; never blocks the send.
-    if (!recordedRef.current) {
-      const sid = claudeSessionIdRef.current;
-      if (sid) {
-        recordedRef.current = true;
-        const title = text.length > 120 ? text.slice(0, 120) : text;
-        recordChatSession(sid, title, cwd ?? null).catch(() => {
-          // failed to persist → allow a later send to retry
-          recordedRef.current = false;
-        });
-        // Label the backend session for the background tray + done-notification.
-        if (sessionIdRef.current != null) chatSetTitle(sessionIdRef.current, title).catch(() => {});
-      }
-    }
+  // Queue a message instead of sending it (used while a turn is streaming). It
+  // fires automatically when the current turn completes (see the flush effect).
+  const enqueue = useCallback((raw: string) => {
+    setQueued((items) => {
+      const next = queueMessage(items, raw);
+      setQueuedIdx(next.selected);
+      return next.items;
+    });
     setInput("");
     setOverlay(null);
-    dispatch(text);
-  }, [input, streaming, dispatch, cwd]);
+  }, []);
+
+  const removeQueued = useCallback((id: string) => {
+    setQueued((items) => {
+      const next = removeQueuedMessage({ items, selected: queuedIdx }, id);
+      setQueuedIdx(next.selected);
+      return next.items;
+    });
+    if (editingQueuedId === id) {
+      setEditingQueuedId(null);
+      setEditingQueuedText("");
+    }
+  }, [queuedIdx, editingQueuedId]);
+
+  const editQueued = useCallback((item: QueuedMessage) => {
+    setEditingQueuedId(item.id);
+    setEditingQueuedText(item.text);
+  }, []);
+
+  const saveQueuedEdit = useCallback(() => {
+    const id = editingQueuedId;
+    if (!id) return;
+    setQueued((items) => {
+      const next = updateQueuedMessage(
+        { items, selected: queuedIdx },
+        id,
+        editingQueuedText,
+      );
+      setQueuedIdx(next.selected);
+      return next.items;
+    });
+    setEditingQueuedId(null);
+    setEditingQueuedText("");
+  }, [editingQueuedId, editingQueuedText, queuedIdx]);
+
+  const moveQueued = useCallback((id: string, delta: number) => {
+    setQueued((items) => {
+      const next = moveQueuedMessage({ items, selected: queuedIdx }, id, delta);
+      setQueuedIdx(next.selected);
+      return next.items;
+    });
+  }, [queuedIdx]);
+
+  // Explicitly inject one highlighted pending message into a live codex turn.
+  // If the backend cannot steer yet, leave it queued so normal auto-send wins.
+  const steerQueued = useCallback(
+    (queuedId: string) => {
+      const item = queuedRef.current.find((q) => q.id === queuedId);
+      if (!item || model.engine !== "codex") return;
+      const id = sessionIdRef.current;
+      if (id == null) return;
+      chatSteer(id, item.text)
+        .then(() => {
+          removeQueued(queuedId);
+          setTurns((prev) => [...prev, { kind: "user", id: uid(), text: item.text, steered: true }]);
+        })
+        .catch(() => {}); // no active turn yet → keep queued for automatic send
+    },
+    [model.engine, removeQueued],
+  );
+
+  // Send an explicit string (used by send() with the composer text, and by the
+  // external "send to AI" submitter which passes the note body directly so it
+  // doesn't race the input state).
+  const sendText = useCallback(
+    (raw: string) => {
+      const text = raw.trim();
+      // attached images go in as quoted temp paths the model can read; allow a
+      // send with images even when the text is empty.
+      const imgPaths = images
+        .filter((im) => im.path)
+        .map((im) => quotePath(im.path as string));
+      if (!text && imgPaths.length === 0) return;
+      if (streaming) return;
+      if (sessionIdRef.current == null) {
+        if (imgPaths.length === 0) {
+          enqueue(text);
+          setInput("");
+          setOverlay(null);
+          setTurns((prev) => [
+            ...prev,
+            {
+              kind: "result",
+              id: uid(),
+              text: "chat is still starting — queued message will send automatically.",
+            },
+          ]);
+          return;
+        }
+        setTurns((prev) => [
+          ...prev,
+          {
+            kind: "result",
+            id: uid(),
+            text: "chat session isn't ready yet. retry this message after startup and attachments will be included.",
+          },
+        ]);
+        return;
+      }
+      // Claude keeps its original first-message labels. Codex starts with a
+      // provisional label for low-signal openers, then promotes the first real
+      // request into a compact stable topic.
+      const engine = model.engine ?? "claude";
+      const suggested = resumeTitle(text, engine);
+      const stableTitle = agentLabel ?? suggested.title;
+      const firstRecord = !recordedRef.current;
+      const promoteCodex =
+        engine === "codex" && !codexTitleLockedRef.current && suggested.meaningful;
+      const sid = claudeSessionIdRef.current;
+      if (sid && (firstRecord || promoteCodex)) {
+        if (firstRecord) recordedRef.current = true;
+        if (promoteCodex) codexTitleLockedRef.current = true;
+        recordChatSession(sid, stableTitle, cwd ?? null, engine, model.id).catch(() => {
+          // failed to persist → allow a later send to retry
+          if (firstRecord) recordedRef.current = false;
+          if (promoteCodex) codexTitleLockedRef.current = false;
+        });
+        if (agentId) {
+          saveMoneyAgentChatSession(agentId, {
+            sessionId: sid,
+            title: stableTitle,
+            updatedAt: Date.now(),
+          });
+        }
+        // Label the backend session for the background tray + done-notification.
+        if (sessionIdRef.current != null)
+          chatSetTitle(sessionIdRef.current, stableTitle).catch(() => {});
+      }
+      setInput("");
+      setImages((prev) => {
+        prev.forEach((im) => URL.revokeObjectURL(im.url));
+        return [];
+      });
+      setOverlay(null);
+      const attachedMemoryBlock = memoryContextBlock(attachedMemories);
+      setAttachedMemoryIds([]);
+      // prepend the image paths so the model sees them with the message
+      const full = imgPaths.length
+        ? imgPaths.join(" ") + (text ? " " + text : "")
+        : text;
+      dispatch(full, { wirePrefix: attachedMemoryBlock });
+    },
+    [streaming, dispatch, cwd, images, model, attachedMemories],
+  );
+
+  const send = useCallback(() => sendText(input), [sendText, input]);
+
+  const steerDraft = useCallback(() => {
+    const text = input.trim();
+    const id = sessionIdRef.current;
+    if (!text || model.engine !== "codex" || id == null) return;
+    chatSteer(id, text)
+      .then(() => {
+        setTurns((prev) => [...prev, { kind: "user", id: uid(), text, steered: true }]);
+        setInput("");
+        setOverlay(null);
+      })
+      .catch(() => enqueue(text));
+  }, [input, model.engine, enqueue]);
+
+  // Keep a fresh ref to sendText so the external submitter (registered once per
+  // paneKey) always calls the latest closure without re-registering.
+  const sendTextRef = useRef(sendText);
+  sendTextRef.current = sendText;
 
   // ── launcher seed: auto-send as the first turn ─────────────────────────────
   // The idle page hands over the prompt you typed as `seed`; fire it once the
@@ -1011,20 +1796,78 @@ export function ChatPane({
     dispatch(last, { skipUserBubble: true });
   }, [streaming, dispatch]);
 
+  const finalizeStreaming = useCallback(
+    (note: string, mode: "interrupt" | "kill-and-restart" = "interrupt") => {
+      const id = sessionIdRef.current;
+      setTurns((prev) =>
+        finalizeStreamingTurns(
+          {
+            turns: prev,
+            streamingTurnId: streamingTurnId.current,
+            thinkingTurnId: thinkingTurnId.current,
+          },
+          Date.now(),
+        ).turns,
+      );
+      streamingTurnId.current = null;
+      thinkingTurnId.current = null;
+      turnStartRef.current = null;
+      setLiveStart(null);
+      setStreaming(false);
+      setBackendBusy(false);
+      setTurns((prev) => [...prev, { kind: "result", id: uid(), text: note }]);
+      if (webChatRuntime) {
+        webAbortRef.current?.abort();
+        webAbortRef.current = null;
+        return;
+      }
+      if (id != null) {
+        if (mode === "kill-and-restart") {
+          sessionIdRef.current = null;
+          chatStop(id)
+            .catch(() => {})
+            .finally(() => {
+              setRunEventState(emptyRunEventState());
+              setRunEventsKey(null);
+              setRestartKey((k) => k + 1);
+            });
+        } else {
+          chatInterrupt(id).catch(() => {});
+        }
+      }
+    },
+    [webChatRuntime],
+  );
+
   // true interrupt of the in-flight turn (process survives)
   const stop = useCallback(() => {
-    const id = sessionIdRef.current;
-    if (id == null) return;
-    chatInterrupt(id)
-      .catch(() => {})
-      .finally(() => setStreaming(false));
-  }, []);
+    if (sessionIdRef.current == null) return;
+    const strategy = stopStrategy(model.engine);
+    finalizeStreaming(
+      strategy === "kill-and-restart"
+        ? "stopped by user — gpt backend restarted"
+        : "stopped by user",
+      strategy,
+    );
+  }, [finalizeStreaming, model.engine]);
+  stopChatRef.current = stop;
 
   // hard reset: clear transcript + re-spin a FRESH claude session (drops any
   // resume id, so a new chat / /clear never keeps continuing a past session).
   const clearSession = useCallback(() => {
+    if (runEventsKey) {
+      try {
+        localStorage.removeItem(runEventsKey);
+      } catch {
+        /* ignore */
+      }
+    }
     setTurns([]);
+    setRunEventState(emptyRunEventState());
+    setRunEventsKey(null);
     setStreaming(false);
+    webAbortRef.current?.abort();
+    webAbortRef.current = null;
     streamingTurnId.current = null;
     thinkingTurnId.current = null;
     lastSentRef.current = null;
@@ -1032,14 +1875,19 @@ export function ChatPane({
     setLiveStart(null);
     setInput("");
     setOverlay(null);
+    setQueued([]);
+    setQueuedIdx(0);
+    setSessionCost(0);
+    usageBaselineRef.current = {};
     setResumeId(null);
     setResumedTitle(null);
     // fresh chat → forget the prior session id + recording flag so the next
     // first-send records a brand-new /resume entry (not the old one).
     claudeSessionIdRef.current = null;
     recordedRef.current = false;
+    codexTitleLockedRef.current = false;
     setRestartKey((k) => k + 1);
-  }, []);
+  }, [runEventsKey]);
 
   // ── /resume: reopen a past chat session ────────────────────────────────────
   // Loads the chat-only session list (lazy, on picker open). On selection we
@@ -1085,13 +1933,20 @@ export function ChatPane({
       setOverlay(null);
       setResumeQuery("");
       claudeSessionIdRef.current = session.id;
+      setRunEventsKey(runEventsStorageKey(session.id));
       recordedRef.current = true;
+      codexTitleLockedRef.current = true;
+      const resumeModel =
+        CHAT_MODELS.find((m) => session.model && m.id === session.model) ??
+        CHAT_MODELS.find((m) => (m.engine ?? "claude") === (session.engine || "claude"));
+      if (resumeModel) setModel(resumeModel);
       setResumeId(session.id);
       setResumedTitle(session.title);
       // show the past conversation immediately while claude re-spins. Paint a
       // placeholder first, then swap in the real transcript when it loads (the
       // session-restart effect never clears `turns`, so this is safe).
       setTurns([]);
+      setRunEventState(emptyRunEventState());
       readChatTranscript(session.id)
         .then((rows) => {
           if (rows.length) setTurns(transcriptToTurns(rows));
@@ -1130,6 +1985,33 @@ export function ChatPane({
         },
       },
       {
+        id: "goal",
+        label: "/goal",
+        desc: "set an ongoing goal (prepended each turn)",
+        icon: <Target size={14} />,
+        run: () => {
+          setOverlay(null);
+          setInput("");
+          const next = window.prompt(
+            "pursue goal — prepended as context each turn until cleared:",
+            goal,
+          );
+          if (next != null) setGoal(next.trim());
+        },
+      },
+      {
+        id: "memory",
+        label: "/memory",
+        desc: "search and attach memory context",
+        icon: <Brain size={14} />,
+        run: () => {
+          setInput("");
+          setOverlay(null);
+          setMemoryPanelOpen(true);
+          setTimeout(() => taRef.current?.focus(), 0);
+        },
+      },
+      {
         id: "resume",
         label: "/resume",
         desc: "reopen a past conversation",
@@ -1156,6 +2038,18 @@ export function ChatPane({
         },
       },
       {
+        id: "handoff",
+        label: "/handoff",
+        desc: "package this session for a target model",
+        icon: <PackageOpen size={14} />,
+        run: () => {
+          setInput("");
+          setOverlay(null);
+          setHandoffPanelOpen(true);
+          setTimeout(() => taRef.current?.focus(), 0);
+        },
+      },
+      {
         id: "help",
         label: "/help",
         desc: "what can this do",
@@ -1175,7 +2069,7 @@ export function ChatPane({
         },
       },
     ],
-    [clearSession, loadResumeSessions],
+    [clearSession, loadResumeSessions, sendText, goal],
   );
 
   // load dir entries for the @-mention picker (lazy, on first open)
@@ -1246,7 +2140,13 @@ export function ChatPane({
   const resumeFiltered = useMemo(() => {
     const q = resumeQuery.trim().toLowerCase();
     if (!q) return resumeSessions;
-    return resumeSessions.filter((s) => s.title.toLowerCase().includes(q));
+    return resumeSessions.filter((s) =>
+      [s.title, s.cwd, s.engine, s.model, s.id]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(q),
+    );
   }, [resumeSessions, resumeQuery]);
 
   // keep the /resume highlight in-bounds as the typed filter shrinks the list
@@ -1304,6 +2204,7 @@ export function ChatPane({
   );
 
   // ── keyboard ─────────────────────────────────────────────────────────────────
+  const activeRun = streaming || backendBusy;
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // overlay navigation takes priority. (the /resume picker drives its own
@@ -1337,56 +2238,314 @@ export function ChatPane({
         }
       }
     }
+    // Pending steer list behaves like the slash menu: arrows choose a queued
+    // follow-up, then Enter injects the highlighted row into a live codex turn.
+    if (streaming && input.trim() === "" && queued.length > 0) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        setQueuedIdx((idx) =>
+          cycleQueueSelection(idx, queued.length, e.key === "ArrowDown" ? 1 : -1),
+        );
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const item = queued[queuedIdx] ?? queued[0];
+        if (item) steerQueued(item.id);
+        return;
+      }
+    }
+    if (e.key === "ArrowDown" && !overlay) {
+      const now = e.timeStamp || performance.now();
+      if (now - lastArrowDownRef.current < 360) {
+        e.preventDefault();
+        lastArrowDownRef.current = 0;
+        jumpToLatest();
+        return;
+      }
+      lastArrowDownRef.current = now;
+    }
+    // copilot-style ghost accept: Tab, or → when the caret is at the very end.
+    if (!overlay && ghostRef.current) {
+      const ta = taRef.current;
+      const atEnd = ta != null && ta.selectionStart === input.length && ta.selectionStart === ta.selectionEnd;
+      if (e.key === "Tab" || (e.key === "ArrowRight" && atEnd)) {
+        e.preventDefault();
+        acceptGhost();
+        return;
+      }
+    }
+    // ↑ on an EMPTY composer recalls the last sent message for quick edit/resend
+    // (TUI staple). Empty-only so it never fights normal cursor movement.
+    if (
+      e.key === "ArrowUp" &&
+      !overlay &&
+      input.trim() === "" &&
+      lastSentRef.current
+    ) {
+      e.preventDefault();
+      const recalled = lastSentRef.current;
+      setInput(recalled);
+      requestAnimationFrame(() => {
+        const ta = taRef.current;
+        if (ta) {
+          ta.focus();
+          ta.setSelectionRange(recalled.length, recalled.length);
+        }
+      });
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      send();
+      // mid-turn Enter is explicit now: Codex steers the active turn; engines
+      // without true steering queue the follow-up for the next turn.
+      if (activeRun) {
+        if (model.engine === "codex") steerDraft();
+        else enqueue(input);
+      }
+      else send();
     }
   };
 
-  const canSend = input.trim().length > 0 && !streaming && started;
+  const hasDraft = input.trim().length > 0;
+  const hasReadyImages = images.some((im) => im.path);
+  const action = sendContract({
+    streaming: activeRun,
+    hasDraft,
+    hasImages: hasReadyImages,
+    engine: model.engine ?? "claude",
+    started,
+  });
+  const contextChips = composerContextChips({
+    cwd,
+    modelLabel: model.label,
+    effortLabel: effort.label,
+    permissionLabel: permission.label,
+    engine: model.engine ?? "claude",
+    contextBudget: effectiveBudget,
+    queuedCount: queued.length,
+    imageCount: images.length,
+    planMode,
+    hasGoal: Boolean(goal.trim()),
+  });
+  const contextBuckets = contextLedger({
+    draft: input,
+    goal,
+    planMode,
+    memoryCount: attachedMemories.length,
+    imageCount: images.length,
+    queuedCount: queued.length,
+    contextBudget: effectiveBudget,
+  });
+  const estimatedContextTokens = contextBuckets.reduce((sum, bucket) => sum + bucket.tokens, 0);
+  const contextLedgerWarning = contextBuckets.some((bucket) => bucket.level === "warning");
+  const runPhase = runEventState.phase;
+  const runEventCount = runEventState.events.length;
+
+  // copilot-style ghost: the remainder of the most recent past message that
+  // prefixes what's typed. Suppressed while an overlay (slash/@/resume) or voice
+  // is active, or on a multi-line draft. Recomputed each keystroke (input dep).
+  const ghost = useMemo(() => {
+    if (!input || overlay || recording || input.includes("\n")) return "";
+    const lc = input.toLowerCase();
+    const hit = historyRef.current.find(
+      (e) => e.length > input.length && e.toLowerCase().startsWith(lc),
+    );
+    return hit ? hit.slice(input.length) : "";
+  }, [input, overlay, recording]);
+  const ghostRef = useRef("");
+  ghostRef.current = ghost;
+  const acceptGhost = useCallback(() => {
+    if (ghostRef.current) setInput((v) => v + ghostRef.current);
+  }, []);
 
   // ── composer (shared between empty hero + docked) ──────────────────────────
 
   const composer = useMemo(
     () => (
       <div className="relative">
-        {/* mode chips above the box: plan + pursue-goal */}
-        {(planMode || goal) && (
-          <div className="mb-2 flex flex-wrap items-center gap-2">
-            {planMode && (
-              <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text)]">
-                <ListChecks size={12} className="text-[var(--color-accent)]" />
-                plan first
-                <button
-                  type="button"
-                  onClick={() => setPlanMode(false)}
-                  className="ml-0.5 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                  title="cancel plan mode"
-                >
-                  <X size={11} />
-                </button>
+        {/* context contract: what this send will use, before the user fires it. */}
+        {contextChips.length > 0 && (
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            {contextChips.map((chip) => (
+              <span
+                key={chip.id}
+                className={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] ${
+                  chip.id === "plan" || chip.id === "goal"
+                    ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
+                    : "border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 text-[var(--color-text-2)]"
+                }`}
+                title={chip.label}
+              >
+                {chip.id === "cwd" ? (
+                  <Folder size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "engine" ? (
+                  <Terminal size={12} className="shrink-0 text-[var(--color-muted)]" />
+                ) : chip.id === "attachments" ? (
+                  <ImageIcon size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "queue" ? (
+                  <Waypoints size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "plan" ? (
+                  <ListChecks size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "goal" ? (
+                  <Target size={12} className="shrink-0 text-[var(--color-accent)]" />
+                ) : chip.id === "budget" ? (
+                  <Gauge size={12} className="shrink-0 text-[var(--color-muted)]" />
+                ) : null}
+                <span className="truncate">{chip.label}</span>
+                {chip.id === "plan" && (
+                  <button
+                    type="button"
+                    onClick={() => setPlanMode(false)}
+                    className="ml-0.5 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                    title="cancel plan mode"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+                {chip.id === "goal" && (
+                  <button
+                    type="button"
+                    onClick={() => setGoal("")}
+                    className="ml-0.5 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                    title="clear goal"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </span>
+            ))}
+            {runEventCount > 0 && (
+              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)]">
+                <Waypoints size={12} className="shrink-0 text-[var(--color-accent)]" />
+                <span className="truncate">run: {runPhase}</span>
               </span>
             )}
-            {goal && (
-              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)]">
-                <Target size={12} className="shrink-0 text-[var(--color-accent)]" />
-                <span className="truncate">goal: {goal}</span>
-                <button
-                  type="button"
-                  onClick={() => setGoal("")}
-                  className="ml-0.5 shrink-0 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                  title="clear goal"
-                >
-                  <X size={11} />
-                </button>
+            {attachedMemories.length > 0 && (
+              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text)]">
+                <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
+                <span className="truncate">{attachedMemories.length} memories attached</span>
               </span>
             )}
           </div>
         )}
 
+        <div
+          className={`mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 px-1 font-mono text-[10px] ${
+            contextLedgerWarning ? "text-[var(--color-warning)]" : "text-[var(--color-faint)]"
+          }`}
+          title="estimated tokens added by the next send; exact billing comes from provider usage"
+        >
+          <span>{estimatedContextTokens.toLocaleString()} est tok</span>
+          {contextBuckets.map((bucket) => (
+            <span
+              key={bucket.id}
+              className={bucket.level === "warning" ? "text-[var(--color-warning)]" : undefined}
+            >
+              {bucket.label}:{bucket.tokens.toLocaleString()}
+            </span>
+          ))}
+        </div>
+
+        {memoryPanelOpen && (
+          <div className="mb-2 flex max-h-36 flex-col gap-1 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]/80 p-1.5">
+            <div className="flex items-center justify-between px-1 pb-1">
+              <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--color-text-2)]">
+                <Brain size={12} className="text-[var(--color-accent)]" />
+                memory
+              </span>
+              <button
+                type="button"
+                onClick={() => setMemoryPanelOpen(false)}
+                className="rounded p-0.5 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                title="close memory search"
+              >
+                <X size={12} />
+              </button>
+            </div>
+            {input.trim().length < 2 ? (
+              <div className="px-2 py-2 text-[11.5px] text-[var(--color-muted)]">type to search memory</div>
+            ) : memoryHits.length === 0 ? (
+              <div className="px-2 py-2 text-[11.5px] text-[var(--color-muted)]">no memory matches</div>
+            ) : (
+              memoryHits.slice(0, 5).map((hit) => {
+                const attached = attachedMemoryIds.includes(hit.id);
+                return (
+                  <button
+                    key={hit.id}
+                    type="button"
+                    onClick={() =>
+                      setAttachedMemoryIds((ids) =>
+                        attached ? ids.filter((id) => id !== hit.id) : [...ids, hit.id],
+                      )
+                    }
+                    className={`flex min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left font-sans text-[11.5px] transition-colors ${
+                      attached
+                        ? "bg-[var(--color-accent-soft)] text-[var(--color-text)]"
+                        : "text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)]"
+                    }`}
+                    title={hit.reasons.join("; ")}
+                  >
+                    <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
+                    <span className="min-w-0 flex-1 truncate">
+                      {hit.title}{" "}
+                      <span className="text-[var(--color-faint)]">· {hit.description || hit.preview}</span>
+                    </span>
+                    <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
+                      {attached ? "attached" : hit.score}
+                    </span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        )}
+
+        {handoffPanelOpen && (
+          <div className="mb-2 flex max-h-48 flex-col gap-1 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]/85 p-1.5">
+            <div className="flex items-center justify-between px-1 pb-1">
+              <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--color-text-2)]">
+                <PackageOpen size={12} className="text-[var(--color-accent)]" />
+                handoff target
+              </span>
+              <button
+                type="button"
+                onClick={() => setHandoffPanelOpen(false)}
+                className="rounded p-0.5 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                title="close handoff targets"
+              >
+                <X size={12} />
+              </button>
+            </div>
+            {CHAT_MODELS.map((target) => (
+              <button
+                key={target.id}
+                type="button"
+                disabled={target.disabled}
+                onClick={() => {
+                  if (target.disabled) return;
+                  setHandoffPanelOpen(false);
+                  const engine = target.engine ?? "claude";
+                  sendText(
+                    `create a clean handoff for continuing this exact session in ${target.label} (${engine} / ${target.id}). include: current objective, important user preferences, shipped changes, files touched, verification already run, known caveats, and the next best actions. make it compact but complete enough that the target model can resume without rereading the whole chat.`,
+                  );
+                }}
+                className="flex min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left text-[11.5px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] disabled:cursor-not-allowed disabled:opacity-45"
+                title={target.note}
+              >
+                <Sparkles size={12} className="shrink-0 text-[var(--color-accent)]" />
+                <span className="min-w-0 flex-1 truncate">{target.label}</span>
+                <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
+                  {target.engine ?? "claude"}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* slash / @-mention overlay */}
         {overlay === "slash" && slashFiltered.length > 0 && (
-          <OverlayPanel>
+          <OverlayPanel compact>
             {slashFiltered.map((c, i) => (
               <OverlayRow
                 key={c.id}
@@ -1450,30 +2609,268 @@ export function ChatPane({
           />
         )}
 
-        <div className="rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
-          <textarea
-            ref={taRef}
-            value={input}
-            onChange={(e) => onChangeInput(e.target.value)}
-            onKeyDown={onKeyDown}
-            rows={1}
-            placeholder={planMode ? "describe the task to plan…" : "do anything"}
-            spellCheck={false}
-            className="block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
+        {/* pending steer queue belongs with the composer in every layout. first
+            Enter queues, arrows highlight, explicit steer injects when possible. */}
+        {queued.length > 0 && (
+          <div className="mb-2 overflow-hidden rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] shadow-xl shadow-black/20">
+            {queued.map((q, i) => (
+              <div
+                key={q.id}
+                onMouseEnter={() => setQueuedIdx(i)}
+                className={`flex items-center gap-2 px-3 py-2 font-sans text-[12px] text-[var(--color-text-2)] ${
+                  i === queuedIdx ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
+                }`}
+              >
+                <Clock size={12} className="shrink-0 text-[var(--color-faint)]" />
+                {editingQueuedId === q.id ? (
+                  <input
+                    value={editingQueuedText}
+                    onChange={(e) => setEditingQueuedText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        saveQueuedEdit();
+                      }
+                      if (e.key === "Escape") {
+                        e.preventDefault();
+                        setEditingQueuedId(null);
+                        setEditingQueuedText("");
+                      }
+                    }}
+                    onBlur={saveQueuedEdit}
+                    autoFocus
+                    className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+                  />
+                ) : (
+                  <span className="min-w-0 flex-1 truncate">{q.text}</span>
+                )}
+                <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">queued</span>
+                {editingQueuedId === q.id ? (
+                  <button
+                    type="button"
+                    onClick={saveQueuedEdit}
+                    className="shrink-0 rounded p-0.5 text-[var(--color-accent)] hover:bg-[var(--color-panel)]"
+                    title="save"
+                  >
+                    <Check size={12} />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => editQueued(q)}
+                    className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                    title="edit queued message"
+                  >
+                    <Pencil size={12} />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => moveQueued(q.id, -1)}
+                  disabled={i === 0}
+                  className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)] disabled:opacity-30"
+                  title="move up"
+                >
+                  <ArrowUp size={12} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => moveQueued(q.id, 1)}
+                  disabled={i === queued.length - 1}
+                  className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)] disabled:opacity-30"
+                  title="move down"
+                >
+                  <ArrowDown size={12} />
+                </button>
+                {model.engine === "codex" && streaming && (
+                  <button
+                    type="button"
+                    onClick={() => steerQueued(q.id)}
+                    className="shrink-0 rounded-md px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-panel)]"
+                    title="inject into current turn"
+                  >
+                    steer
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => removeQueued(q.id)}
+                  className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                  title="cancel"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="flash-composer relative rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
+          {/* attached-image thumbnails (paste a screenshot / + attach) */}
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3 pt-3">
+              {images.map((im) => (
+                <div
+                  key={im.id}
+                  className="group relative h-14 w-14 overflow-hidden rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-panel)]"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={im.url} alt="" className="h-full w-full object-cover" />
+                  {im.path == null && (
+                    <div className="absolute inset-0 grid place-items-center bg-[var(--color-bg)]/60">
+                      <Loader2 size={14} className="animate-spin text-[var(--color-accent)]" />
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => removeImage(im.id)}
+                    className="absolute right-0.5 top-0.5 grid h-4 w-4 place-items-center rounded-full bg-[var(--color-bg)]/80 text-[var(--color-muted)] opacity-0 transition-opacity hover:text-[var(--color-text)] group-hover:opacity-100"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <input
+            ref={imgInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const files = e.target.files;
+              if (files) for (const f of files) void addImage(f, f.type);
+              e.target.value = "";
+            }}
           />
-          <div className="flex items-center gap-1.5 px-3 pb-3 pt-1">
-            {/* permission chip */}
+          <style>{WAVE_KEYFRAMES}</style>
+          {recording ? (
+            <div className="flex items-center gap-3 px-4 pt-4 pb-2">
+              <div className="flex h-7 flex-1 items-center gap-[3px] overflow-hidden">
+                {WAVEFORM_BARS.map((b, i) => (
+                  <span
+                    key={i}
+                    className="w-[3px] shrink-0 origin-center rounded-full bg-[var(--color-accent)]"
+                    style={{
+                      height: `${b.h}%`,
+                      animation: "aios-wave 0.9s ease-in-out infinite",
+                      animationDelay: `${b.delay}ms`,
+                    }}
+                  />
+                ))}
+              </div>
+              <span className="font-mono text-[12px] tabular-nums text-[var(--color-text)]">
+                {fmtElapsed(voiceElapsed)}
+              </span>
+              <button
+                type="button"
+                onClick={() => void micStop()}
+                title="stop dictation (esc to cancel)"
+                className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
+              >
+                <Square size={14} className="fill-current" />
+              </button>
+            </div>
+          ) : (
+            <div className="relative">
+              {/* copilot-style ghost suggestion: a mirror layer behind the
+                  textarea reserves the typed text (transparent) then renders the
+                  remaining suggestion dimmed, so it lines up exactly after the
+                  caret. Tab / → accepts. Same box model as the textarea. */}
+              {ghost && (
+                <div
+                  aria-hidden
+                  className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-transparent"
+                >
+                  {input}
+                  <span className="text-[var(--color-faint)]">{ghost}</span>
+                </div>
+              )}
+              <textarea
+                ref={taRef}
+                value={input}
+                onChange={(e) => onChangeInput(e.target.value)}
+                onKeyDown={onKeyDown}
+                onPaste={onPasteImage}
+                rows={1}
+                placeholder={
+                  streaming
+                    ? model.engine === "codex"
+                      ? "steer the model… (won't interrupt)"
+                      : "queue a follow-up…"
+                    : planMode
+                      ? "describe the task to plan…"
+                      : "do anything"
+                }
+                spellCheck={false}
+                className="relative block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
+              />
+            </div>
+          )}
+          <div className="flex flex-wrap items-center justify-end gap-1.5 px-3 pb-3 pt-1">
+            {/* advanced controls stay available, but the composer stays clean. */}
+            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            {!empty && (
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenMenu(null);
+                  setComposerCollapsed(true);
+                }}
+                className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+                title="hide composer"
+              >
+                <ChevronDown size={15} />
+              </button>
+            )}
             <Dropdown
-              open={openMenu === "perm"}
-              onToggle={() => setOpenMenu(openMenu === "perm" ? null : "perm")}
-              trigger={
-                <>
-                  <Plus size={14} className="text-[var(--color-muted)]" />
-                  <span>{permission.label}</span>
-                  <ChevronDown size={12} className="text-[var(--color-faint)]" />
-                </>
-              }
+              open={openMenu === "advanced"}
+              onToggle={() => setOpenMenu(openMenu === "advanced" ? null : "advanced")}
+              align="right"
+              triggerClassName="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+              trigger={<Wrench size={15} />}
             >
+              <div className="px-3 pb-1 pt-1.5 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
+                tools
+              </div>
+              <MenuItem
+                onClick={() => {
+                  setResumeQuery("");
+                  setOverlay("resume");
+                  setOverlayIdx(0);
+                  void loadResumeSessions();
+                  setOpenMenu(null);
+                  setTimeout(() => resumeSearchRef.current?.focus(), 0);
+                }}
+              >
+                <span className="flex items-center gap-2">
+                  <History size={13} /> resume session
+                </span>
+              </MenuItem>
+              <MenuItem
+                onClick={() => {
+                  imgInputRef.current?.click();
+                  setOpenMenu(null);
+                }}
+              >
+                <span className="flex items-center gap-2">
+                  <ImageIcon size={13} /> attach image
+                </span>
+              </MenuItem>
+              <MenuItem
+                onClick={() => {
+                  void micStart();
+                  setOpenMenu(null);
+                }}
+              >
+                <span className="flex items-center gap-2">
+                  <Mic size={13} /> dictate
+                </span>
+              </MenuItem>
+              <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
+                access
+              </div>
               {PERMISSION_MODES.map((p) => (
                 <MenuItem
                   key={p.id}
@@ -1486,126 +2883,53 @@ export function ChatPane({
                   {p.label}
                 </MenuItem>
               ))}
-            </Dropdown>
-
-            {/* attach a file — opens a native picker (OS file-drop doesn't fire
-                in the webview on Windows; this works everywhere). */}
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              className="hidden"
-              onChange={(e) => {
-                onAttachFiles(e.target.files);
-                e.target.value = ""; // allow re-picking the same file
-              }}
-            />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              title="attach a file"
-              className="flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
-            >
-              <Paperclip size={13} />
-              <span>attach</span>
-            </button>
-
-            {/* effort */}
-            <Dropdown
-              open={openMenu === "effort"}
-              onToggle={() => setOpenMenu(openMenu === "effort" ? null : "effort")}
-              triggerClassName={
-                effort.ultra
-                  ? "aios-ultra flex items-center gap-1.5 rounded-full px-2.5 py-1 font-sans text-[11.5px] font-semibold"
-                  : undefined
-              }
-              trigger={
-                <>
-                  {effort.ultra && <Sparkles size={12} className="shrink-0" />}
-                  <span>{effort.label}</span>
-                  <ChevronDown
-                    size={12}
-                    className={effort.ultra ? "text-white/80" : "text-[var(--color-faint)]"}
-                  />
-                </>
-              }
-            >
-              {EFFORTS.map((ef) =>
-                ef.ultra ? (
-                  <button
-                    key={ef.id}
-                    type="button"
-                    onClick={() => {
-                      setEffort(ef);
-                      setOpenMenu(null);
-                    }}
-                    className={`group/ultra flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors ${
-                      ef.id === effort.id ? "bg-[var(--color-panel)]" : "hover:bg-[var(--color-panel)]"
-                    }`}
-                  >
-                    <Sparkles size={13} className="shrink-0 text-[#a855f7]" />
-                    <span className="flex min-w-0 flex-col">
-                      <span className="aios-ultra-text font-sans text-[12px] font-semibold">
-                        {ef.label}
-                      </span>
-                      {ef.sub && (
-                        <span className="font-mono text-[9.5px] text-[var(--color-faint)]">{ef.sub}</span>
-                      )}
+              <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
+                context
+              </div>
+              {CONTEXT_BUDGETS.map((b) => (
+                <MenuItem
+                  key={b.id}
+                  active={b.id === effectiveBudget}
+                  title={b.sub}
+                  onClick={() => {
+                    setContextBudget(b.id);
+                    if (b.id === "ultracode") {
+                      const ultra = EFFORTS.find((ef) => ef.ultra);
+                      if (ultra) setEffort(ultra);
+                    } else if (effort.ultra) {
+                      setEffort(EFFORTS[1]);
+                    }
+                    setOpenMenu(null);
+                  }}
+                >
+                  <span className="flex min-w-0 flex-col">
+                    <span className="flex items-center gap-2">
+                      {b.id === "ultracode" && <Sparkles size={13} className="text-[#a855f7]" />}
+                      {b.label}
                     </span>
-                  </button>
-                ) : (
-                  <MenuItem
-                    key={ef.id}
-                    active={ef.id === effort.id}
-                    onClick={() => {
-                      setEffort(ef);
-                      setOpenMenu(null);
-                    }}
-                  >
+                    <span className="truncate text-[10.5px] text-[var(--color-faint)]">{b.sub}</span>
+                  </span>
+                </MenuItem>
+              ))}
+              <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
+                effort
+              </div>
+              {EFFORTS.map((ef) => (
+                <MenuItem
+                  key={ef.id}
+                  active={ef.id === effort.id}
+                  onClick={() => {
+                    setEffort(ef);
+                    setOpenMenu(null);
+                  }}
+                >
+                  <span className="flex items-center gap-2">
+                    {ef.ultra && <Sparkles size={13} className="text-[#a855f7]" />}
                     {ef.label}
-                  </MenuItem>
-                ),
-              )}
+                  </span>
+                </MenuItem>
+              ))}
             </Dropdown>
-
-            {/* plan toggle */}
-            <button
-              type="button"
-              onClick={() => setPlanMode((p) => !p)}
-              title="plan first on the next message"
-              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
-                planMode
-                  ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                  : "border-[var(--color-border)] bg-[var(--color-panel)]/50 text-[var(--color-text-2)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
-              }`}
-            >
-              <ListChecks size={13} />
-              <span>plan</span>
-            </button>
-
-            {/* pursue-goal pill: set / focus */}
-            <button
-              type="button"
-              onClick={() => {
-                const next = window.prompt(
-                  "pursue goal — prepended as context each turn until cleared:",
-                  goal,
-                );
-                if (next != null) setGoal(next.trim());
-              }}
-              title="set an ongoing goal"
-              className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
-                goal
-                  ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                  : "border-[var(--color-border)] bg-[var(--color-panel)]/50 text-[var(--color-text-2)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
-              }`}
-            >
-              <Target size={13} />
-              <span>goal</span>
-            </button>
-
-            <div className="flex-1" />
-
             {/* model selector (right) */}
             <Dropdown
               open={openMenu === "model"}
@@ -1613,7 +2937,7 @@ export function ChatPane({
               align="right"
               trigger={
                 <>
-                  <span>{model.label}</span>
+                  <span className="whitespace-nowrap">{model.label}</span>
                   <ChevronDown size={12} className="text-[var(--color-faint)]" />
                 </>
               }
@@ -1627,6 +2951,12 @@ export function ChatPane({
                   onClick={() => {
                     if (m.disabled) return;
                     setModel(m);
+                    // picking a model sets it as the global default (sticks
+                    // across panes + restarts). engine omitted = claude.
+                    saveSettings({
+                      chatModel: m.id,
+                      chatProvider: `${m.engine ?? "claude"}-cli`,
+                    });
                     setOpenMenu(null);
                   }}
                 >
@@ -1642,51 +2972,93 @@ export function ChatPane({
               ))}
             </Dropdown>
 
-            {/* mic */}
-            <button
-              type="button"
-              className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-              title="dictate (⌘J)"
-            >
-              <Mic size={16} />
-            </button>
+            {voicePhase === "transcribing" ? (
+              <div className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-accent)]">
+                <Loader2 size={16} className="animate-spin" />
+              </div>
+            ) : null}
 
-            {/* send / stop */}
-            {streaming ? (
-              <button
-                type="button"
-                onClick={stop}
-                className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-danger)] text-[var(--color-bg)] transition-all hover:opacity-90"
-                title="stop"
-              >
-                <Square size={14} className="fill-current" />
-              </button>
+            {/* send / steer / queue / stop. The label is the contract. */}
+            {activeRun ? (
+              <>
+                {hasDraft && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (action.mode === "steer") steerDraft();
+                      else enqueue(input);
+                    }}
+                    disabled={action.disabled}
+                    className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
+                    title={action.title}
+                  >
+                    {action.mode === "steer" ? <Waypoints size={14} /> : <Clock size={14} />}
+                    {action.label}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={stop}
+                  className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-danger)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:opacity-90"
+                  title="interrupt active run"
+                >
+                  <Square size={13} className="fill-current" />
+                  stop
+                </button>
+              </>
             ) : (
               <button
                 type="button"
                 onClick={send}
-                disabled={!canSend}
-                className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
-                title="send"
+                disabled={action.disabled}
+                className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
+                title={action.title}
               >
                 <ArrowUp size={16} />
+                {action.label}
               </button>
             )}
+            </div>
           </div>
         </div>
       </div>
     ),
     // re-render composer on the inputs that affect it
+    // (images: chip row + attach-button state)
     [
       input,
+      ghost,
+      empty,
       openMenu,
       permission,
       effort,
       model,
+      ctxTokens,
+      images,
+      voicePhase,
+      voiceElapsed,
       streaming,
-      canSend,
+      backendBusy,
+      activeRun,
+      action,
+      contextChips,
+      memoryHits,
+      attachedMemoryIds,
+      attachedMemories,
+      handoffPanelOpen,
+      hasDraft,
       send,
       stop,
+      enqueue,
+      queued,
+      queuedIdx,
+      editingQueuedId,
+      editingQueuedText,
+      editQueued,
+      saveQueuedEdit,
+      moveQueued,
+      steerQueued,
+      steerDraft,
       planMode,
       goal,
       overlay,
@@ -1700,6 +3072,7 @@ export function ChatPane({
       resumeSessions.length,
       resumeLoading,
       resumeQuery,
+      loadResumeSessions,
       onResumeKeyDown,
       resumeSession,
       closeResume,
@@ -1772,7 +3145,7 @@ export function ChatPane({
 
   if (empty) {
     return (
-      <PaneDropZone onPath={insertPath} label="drop to add to message">
+      <PaneDropZone onPath={insertPath} onFiles={onDropFiles} label="drop image or path">
       <div className="flex h-full min-h-0 w-full flex-col items-center justify-center bg-[var(--color-bg)] px-6">
         <div className="w-full max-w-2xl">
           <h1 className="mb-7 text-center font-sans text-3xl font-medium tracking-tight text-[var(--color-text)]">
@@ -1802,7 +3175,7 @@ export function ChatPane({
 
   return (
     <PaneDropZone onPath={insertPath} label="drop to add to message">
-    <div className="flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
+    <div className="relative flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-2xl flex-col gap-5 px-6 py-8">
           {resumedTitle && (
@@ -1836,6 +3209,7 @@ export function ChatPane({
                   if (!streaming && sessionIdRef.current != null) dispatch(label);
                 }}
                 disabled={streaming}
+                onOpenUrl={onOpenUrl}
               />
             ) : b.kind === "thinking" ? (
               <ThinkingBlock key={b.id} turn={b.turn} />
@@ -1862,11 +3236,164 @@ export function ChatPane({
             )}
         </div>
       </div>
+      {/* jump-to-latest pill — appears when autoscroll is paused or viewport is off-bottom */}
+      {showJump && (
+        <button
+          type="button"
+          onClick={jumpToLatest}
+          title="scroll to bottom"
+          className="absolute bottom-24 right-5 z-20 grid h-9 w-9 place-items-center rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/95 text-[var(--color-text-2)] shadow-2xl shadow-black/40 backdrop-blur transition-colors hover:border-[var(--color-accent)]/60 hover:text-[var(--color-text)]"
+        >
+          <ArrowDown size={15} />
+        </button>
+      )}
       <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg)]/80 px-6 pb-5 pt-3 backdrop-blur">
-        <div className="mx-auto max-w-2xl">{composer}</div>
+        <div className="mx-auto max-w-2xl">
+          {/* context readout — out of the cramped composer, model-aware window
+              (opus 4.8 = 1M, sonnet/haiku = 200K, codex = 272K) */}
+          {ctxTokens != null && (
+            <div
+              title={`${ctxTokens.toLocaleString()} tokens of context`}
+              className="mb-1.5 flex justify-end px-1 font-mono text-[10.5px] tabular-nums text-[var(--color-faint)]"
+            >
+              {(() => {
+                const win = model.id.startsWith("claude-opus")
+                  ? 1_000_000
+                  : model.engine === "codex"
+                    ? 272_000
+                    : model.engine === "opencode"
+                      ? 256_000
+                      : 200_000;
+                const pct = Math.round((ctxTokens / win) * 100);
+                return `${(ctxTokens / 1000).toFixed(1)}K${pct > 0 ? ` · ${pct}%` : ""} ctx`;
+              })()}
+            </div>
+          )}
+          <UsageStrip
+            usage={usage}
+            baseline={usageBaselineRef.current[usageProvider] ?? null}
+            window={usageWindow}
+            onWindowChange={setUsageWindow}
+            cost={sessionCost}
+            engine={usageLabel}
+          />
+          {isComposerCollapsed ? (
+            <button
+              type="button"
+              onClick={() => setComposerCollapsed(false)}
+              title="show composer"
+              className="flex min-h-10 w-full items-center justify-between gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-panel-2)]/80 px-3 py-2 text-left text-[12px] text-[var(--color-text-2)] shadow-xl shadow-black/25 backdrop-blur transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <CornerDownLeft size={14} className="shrink-0 text-[var(--color-accent)]" />
+                <span className="truncate">composer hidden</span>
+              </span>
+              <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">
+                {hasDraft ? "draft saved" : activeRun ? "run active" : "open"}
+              </span>
+            </button>
+          ) : (
+            composer
+          )}
+        </div>
       </div>
     </div>
     </PaneDropZone>
+  );
+}
+
+/**
+ * The live usage strip under the composer: the active engine's 5h rate-limit
+ * window as a thin bar (color-coded), the 7d window + reset as faint text, and
+ * cumulative session cost. Ticks AS YOU TALK — codex pushes rate-limit updates,
+ * claude re-reads usage.json after each turn (both arrive as `usage` events).
+ */
+function UsageStrip({
+  usage,
+  baseline,
+  window,
+  onWindowChange,
+  cost,
+  engine,
+}: {
+  usage: { fiveHour: { pct: number | null; resetsAt: number | null }; sevenDay: { pct: number | null; resetsAt: number | null } } | null;
+  baseline: { fiveHour: { pct: number | null; resetsAt: number | null }; sevenDay: { pct: number | null; resetsAt: number | null } } | null;
+  window: "fiveHour" | "sevenDay";
+  onWindowChange: (window: "fiveHour" | "sevenDay") => void;
+  cost: number;
+  engine: string;
+}) {
+  const current = usage?.[window].pct ?? null;
+  const initial = baseline?.[window].pct ?? current;
+  // nothing to show yet (e.g. codex before its first rate-limit push) → hide.
+  if (current == null && cost <= 0) return null;
+  const stack = current != null && initial != null ? usageStack(current, initial) : null;
+  const reset = usage?.[window].resetsAt ? resetIn(usage[window].resetsAt) : "";
+  const remaining = stack ? 100 - stack.total : null;
+  const paceRisk =
+    (engine === "codex" || engine === "spark") && usage
+      ? usagePaceRisk({
+          pct: current,
+          resetsAt: usage[window].resetsAt,
+          windowSeconds: window === "fiveHour" ? 5 * 3600 : 7 * 24 * 3600,
+        })
+      : null;
+  return (
+    <div className="mb-2 flex items-center gap-2.5 px-1 font-mono text-[10px] tabular-nums text-[var(--color-faint)]">
+      <span className="shrink-0 lowercase tracking-wide text-[var(--color-muted)]">{engine}</span>
+      <span className="flex shrink-0 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]">
+        {(["fiveHour", "sevenDay"] as const).map((id) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => onWindowChange(id)}
+            className={`px-1.5 py-0.5 transition-colors ${
+              window === id
+                ? "bg-[var(--color-panel-2)] text-[var(--color-text-2)]"
+                : "text-[var(--color-faint)] hover:text-[var(--color-muted)]"
+            }`}
+          >
+            {id === "fiveHour" ? "5h" : "7d"}
+          </button>
+        ))}
+      </span>
+      {stack ? (
+        <>
+          <span className="flex-1">
+            <span className="flex h-1 w-full overflow-hidden rounded-full bg-[var(--color-panel-2)]">
+              <span
+                className="block h-full bg-[var(--color-muted)] transition-[width] duration-700"
+                style={{ width: `${stack.baseline}%` }}
+              />
+              <span
+                className="block h-full bg-[var(--color-accent)] transition-[width] duration-700"
+                style={{ width: `${stack.session}%` }}
+              />
+            </span>
+          </span>
+          <span className="shrink-0 text-[var(--color-text-2)]">
+            {engine === "codex" ? `${Math.round(remaining!)}% left` : `${Math.round(stack.total)}% total`}
+          </span>
+          <span className="shrink-0 text-[var(--color-accent)]">+{Math.round(stack.session)}% chat</span>
+          {paceRisk && (
+            <span
+              className={`shrink-0 rounded border px-1.5 py-0.5 ${
+                paceRisk.level === "danger"
+                  ? "border-[color-mix(in_srgb,var(--color-danger)_45%,transparent)] bg-[color-mix(in_srgb,var(--color-danger)_12%,transparent)] text-[var(--color-danger)]"
+                  : "border-[color-mix(in_srgb,var(--color-warning)_45%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_12%,transparent)] text-[var(--color-warning)]"
+              }`}
+              title={paceRisk.detail}
+            >
+              {paceRisk.title}
+            </span>
+          )}
+          {reset && <span className="shrink-0">resets {reset}</span>}
+        </>
+      ) : (
+        <span className="flex-1" />
+      )}
+      {cost > 0 && <span className="shrink-0 text-[var(--color-text-2)]">${cost.toFixed(2)}</span>}
+    </div>
   );
 }
 
@@ -2031,8 +3558,8 @@ function toolDetail(turn: ToolTurn): React.ReactNode {
   const str = (k: string) =>
     typeof inp[k] === "string" ? (inp[k] as string) : undefined;
 
-  if (name === "bash" || name === "bashoutput") {
-    const cmd = str("command");
+  if (name === "bash" || name === "bashoutput" || name === "exec_command" || name === "write_stdin") {
+    const cmd = str("command") ?? str("cmd") ?? str("chars");
     if (!cmd) return null;
     return (
       <pre className="overflow-auto whitespace-pre-wrap break-words rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[var(--color-text-2)]">
@@ -2193,7 +3720,8 @@ function TodoList({ todos }: { todos: Array<Record<string, unknown>> }) {
 }
 
 /** Clean artifact card for a file a turn produced (Codex "Open in…"). Click →
- *  open externally via the OS. Icon keyed by file type. */
+ *  open as an in-app viewer pane (image/pdf/text preview); falls back to the OS
+ *  app only if no pane opener is wired. Icon keyed by file type. */
 function FileCard({ artifact }: { artifact: Artifact }) {
   const Icon =
     artifact.kind === "img"
@@ -2206,17 +3734,31 @@ function FileCard({ artifact }: { artifact: Artifact }) {
   // surface failures instead of swallowing them — a denied scope or missing
   // file briefly flips the label to the reason so it's debuggable, not silent.
   const [err, setErr] = useState<string | null>(null);
+  const openWith = (mode: "editor" | "viewer" | "files") => {
+    setErr(null);
+    const ok =
+      mode === "editor"
+        ? openEditorFileInPane(artifact.path, artifact.name)
+        : mode === "viewer"
+          ? openViewerFileInPane(artifact.path, artifact.name)
+          : revealFileInPane(artifact.path, artifact.name);
+    if (ok) return;
+    openPath(artifact.path).catch((e) => {
+      setErr(String(e));
+      console.error("openPath failed:", artifact.path, e);
+    });
+  };
   const open = () => {
     setErr(null);
+    // prefer an in-app viewer pane; only hand off to the OS if none is wired.
+    if (openFileInPane(artifact.path, artifact.name)) return;
     openPath(artifact.path).catch((e) => {
       setErr(String(e));
       console.error("openPath failed:", artifact.path, e);
     });
   };
   return (
-    <button
-      type="button"
-      onClick={open}
+    <div
       title={err ? `${err} — ${artifact.path}` : `open ${artifact.path}`}
       className={`group/file flex max-w-full items-center gap-2.5 rounded-lg border bg-[var(--color-panel-2)] px-3 py-2 text-left transition-colors ${
         err
@@ -2224,23 +3766,54 @@ function FileCard({ artifact }: { artifact: Artifact }) {
           : "border-[var(--color-border)] hover:border-[var(--color-accent)]/50"
       }`}
     >
-      <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
-        <Icon size={14} />
-      </span>
-      <span className="min-w-0 flex flex-col">
-        <span className="truncate font-mono text-[12px] text-[var(--color-text)]">
-          {artifact.name}
+      <button type="button" onClick={open} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
+        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
+          <Icon size={14} />
         </span>
-        <span
-          className={`font-sans text-[10.5px] ${
-            err
-              ? "text-[var(--color-danger)]"
-              : "text-[var(--color-faint)] group-hover/file:text-[var(--color-muted)]"
-          }`}
-        >
-          {err ? "couldn’t open — see tooltip" : "open"}
+        <span className="min-w-0 flex flex-col">
+          <span className="truncate font-mono text-[12px] text-[var(--color-text)]">
+            {artifact.name}
+          </span>
+          <span
+            className={`font-sans text-[10.5px] ${
+              err
+                ? "text-[var(--color-danger)]"
+                : "text-[var(--color-faint)] group-hover/file:text-[var(--color-muted)]"
+            }`}
+          >
+            {err ? "couldn’t open — see tooltip" : "open"}
+          </span>
         </span>
+      </button>
+      <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/file:opacity-100">
+        <ArtifactActionButton label="editor" icon={<Pencil size={12} />} onClick={() => openWith("editor")} />
+        <ArtifactActionButton label="viewer" icon={<FileType size={12} />} onClick={() => openWith("viewer")} />
+        <ArtifactActionButton label="files" icon={<Folder size={12} />} onClick={() => openWith("files")} />
       </span>
+    </div>
+  );
+}
+
+function ArtifactActionButton({
+  label,
+  icon,
+  onClick,
+}: {
+  label: string;
+  icon: ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+    >
+      {icon}
     </button>
   );
 }
@@ -2315,6 +3888,11 @@ function UserBubble({
 }) {
   return (
     <div className="group flex flex-col items-end gap-1">
+      {turn.steered && (
+        <span className="flex items-center gap-1 pr-1 font-mono text-[10px] text-[var(--color-faint)]">
+          <Waypoints size={10} /> steered into the running turn
+        </span>
+      )}
       <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-[var(--color-accent-soft)] px-4 py-2.5 font-sans text-[14px] leading-relaxed text-[var(--color-text)]">
         {turn.text}
       </div>
@@ -2351,7 +3929,7 @@ function parseButtons(text: string): { body: string; buttons: string[] } {
 
 /** The model's extended-thinking trace — dim + collapsible. Auto-expanded while
  *  the tokens are streaming in (so you read the reasoning live), then collapses
- *  to a faint "Thought ›" line you can re-open. Mirrors claude-code's ✻ thinking. */
+ *  to a faint "Thought ›" line you can re-open. Mirrors claude-code's quiet trace. */
 function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) {
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
   const open = userToggled ?? turn.streaming;
@@ -2360,25 +3938,21 @@ function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) 
       <button
         type="button"
         onClick={() => setUserToggled(!open)}
-        className="-mx-1 flex w-fit items-center gap-1.5 rounded-md px-1 py-0.5 text-left font-sans text-[12.5px] text-[var(--color-muted)] transition-colors hover:text-[var(--color-text-2)]"
+        className="-mx-1 flex w-fit items-center gap-1 rounded-md px-1 py-0.5 text-left font-sans text-[12.5px] leading-[1.5] text-[var(--color-muted)] transition-colors hover:text-[var(--color-text-2)]"
       >
-        <Sparkles
-          size={13}
-          className={`shrink-0 ${turn.streaming ? "animate-pulse text-[var(--color-accent)]" : "text-[var(--color-faint)]"}`}
-        />
-        <span className={turn.streaming ? "animate-pulse" : undefined}>
-          {turn.streaming
-            ? "Thinking…"
-            : turn.durationMs != null
-              ? `Thought for ${fmtDuration(turn.durationMs)}`
-              : "Thought"}
-        </span>
-        {!turn.streaming && (
+        {turn.streaming ? (
+          <CadencedShimmer>thinking</CadencedShimmer>
+        ) : (
+          <span>
+            {turn.durationMs != null ? `thought for ${fmtDuration(turn.durationMs)}` : "thought"}
+          </span>
+        )}
+        {!turn.streaming ? (
           <ChevronRight
             size={12}
             className={`shrink-0 text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
           />
-        )}
+        ) : null}
       </button>
       {open && (
         <div className="ml-[6px] whitespace-pre-wrap break-words border-l border-[var(--color-border)] pl-3 font-sans text-[12.5px] italic leading-relaxed text-[var(--color-muted)]">
@@ -2389,14 +3963,52 @@ function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) 
   );
 }
 
+function CadencedShimmer({ children }: { children: string }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const [active, setActive] = useState(false);
+
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    let removeTimer: number | undefined;
+    const run = () => {
+      setActive(false);
+      window.requestAnimationFrame(() => {
+        setActive(true);
+        removeTimer = window.setTimeout(() => setActive(false), 1000);
+      });
+    };
+    const startTimer = window.setTimeout(run, 600);
+    const interval = window.setInterval(run, 4000);
+    return () => {
+      window.clearTimeout(startTimer);
+      window.clearInterval(interval);
+      if (removeTimer != null) window.clearTimeout(removeTimer);
+    };
+  }, []);
+
+  return (
+    <span
+      ref={ref}
+      className={`aios-cadenced-shimmer select-none truncate ${active ? "aios-cadenced-shimmer--active" : ""}`}
+    >
+      {children}
+      <span aria-hidden="true" className="aios-cadenced-shimmer__sweep">
+        <span className="aios-cadenced-shimmer__highlight">{children}</span>
+      </span>
+    </span>
+  );
+}
+
 function AssistantBubble({
   turn,
   onButton,
   disabled,
+  onOpenUrl,
 }: {
   turn: Extract<Turn, { kind: "assistant" }>;
   onButton: (label: string) => void;
   disabled: boolean;
+  onOpenUrl?: (url: string) => void;
 }) {
   // Don't render the sentinel as a half-baked pill while still streaming in —
   // wait for the full message so we don't flicker partial `[[btn:` text.
@@ -2406,7 +4018,7 @@ function AssistantBubble({
   return (
     <div className="group flex flex-col items-start gap-1">
       <div className="max-w-[92%] font-sans text-[14.5px] leading-relaxed text-[var(--color-text-2)]">
-        <Markdown text={body} />
+        <Markdown text={body} onOpenUrl={onOpenUrl} />
         {turn.streaming && (
           <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-pulse bg-[var(--color-accent)]" />
         )}
@@ -2574,7 +4186,13 @@ function splitFences(
   return out;
 }
 
-function Markdown({ text }: { text: string }) {
+function Markdown({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   const segments = useMemo(() => splitFences(text), [text]);
   return (
     <div className="flex flex-col gap-2">
@@ -2582,7 +4200,7 @@ function Markdown({ text }: { text: string }) {
         seg.code ? (
           <CodeBlock key={i} lang={seg.lang} body={seg.body} />
         ) : (
-          <MarkdownBlocks key={i} text={seg.body} />
+          <MarkdownBlocks key={i} text={seg.body} onOpenUrl={onOpenUrl} />
         ),
       )}
     </div>
@@ -2609,7 +4227,13 @@ function CodeBlock({ lang, body }: { lang: string; body: string }) {
 
 /** Render the non-code body: split into block-level lines (headings / lists /
  *  paragraphs), each with inline formatting. */
-function MarkdownBlocks({ text }: { text: string }) {
+function MarkdownBlocks({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   if (!text.trim()) return null;
   const lines = text.split("\n");
   const out: React.ReactNode[] = [];
@@ -2629,7 +4253,7 @@ function MarkdownBlocks({ text }: { text: string }) {
             <li key={j} className="flex gap-2">
               <span className="select-none text-[var(--color-faint)]">{j + 1}.</span>
               <span className="flex-1">
-                <Inline text={it} />
+                <Inline text={it} onOpenUrl={onOpenUrl} />
               </span>
             </li>
           ))}
@@ -2640,7 +4264,7 @@ function MarkdownBlocks({ text }: { text: string }) {
             <li key={j} className="flex gap-2">
               <span className="select-none text-[var(--color-accent)]">•</span>
               <span className="flex-1">
-                <Inline text={it} />
+                <Inline text={it} onOpenUrl={onOpenUrl} />
               </span>
             </li>
           ))}
@@ -2668,7 +4292,7 @@ function MarkdownBlocks({ text }: { text: string }) {
           key={`h${key++}`}
           className={`mt-1 font-sans font-semibold text-[var(--color-text)] ${size}`}
         >
-          <Inline text={h[2]} />
+          <Inline text={h[2]} onOpenUrl={onOpenUrl} />
         </div>,
       );
       continue;
@@ -2702,7 +4326,7 @@ function MarkdownBlocks({ text }: { text: string }) {
     flushList();
     out.push(
       <p key={`p${key++}`} className="whitespace-pre-wrap break-words">
-        <Inline text={line} />
+        <Inline text={line} onOpenUrl={onOpenUrl} />
       </p>,
     );
   }
@@ -2713,7 +4337,13 @@ function MarkdownBlocks({ text }: { text: string }) {
 /** Inline span formatting: `code`, **bold**, *italic* / _italic_, [text](url).
  *  Single-pass tokenizer — partial markers (e.g. a lone trailing `**` during
  *  streaming) just render literally, never throw. */
-function Inline({ text }: { text: string }) {
+function Inline({
+  text,
+  onOpenUrl,
+}: {
+  text: string;
+  onOpenUrl?: (url: string) => void;
+}) {
   const nodes: React.ReactNode[] = [];
   let i = 0;
   let k = 0;
@@ -2733,13 +4363,30 @@ function Inline({ text }: { text: string }) {
       const end = text.indexOf("`", i + 1);
       if (end > i) {
         flush();
+        const code = text.slice(i + 1, end);
+        const fileish = isPaneFileTarget(code);
         nodes.push(
-          <code
-            key={`c${k++}`}
-            className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-text)]"
-          >
-            {text.slice(i + 1, end)}
-          </code>,
+          fileish ? (
+            <button
+              key={`c${k++}`}
+              type="button"
+              onClick={() => {
+                const path = resolvePaneFileTarget(code);
+                openFileInPane(path, targetLabel(path));
+              }}
+              className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-accent)] underline decoration-[var(--color-accent)]/30 underline-offset-2 hover:decoration-[var(--color-accent)]"
+              title="open in pane"
+            >
+              {code}
+            </button>
+          ) : (
+            <code
+              key={`c${k++}`}
+              className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-text)]"
+            >
+              {code}
+            </code>
+          ),
         );
         i = end + 1;
         continue;
@@ -2753,7 +4400,7 @@ function Inline({ text }: { text: string }) {
         flush();
         nodes.push(
           <strong key={`b${k++}`} className="font-semibold text-[var(--color-text)]">
-            <Inline text={text.slice(i + 2, end)} />
+            <Inline text={text.slice(i + 2, end)} onOpenUrl={onOpenUrl} />
           </strong>,
         );
         i = end + 2;
@@ -2770,12 +4417,27 @@ function Inline({ text }: { text: string }) {
           flush();
           const label = text.slice(i + 1, close);
           const url = text.slice(close + 2, paren);
+          const http = isHttpPaneTarget(url);
+          const fileish = isPaneFileTarget(url);
           nodes.push(
             <a
               key={`a${k++}`}
               href={url}
-              target="_blank"
+              target={http ? "_blank" : undefined}
               rel="noreferrer"
+              onClick={(e) => {
+                if (http) {
+                  e.preventDefault();
+                  if (onOpenUrl) onOpenUrl(url);
+                  else openUrlInPane(url);
+                  return;
+                }
+                if (fileish) {
+                  e.preventDefault();
+                  const path = resolvePaneFileTarget(url);
+                  openFileInPane(path, targetLabel(path));
+                }
+              }}
               className="text-[var(--color-accent)] underline decoration-[var(--color-accent)]/40 underline-offset-2 hover:decoration-[var(--color-accent)]"
             >
               {label}
@@ -2896,9 +4558,20 @@ interface SlashCommand {
 }
 
 /** The floating panel that sits just above the composer for `/` and `@`. */
-function OverlayPanel({ children }: { children: React.ReactNode }) {
+function OverlayPanel({
+  children,
+  compact = false,
+}: {
+  children: React.ReactNode;
+  /** compact = a left-anchored dropdown (slash menu) vs the full-width panel. */
+  compact?: boolean;
+}) {
   return (
-    <div className="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-64 overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50">
+    <div
+      className={`absolute bottom-full z-40 mb-2 max-h-64 overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50 ${
+        compact ? "left-3 min-w-[220px] max-w-[min(360px,90%)]" : "left-0 right-0"
+      }`}
+    >
       {children}
     </div>
   );
@@ -2987,6 +4660,21 @@ function ResumePicker({
   onPick: (s: ChatSessionInfo) => void;
   onClose: () => void;
 }) {
+  const byProject = sessions.reduce<Array<{ key: string; label: string; items: ChatSessionInfo[] }>>(
+    (groups, session) => {
+      const label = baseName(session.cwd || "") || "unknown project";
+      const key = `${label}:${session.cwd || ""}`;
+      const group = groups.find((g) => g.key === key);
+      if (group) {
+        group.items.push(session);
+      } else {
+        groups.push({ key, label, items: [session] });
+      }
+      return groups;
+    },
+    [],
+  );
+  let rowIndex = 0;
   return (
     <div className="absolute bottom-full left-0 right-0 z-40 mb-2 overflow-hidden rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] shadow-2xl shadow-black/50">
       {/* sticky search header */}
@@ -2995,6 +4683,9 @@ function ResumePicker({
         <span className="shrink-0 font-sans text-[12px] text-[var(--color-text-2)]">
           resume
         </span>
+        <span className="shrink-0 rounded-full border border-[var(--color-border)] px-1.5 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
+          {total} sessions
+        </span>
         <span className="ml-1 flex min-w-0 flex-1 items-center gap-1.5">
           <Search size={12} className="shrink-0 text-[var(--color-faint)]" />
           <input
@@ -3002,7 +4693,7 @@ function ResumePicker({
             value={query}
             onChange={(e) => onQueryChange(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="filter by title…"
+            placeholder="search title, project, model, id…"
             spellCheck={false}
             className="min-w-0 flex-1 bg-transparent font-sans text-[12.5px] text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
           />
@@ -3018,11 +4709,11 @@ function ResumePicker({
       </div>
 
       {/* body */}
-      <div className="max-h-72 overflow-y-auto py-1">
+      <div className="max-h-[22rem] overflow-y-auto py-1">
         {loading ? (
           <div className="flex items-center gap-2 px-3 py-3 font-sans text-[12px] text-[var(--color-faint)]">
             <Loader2 size={13} className="animate-spin" />
-            loading recent sessions…
+            loading codex + chatpane sessions…
           </div>
         ) : sessions.length === 0 ? (
           <div className="px-3 py-3 font-sans text-[12px] text-[var(--color-faint)]">
@@ -3031,14 +4722,25 @@ function ResumePicker({
               : `no sessions match “${query}”`}
           </div>
         ) : (
-          sessions.map((s, i) => (
-            <ResumeRow
-              key={s.id}
-              session={s}
-              active={i === activeIdx}
-              onMouseEnter={() => onHover(i)}
-              onClick={() => onPick(s)}
-            />
+          byProject.map((group) => (
+            <div key={group.key}>
+              <div className="sticky top-0 z-10 flex items-center justify-between border-y border-[var(--color-border)] bg-[var(--color-panel-2)]/95 px-3 py-1 font-sans text-[10px] uppercase tracking-[0.08em] text-[var(--color-faint)] backdrop-blur first:border-t-0">
+                <span className="truncate">{group.label}</span>
+                <span className="font-mono tracking-normal">{group.items.length}</span>
+              </div>
+              {group.items.map((s) => {
+                const i = rowIndex++;
+                return (
+                  <ResumeRow
+                    key={s.id}
+                    session={s}
+                    active={i === activeIdx}
+                    onMouseEnter={() => onHover(i)}
+                    onClick={() => onPick(s)}
+                  />
+                );
+              })}
+            </div>
           ))
         )}
       </div>
@@ -3061,12 +4763,17 @@ function ResumeRow({
 }) {
   const dir = baseName(session.cwd || "");
   const when = session.mtime ? fmtRelativeTime(session.mtime) : "";
+  const engine = session.engine || "claude";
+  const model = session.model || "";
+  const shortId = session.id ? session.id.slice(0, 8) : "";
+  const sourceLabel =
+    engine === "codex" ? "codex terminal/chat" : engine === "opencode" ? "opencode" : "chatpane";
   return (
     <button
       type="button"
       onClick={onClick}
       onMouseEnter={onMouseEnter}
-      className={`flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors ${
+      className={`flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors ${
         active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
       }`}
     >
@@ -3077,10 +4784,15 @@ function ResumeRow({
         }`}
       />
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate font-sans text-[13px] text-[var(--color-text)]">
-          {session.title || "untitled session"}
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate font-sans text-[13px] text-[var(--color-text)]">
+            {session.title || "untitled session"}
+          </span>
+          <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
+            {engine}
+          </span>
         </span>
-        <span className="flex items-center gap-1.5 truncate font-sans text-[11px] text-[var(--color-faint)]">
+        <span className="mt-1 flex items-center gap-1.5 truncate font-sans text-[11px] text-[var(--color-faint)]">
           {dir && (
             <span className="inline-flex items-center gap-1">
               <Folder size={10} />
@@ -3094,11 +4806,23 @@ function ResumeRow({
               {when}
             </span>
           )}
+          {model && <span className="text-[var(--color-border-strong)]">·</span>}
+          {model && <span className="truncate">{model}</span>}
+          {shortId && <span className="text-[var(--color-border-strong)]">·</span>}
+          {shortId && <span className="font-mono">{shortId}</span>}
         </span>
       </span>
-      {active && (
-        <CornerDownLeft size={12} className="shrink-0 text-[var(--color-faint)]" />
-      )}
+      <span className="hidden shrink-0 items-center gap-1.5 sm:flex">
+        <span className="rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-faint)]">
+          {sourceLabel}
+        </span>
+        {active && (
+          <span className="inline-flex items-center gap-1 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-panel)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-text-2)]">
+            resume
+            <CornerDownLeft size={11} />
+          </span>
+        )}
+      </span>
     </button>
   );
 }
