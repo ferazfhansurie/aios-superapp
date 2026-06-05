@@ -88,6 +88,15 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let palette = MenuItemBuilder::with_id("pane:palette", "Command Palette")
         .accelerator("CmdOrCtrl+K")
         .build(app)?;
+    // ⌘P fuzzy file finder + ⌘⇧F global content search. Routed through the native
+    // menu (not just window.keydown) so they fire even while focus is inside a
+    // terminal/browser child webview — same reasoning as the rest of the Pane menu.
+    let file_finder = MenuItemBuilder::with_id("pane:file-finder", "Find File…")
+        .accelerator("CmdOrCtrl+P")
+        .build(app)?;
+    let global_search = MenuItemBuilder::with_id("pane:global-search", "Search in Files…")
+        .accelerator("CmdOrCtrl+Shift+F")
+        .build(app)?;
     let sidebar = MenuItemBuilder::with_id("pane:sidebar", "Toggle Sidebar")
         .accelerator("CmdOrCtrl+B")
         .build(app)?;
@@ -109,6 +118,8 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .item(&close_pane)
         .separator()
         .item(&palette)
+        .item(&file_finder)
+        .item(&global_search)
         .item(&sidebar)
         .item(&minimize)
         .item(&overview)
@@ -220,6 +231,7 @@ pub fn run() {
             files::read_file_preview,
             files::read_text_file,
             files::write_text_file,
+            files::file_mtime,
             files::delete_path,
             files::convert_office_to_pdf,
             files::save_image_temp,

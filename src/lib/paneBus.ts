@@ -107,8 +107,15 @@ export function registerPaneDropSink(key: string, sink: PaneDropSink): () => voi
 // a file as an in-app viewer pane rather than handing it to the OS. App registers
 // its opener once; callers use openFileInPane and fall back to the OS only if
 // nothing is registered.
+/** Optional jump target when opening a file in the editor (1-based). Used by
+ *  global search (⌘⇧F) to open a file AND scroll to the matched line. */
+export interface OpenAt {
+  line?: number;
+  col?: number;
+}
+
 let openFileImpl: ((path: string, name: string) => void) | null = null;
-let openEditorFileImpl: ((path: string, name: string) => void) | null = null;
+let openEditorFileImpl: ((path: string, name: string, at?: OpenAt) => void) | null = null;
 let openViewerFileImpl: ((path: string, name: string) => void) | null = null;
 let revealFileImpl: ((path: string, name: string) => void) | null = null;
 
@@ -131,7 +138,7 @@ export function openFileInPane(path: string, name: string): boolean {
 }
 
 export function registerOpenEditorFile(
-  fn: (path: string, name: string) => void,
+  fn: (path: string, name: string, at?: OpenAt) => void,
 ): () => void {
   openEditorFileImpl = fn;
   return () => {
@@ -157,9 +164,9 @@ export function registerRevealFile(
   };
 }
 
-export function openEditorFileInPane(path: string, name: string): boolean {
+export function openEditorFileInPane(path: string, name: string, at?: OpenAt): boolean {
   if (!openEditorFileImpl) return false;
-  openEditorFileImpl(path, name);
+  openEditorFileImpl(path, name, at);
   return true;
 }
 

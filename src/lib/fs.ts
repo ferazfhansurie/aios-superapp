@@ -95,14 +95,75 @@ export async function readTextFile(path: string): Promise<string> {
   return invoke<string>("read_text_file", { path });
 }
 
-/** Writes UTF-8 contents back to a file (editor save, atomic via temp+rename). */
-export async function writeTextFile(path: string, content: string): Promise<void> {
-  return invoke<void>("write_text_file", { path, content });
+/** File last-modified time in unix MILLISECONDS (0 if missing). The editor pane
+ *  captures this on load for save-conflict detection. */
+export async function fileMtime(path: string): Promise<number> {
+  return invoke<number>("file_mtime", { path });
+}
+
+/** Thrown by {@link writeTextFile} when the on-disk file changed since the
+ *  editor loaded it (AI or human edited it underneath us). `currentMtime` is the
+ *  file's now-current mtime in ms, for re-basing after an explicit overwrite. */
+export class SaveConflictError extends Error {
+  constructor(public currentMtime: number) {
+    super("file changed on disk");
+    this.name = "SaveConflictError";
+  }
+}
+
+/** Writes UTF-8 contents back to a file (editor save, atomic via temp+rename).
+ *  When `expectedMtime` is given, the backend refuses the write if the file
+ *  changed on disk since load (throws {@link SaveConflictError}). Returns the
+ *  file's new mtime in ms so the caller can re-base its conflict guard. */
+export async function writeTextFile(
+  path: string,
+  content: string,
+  expectedMtime?: number,
+): Promise<number> {
+  try {
+    return await invoke<number>("write_text_file", {
+      path,
+      content,
+      expectedMtime: expectedMtime ?? null,
+    });
+  } catch (e) {
+    const msg = String(e);
+    const m = /^conflict:([\d.]+)$/.exec(msg);
+    if (m) throw new SaveConflictError(Number(m[1]));
+    throw e;
+  }
 }
 
 /** Deletes a single file (notes CRUD). No-op if it's already gone; refuses dirs. */
 export async function deletePath(path: string): Promise<void> {
   return invoke<void>("delete_path", { path });
+}
+
+/** Flat list of every file under `root` (relative paths), honoring .gitignore +
+ *  pruning node_modules. Powers the ⌘P fuzzy finder — call once, cache, score
+ *  client-side. `max` caps the walk (default backend = generous). */
+export async function findFiles(root: string, max = 20000): Promise<string[]> {
+  return invoke<string[]>("find_files", { root, max });
+}
+
+/** One content-search hit. `path` is RELATIVE to the search root; `line`/`col`
+ *  are 1-based; `text` is the trimmed matching line. */
+export interface SearchHit {
+  path: string;
+  line: number;
+  col: number;
+  text: string;
+}
+
+/** Literal, case-insensitive content search under `root` (ripgrep w/ Rust
+ *  fallback). Returns flat hits (≤`max`, default 1000); the UI groups by file.
+ *  Powers ⌘⇧F. */
+export async function searchInFiles(
+  root: string,
+  query: string,
+  max = 1000,
+): Promise<SearchHit[]> {
+  return invoke<SearchHit[]>("search_in_files", { root, query, max });
 }
 
 /** Converts an office doc (docx/xlsx/pptx/…) to a cached PDF via headless

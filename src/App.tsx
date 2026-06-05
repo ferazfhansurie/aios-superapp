@@ -52,6 +52,8 @@ import { recallUrl } from "./lib/browser-mem";
 import { setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
 import { CommandPalette, type Command } from "./components/CommandPalette";
+import { FileFinder } from "./components/FileFinder";
+import { GlobalSearch } from "./components/GlobalSearch";
 import { IdleDashboard } from "./components/IdleDashboard";
 import { MirrorViewer } from "./components/MirrorViewer";
 import { MoneyAgentsSection, type MoneyAgentChatState } from "./components/MoneyAgentsSection";
@@ -282,6 +284,32 @@ function saveLayout(panes: Pane[]) {
   }
 }
 
+// ── recent-files MRU (⌘P empty-query list) ───────────────────────────────────
+// Generalizes the old single `lastOpenPath` ref into a persisted most-recently-
+// used list so the fuzzy finder can show "recent files" before you type. Newest
+// first, de-duped, capped.
+const MRU_KEY = "aios.files.mru";
+const MRU_LIMIT = 40;
+
+function loadMru(): string[] {
+  try {
+    const raw = localStorage.getItem(MRU_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function pushMru(path: string) {
+  try {
+    const next = [path, ...loadMru().filter((p) => p !== path)].slice(0, MRU_LIMIT);
+    localStorage.setItem(MRU_KEY, JSON.stringify(next));
+  } catch {
+    /* quota / unavailable — skip */
+  }
+}
+
 function startWindowDrag(e: React.MouseEvent<HTMLElement>) {
   if (e.button !== 0) return;
   if ((e.target as HTMLElement | null)?.closest(INTERACTIVE_SELECTOR)) return;
@@ -301,6 +329,10 @@ function App() {
   const [splash, setSplash] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [fileFinderOpen, setFileFinderOpen] = useState(false);
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  // Recent-files MRU (⌘P empty-query list); kept in state so opens repaint it.
+  const [mru, setMru] = useState<string[]>(loadMru);
   const [notifications, setNotifications] = useState<AiosNotification[]>(listNotifications);
   const [remoteMirrorSnapshot, setRemoteMirrorSnapshot] = useState<MirrorSnapshot | null>(null);
   const [mirrorStatus, setMirrorStatus] = useState<MirrorConnectionStatus>("off");
@@ -629,26 +661,68 @@ function App() {
 
   // remember the last file opened in the editor so F5 knows which project to run
   const lastOpenPath = useRef<string | null>(null);
+  // Live mirrors of state/callbacks the open path needs for DEDUP, but which are
+  // declared later (focusPane) — refs keep these callbacks dependency-free while
+  // always reading the freshest values (assigned in an effect below).
+  const panesRef = useRef<Pane[]>([]);
+  const focusPaneRef = useRef<(key: string) => void>(() => {});
+  const setPanesRef = useRef<typeof setPanes>(setPanes);
+
+  // OPEN-FILE DEDUP (panes ARE tabs): if a pane already shows this exact file,
+  // focus it instead of spawning a duplicate. For the editor we also reveal the
+  // requested line by patching the pane's kind (EditorPane re-runs on line change).
+  // Returns the focused pane's key, or null when nothing matched (caller spawns).
+  const focusExistingFilePane = useCallback(
+    (kind: "editor" | "file", path: string, at?: { line?: number; col?: number }): string | null => {
+      const existing = panesRef.current.find(
+        (p) => p.kind.type === kind && p.kind.path === path,
+      );
+      if (!existing) return null;
+      if (kind === "editor" && at?.line) {
+        setPanesRef.current((ps) =>
+          ps.map((p) =>
+            p.key === existing.key && p.kind.type === "editor"
+              ? { ...p, kind: { ...p.kind, line: at.line, col: at.col } }
+              : p,
+          ),
+        );
+      }
+      focusPaneRef.current(existing.key);
+      return existing.key;
+    },
+    [],
+  );
+
+  const recordMru = useCallback((path: string) => {
+    lastOpenPath.current = path;
+    pushMru(path);
+    setMru(loadMru());
+  }, []);
   const openFile = useCallback(
     (path: string, name: string) => {
-      lastOpenPath.current = path;
-      spawn(paneForFile(path, name), name);
+      recordMru(path);
+      const kind = paneForFile(path, name);
+      const fileKind = kind.type === "editor" ? "editor" : "file";
+      if (focusExistingFilePane(fileKind, path)) return;
+      spawn(kind, name);
     },
-    [spawn],
+    [spawn, focusExistingFilePane, recordMru],
   );
   const openEditorFile = useCallback(
-    (path: string, name: string) => {
-      lastOpenPath.current = path;
-      spawn({ type: "editor", path, name }, name);
+    (path: string, name: string, at?: { line?: number; col?: number }) => {
+      recordMru(path);
+      if (focusExistingFilePane("editor", path, at)) return;
+      spawn({ type: "editor", path, name, line: at?.line, col: at?.col }, name);
     },
-    [spawn],
+    [spawn, focusExistingFilePane, recordMru],
   );
   const openViewerFile = useCallback(
     (path: string, name: string) => {
-      lastOpenPath.current = path;
+      recordMru(path);
+      if (focusExistingFilePane("file", path)) return;
       spawn({ type: "file", path, name }, name);
     },
-    [spawn],
+    [spawn, focusExistingFilePane, recordMru],
   );
   const revealFile = useCallback(
     (path: string, name: string) => {
@@ -806,6 +880,19 @@ function App() {
     loadProjects();
   }, [loadProjects]);
 
+  // Root for ⌘P file-finder + ⌘⇧F global search. Priority: the active/focused
+  // files pane's root → the dir of the last-opened file → $HOME. So the finder
+  // searches the project you're actually working in, like VS Code's workspace.
+  const finderRoot = useMemo(() => {
+    const k = activeKey ?? focusedPane.current;
+    const active = k ? panes.find((p) => p.key === k) : null;
+    if (active?.kind.type === "files" && active.kind.root) return active.kind.root;
+    const filesPane = panes.find((p) => p.kind.type === "files" && p.kind.root);
+    if (filesPane && filesPane.kind.type === "files" && filesPane.kind.root) return filesPane.kind.root;
+    if (lastOpenPath.current) return containingDir(lastOpenPath.current);
+    return home;
+  }, [panes, activeKey, home]);
+
   // spawn a run terminal for a discovered project, exactly like F5 (logs stream
   // + flutter `r` hot-reload work in-pane). Uses the project's primary command.
   const runProject = useCallback(
@@ -840,6 +927,13 @@ function App() {
     focusedPane.current = key;
     setActiveKey(key);
   }, []);
+  // Keep the open-file-dedup refs pointed at the freshest panes + focusPane.
+  useEffect(() => {
+    panesRef.current = panes;
+  }, [panes]);
+  useEffect(() => {
+    focusPaneRef.current = focusPane;
+  }, [focusPane]);
   // Rename a pane (double-click its OPEN-rail row) — persists via the layout save.
   const renamePane = useCallback((key: string, label: string) => {
     const v = label.trim();
@@ -978,6 +1072,15 @@ function App() {
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setPaletteOpen((v) => !v);
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === "f") {
+        // ⌘⇧F — global content search (must come BEFORE the bare ⌘F fullscreen
+        // branch below, which also keys on "f").
+        e.preventDefault();
+        setGlobalSearchOpen((v) => !v);
+      } else if (mod && !e.shiftKey && e.key.toLowerCase() === "p") {
+        // ⌘P — fuzzy file finder ("go to file"). firaz's #1 pain.
+        e.preventDefault();
+        setFileFinderOpen((v) => !v);
       } else if (mod && e.key.toLowerCase() === "b") {
         e.preventDefault();
         setSidebarOpen((v) => !v);
@@ -1088,6 +1191,12 @@ function App() {
         }
         case "palette":
           setPaletteOpen((v) => !v);
+          break;
+        case "file-finder":
+          setFileFinderOpen((v) => !v);
+          break;
+        case "global-search":
+          setGlobalSearchOpen((v) => !v);
           break;
         case "sidebar":
           setSidebarOpen((v) => !v);
@@ -2028,6 +2137,21 @@ function App() {
         commands={commands}
         onAsk={askFromPalette}
         onDeepSearch={deepSearchFromPalette}
+      />
+      <FileFinder
+        open={fileFinderOpen}
+        root={finderRoot}
+        mru={mru}
+        onClose={() => setFileFinderOpen(false)}
+        onPick={(abs) => openFile(abs, abs.split("/").filter(Boolean).pop() ?? abs)}
+      />
+      <GlobalSearch
+        open={globalSearchOpen}
+        root={finderRoot}
+        onClose={() => setGlobalSearchOpen(false)}
+        onPick={(abs, line, col) =>
+          openEditorFile(abs, abs.split("/").filter(Boolean).pop() ?? abs, { line, col })
+        }
       />
       <PinSiteModal spaceId={pinSiteSpace} onClose={() => setPinSiteSpace(null)} />
       <PaneOverview
@@ -3508,7 +3632,13 @@ function PaneCard({
           ) : pane.kind.type === "file" ? (
             <FileViewerPane path={pane.kind.path} paneKey={pane.key} />
           ) : pane.kind.type === "editor" ? (
-            <EditorPane path={pane.kind.path} name={pane.kind.name} paneKey={pane.key} />
+            <EditorPane
+              path={pane.kind.path}
+              name={pane.kind.name}
+              paneKey={pane.key}
+              line={pane.kind.line}
+              col={pane.kind.col}
+            />
           ) : !chatCwd ? (
             <PaneLoading />
           ) : (

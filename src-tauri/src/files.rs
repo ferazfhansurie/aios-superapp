@@ -626,11 +626,54 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "not a UTF-8 text file".to_string())
 }
 
+/// File modification time in unix MILLISECONDS (0 if unavailable). Higher
+/// precision than the seconds used in directory listings, so the editor's
+/// save-conflict guard can tell two saves a fraction of a second apart apart.
+fn file_mtime_ms(path: &std::path::Path) -> f64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// Returns a file's last-modified time in unix milliseconds (0 if missing /
+/// unavailable). The editor pane captures this on load so it can detect a
+/// conflicting on-disk change before overwriting (AI + human editing the same
+/// file). Cheap stat — safe to call on every open/save.
+#[tauri::command]
+pub fn file_mtime(path: String) -> f64 {
+    file_mtime_ms(std::path::Path::new(&path))
+}
+
 /// Writes UTF-8 contents back to a file (editor save). Writes to a temp file in
 /// the same dir then renames, so a crash mid-write can't truncate the original.
+///
+/// SAVE-CONFLICT GUARD: when `expected_mtime` is provided (the mtime the editor
+/// captured when it loaded the file), the on-disk mtime is re-checked just
+/// before the rename. If it changed, the file was modified by someone else (a
+/// human, or the AI) since load — we abort with a `conflict:<current_mtime>`
+/// error rather than silently clobbering their work. The frontend parses the
+/// `conflict:` prefix to show a reload/overwrite prompt. A bare overwrite (no
+/// guard) is still possible by passing `expected_mtime = None`.
 #[tauri::command]
-pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+pub fn write_text_file(
+    path: String,
+    content: String,
+    expected_mtime: Option<f64>,
+) -> Result<f64, String> {
     let p = std::path::Path::new(&path);
+    // Conflict check: tolerate sub-millisecond float jitter. A real external
+    // write moves the mtime by far more than 1ms, so a >1ms delta = conflict.
+    if let Some(expected) = expected_mtime {
+        if expected > 0.0 {
+            let current = file_mtime_ms(p);
+            if current > 0.0 && (current - expected).abs() > 1.0 {
+                return Err(format!("conflict:{current}"));
+            }
+        }
+    }
     let dir = p.parent().ok_or_else(|| "invalid path".to_string())?;
     let tmp = dir.join(format!(
         ".{}.aios-tmp",
@@ -638,7 +681,9 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     ));
     std::fs::write(&tmp, content.as_bytes()).map_err(|e| format!("{e}"))?;
     std::fs::rename(&tmp, p).map_err(|e| format!("{e}"))?;
-    Ok(())
+    // Hand the new mtime back so the editor re-bases its conflict guard without a
+    // second stat round-trip.
+    Ok(file_mtime_ms(p))
 }
 
 /// Delete a single file (used by the notes pane — full CRUD). Refuses to touch

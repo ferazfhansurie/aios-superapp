@@ -41,7 +41,7 @@ export type PaneContent =
     }
   | { type: "pet" }
   | { type: "file"; path: string; name: string }
-  | { type: "editor"; path: string; name: string };
+  | { type: "editor"; path: string; name: string; line?: number; col?: number };
 
 /** A built-in app — `id` is the stable key persisted by the sidebar store
  *  (labels are user-editable, ids are not). */

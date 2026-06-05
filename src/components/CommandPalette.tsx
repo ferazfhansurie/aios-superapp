@@ -27,7 +27,7 @@ export interface Command {
 /** Subsequence fuzzy match. Returns matched-char indices (into `title`) + a
  *  score, or null on no match. Scoring rewards contiguous runs and matches at
  *  word boundaries / the very start; later matches decay. Higher = better. */
-function fuzzyMatch(query: string, title: string): { score: number; idx: number[] } | null {
+export function fuzzyMatch(query: string, title: string): { score: number; idx: number[] } | null {
   const q = query.toLowerCase();
   const t = title.toLowerCase();
   if (!q) return { score: 0, idx: [] };
@@ -86,7 +86,7 @@ function scoreCommand(query: string, c: Command): { score: number; idx: number[]
  *  per contiguous RUN (matched vs plain) rather than per character, so a 40-char
  *  title makes ~3 nodes instead of 40 — keeps the list cheap to repaint. Memoized
  *  so unchanged rows don't re-render while typing. */
-const Highlight = memo(function Highlight({ text, idx }: { text: string; idx: number[] }) {
+export const Highlight = memo(function Highlight({ text, idx }: { text: string; idx: number[] }) {
   if (!idx.length) return <>{text}</>;
   const set = new Set(idx);
   const out: React.ReactNode[] = [];
