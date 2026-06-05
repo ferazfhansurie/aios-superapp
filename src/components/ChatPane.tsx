@@ -22,7 +22,7 @@
  *   7. `/` slash menu (clear / plan / model / help)
  *   8. `@` file-mention picker sourced from cwd
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
@@ -143,12 +143,13 @@ import {
   onPetUserMessage,
 } from "../lib/pet";
 import {
+  AUTOSCROLL_STICK_THRESHOLD_PX,
   distanceFromBottom,
   nextAutoscrollPaused,
   shouldAutoscroll,
   type ScrollIntent,
 } from "../lib/chatScroll";
-import { isTauriRuntime } from "../lib/tauri";
+import { invoke, isTauriRuntime } from "../lib/tauri";
 import { PaneDropZone } from "./PaneDropZone";
 
 // ── transcript model ──────────────────────────────────────────────────────
@@ -387,6 +388,46 @@ function toolTarget(turn: ToolTurn): { label: string; full: string } {
   return { label: ellipsizeMid(preview, 56), full: preview };
 }
 
+/** Extract the file path a tool acted on, from its model-emitted input — the
+ *  gold source for "open in pane". Covers claude Read/Edit/Write/MultiEdit/
+ *  NotebookEdit (`file_path`/`notebook_path`) and codex apply_patch/exec
+ *  (`path`/`file`). Bash file args are intentionally NOT guessed here (too
+ *  ambiguous); a real file there shows up as a separate Read/Edit tool anyway.
+ *  Returns null when the tool isn't file-shaped. */
+function toolFilePath(turn: ToolTurn): string | null {
+  const name = turn.name.toLowerCase();
+  const inp = turn.input ?? {};
+  const str = (k: string) => (typeof inp[k] === "string" ? (inp[k] as string) : undefined);
+  switch (name) {
+    case "read":
+    case "write":
+    case "edit":
+    case "multiedit":
+      return str("file_path") ?? str("path") ?? null;
+    case "notebookedit":
+      return str("notebook_path") ?? str("file_path") ?? null;
+    // tools whose `path`/args are NOT a single file to open (a search dir, a
+    // shell command, a URL) — never offer "open in pane".
+    case "bash":
+    case "bashoutput":
+    case "exec_command":
+    case "write_stdin":
+    case "grep":
+    case "glob":
+    case "search":
+    case "webfetch":
+    case "webfetch_tool":
+    case "websearch":
+    case "task":
+    case "todowrite":
+      return null;
+    // codex maps apply_patch/fileChange → "edit" (handled above); a bare codex
+    // file action may still carry path/file.
+    default:
+      return str("file_path") ?? str("notebook_path") ?? str("path") ?? str("file") ?? null;
+  }
+}
+
 /** A short verb for the tool, Codex-style ("Read", "Ran", "Edited", "Searched"). */
 function toolVerb(name: string): string {
   switch (name.toLowerCase()) {
@@ -541,6 +582,78 @@ function fmtRelativeTime(unixSeconds: number): string {
   return `${Math.floor(day / 365)}y ago`;
 }
 
+// ── deterministic in-chat file open ──────────────────────────────────────────
+//
+// Opening a file the model mentioned must NOT rely on the model or on a
+// name-search-and-hope. Two reliable sources:
+//   1. ABSOLUTE paths harvested from tool_use inputs (Read/Edit/Write/… file_path,
+//      codex apply_patch path) — already model-verified, opened directly.
+//   2. text/code-fence mentions → resolved against the session cwd by the backend
+//      (`resolve_in_cwd`), which returns a real absolute path ONLY if the file
+//      exists. A bounded fuzzy `find_files` is the LAST resort (exact-join first).
+// Everything routes through `openFileInPane` (paneBus) → identical to FilesPane.
+//
+// `cwd` is provided once at the ChatPane root via this context so the deep
+// markdown/inline/tool renderers don't each need it threaded through.
+
+type ChatFileOpener = (ref: string) => void;
+const ChatFileOpenContext = createContext<ChatFileOpener | null>(null);
+
+function useChatFileOpener(): ChatFileOpener {
+  const ctx = useContext(ChatFileOpenContext);
+  return (
+    ctx ??
+    // fallback (no provider, e.g. web/test): open as-is, best-effort.
+    ((ref: string) => {
+      const path = resolvePaneFileTarget(ref);
+      openFileInPane(path, targetLabel(path));
+    })
+  );
+}
+
+/** Resolve a file reference against `cwd` (backend existence check) and open it
+ *  in a pane. Absolute/`~` paths skip resolution. Falls back to a BOUNDED fuzzy
+ *  basename match via `find_files` only when an exact join fails — never a blind
+ *  name search. Silent if nothing real resolves (no broken pane spawn). */
+async function openChatFileReference(ref: string, cwd?: string | null): Promise<void> {
+  const normalized = resolvePaneFileTarget(ref);
+  // Absolute or home paths are already concrete — open directly (paneForFile
+  // handles the existence/decoding). This matches harvested tool paths too.
+  if (normalized.startsWith("/") || normalized.startsWith("~/")) {
+    openFileInPane(normalized, targetLabel(normalized));
+    return;
+  }
+  if (!isTauriRuntime() || !cwd) {
+    // can't existence-check without a backend/cwd → best-effort as-is.
+    openFileInPane(normalized, targetLabel(normalized));
+    return;
+  }
+  try {
+    const resolved = await invoke<string | null>("resolve_in_cwd", {
+      cwd,
+      reference: normalized,
+    });
+    if (resolved) {
+      openFileInPane(resolved, targetLabel(resolved));
+      return;
+    }
+    // last resort: bounded fuzzy basename match (exact join already failed).
+    const base = targetLabel(normalized).toLowerCase();
+    if (base.includes(".")) {
+      const files = await invoke<string[]>("find_files", { root: cwd, max: 20000 });
+      const hit =
+        files.find((f) => f.toLowerCase().endsWith(`/${base}`)) ??
+        files.find((f) => f.toLowerCase() === base);
+      if (hit) {
+        const abs = hit.startsWith("/") ? hit : `${cwd.replace(/\/+$/, "")}/${hit}`;
+        openFileInPane(abs, targetLabel(abs));
+      }
+    }
+  } catch {
+    /* resolution failed → don't open a broken pane */
+  }
+}
+
 // ── component ────────────────────────────────────────────────────────────────
 
 const runEventsStorageKey = (sessionId: string) => `aios.chat.run-events:${sessionId}`;
@@ -548,6 +661,7 @@ const runEventsStorageKey = (sessionId: string) => `aios.chat.run-events:${sessi
 export function ChatPane({
   cwd,
   paneKey,
+  active,
   seed,
   resume,
   reattach,
@@ -558,6 +672,9 @@ export function ChatPane({
 }: {
   cwd?: string;
   paneKey?: string;
+  /** True when this is the focused/active pane. Drives composer auto-focus on
+   *  becoming active (and on mount) — but never steals focus mid-action. */
+  active?: boolean;
   seed?: string;
   modelId?: string;
   agentId?: string;
@@ -766,6 +883,9 @@ export function ChatPane({
   const [resumeId, setResumeId] = useState<string | null>(resume?.id ?? null);
   // the title of the resumed session, shown as a note once after resuming
   const [resumedTitle, setResumedTitle] = useState<string | null>(resume?.title ?? null);
+  // reactive mirror of claudeSessionIdRef — the engine session id currently open
+  // in THIS pane, so the /resume picker can highlight "the one you're in".
+  const [openSessionId, setOpenSessionId] = useState<string | null>(resume?.id ?? null);
 
   const sessionIdRef = useRef<number | null>(null);
   const webAbortRef = useRef<AbortController | null>(null);
@@ -859,11 +979,55 @@ export function ChatPane({
     };
   }, [paneKey]);
 
+  // ── auto-focus the composer ────────────────────────────────────────────────
+  // Focus the composer textarea when the pane MOUNTS and each time it BECOMES
+  // the active pane (false→true transition only — never on every render). Don't
+  // steal focus if the user is already typing/selecting in an editable field
+  // (e.g. a terminal/editor/composer in another pane): only grab focus when the
+  // current focus isn't an interactive input the user is mid-action in. Runs on
+  // a rAF so it lands after the pane's layout/visibility settles.
+  const wasActiveRef = useRef(false);
+  useEffect(() => {
+    const isActive = active ?? true; // panes without an active signal focus on mount
+    const becameActive = isActive && !wasActiveRef.current;
+    wasActiveRef.current = isActive;
+    if (!becameActive) return;
+    const ta = taRef.current;
+    if (!ta) return;
+    const raf = requestAnimationFrame(() => {
+      // don't yank focus out from under a user mid-action in ANOTHER editable.
+      const el = document.activeElement as HTMLElement | null;
+      const inThisPane = el ? ta.closest("[data-chat-pane]")?.contains(el) : false;
+      const editingElsewhere =
+        el != null &&
+        !inThisPane &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.isContentEditable ||
+          // terminal/browser webviews capture keys via these
+          el.tagName === "CANVAS" ||
+          el.tagName === "IFRAME" ||
+          el.tagName === "WEBVIEW");
+      if (editingElsewhere) return;
+      ta.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [active]);
+
   // A path dragged from another pane (Files) → append it to the composer.
   const insertPath = useCallback((path: string) => {
     setInput((v) => (v ? v.trimEnd() + " " + path + " " : path + " "));
     taRef.current?.focus();
   }, []);
+
+  // Deterministic in-chat file open, bound to THIS session's cwd. Provided via
+  // context so deep markdown/tool renderers can open files without threading cwd.
+  const openChatFile = useCallback<ChatFileOpener>(
+    (ref: string) => {
+      void openChatFileReference(ref, cwd);
+    },
+    [cwd],
+  );
 
   // ── image attach: paste a screenshot / pick a file → temp file + thumbnail ──
   const [images, setImages] = useState<ImageChip[]>([]);
@@ -1228,9 +1392,12 @@ export function ChatPane({
           if (prev && prev !== ev.session_id && recordedRef.current) {
             const m = activeModelRef.current;
             const title = resume?.title ?? "chat";
-            recordChatSession(ev.session_id, title, cwd ?? null, m.engine ?? "claude", m.id).catch(() => {});
+            // re-keying on a resume fork is bookkeeping, not real activity →
+            // don't bump mtime (preserve the session's genuine recency order).
+            recordChatSession(ev.session_id, title, cwd ?? null, m.engine ?? "claude", m.id, false).catch(() => {});
           }
           claudeSessionIdRef.current = ev.session_id;
+          setOpenSessionId(ev.session_id);
           setRunEventsKey(runEventsStorageKey(ev.session_id));
         }
         setClaudeReady(true);
@@ -1479,6 +1646,10 @@ export function ChatPane({
           previousScrollHeight: lastScrollHeightRef.current || undefined,
         },
         pausedRef.current,
+        // wide stick threshold so a fast token stream can't overshoot the bottom
+        // and silently fall off; the scroll/wheel handlers still pause the moment
+        // the user scrolls up, so this only affects auto-pinning.
+        AUTOSCROLL_STICK_THRESHOLD_PX,
       )
     ) {
       programmaticRef.current = true;
@@ -1493,7 +1664,11 @@ export function ChatPane({
       lastScrollTopRef.current = 0;
       syncJumpVisibility(null);
     }
-  }, [turns, streaming, liveStart, now, syncJumpVisibility]);
+    // `now` deliberately DROPPED from deps: it ticks every second from the 1Hz
+    // timer and re-ran this layout effect (thrashing layout) without new content.
+    // Content/stream changes already re-fire this; the running clock must not.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turns, streaming, liveStart, syncJumpVisibility]);
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -2030,6 +2205,7 @@ export function ChatPane({
     // fresh chat → forget the prior session id + recording flag so the next
     // first-send records a brand-new /resume entry (not the old one).
     claudeSessionIdRef.current = null;
+    setOpenSessionId(null);
     recordedRef.current = false;
     codexTitleLockedRef.current = false;
     setRestartKey((k) => k + 1);
@@ -2079,6 +2255,7 @@ export function ChatPane({
       setOverlay(null);
       setResumeQuery("");
       claudeSessionIdRef.current = session.id;
+      setOpenSessionId(session.id);
       setRunEventsKey(runEventsStorageKey(session.id));
       recordedRef.current = true;
       codexTitleLockedRef.current = true;
@@ -2453,6 +2630,36 @@ export function ChatPane({
     }
   };
 
+  // Pane-level double-tap ↓ → jump to bottom + re-latch autoscroll. The composer
+  // textarea handles its own double-tap (see onKeyDown) so it can also recall the
+  // last message on a single ↑; here we cover the REST of the pane (transcript,
+  // tool cards, focus on the pane root) so ↓↓ works anywhere. Skip when focus is
+  // in any editable field so it never fights cursor movement / a search input.
+  const onPaneKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key !== "ArrowDown") return;
+      const t = e.target as HTMLElement | null;
+      if (t === taRef.current) return; // composer owns its own ↓↓
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      const stamp = e.timeStamp || performance.now();
+      if (stamp - lastArrowDownRef.current < 360) {
+        e.preventDefault();
+        lastArrowDownRef.current = 0;
+        jumpToLatest();
+        return;
+      }
+      lastArrowDownRef.current = stamp;
+    },
+    [jumpToLatest],
+  );
+
   const hasDraft = input.trim().length > 0;
   const hasReadyImages = images.some((im) => im.path);
   const action = sendContract({
@@ -2746,6 +2953,7 @@ export function ChatPane({
             loading={resumeLoading}
             query={resumeQuery}
             activeIdx={overlayIdx}
+            currentSessionId={openSessionId}
             searchRef={resumeSearchRef}
             onQueryChange={setResumeQuery}
             onKeyDown={onResumeKeyDown}
@@ -3291,6 +3499,7 @@ export function ChatPane({
 
   if (empty) {
     return (
+      <ChatFileOpenContext.Provider value={openChatFile}>
       <PaneDropZone onPath={insertPath} onFiles={onDropFiles} label="drop image or path">
       <div className="flex h-full min-h-0 w-full flex-col items-center justify-center bg-[var(--color-bg)] px-6">
         <div className="w-full max-w-2xl">
@@ -3316,12 +3525,19 @@ export function ChatPane({
         </div>
       </div>
       </PaneDropZone>
+      </ChatFileOpenContext.Provider>
     );
   }
 
   return (
+    <ChatFileOpenContext.Provider value={openChatFile}>
     <PaneDropZone onPath={insertPath} label="drop to add to message">
-    <div className="relative flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
+    <div
+      data-chat-pane
+      tabIndex={-1}
+      onKeyDown={onPaneKeyDown}
+      className="relative flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)] outline-none"
+    >
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-2xl flex-col gap-5 px-6 py-8">
           {resumedTitle && (
@@ -3444,6 +3660,7 @@ export function ChatPane({
       </div>
     </div>
     </PaneDropZone>
+    </ChatFileOpenContext.Provider>
   );
 }
 
@@ -3635,6 +3852,9 @@ function ActivityStep({ turn, live }: { turn: ToolTurn; live: boolean }) {
   const hasResult = turn.result != null && turn.result.trim().length > 0;
   const detail = toolDetail(turn);
   const expandable = hasResult || detail != null;
+  // the real, model-emitted file path this tool acted on → deterministic open.
+  const filePath = toolFilePath(turn);
+  const openInPane = useChatFileOpener();
 
   // running step opens itself while the turn is live, and an errored step always
   // opens (you want to see what broke); otherwise user-controlled. (AI Elements
@@ -3643,12 +3863,13 @@ function ActivityStep({ turn, live }: { turn: ToolTurn; live: boolean }) {
   const open = userToggled ?? ((live && running) || turn.isError === true);
 
   return (
-    <div className="flex flex-col">
+    <div className="group/step flex flex-col">
+      <div className="flex w-full items-center gap-2 rounded-md py-0.5 pr-1">
       <button
         type="button"
         onClick={() => expandable && setUserToggled(!open)}
         title={full || undefined}
-        className={`flex w-full items-center gap-2 rounded-md py-0.5 pr-1 text-left ${
+        className={`flex min-w-0 flex-1 items-center gap-2 text-left ${
           expandable ? "cursor-pointer" : "cursor-default"
         }`}
       >
@@ -3662,17 +3883,37 @@ function ActivityStep({ turn, live }: { turn: ToolTurn; live: boolean }) {
           </span>
         )}
         <span className="flex-1" />
+      </button>
+        {filePath && (
+          <button
+            type="button"
+            title={`open ${filePath} in pane`}
+            onClick={(e) => {
+              e.stopPropagation();
+              openInPane(filePath);
+            }}
+            className="shrink-0 grid h-5 w-5 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-accent)] group-hover/step:opacity-100"
+          >
+            <FileText size={12} />
+          </button>
+        )}
         {running ? (
           <Loader2 size={11} className="shrink-0 animate-spin text-[var(--color-faint)]" />
         ) : turn.isError ? (
           <X size={12} className="shrink-0 text-[var(--color-danger)]" />
         ) : expandable ? (
-          <ChevronRight
-            size={12}
-            className={`shrink-0 text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
-          />
+          <button
+            type="button"
+            onClick={() => setUserToggled(!open)}
+            className="shrink-0"
+          >
+            <ChevronRight
+              size={12}
+              className={`text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
+            />
+          </button>
         ) : null}
-      </button>
+      </div>
       {open && (
         <div className="mb-1 ml-[7px] flex flex-col gap-1.5 border-l border-[var(--color-border)] pl-3 pt-1">
           {detail}
@@ -3865,6 +4106,7 @@ function TodoList({ todos }: { todos: Array<Record<string, unknown>> }) {
  *  open as an in-app viewer pane (image/pdf/text preview); falls back to the OS
  *  app only if no pane opener is wired. Icon keyed by file type. */
 function FileCard({ artifact }: { artifact: Artifact }) {
+  const openInPane = useChatFileOpener();
   const Icon =
     artifact.kind === "img"
       ? ImageIcon
@@ -3892,12 +4134,18 @@ function FileCard({ artifact }: { artifact: Artifact }) {
   };
   const open = () => {
     setErr(null);
-    // prefer an in-app viewer pane; only hand off to the OS if none is wired.
-    if (openFileInPane(artifact.path, artifact.name)) return;
-    openPath(artifact.path).catch((e) => {
-      setErr(String(e));
-      console.error("openPath failed:", artifact.path, e);
-    });
+    // absolute path (claude file_path) → open directly; a relative one (some
+    // codex apply_patch paths) → resolve against the session cwd first. Both
+    // route through the same paneBus open primitive as FilesPane.
+    if (artifact.path.startsWith("/") || artifact.path.startsWith("~/")) {
+      if (openFileInPane(artifact.path, artifact.name)) return;
+      openPath(artifact.path).catch((e) => {
+        setErr(String(e));
+        console.error("openPath failed:", artifact.path, e);
+      });
+      return;
+    }
+    openInPane(artifact.path);
   };
   return (
     <div
@@ -4486,6 +4734,10 @@ function Inline({
   text: string;
   onOpenUrl?: (url: string) => void;
 }) {
+  // deterministic cwd-anchored file open (context-provided), so a bare
+  // `foo.ts` mention resolves against the session cwd + existence-checks before
+  // opening — never a blind name search.
+  const openFile = useChatFileOpener();
   const nodes: React.ReactNode[] = [];
   let i = 0;
   let k = 0;
@@ -4512,10 +4764,7 @@ function Inline({
             <button
               key={`c${k++}`}
               type="button"
-              onClick={() => {
-                const path = resolvePaneFileTarget(code);
-                openFileInPane(path, targetLabel(path));
-              }}
+              onClick={() => openFile(code)}
               className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-accent)] underline decoration-[var(--color-accent)]/30 underline-offset-2 hover:decoration-[var(--color-accent)]"
               title="open in pane"
             >
@@ -4576,8 +4825,7 @@ function Inline({
                 }
                 if (fileish) {
                   e.preventDefault();
-                  const path = resolvePaneFileTarget(url);
-                  openFileInPane(path, targetLabel(path));
+                  openFile(url);
                 }
               }}
               className="text-[var(--color-accent)] underline decoration-[var(--color-accent)]/40 underline-offset-2 hover:decoration-[var(--color-accent)]"
@@ -4783,6 +5031,7 @@ function ResumePicker({
   loading,
   query,
   activeIdx,
+  currentSessionId,
   searchRef,
   onQueryChange,
   onKeyDown,
@@ -4795,6 +5044,9 @@ function ResumePicker({
   loading: boolean;
   query: string;
   activeIdx: number;
+  /** The engine session id currently open in THIS pane — its row gets an
+   *  accent ring + "current" dot so "which one am I in" is obvious. */
+  currentSessionId: string | null;
   searchRef: React.RefObject<HTMLInputElement | null>;
   onQueryChange: (v: string) => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
@@ -4877,6 +5129,7 @@ function ResumePicker({
                     key={s.id}
                     session={s}
                     active={i === activeIdx}
+                    current={!!currentSessionId && s.id === currentSessionId}
                     onMouseEnter={() => onHover(i)}
                     onClick={() => onPick(s)}
                   />
@@ -4890,16 +5143,29 @@ function ResumePicker({
   );
 }
 
-/** One row in the /resume picker: a RotateCcw glyph, the title (truncated), and
- *  a faint secondary line with the cwd basename + relative time. */
+/** The accent color for an engine — so claude/codex/opencode rows are
+ *  distinguishable at a glance (claude=accent, codex=blue, opencode=amber). */
+function engineColorVar(engine: string): string {
+  if (engine === "codex") return "var(--color-info)";
+  if (engine === "opencode") return "var(--color-warning)";
+  return "var(--color-accent)";
+}
+
+/** One row in the /resume picker. Shows the title (stable first message), an
+ *  engine-colored badge, a "where you left off" preview of the LATEST user
+ *  message, and a faint meta line (project · relative time · model · id). The
+ *  session currently open in THIS pane gets an accent ring + "current" dot so
+ *  it's unmistakable which one you're working in. */
 function ResumeRow({
   session,
   active,
+  current,
   onMouseEnter,
   onClick,
 }: {
   session: ChatSessionInfo;
   active: boolean;
+  current: boolean;
   onMouseEnter: () => void;
   onClick: () => void;
 }) {
@@ -4908,6 +5174,8 @@ function ResumeRow({
   const engine = session.engine || "claude";
   const model = session.model || "";
   const shortId = session.id ? session.id.slice(0, 8) : "";
+  const preview = (session.last_user || "").trim();
+  const engineColor = engineColorVar(engine);
   const sourceLabel =
     engine === "codex" ? "codex terminal/chat" : engine === "opencode" ? "opencode" : "chatpane";
   return (
@@ -4915,25 +5183,46 @@ function ResumeRow({
       type="button"
       onClick={onClick}
       onMouseEnter={onMouseEnter}
-      className={`flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors ${
-        active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
+      style={current ? { boxShadow: `inset 2px 0 0 ${engineColor}` } : undefined}
+      className={`flex w-full items-start gap-2.5 px-3 py-2.5 text-left transition-colors ${
+        active
+          ? "bg-[var(--color-accent-soft)]"
+          : current
+            ? "bg-[var(--color-panel)]/60"
+            : "hover:bg-[var(--color-panel)]"
       }`}
     >
       <RotateCcw
         size={14}
-        className={`shrink-0 ${
-          active ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]"
-        }`}
+        style={{ color: active || current ? engineColor : "var(--color-muted)" }}
+        className="mt-0.5 shrink-0"
       />
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="flex min-w-0 items-center gap-1.5">
           <span className="truncate font-sans text-[13px] text-[var(--color-text)]">
             {session.title || "untitled session"}
           </span>
-          <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
+          <span
+            style={{ color: engineColor, borderColor: `color-mix(in srgb, ${engineColor} 40%, transparent)` }}
+            className="shrink-0 rounded border px-1 py-0.5 font-mono text-[9px]"
+          >
             {engine}
           </span>
+          {current && (
+            <span
+              style={{ color: engineColor, borderColor: `color-mix(in srgb, ${engineColor} 50%, transparent)` }}
+              className="shrink-0 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 font-sans text-[9px] uppercase tracking-[0.06em]"
+            >
+              <span style={{ background: engineColor }} className="h-1.5 w-1.5 rounded-full" />
+              current
+            </span>
+          )}
         </span>
+        {preview && (
+          <span className="mt-0.5 truncate font-sans text-[11.5px] text-[var(--color-text-2)]">
+            {preview}
+          </span>
+        )}
         <span className="mt-1 flex items-center gap-1.5 truncate font-sans text-[11px] text-[var(--color-faint)]">
           {dir && (
             <span className="inline-flex items-center gap-1">
@@ -4954,7 +5243,7 @@ function ResumeRow({
           {shortId && <span className="font-mono">{shortId}</span>}
         </span>
       </span>
-      <span className="hidden shrink-0 items-center gap-1.5 sm:flex">
+      <span className="hidden shrink-0 items-center gap-1.5 pt-0.5 sm:flex">
         <span className="rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-faint)]">
           {sourceLabel}
         </span>

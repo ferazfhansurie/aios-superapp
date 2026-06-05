@@ -89,6 +89,7 @@ pub fn run() {
             files::convert_office_to_pdf,
             files::save_image_temp,
             files::find_files,
+            files::resolve_in_cwd,
             files::search_in_files,
             plugins::list_plugins,
             browser::browser_zoom,

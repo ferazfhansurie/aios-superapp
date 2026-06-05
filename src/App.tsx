@@ -3360,6 +3360,7 @@ function PaneCard({
           ) : (
             <ChatPane
               paneKey={pane.key}
+              active={active}
               cwd={chatCwd}
               seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
               modelId={pane.kind.type === "chat" ? pane.kind.modelId : undefined}

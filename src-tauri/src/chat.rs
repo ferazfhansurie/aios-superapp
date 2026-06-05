@@ -2365,6 +2365,12 @@ pub struct ChatSessionInfo {
     /// Model id used when the session was recorded, if known.
     #[serde(default)]
     pub model: String,
+    /// The MOST RECENT user message in the conversation (preview line in the
+    /// /resume picker). The `title` stays the FIRST user message (a stable
+    /// label); this surfaces "where you left off". Populated lazily by
+    /// `list_chat_sessions` from the transcript/rollout; empty when unknown.
+    #[serde(default)]
+    pub last_user: String,
 }
 
 /// One rendered turn loaded from a transcript, to repaint a resumed conversation.
@@ -2402,10 +2408,19 @@ pub fn record_chat_session(
     cwd: Option<String>,
     engine: Option<String>,
     model: Option<String>,
+    // True only on a REAL content advance (a genuine user send). False for
+    // bookkeeping upserts — a no-op resume that merely re-keys the entry to a
+    // fresh claude session_id, or a metadata refresh. Bumping mtime on every
+    // upsert scrambled the recency order in the /resume picker (a session you
+    // only RE-OPENED jumped to the top over one you actually worked in), so we
+    // only advance mtime when there's true activity. Defaults to true so older
+    // callers / the web path keep the previous behavior.
+    bump_mtime: Option<bool>,
 ) -> Result<(), String> {
     if id.trim().is_empty() {
         return Ok(());
     }
+    let bump_mtime = bump_mtime.unwrap_or(true);
     let mut store = load_store();
     let trimmed = {
         let t = title.trim().replace('\n', " ");
@@ -2419,7 +2434,9 @@ pub fn record_chat_session(
     };
     let now = now_secs();
     if let Some(existing) = store.iter_mut().find(|s| s.id == id) {
-        existing.mtime = now;
+        if bump_mtime {
+            existing.mtime = now;
+        }
         if !title.trim().is_empty() {
             existing.title = trimmed;
         }
@@ -2437,6 +2454,7 @@ pub fn record_chat_session(
             mtime: now,
             engine: engine.unwrap_or_default(),
             model: model.unwrap_or_default(),
+            last_user: String::new(),
         });
     }
     store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
@@ -2473,7 +2491,58 @@ pub fn list_chat_sessions(limit: Option<u32>) -> Vec<ChatSessionInfo> {
     }
     store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
     store.truncate(limit.unwrap_or(40) as usize);
+    // Enrich ONLY the returned (post-truncate) entries with their most-recent
+    // user message, for the picker's "where you left off" preview. Bounded to
+    // the visible window so we never read hundreds of transcripts.
+    if let Ok(home) = std::env::var("HOME") {
+        let home = std::path::Path::new(&home);
+        for session in &mut store {
+            session.last_user = last_user_text(home, &session.id).unwrap_or_default();
+        }
+    }
     store
+}
+
+/// Reads the MOST RECENT user-authored text from a session's transcript/rollout.
+/// Handles both engines via the same files `read_chat_transcript` reads: a claude
+/// `*.jsonl` at `~/.claude/projects/*/<id>.jsonl`, or a codex rollout. Returns the
+/// last user turn (trimmed, single-lined, capped) — what the user said last, i.e.
+/// where they left off. `None` if no transcript / no user turn is found.
+fn last_user_text(home: &std::path::Path, id: &str) -> Option<String> {
+    let projects = home.join(".claude/projects");
+    let mut turns: Option<Vec<ChatTurn>> = None;
+    if let Ok(dirs) = std::fs::read_dir(&projects) {
+        for dir in dirs.flatten() {
+            let cand = dir.path().join(format!("{id}.jsonl"));
+            if cand.is_file() {
+                if let Ok(text) = std::fs::read_to_string(&cand) {
+                    turns = Some(parse_claude_transcript(&text));
+                }
+                break;
+            }
+        }
+    }
+    if turns.is_none() {
+        if let Some(fp) = find_codex_rollout_in_home(home, id) {
+            if let Ok(text) = std::fs::read_to_string(&fp) {
+                turns = Some(parse_codex_rollout(&text));
+            }
+        }
+    }
+    let last = turns?
+        .into_iter()
+        .rev()
+        .find(|t| t.role == "user")
+        .map(|t| t.text)?;
+    let one_line = last.trim().replace('\n', " ");
+    if one_line.is_empty() {
+        return None;
+    }
+    Some(if one_line.chars().count() > 120 {
+        format!("{}…", one_line.chars().take(120).collect::<String>())
+    } else {
+        one_line
+    })
 }
 
 /// Loads a past session's conversation (user + assistant text turns) so the pane
@@ -2698,6 +2767,7 @@ fn codex_session_info_from_rollout(path: &std::path::Path) -> Option<ChatSession
         mtime,
         engine: "codex".to_string(),
         model,
+        last_user: String::new(),
     })
 }
 

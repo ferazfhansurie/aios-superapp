@@ -1059,6 +1059,55 @@ pub fn find_files(root: String, max: Option<usize>) -> Result<Vec<String>, Strin
     Ok(out)
 }
 
+/// Deterministically resolves a file `reference` (as emitted by an LLM in chat
+/// — a bare name, a relative path, or an absolute/`~` path) against the chat
+/// session's working dir. Returns the canonical absolute path ONLY if it points
+/// at a file that actually exists; `None` otherwise. This is the gold-source
+/// check behind chat's "open in pane" affordance — we never search-by-name and
+/// hope. The resolution order mirrors how a human reads a path the model wrote:
+///   1. absolute (`/…`) or home (`~/…`) — used as-is;
+///   2. exact join against `cwd` (`{cwd}/{ref}`) — the common case;
+///   3. nothing matched → `None` (caller may fall back to a bounded fuzzy find).
+/// Symlinks/`..` are collapsed via `canonicalize`, which also confirms existence.
+#[tauri::command]
+pub fn resolve_in_cwd(cwd: String, reference: String) -> Option<String> {
+    let r = reference.trim();
+    if r.is_empty() {
+        return None;
+    }
+    // strip a trailing :line[:col] suffix (e.g. "src/x.rs:42") the model may add.
+    let r = r
+        .rsplit_once(':')
+        .and_then(|(head, tail)| {
+            if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() {
+                Some(head)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(r);
+
+    let candidate: std::path::PathBuf = if let Some(rest) = r.strip_prefix("~/") {
+        std::path::Path::new(&home_dir()).join(rest)
+    } else if r == "~" {
+        std::path::PathBuf::from(home_dir())
+    } else if r.starts_with('/') {
+        std::path::PathBuf::from(r)
+    } else if cwd.trim().is_empty() {
+        // no cwd to anchor a relative ref against → can't resolve deterministically.
+        return None;
+    } else {
+        std::path::Path::new(&cwd).join(r)
+    };
+
+    let canon = candidate.canonicalize().ok()?;
+    if canon.is_file() {
+        Some(canon.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
 /// One content-search match. `path` is relative to the search root, `line`/`col`
 /// are 1-based, `text` is the matching line trimmed + capped at ~300 chars.
 #[derive(Serialize)]

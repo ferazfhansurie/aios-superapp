@@ -59,6 +59,10 @@ export interface ChatSessionInfo {
   mtime: number;
   engine?: "claude" | "codex" | "opencode" | string;
   model?: string;
+  /** The most recent user message in the conversation — the picker's "where you
+   *  left off" preview line. Empty when no transcript is found. `title` stays
+   *  the FIRST user message (a stable label). */
+  last_user?: string;
 }
 
 /** Lists the chats started in the chat pane (from the chat store) for /resume. */
@@ -66,13 +70,18 @@ export async function listChatSessions(limit = 40): Promise<ChatSessionInfo[]> {
   return invoke<ChatSessionInfo[]>("list_chat_sessions", { limit });
 }
 
-/** Records (upserts) a chat-pane session so /resume lists only chats started here. */
+/** Records (upserts) a chat-pane session so /resume lists only chats started here.
+ *  `bumpMtime` should be true ONLY on a real content advance (a genuine user
+ *  send) so the /resume list reflects genuine recent activity; pass false for
+ *  bookkeeping upserts (a no-op resume that just re-keys to a fresh session id).
+ *  Defaults to true to match the backend's default. */
 export async function recordChatSession(
   id: string,
   title: string,
   cwd?: string | null,
   engine?: string | null,
   model?: string | null,
+  bumpMtime = true,
 ): Promise<void> {
   return invoke("record_chat_session", {
     id,
@@ -80,6 +89,7 @@ export async function recordChatSession(
     cwd: cwd ?? null,
     engine: engine ?? null,
     model: model ?? null,
+    bumpMtime,
   });
 }
 
