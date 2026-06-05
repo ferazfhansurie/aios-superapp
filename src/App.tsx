@@ -494,6 +494,15 @@ function App() {
 
   const spawn = useCallback((kind: PaneContent, label: string): string => {
     const key = nextKey();
+    // EXIT FULLSCREEN ON ANY NEW-PANE SPAWN (R2a FIX 3): if a pane currently owns
+    // OS fullscreen / maximize, a freshly-spawned pane would be invisible behind
+    // it (the maximized pane fills the window + every other pane deactivates). Drop
+    // fullscreen first so the new pane actually appears in the grid and firaz SEES
+    // it. Functional setState reads the live value without a deps dependency.
+    setMaximizedKey((m) => {
+      if (m !== null) setWindowFullscreen(false).catch(() => {});
+      return null;
+    });
     setPanes((p) => {
       // Make every pane label identifiable at a glance:
       //  - shell/claude panes with a cwd → suffix the dir basename ("terminal · shell")
@@ -527,13 +536,44 @@ function App() {
     if (!isTauriRuntime()) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listen<{ url: string; profile?: string }>("browser-new-pane", ({ payload }) => {
-      if (!payload.url) return;
-      spawn({ type: "browser", url: payload.url, profile: payload.profile }, "browser");
-    }).then((stop) => {
-      if (disposed) stop();
-      else unlisten = stop;
-    }).catch(() => {});
+    // Debounce spawn spam: a link-heavy page (or a misbehaving site) can fire many
+    // window.open / target=_blank requests in a burst. De-dupe identical urls
+    // within a short window so one click can't spawn 10 panes.
+    const recent = new Map<string, number>();
+    const DEDUP_MS = 800;
+    void listen<{ url: string; profile?: string; is_popup?: boolean }>(
+      "browser-new-pane",
+      ({ payload }) => {
+        if (!payload.url) return;
+        const now = Date.now();
+        const last = recent.get(payload.url) ?? 0;
+        if (now - last < DEDUP_MS) return; // burst from the same url → ignore
+        recent.set(payload.url, now);
+        // prune so the map can't grow unbounded on a long-lived session
+        if (recent.size > 64) {
+          for (const [u, t] of recent) if (now - t > DEDUP_MS) recent.delete(u);
+        }
+        // OAuth nuance: a popup (window.open with explicit size features — the
+        // "sign in with Google/Apple" shape) is a TRANSIENT child of its opener.
+        // We still open it as a pane (so the auth flow can complete in-app), but
+        // tag it transient=true so it can be auto-reaped/associated with the opener
+        // rather than stranding a permanent pane after the redirect closes it.
+        spawn(
+          {
+            type: "browser",
+            url: payload.url,
+            profile: payload.profile,
+            transient: payload.is_popup === true,
+          },
+          payload.is_popup ? "sign-in" : "browser",
+        );
+      },
+    )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {});
     return () => {
       disposed = true;
       unlisten?.();
@@ -632,6 +672,19 @@ function App() {
     }
   }, [spawn, flash]);
   const addShell = useCallback(() => spawn({ type: "shell" }, "terminal"), [spawn]);
+  // ⌘T / "New Pane" is CONTEXT-AWARE (R2a FIX 2): if the active/focused pane is a
+  // BROWSER, ⌘T opens a fresh browser pane (tab=pane muscle memory) instead of a
+  // terminal; otherwise it falls back to the normal new-terminal behavior. Reads
+  // the live pane type so the menu accelerator and the keydown fallback agree.
+  const newPaneForContext = useCallback(() => {
+    const k = activeKey ?? focusedPane.current;
+    const active = k ? panes.find((p) => p.key === k) : null;
+    if (active?.kind.type === "browser") {
+      spawn({ type: "browser" }, "browser");
+    } else {
+      addShell();
+    }
+  }, [activeKey, panes, addShell, spawn]);
   const addOracle = useCallback(
     (identity: string) => spawn({ type: "oracle", identity }, identity),
     [spawn],
@@ -901,9 +954,10 @@ function App() {
         e.preventDefault();
         setSidebarOpen((v) => !v);
       } else if (mod && (e.key.toLowerCase() === "t" || e.key.toLowerCase() === "n")) {
-        // ⌘T / ⌘N — new terminal
+        // ⌘T / ⌘N — new pane (context-aware: browser pane focused → new browser
+        // pane; otherwise a new terminal).
         e.preventDefault();
-        addShell();
+        newPaneForContext();
       } else if (mod && e.key.toLowerCase() === "r") {
         // ⌘R — reload the cockpit fresh (re-init theme, re-poll all live data).
         e.preventDefault();
@@ -963,7 +1017,89 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addShell, fireAppshot, runF5, toggleFullscreenSelected, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
+  }, [addShell, newPaneForContext, fireAppshot, runF5, toggleFullscreenSelected, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
+
+  // NATIVE MENU BRIDGE (R2a FIX 1 — the urgent fix). The `window.keydown` handler
+  // above only fires when the REACT webview has focus. When focus is inside a
+  // native child webview — a browser PANE (its own WKWebView) or a terminal
+  // (xterm grabs keys) — those keystrokes never reach React, so Esc/⌘F/⌘W/⌘1-9/…
+  // all DIE exactly when a pane is focused (firaz got stuck unable to exit a
+  // fullscreen pane). A real app-MENU accelerator fires whenever the app is
+  // frontmost REGARDLESS of which webview holds focus, so the Rust menu emits
+  // `menu-action` and we dispatch into the SAME handlers as the keydown fallback.
+  // The keydown handler stays as the in-React path; the handlers are idempotent
+  // (functional setState / focusPane) so a double-fire is harmless.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ action: string; arg?: number | null }>("menu-action", ({ payload }) => {
+      const { action } = payload;
+      switch (action) {
+        case "exit-fullscreen": {
+          // THE URGENT PATH: unconditionally drop OS fullscreen + clear the
+          // maximized pane. Works even when a browser webview has focus because
+          // it arrives via the native menu, not a webview keystroke.
+          setWindowFullscreen(false).catch(() => {});
+          setMaximizedKey(null);
+          break;
+        }
+        case "toggle-fullscreen":
+          // ⌘F — same path firaz hit: maximize a pane to screen-fill, or restore.
+          // toggleFullscreenSelected drops maximizedKey + setWindowFullscreen(false)
+          // on the way out (App.tsx onVideoFullscreen exit branch).
+          toggleFullscreenSelected();
+          break;
+        case "new":
+          newPaneForContext();
+          break;
+        case "close": {
+          const k = focusedPane.current ?? activeKey;
+          if (k) requestClose(k);
+          break;
+        }
+        case "palette":
+          setPaletteOpen((v) => !v);
+          break;
+        case "sidebar":
+          setSidebarOpen((v) => !v);
+          break;
+        case "minimize": {
+          const k = activeKey ?? focusedPane.current;
+          if (k) toggleHide(k);
+          break;
+        }
+        case "overview":
+          if (panes.length > 0) setOverviewOpen((v) => !v);
+          break;
+        case "jump": {
+          const idx = (payload.arg ?? 0) - 1;
+          const p = idx >= 0 ? panes[idx] : null;
+          if (p) focusPane(p.key);
+          break;
+        }
+        default:
+          break;
+      }
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [
+    toggleFullscreenSelected,
+    newPaneForContext,
+    requestClose,
+    toggleHide,
+    focusPane,
+    activeKey,
+    panes,
+  ]);
 
   // Native OS drag-drop (Finder files/folders, e.g. a screenshot) → insert paths
   // into the targeted terminal pane. Because `dragDropEnabled` is true, macOS

@@ -37,12 +37,20 @@ fn parse(url: &str) -> Result<Url, String> {
 struct BrowserNewPane {
     url: String,
     profile: Option<String>,
+    /// True when the page requested this via `window.open` with explicit window
+    /// features (a size was specified) — the classic OAuth / "sign in with …"
+    /// popup shape (`window.open(url, "_blank", "width=500,height=600,menubar=no")`).
+    /// The frontend treats a popup as a TRANSIENT child tied to its opener (so an
+    /// auth flow doesn't strand a permanent pane), versus a plain link/⌘-click
+    /// (`is_popup=false`) which becomes a normal persistent pane.
+    is_popup: bool,
 }
 
-fn browser_new_pane(url: &Url, profile: &Option<String>) -> BrowserNewPane {
+fn browser_new_pane(url: &Url, profile: &Option<String>, is_popup: bool) -> BrowserNewPane {
     BrowserNewPane {
         url: url.to_string(),
         profile: profile.clone(),
+        is_popup,
     }
 }
 
@@ -194,8 +202,17 @@ pub async fn browser_show(
     #[allow(unused_mut)]
     let mut builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
         .user_agent(UA)
-        .on_new_window(move |url, _features| {
-            let _ = popup_app.emit("browser-new-pane", browser_new_pane(&url, &popup_profile));
+        .on_new_window(move |url, features| {
+            // A `window.open` with explicit window features (a size) is the OAuth
+            // popup shape; a bare target=_blank / ⌘-click / window.open has none.
+            let is_popup = features.size().is_some();
+            let _ = popup_app.emit(
+                "browser-new-pane",
+                browser_new_pane(&url, &popup_profile, is_popup),
+            );
+            // Always deny the native OS window — every "new window" becomes an
+            // in-app browser PANE instead (TAB = PANE, R2a FIX 2). The frontend
+            // debounces spawn spam + handles popups as transient children.
             tauri::webview::NewWindowResponse::Deny
         });
     // A named profile gets its own persistent cookie partition on macOS. Other

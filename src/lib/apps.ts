@@ -20,7 +20,7 @@ import type { PaneKind } from "../components/TerminalPane";
 export type PaneContent =
   | PaneKind
   | { type: "files"; root?: string }
-  | { type: "browser"; url?: string; profile?: string; memKey?: string }
+  | { type: "browser"; url?: string; profile?: string; memKey?: string; transient?: boolean }
   | { type: "notes" }
   | { type: "bridges" }
   | { type: "plugins" }
