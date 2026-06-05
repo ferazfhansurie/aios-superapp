@@ -28,18 +28,26 @@ struct Session {
     child: Mutex<Box<dyn Child + Send + Sync>>,
 }
 
-/// Shared registry of all live sessions, keyed by an incrementing id.
+/// Shared registry of all live sessions, keyed by an incrementing id. The map
+/// is behind an `Arc` so a session's reader thread can hold a handle and remove
+/// itself when the child exits (B4) without borrowing `&self`.
 pub struct PtyState {
-    sessions: Mutex<HashMap<u32, Arc<Session>>>,
+    sessions: Arc<Mutex<HashMap<u32, Arc<Session>>>>,
     next_id: AtomicU32,
 }
 
 impl PtyState {
     pub fn new() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU32::new(1),
         }
+    }
+
+    /// A cloned handle to the shared session map — for the reader thread to
+    /// evict its own entry on child exit.
+    fn sessions_handle(&self) -> Arc<Mutex<HashMap<u32, Arc<Session>>>> {
+        Arc::clone(&self.sessions)
     }
 }
 
@@ -88,6 +96,13 @@ fn spawn_internal(
 
     let id = state.next_id.fetch_add(1, Ordering::SeqCst);
 
+    // The reader thread needs to drop the session from the registry when the
+    // child exits (B4) — otherwise dead PTYs leak AND `pty_write` keeps finding
+    // the corpse and write_all's into a dead master (error swallowed by the
+    // frontend's `.catch(()=>{})`), so the user types into nothing with zero
+    // feedback. Clone the sessions Arc-map into the thread so it can self-remove.
+    let sessions = state.sessions_handle();
+
     // Reader thread: blocking reads → UTF-8-safe chunks → per-session Channel.
     thread::spawn(move || {
         let mut pending: Vec<u8> = Vec::new();
@@ -108,6 +123,10 @@ fn spawn_internal(
                 Err(_) => break,
             }
         }
+        // Child exited / reader EOF: evict the session BEFORE announcing the
+        // exit, so any pty_write racing the exit notification can't land on a
+        // dead master. Dropping the Arc<Session> here also frees the PTY master.
+        sessions.lock().remove(&id);
         let _ = app.emit("pty-exit", id);
     });
 
@@ -433,4 +452,61 @@ pub fn pty_kill(state: State<PtyState>, id: u32) -> Result<(), String> {
         let _ = s.child.lock().kill();
     }
     Ok(())
+}
+
+/// Startup reaper (B2): kills orphaned `aios-term-*` tmux sessions on the oracle
+/// socket that have NO corresponding restored pane. Without this, B1's old
+/// new-key-every-launch behaviour (now fixed) plus normal pane churn leaves
+/// zombie sessions — often a `claude` still burning context — accumulating
+/// forever (`pty_kill` only detaches the attach client; nothing ever
+/// kill-sessions them).
+///
+/// `keep` is the set of `aios-term-<name>` SESSION SUFFIXES that map to live
+/// restored panes (the frontend passes each pane's `termSessionName`). We list
+/// every `aios-term-*` session and `kill-session` only those NOT in `keep` —
+/// conservative by design: an unknown session is reaped only when it provably
+/// has no pane. Non-unix / no-tmux → no-op. Returns the names reaped.
+#[tauri::command]
+pub fn pty_reap_terminals(keep: Vec<String>) -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        let _ = keep;
+        Ok(Vec::new())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::collections::HashSet;
+        let tmux = tmux_bin();
+        // The full session names we must preserve, e.g. `aios-term-k3-abcd`.
+        let keep: HashSet<String> = keep
+            .into_iter()
+            .map(|n| format!("aios-term-{n}"))
+            .collect();
+        let output = std::process::Command::new(&tmux)
+            .args(["-L", "adletic", "list-sessions", "-F", "#{session_name}"])
+            .output()
+            .map_err(|e| format!("failed to run tmux: {e}"))?;
+        // No server / no sessions → tmux exits non-zero; treat as "nothing to do".
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut reaped = Vec::new();
+        for line in stdout.lines() {
+            let name = line.trim();
+            if name.is_empty() || !name.starts_with("aios-term-") {
+                continue;
+            }
+            if keep.contains(name) {
+                continue; // has a live pane → leave it running
+            }
+            let killed = std::process::Command::new(&tmux)
+                .args(["-L", "adletic", "kill-session", "-t", name])
+                .output();
+            if matches!(killed, Ok(o) if o.status.success()) {
+                reaped.push(name.to_string());
+            }
+        }
+        Ok(reaped)
+    }
 }

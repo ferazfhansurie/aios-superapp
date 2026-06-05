@@ -65,7 +65,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import { appshot, listOracles, type OracleInfo } from "./lib/pty";
+import { appshot, listOracles, reapTerminals, type OracleInfo } from "./lib/pty";
 import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } from "./lib/chat";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
@@ -226,6 +226,29 @@ function paneForFile(path: string, name: string): PaneContent {
 let seq = 0;
 const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
 
+/** Advance `seq` past a restored pane key's numeric index so a freshly-minted
+ *  key (`nextKey`) can never collide with a persisted one (B1). Restored keys
+ *  have the shape `k<seq>-<rand>`; parse the <seq> and keep `seq` ahead of it. */
+function reserveKeySeq(key: string) {
+  const m = /^k(\d+)-/.exec(key);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > seq) seq = n;
+  }
+}
+
+/** Derives the `aios-term-<name>` session SUFFIX from a pane key — MUST match
+ *  `termSessionName` in TerminalRuntime.tsx (kept inline here so the reaper
+ *  doesn't pull xterm into the main bundle). Used to build the keep-set for the
+ *  startup GC (B2) so a live pane's session is never reaped. */
+function termSessionSuffix(paneKey: string): string {
+  const base = paneKey
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return base; // fallback case (no key) never reaches the reaper — keys exist here
+}
+
 // ── session layout persistence ───────────────────────────────────────────────
 // Reopen whatever panes were open last time (mac-app muscle memory) — closing a
 // pane with its X removes it from the saved set, so the layout reflects what you
@@ -262,9 +285,19 @@ function loadLayout(): Pane[] {
   try {
     const raw = localStorage.getItem(LAYOUT_KEY);
     if (!raw) return [];
-    const saved = JSON.parse(raw) as { label: string; kind: PaneContent }[];
+    const saved = JSON.parse(raw) as { key?: string; label: string; kind: PaneContent }[];
     if (!Array.isArray(saved)) return [];
-    return saved.map((p) => ({ key: nextKey(), label: p.label, kind: p.kind }));
+    return saved.map((p) => {
+      // B1: REUSE the persisted key so a restored terminal pane keeps its
+      // original pane key → `termSessionName` derives the SAME `aios-term-<name>`
+      // and reattaches to the session its claude/codex was running in. Minting a
+      // fresh key here (the old bug) computed a brand-new name → `new-session -A`
+      // created an empty session and orphaned the real one. Reserve `seq` past
+      // the restored index so a future nextKey() can't collide.
+      const key = typeof p.key === "string" && p.key ? p.key : nextKey();
+      reserveKeySeq(key);
+      return { key, label: p.label, kind: p.kind };
+    });
   } catch {
     return [];
   }
@@ -275,7 +308,9 @@ function saveLayout(panes: Pane[]) {
     const out = panes
       .map((p) => {
         const kind = persistableKind(p.kind);
-        return kind ? { label: p.label, kind } : null;
+        // Persist the pane KEY (B1) — it's the seed for `termSessionName`, so a
+        // restored terminal pane must keep the same key to reattach its session.
+        return kind ? { key: p.key, label: p.label, kind } : null;
       })
       .filter(Boolean);
     localStorage.setItem(LAYOUT_KEY, JSON.stringify(out));
@@ -470,6 +505,26 @@ function App() {
     const teardown = initTheme();
     applyFlashLevel(); // reflect stored composer flash level on <html>
     return teardown;
+  }, []);
+
+  // Startup GC (B2): reap orphaned `aios-term-*` tmux sessions with no restored
+  // pane. Build the keep-set from the panes present at mount (the restored
+  // layout) — only shell-type terminal panes back a persistent `aios-term-*`
+  // session, so those are the only suffixes we preserve. Mount-once; reads the
+  // initial `panes` closure (== the restored layout). Conservative: the backend
+  // kills only sessions outside the keep-set.
+  useEffect(() => {
+    if (!nativeRuntime) return;
+    const keep = panes
+      .filter((p) => p.kind.type === "shell")
+      .map((p) => termSessionSuffix(p.key))
+      .filter(Boolean);
+    reapTerminals(keep).catch(() => {
+      /* no tmux server / non-AIOS box → nothing to reap */
+    });
+    // mount-once: the restored layout is fixed at boot; later pane churn is
+    // handled by detach/close, not the startup reaper.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Persist the open-pane layout whenever it changes, so the next launch reopens

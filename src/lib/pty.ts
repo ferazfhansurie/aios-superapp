@@ -127,3 +127,13 @@ export async function ptyResize(id: number, cols: number, rows: number): Promise
 export async function ptyKill(id: number): Promise<void> {
   return invoke("pty_kill", { id });
 }
+
+/**
+ * Startup GC (B2): kills orphaned `aios-term-*` tmux sessions that have NO live
+ * restored pane. `keep` is the list of `termSessionName` suffixes for the panes
+ * currently in the layout; the backend reaps only sessions outside that set.
+ * Returns the full session names that were reaped.
+ */
+export async function reapTerminals(keep: string[]): Promise<string[]> {
+  return invoke<string[]>("pty_reap_terminals", { keep });
+}

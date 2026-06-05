@@ -190,18 +190,17 @@ export function TerminalComposer({
     const raw = onRaw;
     raw?.("\x15");
     raw?.("/clear\r");
-    // after /clear settles, drop in the resume prompt, THEN submit with a
-    // SEPARATE \r on its own tick. claude code's TUI buffers a \r that arrives
-    // in the same chunk as a long paste as a newline (multiline composer mode)
-    // instead of Enter — so it sits in the box unsent. Writing the body first,
-    // then \r on a later tick, registers as the submit key (the dual-enter
-    // gotcha; see the relay-to-oracle skill).
+    // R6: drop the resume prompt as a BRACKETED paste with a real Enter OUTSIDE
+    // the paste brackets, all in one write. The `\x1b[201~` terminator closes
+    // the paste so the trailing \r is a genuine submit — no longer relying on
+    // 600ms/150ms setTimeouts to win the dual-enter race (which broke on a loaded
+    // machine: the \r could land inside the paste → newline, prompt sits unsent).
+    // A small delay still lets the prior /clear settle before the paste arrives.
+    const PROMPT =
+      "read HANDOFF-SESSION.md (this repo, else ~/.aios/state/handoffs/ newest) and continue exactly where the last session left off";
     setTimeout(() => {
-      raw?.(
-        "read HANDOFF-SESSION.md (this repo, else ~/.aios/state/handoffs/ newest) and continue exactly where the last session left off",
-      );
-      setTimeout(() => raw?.("\r"), 150);
-    }, 600);
+      raw?.(`\x1b[200~${PROMPT}\x1b[201~\r`);
+    }, 250);
     setHandoffArmed(false);
   }, [onRaw]);
   const taRef = useRef<HTMLTextAreaElement>(null);

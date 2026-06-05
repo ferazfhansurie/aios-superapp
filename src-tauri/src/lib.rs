@@ -213,6 +213,7 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
+            pty::pty_reap_terminals,
             oracles::list_oracles,
             oracles::list_tmux_sessions,
             oracles::create_oracle,

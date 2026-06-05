@@ -5,8 +5,9 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { MessageSquarePlus, X } from "lucide-react";
+import { MessageSquarePlus, RotateCw, X } from "lucide-react";
 import { Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -22,8 +23,20 @@ import {
   spawnTmux,
 } from "../lib/pty";
 import { homeDir, saveImageTemp } from "../lib/fs";
-import { paneWriters, paneSubmitters } from "../lib/paneBus";
+import { paneWriters, paneSubmitters, openUrlInPane } from "../lib/paneBus";
 import { isTauriRuntime } from "../lib/tauri";
+
+/** Wrap text in bracketed-paste markers so a TUI (claude code, vim, a shell with
+ *  bracketed-paste mode on) treats it as ONE atomic paste — the trailing CR
+ *  inside the brackets is delivered literally instead of racing a separate
+ *  setTimeout'd Enter (the old 40/150/600ms "dual-enter" hack). For a shell this
+ *  also means a multi-line clipboard paste lands as one editable block instead of
+ *  auto-executing each line. ESC[200~ … ESC[201~. */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+function bracketed(text: string): string {
+  return `${PASTE_START}${text}${PASTE_END}`;
+}
 import { TerminalComposer } from "./TerminalComposer";
 import { PaneDropZone } from "./PaneDropZone";
 
@@ -94,7 +107,7 @@ export type PaneKind =
  * (that pane just won't persist across full app restarts — acceptable).
  */
 let termFallbackSeq = 0;
-function termSessionName(paneKey?: string): string {
+export function termSessionName(paneKey?: string): string {
   const base = (paneKey ?? `pane-${++termFallbackSeq}`)
     .toLowerCase()
     .replace(/[^a-z0-9_-]+/g, "-")
@@ -117,6 +130,12 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       (kind.type === "shell" && !!kind.cmd && kind.cmd.startsWith("claude")),
   );
   const [savingImg, setSavingImg] = useState(false);
+  // B3: the backend emits `pty-exit <sessionId>` when the child/reader dies.
+  // When THIS pane's session exits we surface an inline "process exited" state
+  // (⏎ restart / ⌘W close) instead of silently swallowing the user's keystrokes
+  // into a dead PTY. `restartNonce` bumps to re-run the mount effect → respawn.
+  const [exited, setExited] = useState(false);
+  const [restartNonce, setRestartNonce] = useState(0);
   // Best-effort cwd for the composer's context bar: a shell pane's explicit cwd,
   // else the home dir (oracle/tmux panes don't carry one). Read-only label only.
   const [paneCwd, setPaneCwd] = useState<string | undefined>(
@@ -150,6 +169,9 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
+    // B3: starting (or restarting) a session → clear any prior exit state so the
+    // fresh terminal renders instead of the "process exited" overlay.
+    setExited(false);
 
     const term = new Xterm({
       fontFamily: FONT_FAMILY,
@@ -172,7 +194,22 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     termRef.current = term;
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.loadAddon(new WebLinksAddon());
+    // N5: route clicked URLs into the IN-APP browser pane (you stay in the
+    // cockpit) instead of bouncing to the OS browser. openUrlInPane returns false
+    // if no pane host is registered (e.g. running outside the desktop shell) —
+    // fall back to the default OS open in that case.
+    term.loadAddon(
+      new WebLinksAddon((event, uri) => {
+        if (event.button !== 0) return; // left-click only, like the default
+        if (!openUrlInPane(uri, "browser")) {
+          try {
+            window.open(uri, "_blank", "noopener,noreferrer");
+          } catch {
+            /* nothing more we can do */
+          }
+        }
+      }),
+    );
     term.open(host);
 
     // Save an image blob to a temp file and write its shell-quoted path (+space)
@@ -211,7 +248,10 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       }
       try {
         const t = await navigator.clipboard.readText();
-        if (t && sid != null) ptyWrite(sid, t).catch(() => {});
+        // R6: bracketed paste so a MULTI-LINE clipboard paste into a shell lands
+        // as one editable block instead of auto-executing each line (the
+        // paste-injection footgun). No trailing CR — pasting never submits.
+        if (t && sid != null) ptyWrite(sid, bracketed(t)).catch(() => {});
       } catch {
         /* nothing pasteable */
       }
@@ -261,14 +301,30 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       navigator.clipboard
         .readText()
         .then((t) => {
-          if (t && sid != null) ptyWrite(sid, t).catch(() => {});
+          // R6: bracketed paste — same multi-line-safety as Cmd+V.
+          if (t && sid != null) ptyWrite(sid, bracketed(t)).catch(() => {});
         })
         .catch(() => {});
     };
     host.addEventListener("auxclick", onAuxClick);
     // WebGL renderer for speed; silently fall back to the default if unavailable.
+    // R2: WebGL renderer for speed. On sleep/wake (or GPU pressure) the browser
+    // can drop the WebGL context — without handling onContextLoss the addon
+    // throws on the next draw and the pane goes black. Dispose the dead addon so
+    // xterm transparently falls back to its DOM/canvas renderer; the pane keeps
+    // painting (slower, but alive) until the next mount restores WebGL.
+    let webgl: WebglAddon | null = null;
     try {
-      term.loadAddon(new WebglAddon());
+      webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        try {
+          webgl?.dispose();
+        } catch {
+          /* already torn down */
+        }
+        webgl = null;
+      });
+      term.loadAddon(webgl);
     } catch {
       /* canvas/dom fallback */
     }
@@ -276,6 +332,8 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     let sessionId: number | null = null;
     let disposed = false;
     let inputDisposer: { dispose: () => void } | null = null;
+    // B3: unlisten handle for this pane's `pty-exit` subscription.
+    let unlistenExit: (() => void) | null = null;
 
     if (!isTauriRuntime()) {
       term.write("\r\n\x1b[33m[aios] terminal panes run inside the desktop shell.\x1b[0m\r\n");
@@ -394,6 +452,24 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       }
 
       sessionIdRef.current = sessionId;
+      // B3: listen for THIS session's exit. The backend evicts the session from
+      // its registry (B4) then emits `pty-exit <id>`. When it's ours, drop the
+      // session ref (so further writes no-op instead of black-holing into a dead
+      // PTY) and surface the inline "process exited" state. A plain shell or
+      // `claude` quitting is the common trigger.
+      {
+        const mySid = sessionId;
+        listen<number>("pty-exit", (e) => {
+          if (disposed || e.payload !== mySid) return;
+          sessionIdRef.current = null;
+          setExited(true);
+        })
+          .then((un) => {
+            if (disposed) un();
+            else unlistenExit = un;
+          })
+          .catch(() => {});
+      }
       // Pane writer for cross-cutting features (voice dictation, file drops).
       // Prefer the compose box when it's open (so dictation lands in the box and
       // is editable before send, like ChatPane); else write straight to the PTY.
@@ -418,13 +494,22 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       }
     })();
 
-    const onResize = () => {
+    // R1: debounce the ResizeObserver. The raw callback fires on EVERY pixel
+    // change while dragging a pane divider; running fit.fit() + ptyResize (an IPC
+    // round-trip + SIGWINCH to the child) per frame floods the PTY and flickers.
+    // Coalesce to a single trailing fit+resize ~60ms after motion settles.
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const applyResize = () => {
       try {
         fit.fit();
         if (sessionId != null) ptyResize(sessionId, term.cols, term.rows).catch(() => {});
       } catch {
         /* ignore */
       }
+    };
+    const onResize = () => {
+      if (resizeTimer != null) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(applyResize, 60);
     };
     const ro = new ResizeObserver(onResize);
     ro.observe(host);
@@ -434,26 +519,51 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       if (paneKey) paneWriters.delete(paneKey);
       host.removeEventListener("auxclick", onAuxClick);
       ro.disconnect();
+      if (resizeTimer != null) clearTimeout(resizeTimer);
+      unlistenExit?.();
       inputDisposer?.dispose();
       if (sessionId != null) ptyKill(sessionId).catch(() => {});
       term.dispose();
     };
-    // Mount once: each pane has a stable React key and fixed kind.
+    // Re-runs on restartNonce (B3 restart): tears down the dead terminal + respawns
+    // — for a tmux-backed pane this reattaches the persistent `aios-term-<name>`
+    // (recreating it via `new-session -A` if the process had exited).
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restartNonce]);
+
+  // B3: restart an exited session — bump the nonce so the mount effect re-runs
+  // (respawn + reattach). Clear the exit flag optimistically.
+  const restartSession = useCallback(() => {
+    setExited(false);
+    setRestartNonce((n) => n + 1);
   }, []);
+
+  // While exited, ⏎ restarts (mirrors the overlay hint). Scoped to keydown on
+  // the host so it doesn't fight global shortcuts; ⌘W (close) is App's job.
+  useEffect(() => {
+    if (!exited) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        restartSession();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [exited, restartSession]);
 
   // Click a button → "type" that choice into the session (text + Enter).
   const sendChoice = (opt: string) => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, `${opt}\r`).catch(() => {});
+    // R6: bracketed-paste the choice text + a real Enter outside the brackets
+    // (same atomic submit as composerSend) so it can't race / get split.
+    if (id != null) ptyWrite(id, bracketed(opt) + "\r").catch(() => {});
     setButtons(null);
     bufRef.current = "";
   };
 
-  // Compose box → write the text, then send Enter as a SEPARATE keystroke a beat
-  // later. Claude Code / Ink TUIs can swallow a CR glued to a pasted block
-  // (bracketed paste), so the prompt wouldn't actually submit. Splitting them
-  // makes the Enter land as a real submit and generation starts.
+  // Compose box → bracketed-paste the text, with a real Enter OUTSIDE the paste
+  // brackets as the submit (see the body comment). One atomic write, no timer.
   const composerSend = (text: string) => {
     const id = sessionIdRef.current;
     if (id == null) return;
@@ -463,8 +573,17 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     // already at the bottom, so normal sends are unaffected.
     termRef.current?.scrollToBottom();
     termRef.current?.focus();
-    ptyWrite(id, text).catch(() => {});
-    setTimeout(() => ptyWrite(id, "\r").catch(() => {}), 40);
+    // R6: bracketed-paste the TEXT (atomic — the TUI inserts it verbatim, no
+    // per-line auto-exec, no garbled multibyte), then a REAL Enter OUTSIDE the
+    // paste brackets as the submit key — all in ONE write, no setTimeout race.
+    //
+    // Why the CR is outside the brackets (the claude-submit caution): claude
+    // code's TUI buffers a \r that arrives INSIDE a paste as a literal newline
+    // (multiline-compose), so it would sit unsent — that's the whole reason the
+    // old code split text + a delayed \r. The `\x1b[201~` terminator closes the
+    // paste, so the trailing \r is then processed as a genuine Enter = submit.
+    // This preserves the claude-code submit flow without any magic timer.
+    ptyWrite(id, bracketed(text) + "\r").catch(() => {});
   };
 
   // Expose composerSend as this pane's SUBMITTER so "send to AI" (notes pane)
@@ -587,6 +706,28 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     >
       <div className="relative min-h-0 flex-1">
         <div ref={hostRef} className="h-full min-h-0 w-full" />
+        {/* B3: process-exited overlay — the shell/CLI died, so writes would
+            black-hole. Tell the user + offer ⏎ restart (respawn/reattach) and
+            point at ⌘W to close. Replaces the silent corpse the old code left. */}
+        {exited && (
+          <div className="absolute inset-0 z-30 grid place-items-center bg-[var(--color-bg)]/80 backdrop-blur-sm">
+            <div className="flex flex-col items-center gap-3 rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel)]/95 px-6 py-5 text-center shadow-2xl shadow-black/50">
+              <span className="text-[13px] text-[var(--color-text)]">
+                process exited
+              </span>
+              <span className="text-[11px] text-[var(--color-faint)]">
+                press ⏎ to restart · ⌘W to close
+              </span>
+              <button
+                onClick={restartSession}
+                className="flex items-center gap-1.5 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)]"
+              >
+                <RotateCw size={13} />
+                restart
+              </button>
+            </div>
+          </div>
+        )}
         {/* toggle the compose box (chat-grade prompt surface for CLI AIs) */}
         {!composerOpen && (
           <button
