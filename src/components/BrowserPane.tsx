@@ -52,6 +52,12 @@ import { addLink } from "../lib/sidebar";
 import { DEFAULT_PROFILE, addProfile, loadProfiles } from "../lib/profiles";
 import { rememberUrl } from "../lib/browser-mem";
 import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
+import { onAiosDrag, openViewerFileInPane, registerPaneDropSink } from "../lib/paneBus";
+import { PaneDropZone } from "./PaneDropZone";
+
+// Extensions the WKWebView can render in-page as a navigation target. Everything
+// else (a .docx, .xlsx, …) goes to the in-app viewer pane instead.
+const BROWSER_VIEWABLE = /\.(pdf|html?|svg|png|jpe?g|gif|webp|txt|md|json|xml|css|js)$/i;
 
 const ANNOT_SENTINEL = "AIOS_ANNOT:";
 const ANNOT_POLL_MS = 700;
@@ -137,6 +143,13 @@ export function BrowserPane({
   onVideoFullscreenRef.current = onVideoFullscreen;
   const fsOnRef = useRef(false);
 
+  // While an in-app path-drag is armed, hide the native webview so it stops
+  // painting ABOVE the React layer — then the PaneDropZone overlay underneath
+  // can actually capture the drop (the webview is a top-most native view that
+  // otherwise swallows everything). Re-show + re-sync bounds on drag end.
+  const [dragArmed, setDragArmed] = useState(false);
+  useEffect(() => onAiosDrag(setDragArmed), []);
+
   const rect = useCallback((): Rect | null => {
     const el = slotRef.current;
     if (!el) return null;
@@ -146,7 +159,7 @@ export function BrowserPane({
   }, []);
 
   useEffect(() => {
-    if (!active) {
+    if (!active || dragArmed) {
       if (shownRef.current) browserHide(label).catch(() => {});
       return;
     }
@@ -177,7 +190,7 @@ export function BrowserPane({
       window.removeEventListener("resize", sync);
       clearInterval(poll);
     };
-  }, [active, current, label, profile, rect]);
+  }, [active, dragArmed, current, label, profile, rect]);
 
   // Poll the webview's REAL url (catches in-page navigation the address bar never
   // sees). On a real change: remember it (pinned sites resume here) and sync the
@@ -282,6 +295,43 @@ export function BrowserPane({
     setInput(url);
     if (shownRef.current) browserNavigate(label, url).catch(() => {});
   }, [input, label]);
+
+  // Drop sink: a file dropped into a browser pane = "show me this in the page".
+  // A viewable file (pdf/html/image/…) → navigate the webview to file://<path>;
+  // anything else (a .docx/.xlsx) → open it in an in-app viewer pane. A dropped
+  // URL string → navigate. Returns true once consumed.
+  const onDropPath = useCallback(
+    (raw: string): boolean => {
+      const s = raw.trim();
+      if (!s) return false;
+      if (/^https?:\/\//i.test(s)) {
+        setCurrent(s);
+        setInput(s);
+        browserNavigate(label, s).catch(() => {});
+        return true;
+      }
+      // a filesystem path
+      if (BROWSER_VIEWABLE.test(s)) {
+        const url = `file://${encodeURI(s)}`;
+        setCurrent(url);
+        setInput(url);
+        browserNavigate(label, url).catch(() => {});
+      } else {
+        const name = s.split("/").pop() ?? s;
+        openViewerFileInPane(s, name);
+      }
+      return true;
+    },
+    [label],
+  );
+  useEffect(
+    () =>
+      registerPaneDropSink(label, (paths) => {
+        const first = paths.find((p) => p && p.trim());
+        return first ? onDropPath(first) : false;
+      }),
+    [label, onDropPath],
+  );
 
   const showToast = useCallback((msg: string, level: NotificationLevel = "info", body?: string) => {
     setToast(msg);
@@ -659,6 +709,9 @@ export function BrowserPane({
       </div>
 
       <div ref={slotRef} className="relative min-h-0 flex-1">
+        <PaneDropZone onPath={onDropPath} label="drop to open in this page">
+          <div className="absolute inset-0" />
+        </PaneDropZone>
         <div className="pointer-events-none absolute inset-0 grid place-items-center px-6 text-center text-[11px] text-[var(--color-faint)]">
           {showError ? (
             <span className="max-w-md text-[var(--color-danger)]">

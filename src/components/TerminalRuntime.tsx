@@ -25,6 +25,7 @@ import { homeDir, saveImageTemp } from "../lib/fs";
 import { paneWriters, paneSubmitters } from "../lib/paneBus";
 import { isTauriRuntime } from "../lib/tauri";
 import { TerminalComposer } from "./TerminalComposer";
+import { PaneDropZone } from "./PaneDropZone";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
 const THEME = {
@@ -560,7 +561,18 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     ptyWrite(id, `${quotePath(path)} `).catch(() => {});
   };
 
+  // Insert a dropped path at the prompt (quoted, trailing space). Used by the
+  // PaneDropZone overlay — which floats ABOVE xterm's canvas while a drag is
+  // armed, so the drop actually reaches React instead of being swallowed.
+  const insertDroppedPath = (raw: string) => {
+    const id = sessionIdRef.current;
+    const s = raw.trim();
+    if (id == null || !s) return;
+    ptyWrite(id, `${quotePath(s)} `).catch(() => {});
+  };
+
   return (
+    <PaneDropZone onPath={insertDroppedPath} label="drop to insert path">
     <div
       className="relative flex h-full min-h-0 w-full flex-col"
       onDragOver={(e) => {
@@ -637,5 +649,6 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         />
       )}
     </div>
+    </PaneDropZone>
   );
 }

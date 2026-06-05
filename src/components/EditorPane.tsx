@@ -2,15 +2,25 @@
  *  highlighting, minimap, breadcrumbs, multi-cursor, find/replace all feel
  *  identical. Opens a file from the Files pane, edits in-app, ⌘S to save
  *  (atomic write). This is the foundation of replacing VS Code with the shell. */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type * as Monaco from "monaco-editor";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { Check, Circle, ExternalLink, Loader2 } from "lucide-react";
 
 import { readTextFile, writeTextFile } from "../lib/fs";
 import { languageForPath } from "../lib/editorLanguage";
+import { openFileInPane, registerPaneDropSink } from "../lib/paneBus";
+import { PaneDropZone } from "./PaneDropZone";
 
-export function EditorPane({ path, name }: { path: string; name: string }) {
+export function EditorPane({
+  path,
+  name,
+  paneKey,
+}: {
+  path: string;
+  name: string;
+  paneKey?: string;
+}) {
   const hostRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -106,7 +116,26 @@ export function EditorPane({ path, name }: { path: string; name: string }) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Drop a file onto the editor → open it (in the correct pane kind via
+  // paneForFile). We don't hot-swap this pane's `path` prop — opening is the
+  // deterministic, consistent route and matches FilesPane "open in pane".
+  const onDropFile = useCallback((raw: string) => {
+    const s = raw.trim();
+    if (!s || /^https?:\/\//i.test(s)) return;
+    openFileInPane(s, s.split("/").pop() ?? s);
+  }, []);
+  useEffect(() => {
+    if (!paneKey) return;
+    return registerPaneDropSink(paneKey, (paths) => {
+      const first = paths.find((p) => p && p.trim() && !/^https?:\/\//i.test(p));
+      if (!first) return false;
+      onDropFile(first);
+      return true;
+    });
+  }, [paneKey, onDropFile]);
+
   return (
+    <PaneDropZone onPath={onDropFile} label="drop file to open">
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-bg)]">
       <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3">
         {dirty ? (
@@ -150,5 +179,6 @@ export function EditorPane({ path, name }: { path: string; name: string }) {
         )}
       </div>
     </div>
+    </PaneDropZone>
   );
 }

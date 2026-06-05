@@ -199,9 +199,53 @@ pub async fn browser_show(
     };
     let popup_app = app.clone();
     let popup_profile = profile.clone();
+    // Download handler: capture the chosen destination on `Requested` (on macOS
+    // the `Finished` event's `path` is ALWAYS empty due to a WKWebView API
+    // limitation — tauri docs note this), then on a successful `Finished` emit
+    // `browser-download` with that path so the frontend opens it in a pane.
+    let dl_app = app.clone();
+    let dl_dest: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let dl_dest_req = dl_dest.clone();
     #[allow(unused_mut)]
     let mut builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
         .user_agent(UA)
+        .on_download(move |_webview, event| {
+            match event {
+                tauri::webview::DownloadEvent::Requested { destination, .. } => {
+                    if let Ok(mut slot) = dl_dest_req.lock() {
+                        *slot = Some(destination.clone());
+                    }
+                }
+                tauri::webview::DownloadEvent::Finished { path, success, .. } => {
+                    if success {
+                        // Prefer the event's path; fall back to the captured
+                        // destination (macOS path is empty on Finished).
+                        let resolved = path.or_else(|| {
+                            dl_dest.lock().ok().and_then(|s| s.clone())
+                        });
+                        if let Some(p) = resolved {
+                            let name = p
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string());
+                            let _ = dl_app.emit(
+                                "browser-download",
+                                serde_json::json!({
+                                    "path": p.to_string_lossy(),
+                                    "name": name,
+                                }),
+                            );
+                        }
+                    }
+                    if let Ok(mut slot) = dl_dest.lock() {
+                        *slot = None;
+                    }
+                }
+                _ => {}
+            }
+            true
+        })
         .on_new_window(move |url, features| {
             // A `window.open` with explicit window features (a size) is the OAuth
             // popup shape; a bare target=_blank / ⌘-click / window.open has none.

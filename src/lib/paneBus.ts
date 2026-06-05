@@ -44,6 +44,64 @@ export function detachBusyChats(notify: boolean): number {
  *  image sink. Each path is absolute on disk; the sink reads + attaches it. */
 export const paneImageDrop = new Map<string, (paths: string[]) => void>();
 
+// ── canonical pane-rect registry (R2b) ──────────────────────────────────────
+// The OS-file-drop hit-test used `document.elementFromPoint`, which FAILS over a
+// native child WKWebView (the browser pane paints ABOVE the React layer and is
+// not a resolvable DOM node). This registry lets App hit-test purely against the
+// React wrappers' live rects (topmost-wins), so drops target the right pane even
+// when a browser webview occupies the cell.
+
+/** What kind of payload a drop carries, so a pane can opt out (canAccept). */
+export type PayloadKind = "path" | "url" | "image" | "files";
+
+export interface PaneHandle {
+  key: string;
+  type: string;
+  /** Live on-screen rect of the pane's wrapper (App's [data-pane-key] div). */
+  getRect: () => DOMRect | null;
+  /** Whether this pane wants a payload of the given kind. */
+  canAccept: (kind: PayloadKind) => boolean;
+}
+
+/** Every mounted PaneCard registers here keyed by pane key. */
+export const paneRegistry = new Map<string, PaneHandle>();
+
+export function registerPane(handle: PaneHandle): () => void {
+  paneRegistry.set(handle.key, handle);
+  return () => {
+    if (paneRegistry.get(handle.key) === handle) paneRegistry.delete(handle.key);
+  };
+}
+
+/** Resolve the pane key under a CSS-pixel point, topmost-wins. Iterates the
+ *  registry's live rects rather than the DOM, so it's robust over native
+ *  webviews. Iteration order = insertion; later-mounted panes win ties (matches
+ *  z-order well enough for a non-overlapping grid). Returns null if no pane. */
+export function paneKeyAtPoint(x: number, y: number): string | null {
+  let hit: string | null = null;
+  for (const handle of paneRegistry.values()) {
+    const r = handle.getRect();
+    if (!r) continue;
+    if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) hit = handle.key;
+  }
+  return hit;
+}
+
+// ── per-pane drop sinks (R2b) ────────────────────────────────────────────────
+// A generic sink each pane registers: given dropped filesystem paths (and the
+// raw FileList when present), do the pane-appropriate thing and return true if
+// the drop was consumed. The central OS-drop handler checks this FIRST, then
+// falls back to the existing image/text-insert logic.
+export type PaneDropSink = (paths: string[], files?: FileList) => boolean;
+export const paneDropSink = new Map<string, PaneDropSink>();
+
+export function registerPaneDropSink(key: string, sink: PaneDropSink): () => void {
+  paneDropSink.set(key, sink);
+  return () => {
+    if (paneDropSink.get(key) === sink) paneDropSink.delete(key);
+  };
+}
+
 // ── open-file-in-pane channel ────────────────────────────────────────────────
 // App owns pane creation; deep children (e.g. a chat artifact card) need to open
 // a file as an in-app viewer pane rather than handing it to the OS. App registers
@@ -166,11 +224,13 @@ export function onAiosDrag(fn: DragListener): () => void {
   };
 }
 
-// Wire the window-level listeners once. We arm the overlays whenever ANY drag
-// enters the window — both in-app drags (Files pane → terminal) AND OS file
-// drags (Finder → pane), since `dragDropEnabled:false` routes OS drops through
-// the webview's native HTML5 layer. Gutter-resizes use mouse events (not HTML5
-// dnd) so they never trip this.
+// Wire the window-level listeners once. We arm the overlays on any in-app HTML5
+// drag (Files-pane row → another pane). NOTE: `dragDropEnabled:true` means OS
+// file drops (Finder → pane) bypass HTML5 entirely and are handled by the
+// central Tauri `onDragDropEvent` handler in App.tsx (which hides nothing — it
+// hit-tests the pane registry). These window listeners therefore arm for the
+// in-app drags, which is exactly what triggers the browser webview-hide unlock.
+// Gutter-resizes use mouse events (not HTML5 dnd) so they never trip this.
 if (typeof window !== "undefined" && !(window as unknown as { __aiosDragWired?: boolean }).__aiosDragWired) {
   (window as unknown as { __aiosDragWired?: boolean }).__aiosDragWired = true;
   const arm = () => setDragActive(true);

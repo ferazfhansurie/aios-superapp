@@ -82,11 +82,16 @@ import {
   paneWriters,
   paneSubmitters,
   paneImageDrop,
+  paneDropSink,
+  registerPane,
+  paneKeyAtPoint,
+  openFileInPane,
   registerOpenFile,
   registerOpenEditorFile,
   registerOpenViewerFile,
   registerRevealFile,
   registerOpenUrl,
+  type PayloadKind,
 } from "./lib/paneBus";
 import { containingDir, paneFileTarget } from "./lib/paneOpenActions";
 import { loadSettings, saveSettings, applyFlashLevel, subscribe as subscribeSettings } from "./lib/settings";
@@ -579,6 +584,29 @@ function App() {
       unlisten?.();
     };
   }, [spawn]);
+
+  // A file downloaded inside a browser pane → open it in the right in-app pane
+  // (pdf→viewer, code→editor via paneForFile). Net: download a PDF in a browser
+  // pane and it pops open in a viewer pane.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ path: string; name?: string }>("browser-download", ({ payload }) => {
+      if (!payload?.path) return;
+      const name = payload.name || payload.path.split("/").pop() || payload.path;
+      openFileInPane(payload.path, name);
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   // Resolve a sidebar item to a spawn: built-in apps look up their kind from the
   // catalog; link items open the embedded browser already at their url.
@@ -1101,20 +1129,21 @@ function App() {
     panes,
   ]);
 
-  // Native OS drag-drop (Finder files/folders, e.g. a screenshot) → insert paths
-  // into the targeted terminal pane. Because `dragDropEnabled` is true, macOS
-  // intercepts file drops natively and the webview's HTML5 drag events never
-  // fire — so this Tauri handler is the ONLY path for OS files (the in-app
-  // `application/x-aios-path` handler on TerminalPane covers Files-pane drags).
+  // Native OS drag-drop (Finder files/folders, e.g. a screenshot) → route to the
+  // targeted pane. Because `dragDropEnabled` is true, macOS intercepts file drops
+  // natively and the webview's HTML5 drag events never fire — so this Tauri
+  // handler is the ONLY path for OS files (the in-app `application/x-aios-path`
+  // handler on the panes covers Files-pane drags).
   useEffect(() => {
     if (!isTauriRuntime()) return;
-    // Resolve the pane key under a physical (device-pixel) drop position. xterm's
-    // canvas/textarea sit inside the [data-pane-key] wrapper, so closest() walks
-    // up to the pane regardless of which internal node is hit-tested.
+    // Resolve the pane key under a physical (device-pixel) drop position via the
+    // canonical pane-rect registry — robust over native child WKWebViews (which
+    // `document.elementFromPoint` cannot resolve, so a browser pane was a dead
+    // zone). Tauri reports the drop position in PHYSICAL pixels; the registry's
+    // rects are in CSS pixels, so divide by the device-pixel ratio.
     const paneKeyAt = (x: number, y: number): string | null => {
       const dpr = window.devicePixelRatio || 1;
-      const el = document.elementFromPoint(x / dpr, y / dpr);
-      return el?.closest<HTMLElement>("[data-pane-key]")?.getAttribute("data-pane-key") ?? null;
+      return paneKeyAtPoint(x / dpr, y / dpr);
     };
 
     const un = getCurrentWebview().onDragDropEvent((event) => {
@@ -1133,10 +1162,21 @@ function App() {
       setDropTargetKey(null);
       const { paths, position } = p;
       if (!paths?.length) return;
-      // Prefer the pane under the cursor; fall back to the focused pane so a drop
-      // that lands on a gap / title bar still inserts (screenshots are easy to
-      // miss-aim). Only fall back to a real terminal-backed pane.
-      let key = paneKeyAt(position.x, position.y);
+      const dropKey = paneKeyAt(position.x, position.y);
+      // 1) A pane-specific drop sink (browser → navigate to file://, editor/
+      // viewer → open it) gets first crack — it owns the meaning of "a file
+      // dropped on me". Falls through to the writer logic only if it declines.
+      if (dropKey) {
+        const sink = paneDropSink.get(dropKey);
+        if (sink && sink(paths)) {
+          flash(`dropped ${paths.length} item${paths.length > 1 ? "s" : ""}`);
+          return;
+        }
+      }
+      // 2) Prefer the pane under the cursor; fall back to the focused pane so a
+      // drop that lands on a gap / title bar still inserts (screenshots are easy
+      // to miss-aim). Only fall back to a real terminal-backed pane.
+      let key = dropKey;
       if (!key || !paneWriters.get(key)) {
         const fk = focusedPane.current;
         if (fk && paneWriters.get(fk)) key = fk;
@@ -3244,6 +3284,22 @@ function PaneCard({
   onVideoFullscreen?: (on: boolean) => void;
 }) {
   const t = pane.kind.type;
+  // Register this pane in the canonical rect registry so the OS-drop hit-test can
+  // target it without `elementFromPoint` (which fails over native webviews). The
+  // wrapper ref gives a live rect; canAccept lets a pane opt a payload out.
+  const wrapRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const canAccept = (_kind: PayloadKind): boolean => {
+      // pet/clock-style decorative panes accept nothing; everything else does.
+      return t !== "pet";
+    };
+    return registerPane({
+      key: pane.key,
+      type: t,
+      getRect: () => wrapRef.current?.getBoundingClientRect() ?? null,
+      canAccept,
+    });
+  }, [pane.key, t]);
   const chatCwd = pane.kind.type === "chat" ? (pane.kind.cwd ?? defaultCwd) : undefined;
   const label =
     t === "oracle" ? `oracle: ${pane.label}` : t === "tmux" ? `tmux: ${pane.label}` : pane.label;
@@ -3266,6 +3322,7 @@ function PaneCard({
   };
   return (
     <div
+      ref={wrapRef}
       data-pane-key={pane.key}
       onMouseDownCapture={onFocus}
       style={hidden ? { display: "none" } : style}
@@ -3449,9 +3506,9 @@ function PaneCard({
           ) : pane.kind.type === "app" ? (
             <AppAttachPane name={pane.kind.name} bundleId={pane.kind.bundleId} />
           ) : pane.kind.type === "file" ? (
-            <FileViewerPane path={pane.kind.path} />
+            <FileViewerPane path={pane.kind.path} paneKey={pane.key} />
           ) : pane.kind.type === "editor" ? (
-            <EditorPane path={pane.kind.path} name={pane.kind.name} />
+            <EditorPane path={pane.kind.path} name={pane.kind.name} paneKey={pane.key} />
           ) : !chatCwd ? (
             <PaneLoading />
           ) : (
