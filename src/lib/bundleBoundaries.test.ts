@@ -15,11 +15,8 @@ test("app shell does not statically import heavy pane implementations", () => {
   const app = read("src/App.tsx");
   const forbidden = [
     "./components/ChatPane",
-    "./components/DatabasePane",
     "./components/EditorPane",
     "./components/TerminalRuntime",
-    "./components/MemoryPane",
-    "./components/MotionPane",
   ];
 
   for (const specifier of forbidden) {
@@ -31,7 +28,6 @@ test("app shell does not statically import heavy pane implementations", () => {
   }
 
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/ChatPane"\)/);
-  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/DatabasePane"\)/);
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/EditorPane"\)/);
 });
 
@@ -50,18 +46,6 @@ test("terminal pane keeps xterm behind terminal runtime", () => {
   assert.equal(shell.includes("@xterm/"), false);
   assert.match(shell, /import\("\.\/TerminalRuntime"\)/);
   assert.match(runtime, /@xterm\/xterm/);
-});
-
-test("memory pane keeps three.js graph behind graph runtime", () => {
-  const pane = read("src/components/MemoryPane.tsx");
-  const graph = read("src/components/MemoryGraph3D.tsx");
-
-  assert.equal(hasRuntimeImport(pane, "3d-force-graph"), false);
-  assert.equal(hasRuntimeImport(pane, "three"), false);
-  assert.equal(hasRuntimeImport(pane, "three/examples/jsm/postprocessing/UnrealBloomPass.js"), false);
-  assert.match(pane, /import\("\.\/MemoryGraph3D"\)/);
-  assert.match(graph, /3d-force-graph/);
-  assert.match(graph, /from "three"/);
 });
 
 test("pet pane uses a seeded code-drawn 8-bit game pet", () => {
@@ -403,16 +387,20 @@ test("codex usage surfaces pace-risk warnings", () => {
   assert.match(usagePace, /slow down/);
 });
 
-test("gpt chatpane stop hard-stops and restarts the backend", () => {
+test("chatpane stop: codex interrupts, only opencode kill-restarts", () => {
   const chatPane = read("src/components/ChatPane.tsx");
   const state = read("src/lib/chatPaneState.ts");
   const chat = read("src/lib/chat.ts");
   const rust = read("src-tauri/src/chat.rs");
 
   assert.match(state, /stopStrategy/);
+  // Round-1 parity: codex now stops via turn/interrupt (keeps the persistent
+  // app-server + thread); only opencode still kill-and-restarts.
   assert.match(state, /kill-and-restart/);
+  assert.match(state, /"interrupt"/);
+  assert.match(rust, /codex_interrupt/);
   assert.match(chatPane, /chatStop\(id\)/);
-  assert.match(chatPane, /gpt backend restarted/);
+  assert.match(chatPane, /backend restarted/);
   assert.match(chatPane, /backendBusy/);
   assert.match(chatPane, /activeRunRef\.current = streaming \|\| backendBusy/);
   assert.match(chatPane, /busy: \(\) => activeRunRef\.current/);
@@ -474,26 +462,9 @@ test("chatpane memory search is explicit slash command only", () => {
   assert.doesNotMatch(chatPane, /q\.length < 4/);
 });
 
-test("status pane surfaces long-running build status inside the shell", () => {
-  const app = read("src/App.tsx");
-  const apps = read("src/lib/apps.ts");
-  const statusPane = read("src/components/StatusPane.tsx");
+test("shell still surfaces source build state via the source-status backend", () => {
   const chatRust = read("src-tauri/src/chat.rs");
 
-  assert.match(app, /StatusPane/);
-  assert.match(app, /onReattachChat/);
-  assert.match(apps, /type: "status"/);
-  assert.match(statusPane, /aios-shell-tauri-build\.log/);
-  assert.match(statusPane, /pending install note/);
-  assert.match(statusPane, /source state/);
-  assert.match(statusPane, /shellSourceStatus/);
-  assert.match(statusPane, /source has changes not guaranteed to be in the installed app/);
-  assert.match(statusPane, /listChatLive/);
-  assert.match(statusPane, /chatStop/);
-  assert.match(statusPane, /stop chat run/);
-  assert.match(statusPane, /listAutomations/);
-  assert.match(statusPane, /chatpane runs/);
-  assert.match(statusPane, /background agents/);
   assert.match(chatRust, /detached\.load\(Ordering::SeqCst\) \|\| s\.busy\.load/);
   assert.match(chatRust, /stopped by user/);
   assert.match(read("src/lib/fs.ts"), /shell_source_status/);

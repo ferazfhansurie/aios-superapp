@@ -77,7 +77,7 @@ function terminalLike(kind: PaneContent): boolean {
 }
 
 export function mirrorPaneRenderMode(kind: PaneContent): MirrorPaneRenderMode {
-  if (kind.type === "browser" || kind.type === "motion") return "visual";
+  if (kind.type === "browser") return "visual";
   if (kind.type === "file") return "visual";
   if (terminalLike(kind)) return "structured";
   if (kind.type === "editor") return "structured";
@@ -93,7 +93,7 @@ export function mirrorPaneCapabilities(kind: PaneContent): MirrorCapability[] {
     caps.push("pixel_stream", "navigate", "history", "reload", "screenshot");
   }
   if (kind.type === "editor" || kind.type === "notes") caps.push("input");
-  if (kind.type === "motion" || kind.type === "file") caps.push("pixel_stream", "screenshot");
+  if (kind.type === "file") caps.push("pixel_stream", "screenshot");
 
   return unique(caps);
 }

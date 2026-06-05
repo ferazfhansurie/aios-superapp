@@ -11,7 +11,6 @@ import {
 } from "react";
 
 import {
-  Activity,
   Bell,
   Bot,
   Camera,
@@ -66,7 +65,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { appshot, listOracles, type OracleInfo } from "./lib/pty";
 import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } from "./lib/chat";
-import { listCustomers, type Customer } from "./lib/inbox";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import {
@@ -153,9 +151,6 @@ import {
 // `import { AppDef } from "../App"` path working without churn.
 export type { AppDef, PaneContent };
 
-const AutomationsPane = lazy(() =>
-  import("./components/AutomationsPane").then((m) => ({ default: m.AutomationsPane })),
-);
 const PetPane = lazy(() => import("./components/PetPane").then((m) => ({ default: m.PetPane })));
 const AttachAppsPane = lazy(() =>
   import("./components/AttachAppsPane").then((m) => ({ default: m.AttachAppsPane })),
@@ -166,16 +161,11 @@ const AppAttachPane = lazy(() =>
 const BridgesPane = lazy(() => import("./components/BridgesPane").then((m) => ({ default: m.BridgesPane })));
 const BrowserPane = lazy(() => import("./components/BrowserPane").then((m) => ({ default: m.BrowserPane })));
 const ChatPane = lazy(() => import("./components/ChatPane").then((m) => ({ default: m.ChatPane })));
-const CrmPane = lazy(() => import("./components/CrmPane").then((m) => ({ default: m.CrmPane })));
-const DatabasePane = lazy(() =>
-  import("./components/DatabasePane").then((m) => ({ default: m.DatabasePane })),
-);
 const EditorPane = lazy(() => import("./components/EditorPane").then((m) => ({ default: m.EditorPane })));
 const FilesPane = lazy(() => import("./components/FilesPane").then((m) => ({ default: m.FilesPane })));
 const FileViewerPane = lazy(() =>
   import("./components/FileViewerPane").then((m) => ({ default: m.FileViewerPane })),
 );
-const MotionPane = lazy(() => import("./components/MotionPane").then((m) => ({ default: m.MotionPane })));
 const MoneyAgentsPane = lazy(() =>
   import("./components/MoneyAgentsPane").then((m) => ({ default: m.MoneyAgentsPane })),
 );
@@ -183,7 +173,6 @@ const NotesPane = lazy(() => import("./components/NotesPane").then((m) => ({ def
 const PluginsPane = lazy(() => import("./components/PluginsPane").then((m) => ({ default: m.PluginsPane })));
 const PulsePane = lazy(() => import("./components/PulsePane").then((m) => ({ default: m.PulsePane })));
 const Settings = lazy(() => import("./components/Settings").then((m) => ({ default: m.Settings })));
-const StatusPane = lazy(() => import("./components/StatusPane").then((m) => ({ default: m.StatusPane })));
 const TerminalPane = lazy(() =>
   import("./components/TerminalPane").then((m) => ({ default: m.TerminalPane })),
 );
@@ -688,14 +677,13 @@ function App() {
     [spawn],
   );
 
-  // Shared live data for the idle homescreen + the ⌘K palette: the fleet, the
-  // recent chats to resume, and the customer inbox. One source, polled gently;
-  // every getter is defensive so a missing backend just yields an empty list.
+  // Shared live data for the idle homescreen + the ⌘K palette: the fleet and the
+  // recent chats to resume. One source, polled gently; every getter is defensive
+  // so a missing backend just yields an empty list.
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [chats, setChats] = useState<ChatSessionInfo[]>([]);
   const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
   const [moneyAgentSessionVersion, setMoneyAgentSessionVersion] = useState(0);
-  const [customers, setCustomers] = useState<Customer[]>([]);
   // every runnable project under ~/Repo (auto-scanned), merged with the user's
   // project store (custom adds / hides / name+cmd overrides — CRUD from Settings).
   const [scanned, setScanned] = useState<ProjectInfo[]>([]);
@@ -709,7 +697,6 @@ function App() {
       listOracles().then((v) => alive && setOracles(v)).catch(() => {});
       listChatSessions(12).then((v) => alive && setChats(v)).catch(() => {});
       listChatLive().then((v) => alive && setLiveChats(v)).catch(() => {});
-      listCustomers().then((v) => alive && setCustomers(v)).catch(() => {});
       if (alive) setMoneyAgentSessionVersion(Date.now());
     };
     load();
@@ -1070,7 +1057,6 @@ function App() {
       home,
       chats,
       oracles,
-      customers,
       projects,
       spawn,
       resumeChat,
@@ -1089,7 +1075,7 @@ function App() {
       setHiddenKeys,
       setMaximizedKey,
     });
-  }, [spawn, fireAppshot, chats, oracles, customers, resumeChat, addOracle, runF5, loadProjects, projects, home, runProject, panes.length, activeKey]);
+  }, [spawn, fireAppshot, chats, oracles, resumeChat, addOracle, runF5, loadProjects, projects, home, runProject, panes.length, activeKey]);
 
   const agentController = useMemo(
     () =>
@@ -1754,9 +1740,6 @@ function App() {
                   onClearNotification={clearNotification}
                   onClearAllNotifications={clearAllNotifications}
                   onOpenMoneyAgentChat={openMoneyAgentChat}
-                  onReattachChat={(chat) =>
-                    spawn({ type: "chat", reattach: chat.id }, chat.title || "chat")
-                  }
                   onAttachApp={(app) =>
                     spawn(
                       { type: "app", name: app.name, bundleId: app.bundle_id },
@@ -2733,17 +2716,12 @@ const PANE_GLYPH: Record<string, typeof Folder> = {
   tmux: TerminalSquare,
   files: Folder,
   browser: Globe,
-  memory: Database,
   notes: NotebookPen,
-  automations: Clock,
   bridges: Radio,
   plugins: Layers,
   pulse: Radio,
-  status: Activity,
   apps: MonitorUp,
   chat: MessageSquare,
-  customers: MessageCircle,
-  motion: Wand2,
   file: FileText,
   editor: FileText,
 };
@@ -2898,18 +2876,13 @@ const DOT: Record<string, string> = {
   shell: "status-dot--idle",
   files: "status-dot--cold",
   browser: "status-dot--cold",
-  memory: "status-dot--cold",
   notes: "status-dot--cold",
-  automations: "status-dot--cold",
   bridges: "status-dot--cold",
   plugins: "status-dot--cold",
   pet: "status-dot--active",
   pulse: "status-dot--active",
-  status: "status-dot--active",
   apps: "status-dot--cold",
   chat: "status-dot--active",
-  customers: "status-dot--active",
-  motion: "status-dot--cold",
   file: "status-dot--cold",
 };
 
@@ -3098,7 +3071,6 @@ function PaneCard({
   onClearNotification,
   onClearAllNotifications,
   onOpenMoneyAgentChat,
-  onReattachChat,
   onAttachApp,
   onProfileChange,
   onVideoFullscreen,
@@ -3131,7 +3103,6 @@ function PaneCard({
   onClearNotification: (id: string) => void;
   onClearAllNotifications: () => void;
   onOpenMoneyAgentChat: (id: string, label: string) => void;
-  onReattachChat: (chat: LiveChat) => void;
   onAttachApp: (app: { name: string; bundle_id: string | null }) => void;
   onProfileChange: (profile: string) => void;
   onVideoFullscreen?: (on: boolean) => void;
@@ -3318,12 +3289,8 @@ function PaneCard({
             />
           ) : pane.kind.type === "pet" ? (
             <PetPane />
-          ) : pane.kind.type === "memory" ? (
-            <DatabasePane onOpenUrl={onOpenUrl} />
           ) : pane.kind.type === "notes" ? (
             <NotesPane onSend={onSendToAi} />
-          ) : pane.kind.type === "automations" ? (
-            <AutomationsPane />
           ) : pane.kind.type === "bridges" ? (
             <BridgesPane />
           ) : pane.kind.type === "plugins" ? (
@@ -3341,16 +3308,10 @@ function PaneCard({
             />
           ) : pane.kind.type === "money-agents" ? (
             <MoneyAgentsPane onOpenAgentChat={onOpenMoneyAgentChat} />
-          ) : pane.kind.type === "status" ? (
-            <StatusPane onReattachChat={onReattachChat} />
           ) : pane.kind.type === "apps" ? (
             <AttachAppsPane onAttachApp={onAttachApp} />
           ) : pane.kind.type === "app" ? (
             <AppAttachPane name={pane.kind.name} bundleId={pane.kind.bundleId} />
-          ) : pane.kind.type === "customers" ? (
-            <CrmPane />
-          ) : pane.kind.type === "motion" ? (
-            <MotionPane />
           ) : pane.kind.type === "file" ? (
             <FileViewerPane path={pane.kind.path} />
           ) : pane.kind.type === "editor" ? (

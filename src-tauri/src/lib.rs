@@ -1,26 +1,20 @@
 //! AIOS — desktop cockpit. Lean Tauri shell: multi-pane PTY terminals + the
 //! oracle roster (attach to bridge-managed tmux sessions). No IDE cruft.
 
-mod automations;
 mod bridges;
 mod browser;
 mod chat;
-mod crm;
-mod db;
 mod device;
 mod files;
-mod inbox;
 mod mac_apps;
 mod memory;
 mod monitor;
-mod motion;
 mod oracles;
 mod plugins;
 mod pty;
 mod stats;
 mod telemetry;
 mod usage;
-mod voice;
 
 use tauri::Manager;
 
@@ -108,47 +102,17 @@ pub fn run() {
             memory::memory_save,
             memory::memory_delete,
             memory::memory_focus,
-            db::db_list_connections,
-            db::db_add_connection,
-            db::db_remove_connection,
-            db::db_test_connection,
-            db::db_list_tables,
-            db::db_table_rows,
-            db::db_query,
-            db::db_table_columns,
-            db::db_update_row,
-            db::db_insert_row,
-            db::db_delete_row,
             stats::usage_extras,
             device::device_stats,
-            automations::list_automations,
-            automations::automation_detail,
-            automations::run_automation,
-            automations::set_automation_enabled,
             bridges::list_bridges,
             bridges::bridge_activity,
             bridges::pair_personal_wa,
-            crm::crm_load,
-            crm::crm_save_contact,
-            crm::crm_delete_contact,
-            inbox::list_customers,
-            inbox::customer_thread,
-            inbox::send_message,
             mac_apps::mac_list_apps,
             mac_apps::mac_focus_app,
             mac_apps::mac_capture_app,
-            motion::motion_models,
-            motion::motion_boards,
-            motion::motion_board_save,
-            motion::motion_generate,
-            motion::motion_status,
-            motion::motion_credits,
             monitor::monitor_start,
             monitor::monitor_stop,
             monitor::list_monitors,
-            voice::dictate_start,
-            voice::dictate_stop,
-            voice::dictate_cancel,
             chat::chat_start,
             chat::chat_send,
             chat::chat_steer,

@@ -3,7 +3,6 @@ import {
   Camera,
   Layers,
   Maximize2,
-  MessageCircle,
   MessageSquare,
   PanelLeft,
   Play,
@@ -15,7 +14,6 @@ import {
 
 import type { Command as PaletteCommand } from "../components/CommandPalette.tsx";
 import type { ChatSessionInfo } from "./chat.ts";
-import type { Customer } from "./inbox.ts";
 import type { OracleInfo } from "./pty.ts";
 import type { ProjectInfo } from "./run.ts";
 import { SPAWN, type PaneContent } from "./apps.ts";
@@ -27,7 +25,6 @@ export interface AppCommandDeps {
   home: string | null;
   chats: ChatSessionInfo[];
   oracles: OracleInfo[];
-  customers: Customer[];
   projects: ProjectInfo[];
   spawn: (kind: PaneContent, label: string) => void;
   resumeChat: (chat: ChatSessionInfo) => void;
@@ -104,19 +101,6 @@ export function buildAppCommands(deps: AppCommandDeps): PaletteCommand[] {
       }),
       group: "fleet",
       actionLabel: "attach",
-    })),
-    ...deps.customers.slice(0, 8).map((c) => ({
-      command: createCommand({
-        id: `customer.open.${c.id}`,
-        label: c.name,
-        description: c.lastAgo ? `${c.lastAgo} ago` : undefined,
-        scope: "global",
-        icon: createElement(MessageCircle, { size: 14 }),
-        keywords: ["customer", "message", "whatsapp", "inbox", c.handle],
-        run: () => deps.spawn({ type: "customers" }, "customers"),
-      }),
-      group: "customers",
-      actionLabel: "open inbox",
     })),
     ...deps.projects.map((p) => ({
       command: createCommand({

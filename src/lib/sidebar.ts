@@ -7,7 +7,7 @@
 import { SPAWN } from "./apps.ts";
 
 const STORAGE_KEY = "aios.sidebar";
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /** A space = a named, collapsible section of the rail. The three built-ins
  *  (sessions / tools / pinned) are `system` — they can be renamed + collapsed +
@@ -74,6 +74,9 @@ export function seedDefault(): SidebarState {
       iconName: a.id, // resolved back to the lucide icon via SPAWN_BY_ID at render
       kind: { type: "app", appId: a.id } as SidebarItemKind,
       group: a.group as SidebarGroup,
+      // non-first-class apps seed hidden — still reachable via ⌘K, just off the
+      // default rail. The user can un-hide any of them from the row menu.
+      hidden: !a.firstClass,
     })),
   };
 }
