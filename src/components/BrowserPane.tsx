@@ -265,8 +265,13 @@ export function BrowserPane({
 
   useEffect(() => {
     return () => {
-      browserClose(label).catch(() => {});
+      // Hide (shrink to 0×0) first so the native view stops compositing
+      // immediately, then close — which stops media + blanks the page Rust-side.
+      // Fire-and-forget but ordered: hide before close so nothing repaints a
+      // half-torn-down webview during the async close.
       shownRef.current = false;
+      browserHide(label).catch(() => {});
+      browserClose(label).catch(() => {});
     };
   }, [label]);
 

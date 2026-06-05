@@ -257,7 +257,7 @@ function recordAgentAudit(entry: AgentAuditEntry) {
 
 /** Strip a pane kind down to its restorable shape (drop one-shot fields). */
 function persistableKind(kind: PaneContent): PaneContent | null {
-  if (kind.type === "chat") return { type: "chat" }; // fresh chat, no seed/resume/reattach
+  if (kind.type === "chat") return { type: "chat", cwd: kind.cwd }; // fresh chat, no seed/resume/reattach
   // file/editor restore by path; everything else is self-describing.
   return kind;
 }
@@ -652,9 +652,17 @@ function App() {
     [spawn],
   );
   const closePane = useCallback((key: string) => {
+    // If the pane being closed owns the OS fullscreen (e.g. a maximized browser
+    // pane with a video in fullscreen), drop fullscreen first — otherwise the
+    // window stays fullscreen with the owning pane gone ("bugs out on close").
+    setMaximizedKey((m) => {
+      if (m === key) setWindowFullscreen(false).catch(() => {});
+      return m === key ? null : m;
+    });
+    if (prevMaxRef.current === key) prevMaxRef.current = null;
+    if (focusedPane.current === key) focusedPane.current = null;
     setPanes((p) => p.filter((x) => x.key !== key));
     setHiddenKeys((h) => h.filter((k) => k !== key));
-    setMaximizedKey((m) => (m === key ? null : m));
     setActiveKey((a) => (a === key ? null : a));
   }, []);
   // Closing a chat pane whose claude is mid-task → prompt to keep it running in
@@ -1015,7 +1023,10 @@ function App() {
       // → thumbnail chip, ready to send for vision), everything else inserts as a
       // quoted path. A pane with no image sink (a terminal) just gets all paths
       // as text, same as before.
-      const isImage = (p: string) => /\.(png|jpe?g|gif|webp|bmp|svg|heic|tiff?)$/i.test(p);
+      // Only formats the vision APIs actually accept. svg/bmp/heic/tiff would be
+      // tagged image/png and rejected — corrupting the whole turn — so let them
+      // fall through to the path-insert writer instead of attaching as an image.
+      const isImage = (p: string) => /\.(png|jpe?g|gif|webp)$/i.test(p);
       const imgs = paths.filter(isImage);
       const rest = paths.filter((p) => !isImage(p));
       const imgSink = key ? paneImageDrop.get(key) : null;
@@ -1705,6 +1716,7 @@ function App() {
                 <PaneCard
                   key={pane.key}
                   pane={pane}
+                  defaultCwd={home}
                   active={
                     !overlayOpen &&
                     !hiddenKeys.includes(pane.key) &&
@@ -3055,6 +3067,7 @@ function OpenPanesList({
 
 function PaneCard({
   pane,
+  defaultCwd,
   active,
   maximized,
   hidden,
@@ -3087,6 +3100,7 @@ function PaneCard({
   onVideoFullscreen,
 }: {
   pane: Pane;
+  defaultCwd?: string;
   active: boolean;
   maximized?: boolean;
   hidden?: boolean;
@@ -3119,6 +3133,7 @@ function PaneCard({
   onVideoFullscreen?: (on: boolean) => void;
 }) {
   const t = pane.kind.type;
+  const chatCwd = pane.kind.type === "chat" ? (pane.kind.cwd ?? defaultCwd) : undefined;
   const label =
     t === "oracle" ? `oracle: ${pane.label}` : t === "tmux" ? `tmux: ${pane.label}` : pane.label;
   // Monitoring works on real tmux sessions (oracle/tmux panes) — the watcher
@@ -3336,9 +3351,12 @@ function PaneCard({
             <FileViewerPane path={pane.kind.path} />
           ) : pane.kind.type === "editor" ? (
             <EditorPane path={pane.kind.path} name={pane.kind.name} />
+          ) : !chatCwd ? (
+            <PaneLoading />
           ) : (
             <ChatPane
               paneKey={pane.key}
+              cwd={chatCwd}
               seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
               modelId={pane.kind.type === "chat" ? pane.kind.modelId : undefined}
               agentId={pane.kind.type === "chat" ? pane.kind.agentId : undefined}

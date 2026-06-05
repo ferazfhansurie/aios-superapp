@@ -1031,6 +1031,33 @@ function heatColor(count: number, max: number): string {
   return `color-mix(in srgb, var(--color-accent) ${pct}%, transparent)`;
 }
 
+/** The ticking clock, isolated so its 1Hz re-render doesn't reconcile the whole
+ *  hero (heatmap, rings, streak) every second — that was the idle-dashboard lag.
+ *  The colon blink is CSS (.aios-colon); only the digits update here. */
+function HeroClock() {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mm = String(now.getMinutes()).padStart(2, "0");
+  const ss = String(now.getSeconds()).padStart(2, "0");
+  return (
+    <div className="flex flex-col">
+      <div className="flex items-baseline gap-1.5 font-mono font-semibold tracking-tight text-[var(--color-text)]">
+        <span className="text-[clamp(40px,6vw,60px)] leading-none">{hh}</span>
+        <span className="aios-colon text-[clamp(40px,6vw,60px)] leading-none text-[var(--color-accent)]">:</span>
+        <span className="text-[clamp(40px,6vw,60px)] leading-none">{mm}</span>
+        <span className="ml-1.5 self-end font-mono text-[15px] leading-none text-[var(--color-faint)]">{ss}</span>
+      </div>
+      <span className="mt-1.5 font-mono text-[12px] text-[var(--color-muted)]">
+        {now.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }).toLowerCase()}
+      </span>
+    </div>
+  );
+}
+
 function Pulse({
   extras,
   rate,
@@ -1040,11 +1067,6 @@ function Pulse({
   rate: IdleRate | null;
   focus: MemoryFocus | null;
 }) {
-  const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, []);
   const streak = useCountUp(extras?.currentStreak ?? null);
   const hasRate = rate && (rate.fiveHour.pct != null || rate.sevenDay.pct != null);
 
@@ -1056,26 +1078,12 @@ function Pulse({
   const weeks: { date: string; count: number }[][] = [];
   for (let i = 0; i < days.length; i += 7) weeks.push(days.slice(i, i + 7));
 
-  const hh = String(now.getHours()).padStart(2, "0");
-  const mm = String(now.getMinutes()).padStart(2, "0");
-  const ss = String(now.getSeconds()).padStart(2, "0");
-
   return (
     <div className="flex h-full items-stretch gap-6">
       {/* left column — clock, streak, stats, rings; vertically centered */}
       <div className="flex shrink-0 flex-col justify-center gap-4">
-        {/* clock — alive (ticking seconds + blinking colon) */}
-        <div className="flex flex-col">
-          <div className="flex items-baseline gap-1.5 font-mono font-semibold tracking-tight text-[var(--color-text)]">
-            <span className="text-[clamp(40px,6vw,60px)] leading-none">{hh}</span>
-            <span className="aios-colon text-[clamp(40px,6vw,60px)] leading-none text-[var(--color-accent)]">:</span>
-            <span className="text-[clamp(40px,6vw,60px)] leading-none">{mm}</span>
-            <span className="ml-1.5 self-end font-mono text-[15px] leading-none text-[var(--color-faint)]">{ss}</span>
-          </div>
-          <span className="mt-1.5 font-mono text-[12px] text-[var(--color-muted)]">
-            {now.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }).toLowerCase()}
-          </span>
-        </div>
+        {/* clock — alive (ticking seconds + blinking colon), isolated re-render */}
+        <HeroClock />
 
         {/* streak — hero stat */}
         <div className="flex items-center gap-2.5">

@@ -977,3 +977,291 @@ pub fn save_image_temp(data: String, ext: String) -> Result<String, String> {
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
+
+// ── Cmd+P file finder + Cmd+Shift+F content search ──────────────────────────
+
+/// Directory names always skipped by the file finder + content search, on top
+/// of whatever `.gitignore` excludes. These are heavy build/dep/vcs dirs the
+/// `ignore` walker doesn't drop by default (it only knows .git).
+fn is_search_pruned_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".turbo"
+            | ".cache"
+            | ".dart_tool"
+            | "Pods"
+            | "vendor"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+    )
+}
+
+/// Builds an `ignore`-crate walker rooted at `root` that honors `.gitignore`
+/// (and global/parent gitignores) and also prunes our extra junk dirs. Shared
+/// by `find_files` and the search fallback so both respect identical rules.
+fn search_walk_builder(root: &str) -> ignore::WalkBuilder {
+    let mut b = ignore::WalkBuilder::new(root);
+    b.hidden(false) // show dotfiles (.claude, .env) like VS Code; we prune junk explicitly
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .filter_entry(|e| {
+            // Prune our extra heavy dirs by name (applies to directories only).
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = e.file_name().to_str() {
+                    return !is_search_pruned_dir(name);
+                }
+            }
+            // Always drop .DS_Store noise.
+            e.file_name().to_str() != Some(".DS_Store")
+        });
+    b
+}
+
+/// Recursively lists file paths under `root`, RELATIVE to `root`, files only.
+/// Honors `.gitignore` (+ global/parent) and prunes heavy dirs (node_modules,
+/// target, dist, .next, …). Capped at `max` (default 20000) so a giant tree
+/// can't run away — returns whatever was found up to the cap. Powers Cmd+P.
+#[tauri::command]
+pub fn find_files(root: String, max: Option<usize>) -> Result<Vec<String>, String> {
+    let cap = max.unwrap_or(20000);
+    let root_path = std::path::Path::new(&root);
+    if !root_path.is_dir() {
+        return Err("root is not a directory".into());
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for dent in search_walk_builder(&root).build() {
+        if out.len() >= cap {
+            break;
+        }
+        let dent = match dent {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        // Files only (depth 0 is the root dir itself).
+        if dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            let rel = dent
+                .path()
+                .strip_prefix(root_path)
+                .unwrap_or(dent.path());
+            out.push(rel.to_string_lossy().to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// One content-search match. `path` is relative to the search root, `line`/`col`
+/// are 1-based, `text` is the matching line trimmed + capped at ~300 chars.
+#[derive(Serialize)]
+pub struct SearchHit {
+    path: String,
+    line: u32,
+    col: u32,
+    text: String,
+}
+
+const HIT_TEXT_CAP: usize = 300;
+
+/// Trims a matching line and caps it at `HIT_TEXT_CAP` chars (char-boundary safe).
+fn cap_hit_text(s: &str) -> String {
+    let t = s.trim();
+    if t.chars().count() <= HIT_TEXT_CAP {
+        return t.to_string();
+    }
+    t.chars().take(HIT_TEXT_CAP).collect()
+}
+
+/// Locates a real `rg` (ripgrep) binary on disk. Returns `None` if not found,
+/// in which case the Rust fallback scanner is used. (We avoid bare "rg" /
+/// PATH lookup because the GUI-launched process has a minimal PATH.)
+fn ripgrep_bin() -> Option<String> {
+    let candidates = [
+        "/opt/homebrew/bin/rg",
+        "/usr/local/bin/rg",
+        "/usr/bin/rg",
+    ];
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+/// Case-insensitive literal substring search of file CONTENTS under `root`.
+/// Honors the same ignore rules as `find_files`. Returns up to `max` hits
+/// (default 1000). Uses `rg --json` when a ripgrep binary is present (fast +
+/// correct, skips binaries); falls back to a Rust line scanner via the
+/// `ignore` walker otherwise. Powers Cmd+Shift+F.
+#[tauri::command]
+pub fn search_in_files(
+    root: String,
+    query: String,
+    max: Option<usize>,
+) -> Result<Vec<SearchHit>, String> {
+    let cap = max.unwrap_or(1000);
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_path = std::path::Path::new(&root);
+    if !root_path.is_dir() {
+        return Err("root is not a directory".into());
+    }
+
+    if let Some(rg) = ripgrep_bin() {
+        return search_with_rg(&rg, root_path, &query, cap);
+    }
+    search_with_ignore(root_path, &query, cap)
+}
+
+/// Runs `rg --json` for a fixed (literal), case-insensitive substring search and
+/// parses the streaming JSON match objects into `SearchHit`s.
+fn search_with_rg(
+    rg: &str,
+    root: &std::path::Path,
+    query: &str,
+    cap: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let output = std::process::Command::new(rg)
+        .arg("--json")
+        .arg("--fixed-strings") // literal, not regex
+        .arg("--ignore-case")
+        .arg("--max-count")
+        .arg(cap.to_string()) // per-file cap; total bounded below too
+        .arg("--")
+        .arg(query)
+        .arg(".")
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("failed to launch rg: {e}"))?;
+
+    // rg exits 1 when there are no matches — that's not an error for us.
+    if !output.status.success() && output.status.code() != Some(1) {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("rg failed: {}", err.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for line in stdout.lines() {
+        if hits.len() >= cap {
+            break;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("match") {
+            continue;
+        }
+        let data = match v.get("data") {
+            Some(d) => d,
+            None => continue,
+        };
+        let path = data
+            .get("path")
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim_start_matches("./")
+            .to_string();
+        let line_no = data
+            .get("line_number")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0) as u32;
+        let text = data
+            .get("lines")
+            .and_then(|l| l.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        // First submatch column (byte offset → 1-based col, best-effort).
+        let col = data
+            .get("submatches")
+            .and_then(|s| s.as_array())
+            .and_then(|a| a.first())
+            .and_then(|m| m.get("start"))
+            .and_then(|n| n.as_u64())
+            .map(|n| n as u32 + 1)
+            .unwrap_or(1);
+        hits.push(SearchHit {
+            path,
+            line: line_no,
+            col,
+            text: cap_hit_text(text),
+        });
+    }
+    Ok(hits)
+}
+
+/// Pure-Rust fallback: walk via the `ignore` crate and scan each text file line
+/// by line for a case-insensitive literal substring. Skips files that aren't
+/// valid UTF-8 (binary) and large files.
+fn search_with_ignore(
+    root: &std::path::Path,
+    query: &str,
+    cap: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let needle = query.to_lowercase();
+    let mut hits: Vec<SearchHit> = Vec::new();
+
+    for dent in search_walk_builder(&root.to_string_lossy()).build() {
+        if hits.len() >= cap {
+            break;
+        }
+        let dent = match dent {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        // Skip very large files outright (binary or generated blobs).
+        if dent.metadata().map(|m| m.len() > EDIT_TEXT_CAP).unwrap_or(false) {
+            continue;
+        }
+        let bytes = match std::fs::read(dent.path()) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Binary heuristic: a NUL byte → skip.
+        if bytes.contains(&0) {
+            continue;
+        }
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rel = dent
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(dent.path())
+            .to_string_lossy()
+            .to_string();
+        for (i, line) in content.lines().enumerate() {
+            if hits.len() >= cap {
+                break;
+            }
+            let lower = line.to_lowercase();
+            if let Some(byte_idx) = lower.find(&needle) {
+                // byte index in the lowercased line ≈ col for ascii; good enough.
+                let col = line[..byte_idx.min(line.len())].chars().count() as u32 + 1;
+                hits.push(SearchHit {
+                    path: rel.clone(),
+                    line: (i + 1) as u32,
+                    col,
+                    text: cap_hit_text(line),
+                });
+            }
+        }
+    }
+    Ok(hits)
+}

@@ -24,6 +24,8 @@ tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 walkdir = "2"
+ignore = "0.4"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 portable-pty = "0.8"
 parking_lot = "0.12"

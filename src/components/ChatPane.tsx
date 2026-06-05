@@ -234,10 +234,6 @@ interface ImageChip {
   path: string | null;
 }
 let _imgSeq = 0;
-/** Shell-quote a path for embedding in a message (single-quote, escape inner '). */
-function quotePath(path: string): string {
-  return `'${path.replace(/'/g, "'\\''")}'`;
-}
 /** "0:05" from elapsed seconds (dictation timer). */
 function fmtElapsed(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -651,7 +647,7 @@ export function ChatPane({
   });
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(EFFORTS[1]);
-  const [contextBudget, setContextBudget] = useState<ContextBudgetMode>("lean");
+  const [contextBudget, setContextBudget] = useState<ContextBudgetMode>("agent");
   const effectiveBudget: ContextBudgetMode =
     contextBudget === "ultracode" || effort.ultra ? "ultracode" : contextBudget;
   // running context size (prompt tokens of the latest turn) → composer indicator
@@ -678,7 +674,6 @@ export function ChatPane({
     setUsage(next);
   }, []);
   // cumulative $ spent this chat session (summed across result events).
-  const [sessionCost, setSessionCost] = useState(0);
 
   // ── message queue / steering (Phase 2) ─────────────────────────────────────
   // Type-ahead while a turn is in flight: submitting queues the message instead
@@ -849,28 +844,49 @@ export function ChatPane({
 
   // ── image attach: paste a screenshot / pick a file → temp file + thumbnail ──
   const [images, setImages] = useState<ImageChip[]>([]);
+  // Live mirror of `images` so an async send can read the freshest paths after
+  // awaiting in-flight saves (the closure-captured `images` would be stale).
+  const imagesRef = useRef<ImageChip[]>([]);
+  useEffect(() => {
+    imagesRef.current = images;
+  }, [images]);
+  // In-flight disk-save promises, keyed by chip id. send() awaits these so a
+  // fast paste→Enter can't ship the turn before the image finishes saving.
+  const pendingSavesRef = useRef<Map<string, Promise<void>>>(new Map());
   const imgInputRef = useRef<HTMLInputElement>(null);
   const addImage = useCallback(async (file: Blob, mime: string) => {
     const id = `img${++_imgSeq}`;
     const url = URL.createObjectURL(file);
     setImages((prev) => [...prev, { id, url, path: null }]);
-    try {
-      const buf = await file.arrayBuffer();
-      const bytes = new Uint8Array(buf);
-      let bin = "";
-      const CHUNK = 0x8000;
-      for (let i = 0; i < bytes.length; i += CHUNK) {
-        bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    const save = (async () => {
+      try {
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        const CHUNK = 0x8000;
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+        }
+        const path = await saveImageTemp(btoa(bin), extFromMime(mime));
+        setImages((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
+      } catch {
+        // surface the failure instead of vanishing the thumbnail silently —
+        // otherwise the user thinks the image attached when it didn't.
+        setImages((prev) => {
+          const gone = prev.find((im) => im.id === id);
+          if (gone) URL.revokeObjectURL(gone.url);
+          return prev.filter((im) => im.id !== id);
+        });
+        setTurns((prev) => [
+          ...prev,
+          { kind: "result", id: uid(), text: "couldn't attach that image (unsupported format or save failed) — not sent." },
+        ]);
+      } finally {
+        pendingSavesRef.current.delete(id);
       }
-      const path = await saveImageTemp(btoa(bin), extFromMime(mime));
-      setImages((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
-    } catch {
-      setImages((prev) => {
-        const gone = prev.find((im) => im.id === id);
-        if (gone) URL.revokeObjectURL(gone.url);
-        return prev.filter((im) => im.id !== id);
-      });
-    }
+    })();
+    pendingSavesRef.current.set(id, save);
+    await save;
   }, []);
   const removeImage = useCallback((id: string) => {
     setImages((prev) => {
@@ -1092,8 +1108,6 @@ export function ChatPane({
         const dur = durationMs != null ? fmtDuration(durationMs) : "";
         const costNum =
           typeof ev.total_cost_usd === "number" ? ev.total_cost_usd : undefined;
-        if (costNum != null && costNum > 0) setSessionCost((c) => c + costNum);
-        const cost = costNum != null ? `$${costNum.toFixed(4)}` : "";
         const tokens = tokensFromUsage(ev.usage);
         const tokStr =
           tokens != null ? `${tokens.toLocaleString()} tok` : "";
@@ -1110,7 +1124,8 @@ export function ChatPane({
             : 0);
         if (ctx > 0) setCtxTokens(ctx);
         const resultText = typeof ev.text === "string" ? ev.text.trim() : "";
-        const foot = [resultText, dur, tokStr, cost].filter(Boolean).join(" · ");
+        // cost intentionally omitted — firaz runs on subs, $ figures are noise.
+        const foot = [resultText, dur, tokStr].filter(Boolean).join(" · ");
         // always emit a result turn (carries durationMs for the activity line),
         // even if the human-readable footer would be empty.
         onPetResult({
@@ -1489,7 +1504,10 @@ export function ChatPane({
   // the transcript (the raw text the user typed); `wire` is what claude receives
   // (display + any plan / goal prefixes). Regenerate replays the same display.
   const dispatch = useCallback(
-    (display: string, opts?: { skipUserBubble?: boolean; wirePrefix?: string }) => {
+    (
+      display: string,
+      opts?: { skipUserBubble?: boolean; wirePrefix?: string; imagePaths?: string[] },
+    ) => {
       const id = sessionIdRef.current;
       if (id == null) return;
       const shellContext = buildAiosShellContext({
@@ -1576,7 +1594,7 @@ export function ChatPane({
           });
         return;
       }
-      chatSend(id, wire).catch((err) => {
+      chatSend(id, wire, opts?.imagePaths).catch((err) => {
         setTurns((prev) => [
           ...prev,
           { kind: "result", id: uid(), text: `send failed: ${err}` },
@@ -1676,13 +1694,20 @@ export function ChatPane({
   // external "send to AI" submitter which passes the note body directly so it
   // doesn't race the input state).
   const sendText = useCallback(
-    (raw: string) => {
+    async (raw: string) => {
       const text = raw.trim();
-      // attached images go in as quoted temp paths the model can read; allow a
-      // send with images even when the text is empty.
-      const imgPaths = images
+      // If any attached image is still saving to disk, wait it out before we
+      // collect paths — a fast paste→Enter used to filter out the pending image
+      // and ship the turn without it (the "image send is buggy" report).
+      if (imagesRef.current.some((im) => im.path == null) && pendingSavesRef.current.size) {
+        await Promise.allSettled([...pendingSavesRef.current.values()]);
+      }
+      // attached images are sent as REAL image content blocks (the backend reads
+      // these temp paths → base64/localImage), so they land on every turn, not
+      // just the first. allow a send with images even when the text is empty.
+      const imgPaths = imagesRef.current
         .filter((im) => im.path)
-        .map((im) => quotePath(im.path as string));
+        .map((im) => im.path as string);
       if (!text && imgPaths.length === 0) return;
       if (streaming) return;
       if (sessionIdRef.current == null) {
@@ -1747,11 +1772,10 @@ export function ChatPane({
       setOverlay(null);
       const attachedMemoryBlock = memoryContextBlock(attachedMemories);
       setAttachedMemoryIds([]);
-      // prepend the image paths so the model sees them with the message
-      const full = imgPaths.length
-        ? imgPaths.join(" ") + (text ? " " + text : "")
-        : text;
-      dispatch(full, { wirePrefix: attachedMemoryBlock });
+      // images ride as native content blocks (opts.imagePaths), not text paths —
+      // the user bubble shows the text and a "[n image(s)]" hint when text-empty.
+      const bubble = text || (imgPaths.length ? `[${imgPaths.length} image${imgPaths.length > 1 ? "s" : ""}]` : "");
+      dispatch(bubble, { wirePrefix: attachedMemoryBlock, imagePaths: imgPaths });
     },
     [streaming, dispatch, cwd, images, model, attachedMemories],
   );
@@ -1877,7 +1901,6 @@ export function ChatPane({
     setOverlay(null);
     setQueued([]);
     setQueuedIdx(0);
-    setSessionCost(0);
     usageBaselineRef.current = {};
     setResumeId(null);
     setResumedTitle(null);
@@ -3274,7 +3297,6 @@ export function ChatPane({
             baseline={usageBaselineRef.current[usageProvider] ?? null}
             window={usageWindow}
             onWindowChange={setUsageWindow}
-            cost={sessionCost}
             engine={usageLabel}
           />
           {isComposerCollapsed ? (
@@ -3313,20 +3335,18 @@ function UsageStrip({
   baseline,
   window,
   onWindowChange,
-  cost,
   engine,
 }: {
   usage: { fiveHour: { pct: number | null; resetsAt: number | null }; sevenDay: { pct: number | null; resetsAt: number | null } } | null;
   baseline: { fiveHour: { pct: number | null; resetsAt: number | null }; sevenDay: { pct: number | null; resetsAt: number | null } } | null;
   window: "fiveHour" | "sevenDay";
   onWindowChange: (window: "fiveHour" | "sevenDay") => void;
-  cost: number;
   engine: string;
 }) {
   const current = usage?.[window].pct ?? null;
   const initial = baseline?.[window].pct ?? current;
   // nothing to show yet (e.g. codex before its first rate-limit push) → hide.
-  if (current == null && cost <= 0) return null;
+  if (current == null) return null;
   const stack = current != null && initial != null ? usageStack(current, initial) : null;
   const reset = usage?.[window].resetsAt ? resetIn(usage[window].resetsAt) : "";
   const remaining = stack ? 100 - stack.total : null;
@@ -3392,7 +3412,6 @@ function UsageStrip({
       ) : (
         <span className="flex-1" />
       )}
-      {cost > 0 && <span className="shrink-0 text-[var(--color-text-2)]">${cost.toFixed(2)}</span>}
     </div>
   );
 }

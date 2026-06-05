@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, MessageSquare, Plus, RefreshCw } from "lucide-react";
+import { ChevronRight, MessageSquare, Plus, RefreshCw, X } from "lucide-react";
 
 import {
-  MONEY_AGENTS,
   createMoneyAgent,
   loadMoneyAgentSummaries,
+  removeMoneyAgent,
   type MoneyAgentSummary,
 } from "../lib/moneyAgents";
 
@@ -80,6 +80,10 @@ export function MoneyAgentsSection({
   };
 
   const open = (id: string, label: string) => onOpenAgentChat(id, label);
+  const remove = (id: string) => {
+    removeMoneyAgent(id);
+    setSummaries((prev) => prev.filter((agent) => agent.id !== id));
+  };
   const create = () => {
     const agent = createMoneyAgent({
       label: draftName,
@@ -94,16 +98,8 @@ export function MoneyAgentsSection({
     refresh();
     onOpenAgentChat(agent.id, agent.label);
   };
-  const rows = summaries.length
-    ? summaries
-    : MONEY_AGENTS.map((agent) => ({
-        id: agent.id,
-        label: agent.label,
-        health: "unknown" as const,
-        primaryMetric: "waiting",
-        currentJob: agent.mission,
-        nextAction: "open chatpane to steer",
-      }));
+  // No defaults — the sidebar is empty until the user creates an agent.
+  const rows = summaries;
 
   if (iconsOnly) {
     return (
@@ -179,14 +175,25 @@ export function MoneyAgentsSection({
           </div>
         </form>
       )}
-      {rows.map((row) => (
-        <AgentRow
-          key={row.id}
-          row={row}
-          chatState={agentChatStates[row.id] ?? "none"}
-          onOpen={() => open(row.id, row.label)}
-        />
-      ))}
+      {rows.length === 0 && !creating ? (
+        <button
+          type="button"
+          onClick={() => setCreating(true)}
+          className="rounded-md border border-dashed border-[var(--color-border)] px-2 py-2 text-left text-[10.5px] text-[var(--color-faint)] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-muted)]"
+        >
+          no agents — click + to create one
+        </button>
+      ) : (
+        rows.map((row) => (
+          <AgentRow
+            key={row.id}
+            row={row}
+            chatState={agentChatStates[row.id] ?? "none"}
+            onOpen={() => open(row.id, row.label)}
+            onRemove={() => remove(row.id)}
+          />
+        ))
+      )}
     </div>
   );
 
@@ -258,37 +265,52 @@ function AgentRow({
   row,
   chatState,
   onOpen,
+  onRemove,
 }: {
   row: MoneyAgentSummary;
   chatState: MoneyAgentChatState;
   onOpen: () => void;
+  onRemove: () => void;
 }) {
   const controlLabel = chatStateLabel(chatState);
   const controlColor = chatStateColor(chatState);
   return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="group flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--color-panel-2)]"
-      title={`${controlLabel} ${row.label} chatpane · ${row.nextAction}`}
-    >
-      <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: healthColor(row.health) }} />
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-[12.5px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
-          {row.label}
-        </span>
-        <span className="block truncate font-mono text-[9.5px] text-[var(--color-faint)]">
-          {row.currentJob}
-        </span>
-      </span>
-      <span className="shrink-0 font-mono text-[9.5px] text-[var(--color-muted)]">{row.primaryMetric}</span>
-      <span
-        className="inline-flex h-6 shrink-0 items-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-pane)] px-1.5 font-mono text-[9.5px]"
-        style={{ color: controlColor }}
+    <div className="group relative flex min-w-0 items-center rounded-md transition-colors hover:bg-[var(--color-panel-2)]">
+      <button
+        type="button"
+        onClick={onOpen}
+        className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left"
+        title={`${controlLabel} ${row.label} chatpane · ${row.nextAction}`}
       >
-        <MessageSquare size={10} />
-        {controlLabel}
-      </span>
-    </button>
+        <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: healthColor(row.health) }} />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[12.5px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">
+            {row.label}
+          </span>
+          <span className="block truncate font-mono text-[9.5px] text-[var(--color-faint)]">
+            {row.currentJob}
+          </span>
+        </span>
+        <span className="shrink-0 font-mono text-[9.5px] text-[var(--color-muted)]">{row.primaryMetric}</span>
+        <span
+          className="inline-flex h-6 shrink-0 items-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-pane)] px-1.5 font-mono text-[9.5px]"
+          style={{ color: controlColor }}
+        >
+          <MessageSquare size={10} />
+          {controlLabel}
+        </span>
+      </button>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          if (confirm(`remove "${row.label}" agent? this clears its saved chat + schedule state.`)) onRemove();
+        }}
+        className="mr-1 grid h-6 w-6 shrink-0 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:text-[var(--color-danger)] group-hover:opacity-100"
+        title={`remove ${row.label}`}
+      >
+        <X size={12} />
+      </button>
+    </div>
   );
 }

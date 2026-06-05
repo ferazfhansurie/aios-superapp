@@ -110,6 +110,10 @@ struct ChatSession {
     cwd: Mutex<Option<String>>,
     /// Model id, captured for per-turn re-spawns (e.g. `gpt-5.5`, `opencode/...`).
     model: Mutex<Option<String>>,
+    /// Reasoning effort the composer picked (`low|medium|high|xhigh|max|ultracode`),
+    /// kept so codex `turn/start` can carry it every turn. Claude passes effort as
+    /// a CLI flag at spawn; codex needs it re-sent per turn. `None` = engine default.
+    effort: Mutex<Option<String>>,
     /// Current frontend channel; `None` while detached (output only buffers).
     sink: Mutex<Option<Channel<String>>>,
     /// Ring buffer of recent raw lines, replayed verbatim on reattach.
@@ -129,7 +133,7 @@ struct ChatSession {
     rpc_id: AtomicU64,
     /// codex app-server: a turn's text queued until `thread/start` resolves the
     /// threadId (the first turn races the handshake). Fired once the id lands.
-    pending_turn: Mutex<Option<String>>,
+    pending_turn: Mutex<Option<(String, Vec<String>)>>,
     /// codex app-server: the in-flight turn's id (from `turn/started`), needed as
     /// `expectedTurnId` to steer it. `None` between turns. Cleared on turn end.
     active_turn: Mutex<Option<String>>,
@@ -443,6 +447,59 @@ fn user_line(text: &str) -> String {
     )
 }
 
+/// Guesses an image media_type from a file path extension. Defaults to png —
+/// claude rejects unknown types, and png is the most common clipboard format.
+fn image_media_type(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    }
+}
+
+/// Builds a stream-json user line carrying REAL image content blocks (base64)
+/// followed by the text block — so claude SEES the images natively every turn,
+/// instead of being handed file paths it has to remember to `Read`. Any path
+/// that fails to read is skipped (still send the text). Falls back to the
+/// text-only `user_line` when nothing readable is attached.
+fn user_line_with_images(text: &str, image_paths: &[String]) -> String {
+    use base64::Engine as _;
+    let mut content: Vec<serde_json::Value> = Vec::new();
+    for path in image_paths {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                content.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image_media_type(path),
+                        "data": data,
+                    }
+                }));
+            }
+            Err(e) => eprintln!("chat: skipping unreadable image {path}: {e}"),
+        }
+    }
+    if content.is_empty() {
+        return user_line(text);
+    }
+    if !text.is_empty() {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    let line = json!({
+        "type": "user",
+        "message": { "role": "user", "content": content }
+    });
+    format!("{line}\n")
+}
+
 /// Writes one already-formed line to a live session's stdin, flushing it. Shared
 /// by every "push a line to claude" path (turns, interrupts, control replies).
 /// `line` should already end in `\n`. No-op error text if the session is gone.
@@ -508,6 +565,7 @@ pub fn chat_start(
             cwd,
             model,
             permission_mode,
+            effort,
             resume,
             fast.unwrap_or(false),
         );
@@ -587,6 +645,7 @@ pub fn chat_start(
         thread_id: Mutex::new(None),
         cwd: Mutex::new(None),
         model: Mutex::new(None),
+        effort: Mutex::new(None), // claude passes effort as a CLI flag, not per turn
         sink: Mutex::new(Some(on_event)),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
         claude_id: Mutex::new(None),
@@ -694,6 +753,7 @@ fn start_per_turn(
         thread_id: Mutex::new(resume.filter(|s| !s.is_empty())),
         cwd: Mutex::new(cwd.filter(|s| !s.is_empty())),
         model: Mutex::new(model.filter(|s| !s.is_empty())),
+        effort: Mutex::new(None), // opencode effort handled per-turn at send
         sink: Mutex::new(Some(on_event)),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
         claude_id: Mutex::new(None),
@@ -930,15 +990,53 @@ fn codex_next_rpc(sess: &Arc<ChatSession>) -> u64 {
     sess.rpc_id.fetch_add(1, Ordering::SeqCst)
 }
 
-/// Sends `turn/start` for an (already-known) thread, with the session model.
-fn codex_fire_turn(sess: &Arc<ChatSession>, thread_id: &str, text: &str) {
+/// Builds the codex `turn/start` input array: any attached local images as
+/// `localImage` items first, then the text item. Mirrors the claude image path.
+fn codex_input_items(text: &str, image_paths: &[String]) -> serde_json::Value {
+    let mut items: Vec<serde_json::Value> = image_paths
+        .iter()
+        .map(|p| json!({ "type": "localImage", "path": p }))
+        .collect();
+    items.push(json!({ "type": "text", "text": text }));
+    json!(items)
+}
+
+/// Maps the composer's effort id onto codex's `ReasoningEffort` enum
+/// (`none|minimal|low|medium|high|xhigh`). The composer also offers `max` and
+/// `ultracode` which codex has no equivalent for — both fold to `xhigh` (its
+/// deepest tier). Returns `None` for anything codex wouldn't accept so we never
+/// send an invalid effort that closes the turn.
+fn codex_effort(raw: &str) -> Option<&'static str> {
+    match raw {
+        "none" => Some("none"),
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "max" | "ultracode" => Some("xhigh"),
+        _ => None,
+    }
+}
+
+/// Sends `turn/start` for an (already-known) thread, with the session model +
+/// reasoning effort. Effort is sent every turn (codex has no spawn-time flag like
+/// claude's `--effort`); `TurnStartParams.effort` overrides it for this turn on.
+fn codex_fire_turn(sess: &Arc<ChatSession>, thread_id: &str, text: &str, image_paths: &[String]) {
     let id = codex_next_rpc(sess);
     let mut params = json!({
         "threadId": thread_id,
-        "input": [{ "type": "text", "text": text }],
+        "input": codex_input_items(text, image_paths),
     });
     if let Some(m) = sess.model.lock().clone().filter(|s| !s.is_empty()) {
         params["model"] = json!(m);
+    }
+    if let Some(ef) = sess
+        .effort
+        .lock()
+        .as_deref()
+        .and_then(codex_effort)
+    {
+        params["effort"] = json!(ef);
     }
     codex_rpc_write(
         sess,
@@ -948,11 +1046,11 @@ fn codex_fire_turn(sess: &Arc<ChatSession>, thread_id: &str, text: &str) {
 
 /// Public turn entry for codex: fire `turn/start` if the thread is ready, else
 /// queue the text until `thread/start` resolves (the first turn races handshake).
-fn codex_send_turn(sess: &Arc<ChatSession>, text: String) -> Result<(), String> {
+fn codex_send_turn(sess: &Arc<ChatSession>, text: String, image_paths: &[String]) -> Result<(), String> {
     let tid = sess.thread_id.lock().clone();
     match tid {
-        Some(t) if !t.is_empty() => codex_fire_turn(sess, &t, &text),
-        _ => *sess.pending_turn.lock() = Some(text),
+        Some(t) if !t.is_empty() => codex_fire_turn(sess, &t, &text, image_paths),
+        _ => *sess.pending_turn.lock() = Some((text, image_paths.to_vec())),
     }
     Ok(())
 }
@@ -1010,6 +1108,7 @@ fn start_codex_appserver(
     cwd: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    effort: Option<String>,
     resume: Option<String>,
     fast: bool,
 ) -> Result<u32, String> {
@@ -1055,6 +1154,7 @@ fn start_codex_appserver(
         thread_id: Mutex::new(None),
         cwd: Mutex::new(dir),
         model: Mutex::new(model.filter(|s| !s.is_empty())),
+        effort: Mutex::new(effort.filter(|s| !s.is_empty())),
         sink: Mutex::new(Some(on_event)),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
         claude_id: Mutex::new(None),
@@ -1223,8 +1323,8 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                 ));
             }
             // Fire any turn queued before the thread existed.
-            if let Some(text) = sess.pending_turn.lock().take() {
-                codex_fire_turn(sess, tid, &text);
+            if let Some((text, images)) = sess.pending_turn.lock().take() {
+                codex_fire_turn(sess, tid, &text, &images);
             }
         }
         return out;
@@ -1826,18 +1926,40 @@ fn notify_done(app: &AppHandle, title: &str) {
 /// resuming the prior thread, whose output is adapted into claude-shaped events.
 /// The reply streams back over the session's Channel. No-op if the session's gone.
 #[tauri::command]
-pub fn chat_send(app: AppHandle, session_id: u32, text: String) -> Result<(), String> {
+pub fn chat_send(
+    app: AppHandle,
+    session_id: u32,
+    text: String,
+    image_paths: Option<Vec<String>>,
+) -> Result<(), String> {
     let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) else {
         return Err(format!("chat session {session_id} not found"));
     };
     s.busy.store(true, Ordering::SeqCst);
+    let images = image_paths.unwrap_or_default();
     if matches!(s.engine, Engine::Codex) {
-        return codex_send_turn(&s, text);
+        return codex_send_turn(&s, text, &images);
     }
     if s.engine.per_turn() {
-        return run_per_turn(s, app, text);
+        // spawn-per-turn engines have no multimodal channel; fall back to quoting
+        // the paths inline so the model can at least Read them.
+        let merged = if images.is_empty() {
+            text
+        } else {
+            let paths = images
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() { paths } else { format!("{paths} {text}") }
+        };
+        return run_per_turn(s, app, merged);
     }
-    write_line(session_id, &user_line(&text))
+    if images.is_empty() {
+        write_line(session_id, &user_line(&text))
+    } else {
+        write_line(session_id, &user_line_with_images(&text, &images))
+    }
 }
 
 /// Detaches a session from its pane WITHOUT killing it: clears the sink so

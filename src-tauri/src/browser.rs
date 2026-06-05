@@ -349,10 +349,19 @@ pub fn browser_hide(app: AppHandle, label: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Destroys the webview entirely (pane closed).
+/// Destroys the webview entirely (pane closed). Before tearing down the wry
+/// handle we MUST stop the page's media + navigate to about:blank — on macOS the
+/// underlying WKWebView can outlive `close()` under ARC (retained by the audio
+/// session / a pending JS task), so without this a closed YouTube pane keeps
+/// playing audio from an orphaned native object. Pause+detach all media, drop
+/// fullscreen, then blank the document so no background media context survives.
 #[tauri::command]
 pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
     if let Some(wv) = app.get_webview(&label) {
+        let _ = wv.eval(
+            "try{document.querySelectorAll('video,audio').forEach(m=>{try{m.pause();m.removeAttribute('src');m.srcObject=null;m.load();}catch(e){}});if(document.fullscreenElement){try{document.exitFullscreen();}catch(e){}}}catch(e){}",
+        );
+        let _ = wv.eval("try{location.replace('about:blank');}catch(e){location.href='about:blank';}");
         let _ = wv.close();
     }
     Ok(())

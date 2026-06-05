@@ -579,6 +579,15 @@ test("chatpane docked composer can collapse and reopen", () => {
   assert.match(chatPane, /setComposerCollapsed\(false\)/);
 });
 
+test("chat panes receive concrete cwd for shell context", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+
+  assert.match(apps, /type: "chat";[\s\S]*cwd\?: string/);
+  assert.match(app, /const chatCwd = pane\.kind\.type === "chat"/);
+  assert.match(app, /<ChatPane[\s\S]*cwd=\{chatCwd\}/);
+});
+
 test("shell exposes a policy-gated agent control bridge", () => {
   const app = read("src/App.tsx");
   const actions = read("src/lib/agentActions.ts");

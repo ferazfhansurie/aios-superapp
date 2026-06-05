@@ -270,9 +270,22 @@ export async function chatStart(
   });
 }
 
-/** Sends one user turn into a live chat session. Reply streams over the Channel. */
-export async function chatSend(id: number, text: string): Promise<void> {
-  return invoke("chat_send", { sessionId: id, text });
+/**
+ * Sends one user turn into a live chat session. Reply streams over the Channel.
+ * `imagePaths` are absolute temp-file paths for attached images; the backend
+ * reads them and sends REAL image content blocks (claude base64 / codex
+ * localImage) so the model sees them natively on every turn — not just the first.
+ */
+export async function chatSend(
+  id: number,
+  text: string,
+  imagePaths?: string[],
+): Promise<void> {
+  return invoke("chat_send", {
+    sessionId: id,
+    text,
+    imagePaths: imagePaths && imagePaths.length ? imagePaths : null,
+  });
 }
 
 /**

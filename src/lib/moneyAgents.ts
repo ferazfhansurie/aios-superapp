@@ -141,16 +141,30 @@ export function loadCustomMoneyAgents(): MoneyAgentConfig[] {
 }
 
 export function loadConfiguredMoneyAgents(): MoneyAgentConfig[] {
-  const defaults = MONEY_AGENTS;
-  const seen = new Set(defaults.map((agent) => agent.id));
-  return [
-    ...defaults,
-    ...loadCustomMoneyAgents().filter((agent) => {
-      if (seen.has(agent.id)) return false;
-      seen.add(agent.id);
-      return true;
-    }),
-  ];
+  // Default: NO agents. The shell ships with an empty sidebar — only agents the
+  // user explicitly creates show up. `MONEY_AGENTS` stays as a catalog of known
+  // ids (for seed/role lookups), but is no longer auto-populated.
+  const seen = new Set<string>();
+  return loadCustomMoneyAgents().filter((agent) => {
+    if (seen.has(agent.id)) return false;
+    seen.add(agent.id);
+    return true;
+  });
+}
+
+/** Removes a user-created agent and its persisted chat session / schedule state.
+ *  Built-in catalog agents (MONEY_AGENTS) aren't shown by default, so this only
+ *  ever needs to drop a custom agent. No-op if the id isn't a custom agent. */
+export function removeMoneyAgent(id: string): void {
+  if (typeof localStorage === "undefined") return;
+  const next = loadCustomMoneyAgents().filter((agent) => agent.id !== id);
+  localStorage.setItem(customAgentsKey, JSON.stringify(next));
+  try {
+    localStorage.removeItem(agentChatSessionKey(id));
+    localStorage.removeItem(lastScheduledRunKey(id));
+  } catch {
+    /* ignore */
+  }
 }
 
 export function createMoneyAgent(input: {

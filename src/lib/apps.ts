@@ -39,6 +39,7 @@ export type PaneContent =
   | { type: "app"; name: string; bundleId?: string | null }
   | {
       type: "chat";
+      cwd?: string;
       seed?: string;
       resume?: { id: string; title: string };
       reattach?: number;
