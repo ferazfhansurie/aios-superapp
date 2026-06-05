@@ -97,6 +97,7 @@ import {
   composerContextChips,
   contextLedger,
   cycleQueueSelection,
+  effortChipLabel,
   moveQueuedMessage,
   queueMessage,
   removeQueuedMessage,
@@ -774,6 +775,16 @@ export function ChatPane({
   // set true when the pane is intentionally detached (kept running) — tells the
   // unmount cleanup NOT to kill the claude process.
   const detachedRef = useRef(false);
+  // the `reattach` id whose background session this pane is currently bound to
+  // AND whose engine/model we auto-synced into `model` state. While set, a
+  // session-effect re-fire CAUSED by that auto-resync is a no-op (don't
+  // re-replay the buffer or kill the externally-owned session). A MANUAL model
+  // switch clears it (see below) so the pane re-spins on the new engine.
+  const reattachBoundRef = useRef<number | null>(null);
+  // armed right before the resync setModel; the very next session-effect cleanup
+  // consumes it to SKIP teardown (that re-run is the benign resync, not a real
+  // model change or unmount). Closure-independent, so no stale-model.id race.
+  const skipResyncTeardownRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   // index into `turns` of the assistant bubble currently being streamed
@@ -1239,6 +1250,16 @@ export function ChatPane({
 
   useEffect(() => {
     let disposed = false;
+    // The resync's setModel re-fired this effect. The previous cleanup already
+    // skipped teardown (skipResyncTeardownRef), the session is live + bound — so
+    // this run must NOT re-reattach (double buffer replay) nor spawn. No-op.
+    // The flag was consumed by the cleanup; here we just detect+skip the body.
+    if (reattach != null && reattachBoundRef.current === reattach) {
+      // distinguish the benign resync re-run from a real model switch: a real
+      // switch went through the cleanup WITHOUT the skip flag, which cleared
+      // reattachBoundRef. So if we're still bound here, it's the resync re-run.
+      return;
+    }
     setStarted(false);
     setClaudeReady(false);
     setCtxTokens(null);
@@ -1267,9 +1288,17 @@ export function ChatPane({
     };
 
     // Reattach to a live backgrounded session (replays its buffer) vs spawn fresh.
+    // On reattach the backend reports the session's real engine/model so we can
+    // re-sync `model` state — otherwise a reattached codex run stays on the
+    // default claude state (wrong stop-strategy, steer hidden, wrong usage).
     const startup =
       reattach != null
-        ? chatReattach(reattach, chan).then((info) => ({ id: reattach, busy: info.busy }))
+        ? chatReattach(reattach, chan).then((info) => ({
+            id: reattach,
+            busy: info.busy,
+            engine: info.engine,
+            model: info.model,
+          }))
         : chatStart(chan, {
             engine: model.engine ?? "claude",
             cwd: cwd ?? null,
@@ -1280,14 +1309,36 @@ export function ChatPane({
             effort: effectiveBudget === "ultracode" ? "xhigh" : effort.id,
             fast: effectiveBudget === "lean",
             resume: resumeId,
-          }).then((id) => ({ id, busy: false }));
+          }).then((id) => ({
+            id,
+            busy: false,
+            engine: null as string | null,
+            model: null as string | null,
+          }));
 
     startup
-      .then(({ id, busy }) => {
+      .then(({ id, busy, engine: liveEngine, model: liveModel }) => {
         if (disposed) {
           // only kill a freshly-spawned session we're abandoning; never a reattach.
           if (reattach == null) chatStop(id).catch(() => {});
           return;
+        }
+        // Reattach: mark this session bound (so the model re-sync below can't
+        // re-replay it) and re-sync `model` state to the session's REAL
+        // engine/model so stop-strategy, steer visibility, and usage provider
+        // all match the engine that's actually running (not default claude).
+        if (reattach != null) {
+          reattachBoundRef.current = reattach;
+          if (liveEngine) {
+            const restored =
+              (liveModel ? CHAT_MODELS.find((m) => m.id === liveModel) : undefined) ??
+              CHAT_MODELS.find((m) => (m.engine ?? "claude") === liveEngine);
+            if (restored && restored.id !== model.id) {
+              // arm: the cleanup fired by this setModel must skip teardown.
+              skipResyncTeardownRef.current = true;
+              setModel(restored);
+            }
+          }
         }
         sessionIdRef.current = id;
         setBackendBusy(busy);
@@ -1310,6 +1361,16 @@ export function ChatPane({
 
     return () => {
       disposed = true;
+      // The benign resync re-run: skip teardown entirely (session stays live +
+      // bound). Consume the flag; reattachBoundRef stays set so the re-run body
+      // no-ops. Closure-independent, so no stale model.id race.
+      if (skipResyncTeardownRef.current) {
+        skipResyncTeardownRef.current = false;
+        return;
+      }
+      // A real teardown (manual model switch, /clear, resume, unmount): this is
+      // no longer a passive resync, so drop the reattach binding.
+      reattachBoundRef.current = null;
       const id = sessionIdRef.current;
       sessionIdRef.current = null;
       // Skip the kill when the pane was intentionally detached (kept running in
@@ -1830,13 +1891,50 @@ export function ChatPane({
   // session is live (started) and claude's init has landed (claudeReady, so the
   // chat records into /resume) — so the text you typed on the idle page IS the
   // first message. No "type once to launch, type again to send".
+  //
+  // Hardening (fix 6.1): a resume / model-switch / restart nulls sessionIdRef
+  // mid-flight, and dispatch() early-returns when the id is null — so naively
+  // firing on (started && claudeReady) could send into a stale/null session and
+  // silently lose the seed. Gate strictly on a LIVE session id, send the seed
+  // text explicitly (not racy `input` state), and only mark it sent once the
+  // dispatch had a live session. If the session never comes live, surface a
+  // visible note instead of swallowing the prompt.
   useEffect(() => {
     if (!seed || seedSentRef.current) return;
     if (!started || !claudeReady) return;
+    // require a live backend session id — not just the started/ready flags,
+    // which can be true for a beat while sessionIdRef is being (re)assigned.
+    if (sessionIdRef.current == null) return;
     seedSentRef.current = true;
-    send();
+    void sendTextRef.current(seed).catch(() => {});
+    // started flips true in the same startup .then() that assigns sessionIdRef,
+    // so by the time this re-runs the id is live.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seed, started, claudeReady]);
+
+  // Safety net: if a seed never got delivered (the session kept restarting so a
+  // live id never settled within a grace window), tell the user instead of
+  // silently dropping the prompt they typed on the idle page.
+  useEffect(() => {
+    if (!seed || seedSentRef.current) return;
+    const t = window.setTimeout(() => {
+      if (seedSentRef.current) return;
+      if (sessionIdRef.current != null) return; // a later tick will send it
+      seedSentRef.current = true;
+      setTurns((prev) => [
+        ...prev,
+        {
+          kind: "result",
+          id: uid(),
+          text: "couldn't auto-send your opening message — the session didn't come live. retype + send.",
+        },
+      ]);
+      // keep the prompt in the composer so it isn't lost.
+      setInput((cur) => (cur ? cur : seed));
+    }, 12000);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed]);
 
   // regenerate: replay the last user turn (no extra user bubble)
   const regenerate = useCallback(() => {
@@ -1894,7 +1992,7 @@ export function ChatPane({
     const strategy = stopStrategy(model.engine);
     finalizeStreaming(
       strategy === "kill-and-restart"
-        ? "stopped by user — gpt backend restarted"
+        ? "stopped by user — backend restarted"
         : "stopped by user",
       strategy,
     );
@@ -2367,7 +2465,7 @@ export function ChatPane({
   const contextChips = composerContextChips({
     cwd,
     modelLabel: model.label,
-    effortLabel: effort.label,
+    effortLabel: effortChipLabel(effort.id, effort.label, model.engine ?? "claude"),
     permissionLabel: permission.label,
     engine: model.engine ?? "claude",
     contextBudget: effectiveBudget,

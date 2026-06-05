@@ -225,8 +225,33 @@ export function sendContract(input: ComposerSendContractInput): ComposerSendCont
   };
 }
 
+/**
+ * The effort label to SHOW for the given engine. Codex's `ReasoningEffort` enum
+ * tops out at `xhigh` — the backend (chat.rs codex_effort) silently folds
+ * `max`/`ultracode` → `xhigh`. Showing the raw picker label would lie ("max"
+ * when codex actually runs xhigh), so for codex we surface the effective cap as
+ * `xhigh (max)` / `xhigh (ultracode)`. Claude accepts these tiers natively, so
+ * it keeps its real label unchanged. Keep the source-of-truth fold here in sync
+ * with codex_effort in chat.rs.
+ */
+export function effortChipLabel(
+  effortId: string,
+  effortLabel: string,
+  engine: string,
+): string {
+  if (engine !== "codex") return effortLabel;
+  if (effortId === "max" || effortId === "ultracode") {
+    return `xhigh (${effortLabel})`;
+  }
+  return effortLabel;
+}
+
 export function stopStrategy(engine: string | null | undefined): ChatStopStrategy {
-  return engine === "codex" || engine === "opencode" ? "kill-and-restart" : "interrupt";
+  // codex now has a real `turn/interrupt` (chat.rs codex_interrupt, wired via
+  // chat_interrupt) — stop it like claude: interrupt the turn, keep the
+  // persistent app-server + thread + buffered partial answer. Only opencode
+  // (no control protocol) still needs a kill-and-restart.
+  return engine === "opencode" ? "kill-and-restart" : "interrupt";
 }
 
 /** Compact chips shown above the composer, ordered by operational importance. */

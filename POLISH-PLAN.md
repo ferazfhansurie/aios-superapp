@@ -31,6 +31,12 @@ Full audit transcripts: `/private/tmp/claude-501/-Users-firazfhansurie/354d3665�
 7. **claude crash/EOF leaves composer stuck streaming forever** (5.3). claude reader emits `chat-exit` but nothing listens + no synthetic result. Listen for `chat-exit`/emit synthetic result on EOF.
 8. **Seed auto-send can vanish into a restarting session** (6.1). gate seed send on post-restart session id.
 
+## ROUND 1.5 — ChatPane UX (run immediately after R1; same files: ChatPane.tsx + chat.rs)
+1. **Auto-focus composer** on entering/activating a chat pane (focus on mount + on becoming active; don't steal focus mid-action).
+2. **Double-tap ↓ → scroll to bottom** (two ArrowDown <300ms) anywhere in the pane → smooth-scroll + re-latch autoscroll-stick. Pairs w/ autoscroll fix (audit 1.4).
+3. **Resume picker rework** — (a) sort by last-edited mtime desc, not created (+ fix record_chat_session stamping mtime on every no-op upsert); (b) preview = latest message sent, not first; (c) show relative timestamp; (d) better color indicator + highlight the currently-open session, show engine + recency.
+4. **Pane-native file routing (deterministic, NO AI reliance — same anti-bloat principle as killing the preamble).** Opening files from chat fails because the AI emits a bare name and paneForFile can't resolve it. Fix: (a) HARVEST absolute paths from tool_use inputs (claude Read/Edit/Write/MultiEdit/NotebookEdit file_path, Bash file args, codex apply_patch/exec) in the stream reducer → 'open in pane' on tool cards using the real path; (b) resolve text/code-fence file mentions against the session cwd → backend existence check → clickable only if it resolves (never search-by-name); (c) all → openFileInPane(absPath) → paneForFile, identical to FilesPane open.
+
 ## ROUND 2 — Cross-pane seamless foundations (the "work together" centerpiece) · Rust + App.tsx + paneBus (disjoint from ChatPane)
 1. **Native menu + `tauri-plugin-global-shortcut`** → emit `pane-nav` events so ⌘1-9/⌘W/⌘F/⌘K/⌘B work while focus is in a terminal or browser webview (currently dead — `window.keydown` never reaches native child webviews). #1 leverage; flagged HIGH by browser + terminal + cross-pane audits.
 2. **Canonical `paneRegistry`** (rect-based `paneKeyAtPoint`, `canAccept`/`drop`/`getRect`/`getContext` per pane) — replaces fragile `elementFromPoint` that fails over WKWebView.
@@ -58,6 +64,8 @@ Full audit transcripts: `/private/tmp/claude-501/-Users-firazfhansurie/354d3665�
 6. `@xterm/addon-search` find bar; debounce ResizeObserver; WebglAddon.onContextLoss; codex composer parity; route URL clicks into in-app browser; font zoom + theme settings.
 
 ## ROUND 5 — BrowserPane first-class
+0. **TAB = PANE (default)** (firaz): every 'new tab' → new browser PANE. ⌘T / target=_blank / window.open / ⌘-click → new pane (on_new_window already does this — make it intentional + easy + add 'open in new pane' affordance). Keep OAuth-popup handling so auth flows don't strand. Debounce spawn spam.
+0b. **Exit fullscreen on ANY new-pane spawn** — if maximizedKey!=null when a pane spawns, drop OS fullscreen + clear maximizedKey so the new pane is visible and firaz sees it. (browser-new-pane listener + spawn().)
 1. **Native back/forward/reload** via WKWebView (not `eval("history.back()")` which fails cross-origin); canGoBack/Forward button states; "Force reload" actually cache-bypass (reloadFromOrigin).
 2. **Enable DevTools** (`devtools` feature + `browser_open_devtools`) — can't replace Chrome for dev without it.
 3. **Find-in-page (⌘F)** native; stop hijacking ⌘F for fullscreen on browser panes.

@@ -311,6 +311,15 @@ export async function chatDetach(id: number, notify: boolean): Promise<void> {
 
 export interface ChatReattachInfo {
   busy: boolean;
+  /** Which engine drives the reattached session (`claude` | `codex` | `opencode`).
+   *  The frontend re-syncs its `model` state from this so a reattached codex run
+   *  isn't driven by the default claude state (wrong stop-strategy / steer / usage). */
+  engine: string;
+  /** Model id the session started with, if the backend knows it (codex stores it;
+   *  claude passes it as a CLI flag and reports null → fall back to engine match). */
+  model: string | null;
+  /** The engine's own session uuid (claude session_id / codex threadId). */
+  claude_id: string | null;
 }
 
 /** Reattaches a reopened pane to a live/backgrounded session; replays the

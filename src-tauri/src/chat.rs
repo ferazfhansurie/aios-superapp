@@ -142,6 +142,20 @@ struct ChatSession {
     /// messages mid-turn; we route THOSE to the thinking block so only the final
     /// answer renders as the reply (not an identical-looking text bubble).
     answer_item: Mutex<Option<String>>,
+    /// codex app-server: true once the current answer item has streamed at least
+    /// one `text_delta`. When true, `item/completed` MUST suppress its full
+    /// `assistant_text_line` (the stream already rendered it — emitting it too
+    /// would double-render the answer). False (a short answer that never
+    /// streamed deltas) → emit the full line so the answer isn't dropped. Reset
+    /// per turn (`turn/started`) and when the answer item id changes.
+    answer_streamed: AtomicBool,
+    /// codex app-server: maps a synthetic approval `request_id` (the string we
+    /// put in the frontend's `can_use_tool` control_request) → the codex
+    /// JSON-RPC request id we must answer. In `on-request` approval mode codex
+    /// sends a server→client request (`exec_command_approval` /
+    /// `apply_patch_approval`); we surface it as the SAME ApprovalCard claude
+    /// uses and, on the user's decision, reply over JSON-RPC with the mapped id.
+    pending_approvals: Mutex<HashMap<String, Value>>,
 }
 
 /// Module-level registry of every live chat session, keyed by an incrementing
@@ -657,6 +671,8 @@ pub fn chat_start(
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
         answer_item: Mutex::new(None),
+        answer_streamed: AtomicBool::new(false),
+        pending_approvals: Mutex::new(HashMap::new()),
     });
 
     // stdout reader: blocking reads → UTF-8-safe → whole lines. Each line is
@@ -693,7 +709,19 @@ pub fn chat_start(
         if !tail.is_empty() {
             ingest_line(&sess, &app_rdr, tail);
         }
-        sess.busy.store(false, Ordering::SeqCst);
+        // Process died mid-turn (crash / EOF / kill) without emitting its own
+        // `result` to close the turn. Synthesize an error result so the composer
+        // frees and the streaming cursor clears — exactly like the codex/opencode
+        // readers do (otherwise streaming=true forever, cursor never clears).
+        // `busy` is still true ONLY if no real `result` line already cleared it.
+        if sess.busy.swap(false, Ordering::SeqCst) {
+            let cid = sess.claude_id.lock().clone().unwrap_or_default();
+            let result = format!(
+                "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"text\":\"claude exited\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
+                json_escape(&cid)
+            );
+            ingest_line(&sess, &app_rdr, &result);
+        }
         let _ = app_rdr.emit("chat-exit", id);
     });
 
@@ -765,6 +793,8 @@ fn start_per_turn(
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
         answer_item: Mutex::new(None),
+        answer_streamed: AtomicBool::new(false),
+        pending_approvals: Mutex::new(HashMap::new()),
     });
     // Bare init (no session_id) just flips claudeReady — the real id arrives on
     // turn 1. ingest into the buffer too so a reattach replays it.
@@ -1166,6 +1196,8 @@ fn start_codex_appserver(
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
         answer_item: Mutex::new(None),
+        answer_streamed: AtomicBool::new(false),
+        pending_approvals: Mutex::new(HashMap::new()),
     });
 
     // Bare init (no session_id) flips claudeReady now; the real session_id lands
@@ -1294,8 +1326,57 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
     let has_id = v.get("id").is_some();
     let mut out = Vec::new();
 
-    // server→client request: echo the id, reply {} so the turn can't hang.
+    // server→client request. In `on-request` approval mode (the composer's "ask
+    // each time"), codex asks BEFORE running a command / applying a patch via
+    // `exec_command_approval` / `apply_patch_approval`. We must NOT blanket-ack
+    // those with `{}` (that silently auto-approves and the user never sees a
+    // card). Instead surface the SAME `can_use_tool` ApprovalCard claude uses and
+    // hold the JSON-RPC id until the user decides (chat_send_raw replies it).
+    // Every other server request (auth refresh etc.) keeps the `{}` ack so the
+    // turn can't hang.
     if method.is_some() && has_id {
+        let m = method.unwrap();
+        let is_approval = matches!(
+            m,
+            "exec_command_approval"
+                | "execCommandApproval"
+                | "apply_patch_approval"
+                | "applyPatchApproval"
+                | "applyPatchApprovalRequest"
+                | "execCommandApprovalRequest"
+        );
+        if is_approval {
+            if let Some(idv) = v.get("id") {
+                // synthetic request_id the frontend echoes back on its decision.
+                let rid = format!("codex-approval-{}", NEXT_REQ.fetch_add(1, Ordering::SeqCst));
+                sess.pending_approvals
+                    .lock()
+                    .insert(rid.clone(), idv.clone());
+                let params = v.get("params");
+                let tool_name = if m.contains("patch") || m.contains("Patch") {
+                    "apply_patch"
+                } else {
+                    "exec_command"
+                };
+                // pass through the codex params as the tool input so the card can
+                // render the command/patch the model wants to run.
+                let input = params.cloned().unwrap_or_else(|| json!({}));
+                out.push(
+                    json!({
+                        "type": "control_request",
+                        "request_id": rid,
+                        "request": {
+                            "subtype": "can_use_tool",
+                            "tool_name": tool_name,
+                            "input": input,
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            return out;
+        }
+        // non-approval server request: ack so nothing stalls.
         if let Some(idv) = v.get("id") {
             codex_rpc_write(sess, &json!({ "jsonrpc": "2.0", "id": idv, "result": {} }));
         }
@@ -1356,6 +1437,9 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                 let is_answer =
                     !m.contains("reasoning") && sess.answer_item.lock().as_deref() == Some(item_id);
                 if is_answer {
+                    // Record that THIS answer item streamed live → item/completed
+                    // must suppress its duplicate full line (one source of truth).
+                    sess.answer_streamed.store(true, Ordering::SeqCst);
                     out.push(text_delta_line(tok));
                 } else {
                     out.push(thinking_delta_line(tok));
@@ -1373,6 +1457,8 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                 if is_final_answer {
                     if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
                         *sess.answer_item.lock() = Some(id.to_string());
+                        // fresh answer item → it hasn't streamed yet.
+                        sess.answer_streamed.store(false, Ordering::SeqCst);
                     }
                 }
                 if codex_is_action_item(item) {
@@ -1396,12 +1482,26 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                             .get("phase")
                             .and_then(|x| x.as_str())
                             .map_or(true, |p| p == "final_answer");
-                        if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
-                            if !t.is_empty() {
-                                if is_final {
-                                    out.push(assistant_text_line(t));
-                                } else {
-                                    out.push(assistant_thinking_line(t));
+                        // Did THIS completed item stream its answer live? If the
+                        // completed item id matches the tracked answer item AND
+                        // that item already streamed deltas, the bubble is
+                        // already rendered — suppress the duplicate full line.
+                        // The stream is the single source of truth. (If it never
+                        // streamed — e.g. a short answer — fall through and emit
+                        // the full line so the answer isn't dropped.)
+                        let completed_id = item.get("id").and_then(|x| x.as_str());
+                        let already_streamed = is_final
+                            && completed_id.is_some()
+                            && sess.answer_item.lock().as_deref() == completed_id
+                            && sess.answer_streamed.load(Ordering::SeqCst);
+                        if !already_streamed {
+                            if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
+                                if !t.is_empty() {
+                                    if is_final {
+                                        out.push(assistant_text_line(t));
+                                    } else {
+                                        out.push(assistant_thinking_line(t));
+                                    }
                                 }
                             }
                         }
@@ -1435,9 +1535,10 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
             }
         }
         "turn/started" => {
-            // new turn → reset the answer-item marker; capture the turn id so a
-            // steer can target it via expectedTurnId.
+            // new turn → reset the answer-item marker + streamed flag; capture
+            // the turn id so a steer can target it via expectedTurnId.
             *sess.answer_item.lock() = None;
+            sess.answer_streamed.store(false, Ordering::SeqCst);
             if let Some(id) = params
                 .and_then(|p| p.get("turn"))
                 .and_then(|t| t.get("id"))
@@ -1450,14 +1551,14 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
             *sess.active_turn.lock() = None;
             *sess.answer_item.lock() = None;
             let tid = sess.thread_id.lock().clone().unwrap_or_default();
-            let usage = params
-                .and_then(|p| {
-                    p.get("turn")
-                        .and_then(|t| t.get("usage"))
-                        .or_else(|| p.get("usage"))
-                })
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "{}".to_string());
+            // Map codex's usage envelope onto claude's field names so the ctx
+            // pill + token footer populate identically to claude (see
+            // codex_usage_to_claude).
+            let usage = codex_usage_to_claude(params.and_then(|p| {
+                p.get("turn")
+                    .and_then(|t| t.get("usage"))
+                    .or_else(|| p.get("usage"))
+            }));
             out.push(format!(
                 "{{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"{}\",\"usage\":{usage},\"total_cost_usd\":0}}",
                 json_escape(&tid)
@@ -1734,10 +1835,7 @@ fn adapt_codex_line(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
         }
         "turn.completed" => {
             let tid = sess.thread_id.lock().clone().unwrap_or_default();
-            let usage = v
-                .get("usage")
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "{}".to_string());
+            let usage = codex_usage_to_claude(v.get("usage"));
             out.push(format!(
                 "{{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"{}\",\"usage\":{usage},\"total_cost_usd\":0}}",
                 json_escape(&tid)
@@ -1900,6 +1998,51 @@ fn codex_usage_event(rl: &serde_json::Value) -> String {
     .to_string()
 }
 
+/// Normalizes a codex turn `usage` object into claude's usage field names so the
+/// frontend's `tokensFromUsage` + ctx-pill math (which read `input_tokens`,
+/// `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`)
+/// populate for codex EXACTLY like claude. Codex emits `cached_input_tokens`
+/// (claude's `cache_read_input_tokens`) and has no separate cache-creation
+/// bucket; accepts both camelCase and snake_case shapes across codex versions.
+/// Returns the literal JSON object string ready to splice into the result line.
+fn codex_usage_to_claude(usage: Option<&serde_json::Value>) -> String {
+    let Some(u) = usage else { return "{}".to_string() };
+    let num = |keys: &[&str]| -> u64 {
+        for k in keys {
+            if let Some(n) = u.get(*k).and_then(|x| x.as_u64()) {
+                return n;
+            }
+            if let Some(f) = u.get(*k).and_then(|x| x.as_f64()) {
+                if f >= 0.0 {
+                    return f as u64;
+                }
+            }
+        }
+        0
+    };
+    // codex `input_tokens` already INCLUDES the cached portion in recent
+    // versions; claude's `input_tokens` is the non-cached remainder. Subtract so
+    // the summed ctx total (input + cache_read + cache_creation) doesn't double
+    // count. If input < cached (older shape where input excludes cache), keep
+    // input as-is.
+    let cache_read = num(&["cached_input_tokens", "cache_read_input_tokens"]);
+    let input_raw = num(&["input_tokens", "prompt_tokens"]);
+    let input = if input_raw >= cache_read {
+        input_raw - cache_read
+    } else {
+        input_raw
+    };
+    let cache_create = num(&["cache_creation_input_tokens"]);
+    let output = num(&["output_tokens", "completion_tokens"]);
+    json!({
+        "input_tokens": input,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_create,
+        "output_tokens": output,
+    })
+    .to_string()
+}
+
 /// Cheap extractor for a top-level `"key":"value"` string field — avoids pulling
 /// a JSON parser into the hot path for the one field we need (`session_id`).
 fn extract_json_str(line: &str, key: &str) -> Option<String> {
@@ -1979,6 +2122,16 @@ pub fn chat_detach(session_id: u32, notify: bool) -> Result<(), String> {
 #[derive(serde::Serialize)]
 pub struct ChatReattachInfo {
     pub busy: bool,
+    /// Which engine drives this session (`claude` | `codex` | `opencode`), so a
+    /// reattached pane re-syncs its `model` state to the RIGHT engine instead of
+    /// staying on the default claude (which would give the wrong stop-strategy,
+    /// hide steer, and read the wrong usage provider). The linchpin parity fix.
+    pub engine: String,
+    /// Model id the session was started with, if known (so the pane can restore
+    /// the exact composer entry, not just the engine).
+    pub model: Option<String>,
+    /// The engine's own session uuid (claude session_id / codex threadId).
+    pub claude_id: Option<String>,
 }
 
 /// Reattaches a reopened pane to a live (possibly backgrounded) session: rebinds
@@ -1996,8 +2149,20 @@ pub fn chat_reattach(session_id: u32, on_event: Channel<String>) -> Result<ChatR
     *s.sink.lock() = Some(on_event);
     s.detached.store(false, Ordering::SeqCst);
     s.notify_on_done.store(false, Ordering::SeqCst);
+    let busy = s.busy.load(Ordering::SeqCst);
+    let engine = match s.engine {
+        Engine::Claude => "claude",
+        Engine::Codex => "codex",
+        Engine::Opencode => "opencode",
+    }
+    .to_string();
+    let model = s.model.lock().clone().filter(|m| !m.is_empty());
+    let claude_id = s.claude_id.lock().clone();
     Ok(ChatReattachInfo {
-        busy: s.busy.load(Ordering::SeqCst),
+        busy,
+        engine,
+        model,
+        claude_id,
     })
 }
 
@@ -2105,6 +2270,51 @@ pub fn chat_steer(session_id: u32, text: String) -> Result<(), String> {
 /// without touching Rust (same philosophy as the dumb-pipe stdout reader).
 #[tauri::command]
 pub fn chat_send_raw(session_id: u32, line: String) -> Result<(), String> {
+    // codex sessions don't speak claude's control protocol. The frontend sends
+    // the SAME claude `control_response` shape for an approval decision (parity
+    // with the ApprovalCard); translate it into codex's JSON-RPC response on the
+    // held request id (see pending_approvals). Anything that isn't a recognized
+    // codex approval reply is dropped (codex has no other raw-stdin protocol).
+    if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
+        if matches!(s.engine, Engine::Codex) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                let resp = v.get("response");
+                let rid = resp
+                    .and_then(|r| r.get("request_id"))
+                    .and_then(|x| x.as_str());
+                if let Some(rid) = rid {
+                    if let Some(rpc_id) = s.pending_approvals.lock().remove(rid) {
+                        // claude inner shape: response.response.behavior = allow|deny.
+                        let behavior = resp
+                            .and_then(|r| r.get("response"))
+                            .and_then(|inner| inner.get("behavior"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("deny");
+                        let allow_always = resp
+                            .and_then(|r| r.get("response"))
+                            .and_then(|inner| inner.get("updatedPermissions"))
+                            .is_some();
+                        // codex decision enum: approved | approved_for_session |
+                        // denied | abort.
+                        let decision = match (behavior, allow_always) {
+                            ("allow", true) => "approved_for_session",
+                            ("allow", false) => "approved",
+                            _ => "denied",
+                        };
+                        codex_rpc_write(
+                            &s,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": rpc_id,
+                                "result": { "decision": decision }
+                            }),
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
     let line = if line.ends_with('\n') {
         line
     } else {
