@@ -135,7 +135,6 @@ import {
   type ChatTurn,
 } from "../lib/chatStream";
 import { memorySearch, type MemoryHit } from "../lib/memory";
-import { buildAiosShellContext } from "../lib/aiosContext";
 import {
   onPetResult,
   onPetError,
@@ -562,8 +561,11 @@ export function ChatPane({
   modelId?: string;
   agentId?: string;
   agentLabel?: string;
-  /** Resume a prior chat session on mount (from the idle "continue" rail). */
-  resume?: { id: string; title: string };
+  /** Resume a prior chat session on mount (from the idle "continue" rail).
+   *  engine/model carry the saved session's backend so a resumed codex thread
+   *  boots on codex (not the default claude) — otherwise --resume sends a codex
+   *  thread-id to the claude binary and the pane comes up blank. */
+  resume?: { id: string; title: string; engine?: string; model?: string };
   /** Reattach to a still-live backgrounded session by its backend id (from the
    *  "running" tray) — replays its buffer and continues live instead of spawning. */
   reattach?: number;
@@ -642,6 +644,16 @@ export function ChatPane({
   // The model the user last picked in the composer IS their default; persisted
   // so codex / opus / whatever sticks across panes + restarts.
   const [model, setModel] = useState<ChatModel>(() => {
+    // Resuming a prior chat: honor its saved model/engine FIRST so a codex thread
+    // doesn't boot on claude (which would mis-route --resume to the wrong binary).
+    if (resume?.model) {
+      const byId = CHAT_MODELS.find((m) => m.id === resume.model);
+      if (byId) return byId;
+    }
+    if (resume?.engine) {
+      const byEngine = CHAT_MODELS.find((m) => (m.engine ?? "claude") === resume.engine);
+      if (byEngine) return byEngine;
+    }
     const preferred = modelId ?? loadSettings().chatModel;
     return CHAT_MODELS.find((m) => m.id === preferred) ?? CHAT_MODELS[0];
   });
@@ -1197,6 +1209,16 @@ export function ChatPane({
       // so the first user send can recordChatSession() into the /resume list.
       case "system": {
         if (ev.session_id) {
+          const prev = claudeSessionIdRef.current;
+          // claude's `--resume` emits a FRESH session_id and writes continued
+          // turns to a new <id>.jsonl. If we were already recorded (a resume),
+          // re-key the store entry to the new id — otherwise the next resume
+          // reads the old transcript (truncated at the fork) and re-forks again.
+          if (prev && prev !== ev.session_id && recordedRef.current) {
+            const m = activeModelRef.current;
+            const title = resume?.title ?? "chat";
+            recordChatSession(ev.session_id, title, cwd ?? null, m.engine ?? "claude", m.id).catch(() => {});
+          }
           claudeSessionIdRef.current = ev.session_id;
           setRunEventsKey(runEventsStorageKey(ev.session_id));
         }
@@ -1510,12 +1532,15 @@ export function ChatPane({
     ) => {
       const id = sessionIdRef.current;
       if (id == null) return;
-      const shellContext = buildAiosShellContext({
-        cwd,
-        paneKey,
-        attachedMemoryCount: attachedMemories.length,
-      });
-      let wire = shellContext + (opts?.wirePrefix ?? "") + display;
+      // No per-turn preamble. claude/codex already know `cwd` natively, attached
+      // memories ride as their own content blocks, and the old shell-context lines
+      // bragged about "native ops" (open panes / route artifacts / reattach runs)
+      // that the chat session has NO tools to actually perform — telling the model
+      // it has powers it lacks induces hallucinated tool-talk and measurably dumbs
+      // it. Repeating any preamble every turn is context bloat (and re-inflates
+      // resumed codex threads). Session identity belongs in CLAUDE.md / AGENTS.md,
+      // read once via cwd by each engine — not stapled to every user message.
+      let wire = (opts?.wirePrefix ?? "") + display;
       if (goal.trim()) wire = GOAL_PREFIX(goal.trim()) + wire;
       if (planMode) wire = PLAN_PREFIX + wire;
       if (effectiveBudget === "ultracode") wire = ULTRA_PREFIX + wire;

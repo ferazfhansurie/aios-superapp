@@ -680,7 +680,11 @@ function App() {
   );
   const resumeChat = useCallback(
     (s: ChatSessionInfo) =>
-      spawn({ type: "chat", resume: { id: s.id, title: s.title } }, s.title || "chat"),
+      spawn(
+        // carry engine+model so a resumed codex thread boots on codex, not claude
+        { type: "chat", resume: { id: s.id, title: s.title, engine: s.engine, model: s.model } },
+        s.title || "chat",
+      ),
     [spawn],
   );
 
