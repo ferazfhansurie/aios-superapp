@@ -207,9 +207,48 @@ pub async fn browser_show(
     let dl_dest: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let dl_dest_req = dl_dest.clone();
+    // Loading state (item 5): a navigation STARTING reflects the destination url
+    // to the toolbar immediately (the address bar otherwise lags the 1500ms poll)
+    // and flips a spinner on; the page FINISHING flips it off. wry/tauri 2.11 has
+    // no load-ERROR callback (`on_page_load` only reports Started/Finished), so a
+    // dead-port / DNS-fail never emits Finished — the frontend treats "Started but
+    // no Finished within a timeout" as a connection error + offers retry.
+    let nav_app = app.clone();
+    let nav_label = label.clone();
+    let load_app = app.clone();
+    let load_label = label.clone();
     #[allow(unused_mut)]
     let mut builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
         .user_agent(UA)
+        .on_navigation(move |url| {
+            // Fires on EVERY top-level + sub-frame navigation request. Reflect the
+            // url + loading=true; the frontend dedupes/ignores sub-frame noise by
+            // only trusting this for the address bar when it's a real page change.
+            let _ = nav_app.emit(
+                "browser-load",
+                serde_json::json!({
+                    "label": nav_label,
+                    "phase": "started",
+                    "url": url.to_string(),
+                }),
+            );
+            true // never block navigation
+        })
+        .on_page_load(move |_webview, payload| {
+            use tauri::webview::PageLoadEvent;
+            let phase = match payload.event() {
+                PageLoadEvent::Started => "started",
+                PageLoadEvent::Finished => "finished",
+            };
+            let _ = load_app.emit(
+                "browser-load",
+                serde_json::json!({
+                    "label": load_label,
+                    "phase": phase,
+                    "url": payload.url().to_string(),
+                }),
+            );
+        })
         .on_download(move |_webview, event| {
             match event {
                 tauri::webview::DownloadEvent::Requested { destination, .. } => {
@@ -377,8 +416,39 @@ pub fn set_window_fullscreen(app: AppHandle, on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Native NAVIGATION via the WKWebView itself (item 2) — replaces the old
+/// `eval("history.back()")` hacks that only walked the PAGE's own SPA history
+/// (silently no-op cross-origin / under CSP / on about:blank). On macOS we reach
+/// the real WKWebView through the same objc2 bridge the fullscreen/adblock code
+/// uses (`with_webview` → `PlatformWebview::inner()` → `*mut WKWebView`) and call
+/// the genuine `goBack`/`goForward`/`reload`/`reloadFromOrigin` selectors (all
+/// present in objc2-web-kit 0.3.2). On Windows (WebView2) we fall back to the
+/// previous JS-history behavior since this objc2 path is macOS-only.
+#[cfg(target_os = "macos")]
+fn with_wk<F: FnOnce(&objc2_web_kit::WKWebView) + Send + 'static>(
+    app: &AppHandle,
+    label: &str,
+    f: F,
+) {
+    if let Some(wv) = app.get_webview(label) {
+        let _ = wv.with_webview(move |pw| {
+            let ptr = pw.inner() as *mut objc2_web_kit::WKWebView;
+            unsafe {
+                if let Some(wk) = ptr.as_ref() {
+                    f(wk);
+                }
+            }
+        });
+    }
+}
+
 #[tauri::command]
 pub fn browser_back(app: AppHandle, label: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    with_wk(&app, &label, |wk| unsafe {
+        let _ = wk.goBack();
+    });
+    #[cfg(not(target_os = "macos"))]
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.eval("history.back()");
     }
@@ -387,6 +457,11 @@ pub fn browser_back(app: AppHandle, label: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn browser_forward(app: AppHandle, label: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    with_wk(&app, &label, |wk| unsafe {
+        let _ = wk.goForward();
+    });
+    #[cfg(not(target_os = "macos"))]
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.eval("history.forward()");
     }
@@ -395,10 +470,134 @@ pub fn browser_forward(app: AppHandle, label: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn browser_reload(app: AppHandle, label: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    with_wk(&app, &label, |wk| unsafe {
+        let _ = wk.reload();
+    });
+    #[cfg(not(target_os = "macos"))]
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.eval("location.reload()");
     }
     Ok(())
+}
+
+/// TRUE cache-bypass reload ("Force reload") — `reloadFromOrigin` re-fetches
+/// every resource ignoring the cache, unlike `reload`. The old "Force reload"
+/// menu item just called `browser_reload` (a lie — identical to normal reload).
+#[tauri::command]
+pub fn browser_force_reload(app: AppHandle, label: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    with_wk(&app, &label, |wk| unsafe {
+        let _ = wk.reloadFromOrigin();
+    });
+    #[cfg(not(target_os = "macos"))]
+    if let Some(wv) = app.get_webview(&label) {
+        // WebView2 has no reloadFromOrigin via eval; force a no-cache reload.
+        let _ = wv.eval("location.reload(true)");
+    }
+    Ok(())
+}
+
+/// Reports `[canGoBack, canGoForward]` so the toolbar Back/Forward buttons can
+/// disable when there's no history (they were always-enabled no-op buttons).
+/// macOS reads the real WKWebView state; elsewhere we can't cheaply know, so we
+/// report `[true, true]` (buttons stay enabled, same as before).
+#[tauri::command]
+pub async fn browser_nav_state(app: AppHandle, label: String) -> [bool; 2] {
+    #[cfg(target_os = "macos")]
+    if let Some(wv) = app.get_webview(&label) {
+        let (tx, rx) = std::sync::mpsc::channel::<[bool; 2]>();
+        let _ = wv.with_webview(move |pw| {
+            let ptr = pw.inner() as *mut objc2_web_kit::WKWebView;
+            let s = unsafe {
+                ptr.as_ref()
+                    .map(|wk| [wk.canGoBack(), wk.canGoForward()])
+                    .unwrap_or([false, false])
+            };
+            let _ = tx.send(s);
+        });
+        return rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .unwrap_or([true, true]);
+    }
+    let _ = (&app, &label);
+    [true, true]
+}
+
+/// Opens the WKWebView's Web Inspector (DevTools) for this pane (item 3).
+/// Compiled into release because the tauri `devtools` feature is enabled in
+/// Cargo.toml — otherwise `open_devtools` only exists under `debug_assertions`.
+#[tauri::command]
+pub fn browser_open_devtools(app: AppHandle, label: String) -> Result<(), String> {
+    let wv = app.get_webview(&label).ok_or("browser not open")?;
+    wv.open_devtools();
+    Ok(())
+}
+
+/// Native find-in-page (item 4) via WKWebView `findString:withConfiguration:`.
+/// `forward` walks matches in direction; `wraps` so the search cycles. Returns
+/// whether a match was found. NOTE: WKFindResult exposes only `matchFound` — the
+/// WebKit public API has NO match-COUNT, so the frontend shows found/not-found,
+/// not "3 of 12". macOS-only; on Windows this is a no-op returning false.
+#[tauri::command]
+pub async fn browser_find(
+    app: AppHandle,
+    label: String,
+    query: String,
+    forward: bool,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use block2::RcBlock;
+        use objc2::MainThreadMarker;
+        use objc2_foundation::NSString;
+        use objc2_web_kit::{WKFindConfiguration, WKFindResult, WKWebView};
+        if query.is_empty() {
+            return false;
+        }
+        if let Some(wv) = app.get_webview(&label) {
+            let (tx, rx) = std::sync::mpsc::channel::<bool>();
+            let _ = wv.with_webview(move |pw| {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    let _ = tx.send(false);
+                    return;
+                };
+                let ptr = pw.inner() as *mut WKWebView;
+                let Some(wk) = (unsafe { ptr.as_ref() }) else {
+                    let _ = tx.send(false);
+                    return;
+                };
+                let cfg = unsafe { WKFindConfiguration::new(mtm) };
+                unsafe {
+                    cfg.setBackwards(!forward);
+                    cfg.setWraps(true);
+                    cfg.setCaseSensitive(false);
+                }
+                let q = NSString::from_str(&query);
+                let tx2 = tx.clone();
+                let handler = RcBlock::new(move |result: std::ptr::NonNull<WKFindResult>| {
+                    let found = unsafe { result.as_ref().matchFound() };
+                    let _ = tx2.send(found);
+                });
+                unsafe {
+                    wk.findString_withConfiguration_completionHandler(
+                        &q,
+                        Some(&cfg),
+                        &handler,
+                    );
+                }
+            });
+            return rx
+                .recv_timeout(std::time::Duration::from_millis(800))
+                .unwrap_or(false);
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&app, &label, &query, &forward);
+        false
+    }
 }
 
 /// Hides without destroying (shrinks to 0×0, preserves the page).
@@ -428,23 +627,82 @@ pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Sets the page zoom via CSS `body.style.zoom`. The frontend tracks the
-/// percentage and passes the factor (e.g. 1.25 for 125%).
+/// Native PAGE ZOOM that persists across navigation (stretch item). The old impl
+/// set `document.body.style.zoom` which WebKit resets on every page load; the
+/// real WKWebView `setPageZoom:` survives navigation within the webview. The
+/// frontend passes the factor (e.g. 1.25 for 125%). macOS-only native path;
+/// elsewhere fall back to the CSS approach.
 #[tauri::command]
 pub fn browser_zoom(app: AppHandle, label: String, factor: f64) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    with_wk(&app, &label, move |wk| unsafe {
+        wk.setPageZoom(factor);
+    });
+    #[cfg(not(target_os = "macos"))]
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.eval(&format!("document.body.style.zoom={factor}"));
     }
     Ok(())
 }
 
-/// Best-effort cookie/storage clear. NOTE: true cookie-store wiping isn't
-/// available via `eval` (HttpOnly cookies + the WKWebView cookie store can't be
-/// reached from page JS), so we do the JS-accessible clears — `document.cookie`
-/// wipe for each non-HttpOnly cookie + localStorage/sessionStorage clear — then
-/// reload so the page re-runs with cleared client state.
+/// macOS-only: remove all data of the given WKWebsiteDataTypes from THIS pane's
+/// website data store (its configured cookie/cache partition). `modifiedSince:
+/// distantPast` = everything. This reaches the REAL store — HttpOnly cookies and
+/// the on-disk cache the old `document.cookie` eval could never touch.
+#[cfg(target_os = "macos")]
+fn remove_website_data(app: &AppHandle, label: &str, types: &[&str]) {
+    use block2::RcBlock;
+    use objc2_foundation::{NSDate, NSSet, NSString};
+    let types: Vec<String> = types.iter().map(|s| s.to_string()).collect();
+    if let Some(wv) = app.get_webview(label) {
+        let _ = wv.with_webview(move |pw| {
+            let ptr = pw.inner() as *mut objc2_web_kit::WKWebView;
+            let Some(wk) = (unsafe { ptr.as_ref() }) else {
+                return;
+            };
+            let store = unsafe { wk.configuration().websiteDataStore() };
+            // Resolve the requested type-name strings to the WebKit constants
+            // (these are `&'static NSString`, so we collect refs directly).
+            let mut refs: Vec<&NSString> = Vec::new();
+            for t in &types {
+                let s: &'static NSString = match t.as_str() {
+                    "cookies" => unsafe { objc2_web_kit::WKWebsiteDataTypeCookies },
+                    "disk-cache" => unsafe { objc2_web_kit::WKWebsiteDataTypeDiskCache },
+                    "memory-cache" => unsafe { objc2_web_kit::WKWebsiteDataTypeMemoryCache },
+                    "local-storage" => unsafe { objc2_web_kit::WKWebsiteDataTypeLocalStorage },
+                    "session-storage" => unsafe { objc2_web_kit::WKWebsiteDataTypeSessionStorage },
+                    _ => continue,
+                };
+                refs.push(s);
+            }
+            let set = NSSet::from_slice(&refs);
+            let since = NSDate::distantPast();
+            let done = RcBlock::new(|| {});
+            unsafe {
+                store.removeDataOfTypes_modifiedSince_completionHandler(&set, &since, &done);
+            }
+        });
+    }
+}
+
+/// Real cookie clear (stretch) — wipes cookies + storage from the pane's actual
+/// WKWebsiteDataStore via objc2, reaching HttpOnly cookies the old eval couldn't.
+/// Then reloads so the page re-runs with cleared state. macOS-only native path;
+/// elsewhere fall back to the JS-accessible clears.
 #[tauri::command]
 pub fn browser_clear_cookies(app: AppHandle, label: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        remove_website_data(
+            &app,
+            &label,
+            &["cookies", "local-storage", "session-storage"],
+        );
+        if let Some(wv) = app.get_webview(&label) {
+            let _ = wv.eval("setTimeout(function(){try{location.reload();}catch(e){}},120)");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.eval(
             "(function(){\
@@ -460,6 +718,25 @@ pub fn browser_clear_cookies(app: AppHandle, label: String) -> Result<(), String
                 location.reload();\
             })()",
         );
+    }
+    Ok(())
+}
+
+/// Real cache clear (stretch) — wipes disk + memory cache from the pane's actual
+/// WKWebsiteDataStore (no eval equivalent existed; the menu item was a duplicate
+/// of clear-cookies). macOS-only native path; elsewhere a cache-bypass reload.
+#[tauri::command]
+pub fn browser_clear_cache(app: AppHandle, label: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        remove_website_data(&app, &label, &["disk-cache", "memory-cache"]);
+        if let Some(wv) = app.get_webview(&label) {
+            let _ = wv.eval("setTimeout(function(){try{location.reload();}catch(e){}},120)");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(wv) = app.get_webview(&label) {
+        let _ = wv.eval("location.reload(true)");
     }
     Ok(())
 }
@@ -797,10 +1074,11 @@ mod tests {
     fn new_browser_pane_keeps_the_source_profile() {
         let url = Url::parse("https://example.com/path").unwrap();
         assert_eq!(
-            browser_new_pane(&url, &Some("work".into())),
+            browser_new_pane(&url, &Some("work".into()), false),
             BrowserNewPane {
                 url: "https://example.com/path".into(),
                 profile: Some("work".into()),
+                is_popup: false,
             }
         );
     }

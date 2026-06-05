@@ -26,12 +26,25 @@ export const setWindowFullscreen = (on: boolean) =>
 export const browserBack = (label: string) => invoke("browser_back", { label });
 export const browserForward = (label: string) => invoke("browser_forward", { label });
 export const browserReload = (label: string) => invoke("browser_reload", { label });
+/** TRUE cache-bypass reload (WKWebView reloadFromOrigin) — the real "force reload". */
+export const browserForceReload = (label: string) => invoke("browser_force_reload", { label });
+/** [canGoBack, canGoForward] from the live WKWebView — drives toolbar button disabling. */
+export const browserNavState = (label: string) =>
+  invoke<[boolean, boolean]>("browser_nav_state", { label });
+/** Opens the WKWebView Web Inspector (DevTools) for this pane. */
+export const browserOpenDevtools = (label: string) =>
+  invoke("browser_open_devtools", { label });
+/** Native find-in-page. Returns whether a match was found (no match-count in the WebKit API). */
+export const browserFind = (label: string, query: string, forward: boolean) =>
+  invoke<boolean>("browser_find", { label, query, forward });
 export const browserHide = (label: string) => invoke("browser_hide", { label });
 export const browserClose = (label: string) => invoke("browser_close", { label });
 export const browserZoom = (label: string, factor: number) =>
   invoke("browser_zoom", { label, factor });
 export const browserClearCookies = (label: string) =>
   invoke("browser_clear_cookies", { label });
+export const browserClearCache = (label: string) =>
+  invoke("browser_clear_cache", { label });
 export const browserDeviceMode = (label: string, mobile: boolean) =>
   invoke("browser_device_mode", { label, mobile });
 export const browserScreenshot = (label: string, r: Rect) =>

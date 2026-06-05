@@ -97,6 +97,12 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let global_search = MenuItemBuilder::with_id("pane:global-search", "Search in Files…")
         .accelerator("CmdOrCtrl+Shift+F")
         .build(app)?;
+    // DevTools for the focused browser pane (R5 item 3). ⌥⌘I = the standard
+    // "Web Inspector" accelerator; routed via the native menu so it fires even
+    // when focus is inside the browser child webview.
+    let devtools = MenuItemBuilder::with_id("pane:open-devtools", "Open DevTools")
+        .accelerator("Alt+CmdOrCtrl+I")
+        .build(app)?;
     let sidebar = MenuItemBuilder::with_id("pane:sidebar", "Toggle Sidebar")
         .accelerator("CmdOrCtrl+B")
         .build(app)?;
@@ -120,6 +126,7 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .item(&palette)
         .item(&file_finder)
         .item(&global_search)
+        .item(&devtools)
         .item(&sidebar)
         .item(&minimize)
         .item(&overview)
@@ -289,6 +296,11 @@ pub fn run() {
             browser::browser_back,
             browser::browser_forward,
             browser::browser_reload,
+            browser::browser_force_reload,
+            browser::browser_nav_state,
+            browser::browser_open_devtools,
+            browser::browser_find,
+            browser::browser_clear_cache,
             browser::browser_hide,
             browser::browser_close,
         ])

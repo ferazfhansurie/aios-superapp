@@ -304,6 +304,8 @@ html, body, #root {
 @keyframes aios-fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes aios-cell-in { from { opacity: 0; transform: scale(0.4); } to { opacity: 1; transform: scale(1); } }
 @keyframes aios-orbit { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+/* Browser pane navigation progress bar — indeterminate sweep. */
+@keyframes browserprog { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
 @keyframes aios-colon { 0%, 45% { opacity: 1; } 55%, 100% { opacity: 0.25; } }
 @keyframes aios-node-live { 0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent) 55%, transparent); } 50% { box-shadow: 0 0 0 4px transparent; } }
 @keyframes aios-drift-a { 0% { transform: translate(-22vw, -14vh) scale(1); } 50% { transform: translate(18vw, 10vh) scale(1.15); } 100% { transform: translate(-22vw, -14vh) scale(1); } }

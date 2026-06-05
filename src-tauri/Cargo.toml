@@ -18,7 +18,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["unstable", "protocol-asset"] }
+# `devtools`: keep the WKWebView Web Inspector available in RELEASE builds too
+# (not just debug) — firaz uses this app as his dev browser, so `open_devtools`
+# must compile in the shipped binary, hence the explicit feature (the API is
+# otherwise gated behind `debug_assertions`).
+tauri = { version = "2", features = ["unstable", "protocol-asset", "devtools"] }
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
@@ -47,5 +51,5 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString"] }
-objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "block2"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDate", "NSSet", "NSArray"] }
+objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKFindConfiguration", "WKFindResult", "WKWebsiteDataStore", "WKWebsiteDataRecord", "block2"] }

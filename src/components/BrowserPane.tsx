@@ -5,33 +5,43 @@
  *  pane is hidden) shrinks the webview to 0 so HTML modals aren't occluded. */
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   ArrowLeft,
   ArrowRight,
   Camera,
+  ChevronDown,
+  ChevronUp,
   Crosshair,
   ExternalLink,
+  Loader2,
   MessageSquarePlus,
   MoreVertical,
   Pin,
   Check,
   Plus,
   RotateCw,
+  Search,
   Smartphone,
   SquareDashedMousePointer,
+  Terminal,
   Trash2,
   Users,
+  X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
 
 import {
   browserBack,
+  browserClearCache,
   browserClearCookies,
   browserClose,
   browserCopySelection,
   browserCurrentUrl,
+  browserFind,
+  browserForceReload,
   browserFullscreenState,
   browserDeviceMode,
   browserEnterAnnotate,
@@ -39,6 +49,8 @@ import {
   browserForward,
   browserHide,
   browserNavigate,
+  browserNavState,
+  browserOpenDevtools,
   browserReload,
   browserScreenshot,
   browserSetBounds,
@@ -66,10 +78,32 @@ const ZOOM_MIN = 50;
 const ZOOM_MAX = 200;
 const ZOOM_STEP = 10;
 
+// If a navigation STARTS but no Finished arrives within this window we treat it
+// as a connection failure (dead localhost port / DNS fail). wry/tauri 2.11 has
+// no load-error callback, so this timeout is the only signal we get.
+const LOAD_TIMEOUT_MS = 12000;
+
+// Hosts that are dev/loopback → treat as a URL (not a search) AND default to
+// http:// (local dev servers rarely have TLS). `localhost`, `127.0.0.1`,
+// `[::1]`, and any bare `host:port` (a digits-only port after a colon) qualify.
+const LOOPBACK_HOST = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:[/?#]|$)/i;
+// `something:1234` or `1.2.3.4:8080` — a bare host with an explicit port, no
+// scheme. These are almost always dev servers, so treat as a URL not a search.
+const HOST_PORT = /^[\w.-]+:\d{1,5}(?:[/?#]|$)/;
+// A bare IPv4 (with optional port already covered above) → URL.
+const BARE_IP = /^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:[/?#]|$)/;
+
 function normalizeUrl(input: string): string {
   const t = input.trim();
   if (!t) return "";
   if (/^https?:\/\//i.test(t)) return t;
+  // file:// / about: / other explicit schemes pass through untouched.
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t) || /^about:/i.test(t)) return t;
+  // localhost / loopback / bare IPv4 / host:port → a real URL. Loopback + bare
+  // IPs default to http:// (dev servers); a named host:port also http:// since
+  // it's the dev-server shape. Everything else (a public host) keeps https://.
+  if (LOOPBACK_HOST.test(t) || BARE_IP.test(t)) return `http://${t}`;
+  if (HOST_PORT.test(t)) return `http://${t}`;
   if (/^[\w-]+(\.[\w-]+)+/.test(t)) return `https://${t}`;
   return `https://www.google.com/search?q=${encodeURIComponent(t)}`;
 }
@@ -125,6 +159,21 @@ export function BrowserPane({
   // Surfaces a browser_show failure instead of silently showing "loading…"
   // forever (the native child-webview can fail to attach on some platforms).
   const [showError, setShowError] = useState<string | null>(null);
+  // Toolbar Back/Forward enablement, read from the live WKWebView history.
+  const [canGoBack, setCanGoBack] = useState(false);
+  const [canGoForward, setCanGoForward] = useState(false);
+  // Page-load progress (driven by the `browser-load` event) + a connection-error
+  // affordance. `loading` flips on at nav-start and off at finish; if a nav
+  // starts but never finishes within LOAD_TIMEOUT_MS we surface a retry card
+  // (wry/tauri has no load-error callback, so a dead port = no Finished event).
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const loadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Find-in-page bar.
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findMiss, setFindMiss] = useState(false);
+  const findInputRef = useRef<HTMLInputElement>(null);
   const shownRef = useRef(false);
   const inputFocusedRef = useRef(false);
   // last url we observed from the live webview — dedupes the poll so we only
@@ -159,7 +208,9 @@ export function BrowserPane({
   }, []);
 
   useEffect(() => {
-    if (!active || dragArmed) {
+    if (!active || dragArmed || loadError) {
+      // loadError → shrink the webview so the React "couldn't connect" card
+      // underneath is visible (the native view otherwise paints over it).
       if (shownRef.current) browserHide(label).catch(() => {});
       return;
     }
@@ -190,7 +241,7 @@ export function BrowserPane({
       window.removeEventListener("resize", sync);
       clearInterval(poll);
     };
-  }, [active, dragArmed, current, label, profile, rect]);
+  }, [active, dragArmed, loadError, current, label, profile, rect]);
 
   // Poll the webview's REAL url (catches in-page navigation the address bar never
   // sees). On a real change: remember it (pinned sites resume here) and sync the
@@ -233,6 +284,77 @@ export function BrowserPane({
         .catch(() => {});
     };
     const poll = setInterval(tick, 350);
+    return () => clearInterval(poll);
+  }, [active, label]);
+
+  // Load progress + error state (item 5). The backend emits `browser-load` with
+  // {label, phase: started|finished, url} on every navigation. On `started` we
+  // reflect the url to the address bar IMMEDIATELY (no more 1500ms poll lag),
+  // flip the spinner on, and arm a timeout; on `finished` we clear both. A
+  // `started` with no `finished` before LOAD_TIMEOUT_MS → connection error.
+  useEffect(() => {
+    if (!active) return;
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<{ label: string; phase: string; url: string }>("browser-load", ({ payload }) => {
+      if (payload.label !== label) return;
+      if (payload.phase === "started") {
+        const u = payload.url;
+        if (u && u !== "about:blank") {
+          lastUrlRef.current = u;
+          rememberUrl(memKey, u);
+          if (!inputFocusedRef.current) {
+            setCurrent(u);
+            setInput(u);
+          }
+        }
+        setLoadError(null);
+        setLoading(true);
+        if (loadTimer.current) clearTimeout(loadTimer.current);
+        loadTimer.current = setTimeout(() => {
+          // Started but never finished → treat as a failed connection.
+          setLoading(false);
+          setLoadError(u || lastUrlRef.current);
+        }, LOAD_TIMEOUT_MS);
+      } else if (payload.phase === "finished") {
+        setLoading(false);
+        setLoadError(null);
+        if (loadTimer.current) {
+          clearTimeout(loadTimer.current);
+          loadTimer.current = null;
+        }
+      }
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+      if (loadTimer.current) {
+        clearTimeout(loadTimer.current);
+        loadTimer.current = null;
+      }
+    };
+  }, [active, label, memKey]);
+
+  // Poll the live WKWebView back/forward history so the toolbar buttons disable
+  // when there's nowhere to go (they were always-enabled no-ops before).
+  useEffect(() => {
+    if (!active) return;
+    const tick = () => {
+      if (!shownRef.current) return;
+      browserNavState(label)
+        .then(([back, fwd]) => {
+          setCanGoBack(back);
+          setCanGoForward(fwd);
+        })
+        .catch(() => {});
+    };
+    tick();
+    const poll = setInterval(tick, 700);
     return () => clearInterval(poll);
   }, [active, label]);
 
@@ -411,6 +533,73 @@ export function BrowserPane({
     showToast("cleared cookies + storage", "success", "browser profile data was cleared for this pane.");
   }, [label, showToast]);
 
+  const clearCache = useCallback(() => {
+    browserClearCache(label).catch(() => {});
+    setMenuOpen(false);
+    showToast("cleared cache", "success", "disk + memory cache cleared for this pane.");
+  }, [label, showToast]);
+
+  const forceReload = useCallback(() => {
+    browserForceReload(label).catch(() => {});
+    setMenuOpen(false);
+  }, [label]);
+
+  const openDevtools = useCallback(() => {
+    browserOpenDevtools(label).catch(() => {});
+    setMenuOpen(false);
+  }, [label]);
+
+  // Retry a failed load by re-navigating to the current url.
+  const retryLoad = useCallback(() => {
+    setLoadError(null);
+    const u = current || normalizeUrl(input);
+    if (u && shownRef.current) browserNavigate(label, u).catch(() => {});
+  }, [current, input, label]);
+
+  // Run a native find for the current query in the given direction.
+  const runFind = useCallback(
+    (forward: boolean) => {
+      const q = findQuery.trim();
+      if (!q) {
+        setFindMiss(false);
+        return;
+      }
+      browserFind(label, q, forward)
+        .then((found) => setFindMiss(!found))
+        .catch(() => setFindMiss(false));
+    },
+    [findQuery, label],
+  );
+
+  const openFind = useCallback(() => {
+    setFindOpen(true);
+    setFindMiss(false);
+    // focus the input next tick (after it mounts)
+    setTimeout(() => findInputRef.current?.focus(), 0);
+  }, []);
+
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    setFindMiss(false);
+  }, []);
+
+  // ⌘F opens find-in-page when THIS browser pane is the active one. App.tsx
+  // detects "active pane is a browser" (the native ⌘F menu accelerator + the
+  // in-React keydown both route there) and dispatches a window CustomEvent
+  // `aios-browser-find` carrying the target pane label. We match on our label so
+  // only the focused browser pane's find bar opens. This is the R5 reconciliation
+  // of the R2a ⌘F→pane-fullscreen binding: browser focused → find; else → fs.
+  useEffect(() => {
+    if (!active) return;
+    const onFind = (e: Event) => {
+      const detail = (e as CustomEvent<{ label?: string }>).detail;
+      if (detail?.label && detail.label !== label) return;
+      openFind();
+    };
+    window.addEventListener("aios-browser-find", onFind as EventListener);
+    return () => window.removeEventListener("aios-browser-find", onFind as EventListener);
+  }, [active, label, openFind]);
+
   // Turn a captured annotation/selection into one chat-ready line.
   const formatAnnotation = useCallback((a: BrowserAnnotation): string => {
     const note = a.note || "(no note)";
@@ -508,14 +697,25 @@ export function BrowserPane({
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-2">
-        <NavBtn title="Back" onClick={() => browserBack(label).catch(() => {})}>
+        <NavBtn
+          title="Back"
+          disabled={!canGoBack}
+          onClick={() => browserBack(label).catch(() => {})}
+        >
           <ArrowLeft size={14} />
         </NavBtn>
-        <NavBtn title="Forward" onClick={() => browserForward(label).catch(() => {})}>
+        <NavBtn
+          title="Forward"
+          disabled={!canGoForward}
+          onClick={() => browserForward(label).catch(() => {})}
+        >
           <ArrowRight size={14} />
         </NavBtn>
-        <NavBtn title="Reload" onClick={() => browserReload(label).catch(() => {})}>
-          <RotateCw size={13} />
+        <NavBtn
+          title={loading ? "Stop" : "Reload"}
+          onClick={() => browserReload(label).catch(() => {})}
+        >
+          {loading ? <Loader2 size={13} className="animate-spin" /> : <RotateCw size={13} />}
         </NavBtn>
         <form
           onSubmit={(e) => {
@@ -542,6 +742,12 @@ export function BrowserPane({
         </NavBtn>
         <NavBtn title="Screenshot" onClick={onScreenshot}>
           <Camera size={13} />
+        </NavBtn>
+        <NavBtn title="Open DevTools (Web Inspector)" onClick={openDevtools}>
+          <Terminal size={13} />
+        </NavBtn>
+        <NavBtn title="Find in page (⌘F)" onClick={openFind}>
+          <Search size={13} />
         </NavBtn>
         <NavBtn title="Send selection to chat" onClick={sendSelection}>
           <MessageSquarePlus size={14} />
@@ -639,12 +845,22 @@ export function BrowserPane({
           {menuOpen && (
             <div className="absolute right-0 top-full z-50 mt-1 w-52 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
               <MenuItem
-                icon={<RotateCw size={13} />}
-                label="Force reload"
+                icon={<Terminal size={13} />}
+                label="Open DevTools"
+                onClick={openDevtools}
+              />
+              <MenuItem
+                icon={<Search size={13} />}
+                label="Find in page"
                 onClick={() => {
-                  browserReload(label).catch(() => {});
                   setMenuOpen(false);
+                  openFind();
                 }}
+              />
+              <MenuItem
+                icon={<RotateCw size={13} />}
+                label="Force reload (bypass cache)"
+                onClick={forceReload}
               />
               <MenuItem
                 icon={<Smartphone size={13} />}
@@ -695,32 +911,108 @@ export function BrowserPane({
               <div className="my-1 border-t border-[var(--color-border)]" />
               <MenuItem
                 icon={<Trash2 size={13} />}
-                label="Clear cookies"
+                label="Clear cookies + storage"
                 onClick={clearCookies}
               />
               <MenuItem
                 icon={<Trash2 size={13} />}
                 label="Clear cache"
-                onClick={clearCookies}
+                onClick={clearCache}
               />
             </div>
           )}
         </div>
       </div>
 
+      {/* Find-in-page bar — lives in REACT chrome (a row under the toolbar), not
+          over the native webview, so it's always visible regardless of the
+          webview compositing above the React layer. */}
+      {findOpen && (
+        <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-2">
+          <Search size={13} className="text-[var(--color-muted)]" />
+          <input
+            ref={findInputRef}
+            value={findQuery}
+            onChange={(e) => {
+              setFindQuery(e.target.value);
+              setFindMiss(false);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                runFind(!e.shiftKey);
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                closeFind();
+              }
+            }}
+            spellCheck={false}
+            placeholder="find in page"
+            className={
+              "min-w-0 flex-1 rounded-md border bg-[var(--color-bg)] px-2.5 py-1 font-mono text-[12px] text-[var(--color-text)] outline-none " +
+              (findMiss
+                ? "border-[var(--color-danger)]"
+                : "border-[var(--color-border)] focus:border-[var(--color-accent)]/50")
+            }
+          />
+          {findMiss && findQuery.trim() && (
+            <span className="text-[11px] text-[var(--color-danger)]">no match</span>
+          )}
+          <NavBtn title="Previous (⇧⏎)" onClick={() => runFind(false)}>
+            <ChevronUp size={14} />
+          </NavBtn>
+          <NavBtn title="Next (⏎)" onClick={() => runFind(true)}>
+            <ChevronDown size={14} />
+          </NavBtn>
+          <NavBtn title="Close (Esc)" onClick={closeFind}>
+            <X size={14} />
+          </NavBtn>
+        </div>
+      )}
+
       <div ref={slotRef} className="relative min-h-0 flex-1">
+        {/* Thin top progress bar while a navigation is in flight. */}
+        {loading && !loadError && (
+          <div className="pointer-events-none absolute left-0 right-0 top-0 z-[60] h-0.5 overflow-hidden">
+            <div className="h-full w-1/3 animate-[browserprog_1.1s_ease-in-out_infinite] bg-[var(--color-accent)]" />
+          </div>
+        )}
         <PaneDropZone onPath={onDropPath} label="drop to open in this page">
           <div className="absolute inset-0" />
         </PaneDropZone>
-        <div className="pointer-events-none absolute inset-0 grid place-items-center px-6 text-center text-[11px] text-[var(--color-faint)]">
-          {showError ? (
-            <span className="max-w-md text-[var(--color-danger)]">
-              native browser failed to load: {showError}
-            </span>
-          ) : (
-            "loading native browser…"
-          )}
-        </div>
+        {loadError ? (
+          <div className="absolute inset-0 z-[55] grid place-items-center bg-[var(--color-pane)] px-6 text-center">
+            <div className="max-w-sm">
+              <div className="text-[13px] font-medium text-[var(--color-text)]">
+                couldn't connect
+              </div>
+              <div className="mt-1 break-all font-mono text-[11px] text-[var(--color-muted)]">
+                {loadError}
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-[var(--color-faint)]">
+                the server didn't respond. if this is a dev server, check it's
+                running and on the right port.
+              </p>
+              <button
+                type="button"
+                onClick={retryLoad}
+                className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+              >
+                retry
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="pointer-events-none absolute inset-0 grid place-items-center px-6 text-center text-[11px] text-[var(--color-faint)]">
+            {showError ? (
+              <span className="max-w-md text-[var(--color-danger)]">
+                native browser failed to load: {showError}
+              </span>
+            ) : (
+              "loading native browser…"
+            )}
+          </div>
+        )}
         {annotating && (
           <div className="pointer-events-none absolute left-1/2 top-2 z-50 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-panel-2)] px-3 py-1 text-[11px] text-[var(--color-accent)] shadow-lg">
             <Crosshair size={12} />
@@ -765,17 +1057,24 @@ function NavBtn({
   children,
   onClick,
   title,
+  disabled = false,
 }: {
   children: React.ReactNode;
   onClick: () => void;
   title: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       title={title}
-      className="rounded p-1.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+      disabled={disabled}
+      className={
+        disabled
+          ? "rounded p-1.5 text-[var(--color-faint)] opacity-40 cursor-default"
+          : "rounded p-1.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+      }
     >
       {children}
     </button>

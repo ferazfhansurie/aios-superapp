@@ -49,7 +49,7 @@ import {
 } from "lucide-react";
 
 import { recallUrl } from "./lib/browser-mem";
-import { setWindowFullscreen } from "./lib/browser";
+import { browserOpenDevtools, setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FileFinder } from "./components/FileFinder";
@@ -463,6 +463,24 @@ function App() {
     onVideoFullscreen(target.key, !isOn);
     return true;
   }, [panes, activeKey, maximizedKey, onVideoFullscreen]);
+
+  // ⌘F reconciliation (R5 item 4 vs R2a pane-fullscreen). When the FOCUSED pane
+  // is a browser, ⌘F means find-in-page → dispatch a window event the matching
+  // BrowserPane listens for (its webview label = its pane key). Otherwise ⌘F
+  // toggles pane fullscreen. Returns true if it handled ⌘F (so the caller
+  // preventDefaults). The ⌘. exit-fullscreen path is untouched.
+  const handleCmdF = useCallback((): boolean => {
+    const sel = activeKey ?? focusedPane.current;
+    const target =
+      panes.find((p) => p.key === sel) ?? (panes.length === 1 ? panes[0] : null);
+    if (target?.kind.type === "browser") {
+      window.dispatchEvent(
+        new CustomEvent("aios-browser-find", { detail: { label: target.key } }),
+      );
+      return true;
+    }
+    return toggleFullscreenSelected();
+  }, [panes, activeKey, toggleFullscreenSelected]);
   // personalizable sidebar — items + order live in lib/sidebar (localStorage).
   const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
   useEffect(() => subscribeSidebar(setSidebar), []);
@@ -1160,9 +1178,9 @@ function App() {
         e.preventDefault();
         if (panes.length > 0) setOverviewOpen((v) => !v);
       } else if (mod && e.key.toLowerCase() === "f") {
-        // ⌘F — fullscreen the SELECTED pane (true screen-fill, any type). Only
-        // intercept when panes exist; otherwise let ⌘F pass (in-page find etc).
-        if (toggleFullscreenSelected()) e.preventDefault();
+        // ⌘F — context-aware: browser pane focused → find-in-page; else fullscreen
+        // the selected pane. Only preventDefault when we actually handled it.
+        if (handleCmdF()) e.preventDefault();
       } else if (mod && e.key.toLowerCase() === "m") {
         // ⌘M — minimize (hide) the selected pane to the OPEN rail. ⇧ restores all.
         e.preventDefault();
@@ -1203,7 +1221,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addShell, newPaneForContext, fireAppshot, runF5, toggleFullscreenSelected, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
+  }, [addShell, newPaneForContext, fireAppshot, runF5, handleCmdF, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
 
   // NATIVE MENU BRIDGE (R2a FIX 1 — the urgent fix). The `window.keydown` handler
   // above only fires when the REACT webview has focus. When focus is inside a
@@ -1231,11 +1249,22 @@ function App() {
           break;
         }
         case "toggle-fullscreen":
-          // ⌘F — same path firaz hit: maximize a pane to screen-fill, or restore.
-          // toggleFullscreenSelected drops maximizedKey + setWindowFullscreen(false)
-          // on the way out (App.tsx onVideoFullscreen exit branch).
-          toggleFullscreenSelected();
+          // ⌘F via the native menu — context-aware: browser pane focused →
+          // find-in-page; else maximize/restore the pane (the path firaz hit).
+          // This is the webview-independent route (fires even when a child
+          // webview holds focus), so ⌘F find works inside a focused browser pane.
+          handleCmdF();
           break;
+        case "open-devtools": {
+          // DevTools for the focused browser pane (native menu item).
+          const sel = activeKey ?? focusedPane.current;
+          const target =
+            panes.find((p) => p.key === sel) ??
+            panes.find((p) => p.kind.type === "browser") ??
+            null;
+          if (target?.kind.type === "browser") browserOpenDevtools(target.key).catch(() => {});
+          break;
+        }
         case "new":
           newPaneForContext();
           break;
@@ -1284,7 +1313,7 @@ function App() {
       unlisten?.();
     };
   }, [
-    toggleFullscreenSelected,
+    handleCmdF,
     newPaneForContext,
     requestClose,
     toggleHide,
