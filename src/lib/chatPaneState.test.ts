@@ -157,8 +157,11 @@ test("sendContract makes streaming send behavior explicit", () => {
   );
 });
 
-test("stopStrategy hard-stops process-backed gpt engines", () => {
-  assert.equal(stopStrategy("codex"), "kill-and-restart");
+test("stopStrategy: codex interrupts (turn/interrupt), only opencode kill-restarts", () => {
+  // Round-1 parity: codex gained a real turn/interrupt, so it stops like claude
+  // (keep the persistent app-server + thread); only opencode lacks a control
+  // protocol and still needs a kill-and-restart.
+  assert.equal(stopStrategy("codex"), "interrupt");
   assert.equal(stopStrategy("opencode"), "kill-and-restart");
   assert.equal(stopStrategy("claude"), "interrupt");
 });

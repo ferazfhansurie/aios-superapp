@@ -19,6 +19,7 @@ import {
   type CodexRate,
 } from "../lib/dashboard";
 import { usagePaceRisk, type UsagePaceRisk } from "../lib/usagePace";
+import { reportDiag } from "../lib/diag";
 
 const FIVE_HOURS = 5 * 3600;
 const SEVEN_DAYS = 7 * 24 * 3600;
@@ -136,7 +137,7 @@ export function SidebarUsage() {
     const load = () => {
       codexRate()
         .then((v) => alive && setCodex(v))
-        .catch(() => {});
+        .catch((e) => reportDiag("sidebar.load", e, { action: "codexRate" }));
     };
     load();
     const t = setInterval(load, 30_000);

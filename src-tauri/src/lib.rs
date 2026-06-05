@@ -5,6 +5,7 @@ mod bridges;
 mod browser;
 mod chat;
 mod device;
+mod diag;
 mod files;
 mod mac_apps;
 mod memory;
@@ -200,6 +201,17 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(pty::PtyState::new())
         .setup(|app| {
+            // Boot the local-first diagnostics store (Phase 0+1): resolve the
+            // per-bundle app-data dir (portable — a fork gets its own dir, no
+            // dependency on firaz's ~/.aios), seed the anon install id, and
+            // install the Rust panic hook so backend panics persist as
+            // DiagEvents instead of dying silently. Soft-fail: if the dir can't
+            // resolve we just skip diag (never block startup).
+            if let Ok(dir) = app.path().app_data_dir() {
+                let version = app.package_info().version.to_string();
+                diag::init(dir, version);
+            }
+
             // Install the native macOS menu so cockpit accelerators (⌘F/⌘W/⌘1-9/…)
             // fire even when a child webview holds focus (R2a urgent fix).
             if let Err(e) = build_app_menu(app.handle()) {
@@ -210,6 +222,10 @@ pub fn run() {
         .on_menu_event(|app, event| handle_menu_event(app, event.id().0.as_str()))
         .invoke_handler(tauri::generate_handler![
             read_telemetry,
+            diag::diag_report,
+            diag::diag_recent,
+            diag::diag_clear,
+            diag::diag_info,
             startup_open_pane,
             pty::pty_spawn,
             pty::pty_spawn_oracle,

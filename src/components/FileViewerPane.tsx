@@ -11,6 +11,7 @@ import { openFileInPane, openUrlInPane, registerPaneDropSink } from "../lib/pane
 import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import { OfficePreview } from "./OfficePreview";
 import { PaneDropZone } from "./PaneDropZone";
+import { reportDiag } from "../lib/diag";
 
 export function FileViewerPane({ path, paneKey }: { path: string; paneKey?: string }) {
   const [preview, setPreview] = useState<FilePreview | null>(null);
@@ -53,7 +54,7 @@ export function FileViewerPane({ path, paneKey }: { path: string; paneKey?: stri
           {preview?.name ?? path.split("/").pop()}
         </span>
         <button
-          onClick={() => openPath(path).catch(() => {})}
+          onClick={() => openPath(path).catch((e) => reportDiag("fileviewer.open", e, { action: "openPath" }))}
           className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
           title="Open externally"
         >
@@ -92,7 +93,7 @@ export function FileViewerPane({ path, paneKey }: { path: string; paneKey?: stri
             <FileText size={28} />
             <span className="text-[12px]">binary file{preview ? ` · ${(preview.size / 1024).toFixed(0)} KB` : ""}</span>
             <button
-              onClick={() => openPath(path).catch(() => {})}
+              onClick={() => openPath(path).catch((e) => reportDiag("fileviewer.open", e, { action: "openPath" }))}
               className="rounded-md border border-[var(--color-border)] px-3 py-1 text-[11px] hover:border-[var(--color-accent)]/50"
             >
               open externally

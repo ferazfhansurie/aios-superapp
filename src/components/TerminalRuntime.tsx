@@ -39,6 +39,7 @@ function bracketed(text: string): string {
 }
 import { TerminalComposer } from "./TerminalComposer";
 import { PaneDropZone } from "./PaneDropZone";
+import { reportDiag } from "../lib/diag";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
 const THEME = {
@@ -220,7 +221,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       try {
         const b64 = await blobToBase64(blob);
         const path = await saveImageTemp(b64, imageExt(mime));
-        ptyWrite(sid, `${quotePath(path)} `).catch(() => {});
+        ptyWrite(sid, `${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "dropPath" }));
       } catch {
         /* best-effort */
       } finally {
@@ -251,7 +252,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         // R6: bracketed paste so a MULTI-LINE clipboard paste into a shell lands
         // as one editable block instead of auto-executing each line (the
         // paste-injection footgun). No trailing CR — pasting never submits.
-        if (t && sid != null) ptyWrite(sid, bracketed(t)).catch(() => {});
+        if (t && sid != null) ptyWrite(sid, bracketed(t)).catch((e) => reportDiag("terminal.write", e, { action: "pasteBracketed" }));
       } catch {
         /* nothing pasteable */
       }
@@ -266,7 +267,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       // Shift+Enter → soft newline, NOT submit. Claude Code / Ink TUIs treat
       // meta+Enter (ESC then CR) as "insert newline"; plain Enter still submits.
       if (e.key === "Enter" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
-        if (sid != null) ptyWrite(sid, "\x1b\r").catch(() => {});
+        if (sid != null) ptyWrite(sid, "\x1b\r").catch((e) => reportDiag("terminal.write", e, { action: "altEnter" }));
         return false;
       }
       // Cmd+V → paste from the system clipboard into the PTY (Ctrl+V stays
@@ -281,7 +282,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       // reaches the PTY as SIGINT (^C) — matching Alacritty on macOS.
       if (e.key === "c" && e.metaKey && !e.ctrlKey && term.hasSelection()) {
         const sel = term.getSelection();
-        if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+        if (sel) navigator.clipboard.writeText(sel).catch((e) => reportDiag("terminal.clipboard", e, { action: "copySelection" }));
         return false;
       }
       return true;
@@ -290,7 +291,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     // Copy-on-select: as soon as a selection settles, mirror it to the clipboard.
     term.onSelectionChange(() => {
       const sel = term.getSelection();
-      if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+      if (sel) navigator.clipboard.writeText(sel).catch((e) => reportDiag("terminal.clipboard", e, { action: "copySelection" }));
     });
 
     // Middle-click paste (X11/Alacritty muscle memory).
@@ -302,9 +303,9 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         .readText()
         .then((t) => {
           // R6: bracketed paste — same multi-line-safety as Cmd+V.
-          if (t && sid != null) ptyWrite(sid, bracketed(t)).catch(() => {});
+          if (t && sid != null) ptyWrite(sid, bracketed(t)).catch((e) => reportDiag("terminal.write", e, { action: "pasteBracketed" }));
         })
-        .catch(() => {});
+        .catch((e) => reportDiag("terminal.clipboard", e, { action: "readText" }));
     };
     host.addEventListener("auxclick", onAuxClick);
     // WebGL renderer for speed; silently fall back to the default if unavailable.
@@ -447,7 +448,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       }
 
       if (disposed) {
-        if (sessionId != null) ptyKill(sessionId).catch(() => {});
+        if (sessionId != null) ptyKill(sessionId).catch((e) => reportDiag("terminal.kill", e, { action: "kill" }));
         return;
       }
 
@@ -468,7 +469,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
             if (disposed) un();
             else unlistenExit = un;
           })
-          .catch(() => {});
+          .catch((e) => reportDiag("terminal.listen", e, { action: "exit" }));
       }
       // Pane writer for cross-cutting features (voice dictation, file drops).
       // Prefer the compose box when it's open (so dictation lands in the box and
@@ -477,10 +478,10 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         paneWriters.set(paneKey, (t) => {
           const toBox = composerAppendRef.current;
           if (toBox) toBox(t);
-          else ptyWrite(sessionId!, t).catch(() => {});
+          else ptyWrite(sessionId!, t).catch((e) => reportDiag("terminal.write", e, { action: "input" }));
         });
       inputDisposer = term.onData((d) => {
-        if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
+        if (sessionId != null) ptyWrite(sessionId, d).catch((e) => reportDiag("terminal.write", e, { action: "data" }));
       });
       // auto-run an init command (e.g. `aios`) once the shell is ready.
       // Skip for persistent panes — there `cmd` is the tmux session's startup
@@ -489,7 +490,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         const c = kind.cmd;
         const sid = sessionId;
         setTimeout(() => {
-          if (!disposed && sid != null) ptyWrite(sid, `${c}\r`).catch(() => {});
+          if (!disposed && sid != null) ptyWrite(sid, `${c}\r`).catch((e) => reportDiag("terminal.write", e, { action: "command" }));
         }, 300);
       }
     })();
@@ -502,7 +503,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const applyResize = () => {
       try {
         fit.fit();
-        if (sessionId != null) ptyResize(sessionId, term.cols, term.rows).catch(() => {});
+        if (sessionId != null) ptyResize(sessionId, term.cols, term.rows).catch((e) => reportDiag("terminal.resize", e, { action: "resize" }));
       } catch {
         /* ignore */
       }
@@ -522,7 +523,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       if (resizeTimer != null) clearTimeout(resizeTimer);
       unlistenExit?.();
       inputDisposer?.dispose();
-      if (sessionId != null) ptyKill(sessionId).catch(() => {});
+      if (sessionId != null) ptyKill(sessionId).catch((e) => reportDiag("terminal.kill", e, { action: "cleanup" }));
       term.dispose();
     };
     // Re-runs on restartNonce (B3 restart): tears down the dead terminal + respawns
@@ -557,7 +558,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const id = sessionIdRef.current;
     // R6: bracketed-paste the choice text + a real Enter outside the brackets
     // (same atomic submit as composerSend) so it can't race / get split.
-    if (id != null) ptyWrite(id, bracketed(opt) + "\r").catch(() => {});
+    if (id != null) ptyWrite(id, bracketed(opt) + "\r").catch((e) => reportDiag("terminal.write", e, { action: "selectOption" }));
     setButtons(null);
     bufRef.current = "";
   };
@@ -583,7 +584,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     // old code split text + a delayed \r. The `\x1b[201~` terminator closes the
     // paste, so the trailing \r is then processed as a genuine Enter = submit.
     // This preserves the claude-code submit flow without any magic timer.
-    ptyWrite(id, bracketed(text) + "\r").catch(() => {});
+    ptyWrite(id, bracketed(text) + "\r").catch((e) => reportDiag("terminal.write", e, { action: "send" }));
   };
 
   // Expose composerSend as this pane's SUBMITTER so "send to AI" (notes pane)
@@ -601,7 +602,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // Interrupt the running CLI (^C) — visible "stop" affordance.
   const interrupt = () => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, "\x03").catch(() => {});
+    if (id != null) ptyWrite(id, "\x03").catch((e) => reportDiag("terminal.write", e, { action: "interrupt" }));
   };
 
   // Write RAW bytes straight to the PTY (no auto-CR, no quoting). The compose
@@ -610,7 +611,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // (\x1b[Z) — exactly as if the user typed them in the terminal.
   const sendRaw = (bytes: string) => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, bytes).catch(() => {});
+    if (id != null) ptyWrite(id, bytes).catch((e) => reportDiag("terminal.write", e, { action: "bytes" }));
   };
 
   // Fall back to the home dir for the composer's context chip when this pane has
@@ -622,7 +623,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       .then((h) => {
         if (alive) setPaneCwd(h);
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("terminal.load", e, { action: "homeDir" }));
     return () => {
       alive = false;
     };
@@ -639,7 +640,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // message. Lets you drive claude's Esc behaviour from the compose box.
   const sendEscape = () => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, "\x1b").catch(() => {});
+    if (id != null) ptyWrite(id, "\x1b").catch((e) => reportDiag("terminal.write", e, { action: "escape" }));
   };
 
   // Save a dropped image → temp file → insert its quoted path into the PTY.
@@ -650,7 +651,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     try {
       const b64 = await blobToBase64(blob);
       const path = await saveImageTemp(b64, imageExt(mime));
-      ptyWrite(id, `${quotePath(path)} `).catch(() => {});
+      ptyWrite(id, `${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "dropPath" }));
     } catch {
       /* best-effort */
     } finally {
@@ -677,7 +678,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const path =
       e.dataTransfer.getData("application/x-aios-path") || e.dataTransfer.getData("text/plain");
     if (!path) return;
-    ptyWrite(id, `${quotePath(path)} `).catch(() => {});
+    ptyWrite(id, `${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "insertPath" }));
   };
 
   // Insert a dropped path at the prompt (quoted, trailing space). Used by the
@@ -687,7 +688,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const id = sessionIdRef.current;
     const s = raw.trim();
     if (id == null || !s) return;
-    ptyWrite(id, `${quotePath(s)} `).catch(() => {});
+    ptyWrite(id, `${quotePath(s)} `).catch((e) => reportDiag("terminal.write", e, { action: "insertPath" }));
   };
 
   return (

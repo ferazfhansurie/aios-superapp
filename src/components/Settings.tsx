@@ -12,6 +12,7 @@ import {
 } from "react";
 
 import {
+  Activity,
   Bell,
   Blocks,
   Brain,
@@ -87,6 +88,14 @@ import {
   subscribe as subscribeTheme,
   subscribeAccent,
 } from "../lib/theme";
+import {
+  reportDiag,
+  diagRecent,
+  diagClear,
+  diagInfo,
+  type DiagEvent,
+  type DiagInfo,
+} from "../lib/diag";
 
 const BridgesPane = lazy(() => import("./BridgesPane").then((m) => ({ default: m.BridgesPane })));
 const PluginsPane = lazy(() => import("./PluginsPane").then((m) => ({ default: m.PluginsPane })));
@@ -626,6 +635,7 @@ type SectionId =
   | "channels"
   | "plugins"
   | "memory"
+  | "diagnostics"
   | "shortcuts"
   | "about";
 
@@ -639,6 +649,7 @@ const NAV: { id: SectionId; label: string; icon: ComponentType<{ size?: number }
   { id: "channels", label: "channels", icon: Radio },
   { id: "plugins", label: "plugins", icon: Blocks },
   { id: "memory", label: "memory", icon: Brain },
+  { id: "diagnostics", label: "diagnostics", icon: Activity },
   { id: "shortcuts", label: "shortcuts", icon: Keyboard },
   { id: "about", label: "about", icon: Info },
 ];
@@ -661,6 +672,213 @@ const SHORTCUTS: { keys: string[]; action: string }[] = [
   { keys: ["⌘", ","], action: "open settings" },
 ];
 
+/* ── diagnostics section (local-first, zero network) ────────────────── */
+
+/** Color a kind chip — errors hot, usage muted, perf neutral. */
+function kindClass(kind: string): string {
+  if (kind === "error") return "text-[var(--color-danger)]";
+  if (kind === "perf") return "text-[var(--color-accent)]";
+  return "text-[var(--color-muted)]"; // usage
+}
+
+/** Reads the local diag store (Phase 1) and renders recent events newest-first,
+ *  filterable by kind/source, with a clear button + the anon install id / app
+ *  version header. Everything stays on-device — no network, no consent prompt. */
+function DiagnosticsSection() {
+  const [events, setEvents] = useState<DiagEvent[]>([]);
+  const [info, setInfo] = useState<DiagInfo>({
+    install_id: "",
+    app_version: "",
+    os: "",
+  });
+  const [kindFilter, setKindFilter] = useState<"all" | "error" | "usage" | "perf">("all");
+  const [sourceFilter, setSourceFilter] = useState<string>("all");
+  const [loading, setLoading] = useState(true);
+
+  const refresh = () => {
+    setLoading(true);
+    Promise.all([diagRecent(300), diagInfo()])
+      .then(([evs, nfo]) => {
+        setEvents(evs);
+        setInfo(nfo);
+      })
+      .catch((e) => reportDiag("settings.diagnostics", e, { action: "refresh" }))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const clearAll = () => {
+    diagClear()
+      .then(() => {
+        setEvents([]);
+      })
+      .catch((e) => reportDiag("settings.diagnostics", e, { action: "clear" }));
+  };
+
+  // Distinct sources for the filter dropdown.
+  const sources = Array.from(new Set(events.map((e) => e.source))).sort();
+
+  // Error count by source (the local pre-cluster).
+  const errorBySource = new Map<string, number>();
+  for (const e of events) {
+    if (e.kind === "error") {
+      errorBySource.set(e.source, (errorBySource.get(e.source) ?? 0) + 1);
+    }
+  }
+  const topErrors = Array.from(errorBySource.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6);
+
+  const filtered = events.filter(
+    (e) =>
+      (kindFilter === "all" || e.kind === kindFilter) &&
+      (sourceFilter === "all" || e.source === sourceFilter),
+  );
+
+  const errorCount = events.filter((e) => e.kind === "error").length;
+  const usageCount = events.filter((e) => e.kind === "usage").length;
+
+  return (
+    <div className="flex flex-col gap-4 text-[12px]">
+      {/* header: install id + version + os */}
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-3 py-2">
+        <div className="flex flex-col gap-0.5">
+          <span className="text-[11px] uppercase tracking-wide text-[var(--color-muted)]">
+            install id
+          </span>
+          <span className="font-mono text-[11px] text-[var(--color-text-2)]">
+            {info.install_id || "—"}
+          </span>
+        </div>
+        <div className="flex flex-col gap-0.5 text-right">
+          <span className="text-[11px] uppercase tracking-wide text-[var(--color-muted)]">
+            version · os
+          </span>
+          <span className="font-mono text-[11px] text-[var(--color-text-2)]">
+            {info.app_version || "—"} · {info.os || "—"}
+          </span>
+        </div>
+      </div>
+
+      {/* summary counts */}
+      <div className="flex flex-wrap gap-2">
+        <span className="rounded-md bg-[var(--color-panel-2)]/50 px-2 py-1 text-[11px] text-[var(--color-text-2)]">
+          {events.length} events
+        </span>
+        <span className="rounded-md bg-[var(--color-panel-2)]/50 px-2 py-1 text-[11px] text-[var(--color-danger)]">
+          {errorCount} errors
+        </span>
+        <span className="rounded-md bg-[var(--color-panel-2)]/50 px-2 py-1 text-[11px] text-[var(--color-muted)]">
+          {usageCount} usage
+        </span>
+      </div>
+
+      {/* error-by-source pre-cluster */}
+      {topErrors.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <span className="text-[11px] uppercase tracking-wide text-[var(--color-muted)]">
+            errors by source
+          </span>
+          <div className="flex flex-wrap gap-1.5">
+            {topErrors.map(([src, n]) => (
+              <button
+                key={src}
+                onClick={() => {
+                  setKindFilter("error");
+                  setSourceFilter(src);
+                }}
+                className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/40 px-2 py-0.5 font-mono text-[10px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-danger)]"
+                title="filter to this source"
+              >
+                {src} · {n}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* controls */}
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          value={kindFilter}
+          onChange={(e) => setKindFilter(e.target.value as typeof kindFilter)}
+          className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2 py-1 text-[11px] text-[var(--color-text)]"
+        >
+          <option value="all">all kinds</option>
+          <option value="error">errors</option>
+          <option value="usage">usage</option>
+          <option value="perf">perf</option>
+        </select>
+        <select
+          value={sourceFilter}
+          onChange={(e) => setSourceFilter(e.target.value)}
+          className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2 py-1 text-[11px] text-[var(--color-text)]"
+        >
+          <option value="all">all sources</option>
+          {sources.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={refresh}
+          className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 text-[11px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+        >
+          refresh
+        </button>
+        <button
+          onClick={clearAll}
+          className="ml-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 text-[11px] text-[var(--color-danger)] transition-colors hover:border-[var(--color-danger)]"
+        >
+          clear
+        </button>
+      </div>
+
+      {/* event list */}
+      <div className="flex flex-col gap-1.5">
+        {loading ? (
+          <span className="text-[11px] text-[var(--color-muted)]">loading…</span>
+        ) : filtered.length === 0 ? (
+          <span className="text-[11px] text-[var(--color-muted)]">
+            no events yet — nothing has errored (or been used) since the store was
+            created. local-first: nothing leaves this machine.
+          </span>
+        ) : (
+          filtered.map((ev, i) => (
+            <div
+              key={`${ev.ts}-${i}`}
+              className="flex flex-col gap-0.5 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/30 px-2.5 py-1.5"
+            >
+              <div className="flex items-center gap-2">
+                <span className={`font-mono text-[10px] uppercase ${kindClass(ev.kind)}`}>
+                  {ev.kind}
+                </span>
+                <span className="font-mono text-[11px] text-[var(--color-text)]">
+                  {ev.source}
+                  {ev.action ? ` · ${ev.action}` : ""}
+                </span>
+                <span className="ml-auto font-mono text-[10px] text-[var(--color-muted)]">
+                  {ev.ts.replace("T", " ").replace(/\.\d+Z$/, "")}
+                </span>
+              </div>
+              {ev.kind !== "usage" && ev.message && (
+                <pre className="whitespace-pre-wrap break-all text-[10px] text-[var(--color-text-2)]">
+                  {ev.message}
+                </pre>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ── projects CRUD section ──────────────────────────────────────────── */
 
 type ProjRow = ProjectInfo & { hidden: boolean; custom: boolean };
@@ -677,7 +895,7 @@ function ProjectsSection() {
   const [nCmd, setNCmd] = useState("");
 
   useEffect(() => {
-    listProjects().then(setScanned).catch(() => {});
+    listProjects().then(setScanned).catch((e) => reportDiag("settings.load", e, { action: "listProjects" }));
   }, []);
   useEffect(() => subscribeProjects(() => setStore(loadProjectsStore())), []);
 
@@ -1200,6 +1418,8 @@ export function Settings({
               )}
 
               {section === "projects" && <ProjectsSection />}
+
+              {section === "diagnostics" && <DiagnosticsSection />}
 
               {section === "oracles" && (
                 <>

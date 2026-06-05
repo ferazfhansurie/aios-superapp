@@ -40,6 +40,7 @@ import {
   type Bridges,
 } from "../lib/bridges";
 import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
+import { reportDiag } from "../lib/diag";
 
 /** Brand-ish icon per channel id (falls back to a generic plug). lucide only. */
 function channelIcon(id: string, size = 13, className = "") {
@@ -234,7 +235,7 @@ export function BridgesPane() {
                 <span className="text-[11px] text-[var(--color-muted)]">pairing code</span>
                 <span className="font-mono text-[18px] font-semibold tracking-[0.2em] text-[var(--color-accent)]">{pairCode}</span>
                 <button
-                  onClick={() => navigator.clipboard?.writeText(pairCode).catch(() => {})}
+                  onClick={() => navigator.clipboard?.writeText(pairCode).catch((e) => reportDiag("bridges.clipboard", e, { action: "pairCode" }))}
                   className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)]"
                   title="copy"
                 >

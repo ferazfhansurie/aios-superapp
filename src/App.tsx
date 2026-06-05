@@ -58,6 +58,7 @@ import { IdleDashboard } from "./components/IdleDashboard";
 import { MirrorViewer } from "./components/MirrorViewer";
 import { MoneyAgentsSection, type MoneyAgentChatState } from "./components/MoneyAgentsSection";
 import { OracleRoster } from "./components/OracleRoster";
+import { PaneErrorBoundary } from "./components/PaneErrorBoundary";
 import { ResizableGrid } from "./components/ResizableGrid";
 import { VoiceButton } from "./components/VoiceButton";
 import type { PaneKind } from "./components/TerminalPane";
@@ -104,6 +105,7 @@ import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/pane
 import { buildAppCommands } from "./lib/appCommands";
 import type { AgentAction } from "./lib/agentActions";
 import { isTauriRuntime } from "./lib/tauri";
+import { reportDiag, reportUsage } from "./lib/diag";
 import {
   ensureMirrorPairing,
   mirrorPairingFromLocation,
@@ -349,7 +351,7 @@ function startWindowDrag(e: React.MouseEvent<HTMLElement>) {
   if (e.button !== 0) return;
   if ((e.target as HTMLElement | null)?.closest(INTERACTIVE_SELECTOR)) return;
   if (!isTauriRuntime()) return;
-  void getCurrentWindow().startDragging().catch(() => {});
+  void getCurrentWindow().startDragging().catch((e) => reportDiag("app.window", e, { action: "startDragging" }));
 }
 
 function App() {
@@ -437,12 +439,12 @@ function App() {
         return key;
       });
       requestAnimationFrame(() =>
-        requestAnimationFrame(() => setWindowFullscreen(true).catch(() => {})),
+        requestAnimationFrame(() => setWindowFullscreen(true).catch((e) => reportDiag("app.window", e, { action: "enterFullscreen" }))),
       );
     } else {
       // reverse order on exit: drop OS fullscreen first, then restore the prior
       // maximize state once the window is back in-space.
-      setWindowFullscreen(false).catch(() => {});
+      setWindowFullscreen(false).catch((e) => reportDiag("app.window", e, { action: "exitFullscreen" }));
       requestAnimationFrame(() =>
         requestAnimationFrame(() => setMaximizedKey(() => prevMaxRef.current)),
       );
@@ -588,13 +590,13 @@ function App() {
               ? `${detachedNow} chat${detachedNow === 1 ? "" : "s"} will keep generating after the shell hides.`
               : "open status to reattach when it finishes.",
         });
-        await win.hide().catch(() => {});
+        await win.hide().catch((e) => reportDiag("app.window", e, { action: "hide" }));
       })
       .then((stop) => {
         if (disposed) stop();
         else unlisten = stop;
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("app.listen", e, { action: "statusEvent" }));
 
     return () => {
       disposed = true;
@@ -604,13 +606,16 @@ function App() {
 
   const spawn = useCallback((kind: PaneContent, label: string): string => {
     const key = nextKey();
+    // Light usage event (kind:"usage") — seeds the "what I use" prioritization.
+    // Carries only the pane-type enum, never any argument/label content.
+    reportUsage("pane.spawn", kind.type);
     // EXIT FULLSCREEN ON ANY NEW-PANE SPAWN (R2a FIX 3): if a pane currently owns
     // OS fullscreen / maximize, a freshly-spawned pane would be invisible behind
     // it (the maximized pane fills the window + every other pane deactivates). Drop
     // fullscreen first so the new pane actually appears in the grid and firaz SEES
     // it. Functional setState reads the live value without a deps dependency.
     setMaximizedKey((m) => {
-      if (m !== null) setWindowFullscreen(false).catch(() => {});
+      if (m !== null) setWindowFullscreen(false).catch((e) => reportDiag("app.window", e, { action: "exitFullscreen" }));
       return null;
     });
     setPanes((p) => {
@@ -683,7 +688,7 @@ function App() {
         if (disposed) stop();
         else unlisten = stop;
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("app.listen", e, { action: "browserEvent" }));
     return () => {
       disposed = true;
       unlisten?.();
@@ -706,7 +711,7 @@ function App() {
         if (disposed) stop();
         else unlisten = stop;
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("app.listen", e, { action: "openFileEvent" }));
     return () => {
       disposed = true;
       unlisten?.();
@@ -825,7 +830,7 @@ function App() {
           openFile(path, targetLabel(path));
         }
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("app.startup", e, { action: "openPane" }));
   }, [openFile, openUrl]);
 
   // F5 / Run — detect the project around the last-opened file (or $HOME) and
@@ -873,7 +878,7 @@ function App() {
     // pane with a video in fullscreen), drop fullscreen first — otherwise the
     // window stays fullscreen with the owning pane gone ("bugs out on close").
     setMaximizedKey((m) => {
-      if (m === key) setWindowFullscreen(false).catch(() => {});
+      if (m === key) setWindowFullscreen(false).catch((e) => reportDiag("app.window", e, { action: "exitFullscreen" }));
       return m === key ? null : m;
     });
     if (prevMaxRef.current === key) prevMaxRef.current = null;
@@ -922,9 +927,9 @@ function App() {
   useEffect(() => {
     let alive = true;
     const load = () => {
-      listOracles().then((v) => alive && setOracles(v)).catch(() => {});
-      listChatSessions(12).then((v) => alive && setChats(v)).catch(() => {});
-      listChatLive().then((v) => alive && setLiveChats(v)).catch(() => {});
+      listOracles().then((v) => alive && setOracles(v)).catch((e) => reportDiag("app.load", e, { action: "oracles" }));
+      listChatSessions(12).then((v) => alive && setChats(v)).catch((e) => reportDiag("app.load", e, { action: "chatSessions" }));
+      listChatLive().then((v) => alive && setLiveChats(v)).catch((e) => reportDiag("app.load", e, { action: "chatLive" }));
       if (alive) setMoneyAgentSessionVersion(Date.now());
     };
     load();
@@ -949,7 +954,7 @@ function App() {
       });
   }, [flash]);
   useEffect(() => {
-    homeDir().then(setHome).catch(() => {});
+    homeDir().then(setHome).catch((e) => reportDiag("app.load", e, { action: "homeDir" }));
     loadProjects();
   }, [loadProjects]);
 
@@ -1021,7 +1026,7 @@ function App() {
         w(text.endsWith(" ") ? text : `${text} `);
         flash("dictated → pane");
       } else {
-        navigator.clipboard?.writeText(text).catch(() => {});
+        navigator.clipboard?.writeText(text).catch((e) => reportDiag("app.clipboard", e, { action: "dictate" }));
         flash("transcribed → ⌘V to paste");
       }
     },
@@ -1037,7 +1042,7 @@ function App() {
         w(text);
         flash("→ chat");
       } else {
-        navigator.clipboard?.writeText(text).catch(() => {});
+        navigator.clipboard?.writeText(text).catch((e) => reportDiag("app.clipboard", e, { action: "toChat" }));
         spawn({ type: "chat" }, "chat");
         flash("opened chat · annotation copied (⌘V)");
       }
@@ -1206,7 +1211,7 @@ function App() {
         runF5();
       } else if (e.key === "Escape" && maximizedKey) {
         // Esc — exit a maximized/fullscreen pane.
-        setWindowFullscreen(false).catch(() => {});
+        setWindowFullscreen(false).catch((e) => reportDiag("app.window", e, { action: "exitFullscreen" }));
         setMaximizedKey(null);
       }
       if (e.key === "Meta") {
@@ -1244,7 +1249,7 @@ function App() {
           // THE URGENT PATH: unconditionally drop OS fullscreen + clear the
           // maximized pane. Works even when a browser webview has focus because
           // it arrives via the native menu, not a webview keystroke.
-          setWindowFullscreen(false).catch(() => {});
+          setWindowFullscreen(false).catch((e) => reportDiag("app.window", e, { action: "exitFullscreen" }));
           setMaximizedKey(null);
           break;
         }
@@ -1262,7 +1267,7 @@ function App() {
             panes.find((p) => p.key === sel) ??
             panes.find((p) => p.kind.type === "browser") ??
             null;
-          if (target?.kind.type === "browser") browserOpenDevtools(target.key).catch(() => {});
+          if (target?.kind.type === "browser") browserOpenDevtools(target.key).catch((e) => reportDiag("app.browser", e, { action: "openDevtools" }));
           break;
         }
         case "new":
@@ -1307,7 +1312,7 @@ function App() {
         if (disposed) stop();
         else unlisten = stop;
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("app.listen", e, { action: "menuAction" }));
     return () => {
       disposed = true;
       unlisten?.();
@@ -1405,7 +1410,7 @@ function App() {
       flash(`dropped ${paths.length} item${paths.length > 1 ? "s" : ""}`);
     });
     return () => {
-      void un.then((f) => f()).catch(() => {});
+      void un.then((f) => f()).catch((e) => reportDiag("app.listen", e, { action: "unlisten" }));
     };
   }, [flash]);
 
@@ -1908,7 +1913,7 @@ function App() {
         <IconBtn
           title={`Copy desktop mirror link · ${mirrorStatus}`}
           onClick={() => {
-            navigator.clipboard?.writeText(mirrorUrl).catch(() => {});
+            navigator.clipboard?.writeText(mirrorUrl).catch((e) => reportDiag("app.clipboard", e, { action: "mirrorUrl" }));
             flash("mirror link copied");
           }}
           active={mirrorStatus === "connected"}
@@ -3524,8 +3529,8 @@ function PaneCard({
   const fileTarget = paneFileTarget(pane.kind);
   const toggleMon = () => {
     if (!monTarget) return;
-    if (mon) monitorStop(monTarget.session).catch(() => {});
-    else monitorStart(monTarget.socket, monTarget.session).catch(() => {});
+    if (mon) monitorStop(monTarget.session).catch((e) => reportDiag("app.monitor", e, { action: "stop" }));
+    else monitorStart(monTarget.socket, monTarget.session).catch((e) => reportDiag("app.monitor", e, { action: "start" }));
     setMon((v) => !v);
   };
   return (
@@ -3672,8 +3677,17 @@ function PaneCard({
         </div>
       </div>
       <div className="min-h-0 flex-1">
-        <Suspense fallback={<PaneLoading />}>
-          {isTerminal(pane.kind) ? (
+        <PaneErrorBoundary
+          label={pane.label || pane.kind.type}
+          onError={(err, info) =>
+            reportDiag(`react.${pane.kind.type}`, err, {
+              action: "render",
+              info: info.componentStack ?? "",
+            })
+          }
+        >
+          <Suspense fallback={<PaneLoading />}>
+            {isTerminal(pane.kind) ? (
             <TerminalPane kind={pane.kind} paneKey={pane.key} />
           ) : pane.kind.type === "files" ? (
             <FilesPane initialRoot={pane.kind.root} onOpenFile={onOpenFile} />
@@ -3739,7 +3753,8 @@ function PaneCard({
               onOpenUrl={onOpenUrl}
             />
           )}
-        </Suspense>
+          </Suspense>
+        </PaneErrorBoundary>
       </div>
       {dropTarget && isTerminal(pane.kind) && (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center border-2 border-dashed border-[var(--color-accent)]/70 bg-[var(--color-accent)]/10">

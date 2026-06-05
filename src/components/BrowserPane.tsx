@@ -66,6 +66,7 @@ import { rememberUrl } from "../lib/browser-mem";
 import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
 import { onAiosDrag, openViewerFileInPane, registerPaneDropSink } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
+import { reportDiag } from "../lib/diag";
 
 // Extensions the WKWebView can render in-page as a navigation target. Everything
 // else (a .docx, .xlsx, …) goes to the in-app viewer pane instead.
@@ -211,7 +212,7 @@ export function BrowserPane({
     if (!active || dragArmed || loadError) {
       // loadError → shrink the webview so the React "couldn't connect" card
       // underneath is visible (the native view otherwise paints over it).
-      if (shownRef.current) browserHide(label).catch(() => {});
+      if (shownRef.current) browserHide(label).catch((e) => reportDiag("browser.hide", e, { action: "hide" }));
       return;
     }
     let raf = 0;
@@ -227,7 +228,7 @@ export function BrowserPane({
             setShowError(typeof e === "string" ? e : String(e));
           });
       } else {
-        browserSetBounds(label, r).catch(() => {});
+        browserSetBounds(label, r).catch((e) => reportDiag("browser.bounds", e, { action: "setBounds" }));
       }
     };
     raf = requestAnimationFrame(() => requestAnimationFrame(sync));
@@ -260,7 +261,7 @@ export function BrowserPane({
             setInput(u);
           }
         })
-        .catch(() => {});
+        .catch((e) => reportDiag("browser.url", e, { action: "currentUrl" }));
     };
     const poll = setInterval(tick, 1500);
     return () => clearInterval(poll);
@@ -281,7 +282,7 @@ export function BrowserPane({
           fsOnRef.current = on;
           onVideoFullscreenRef.current?.(on);
         })
-        .catch(() => {});
+        .catch((e) => reportDiag("browser.fullscreen", e, { action: "statePoll" }));
     };
     const poll = setInterval(tick, 350);
     return () => clearInterval(poll);
@@ -329,7 +330,7 @@ export function BrowserPane({
         if (disposed) stop();
         else unlisten = stop;
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("browser.listen", e, { action: "navState" }));
     return () => {
       disposed = true;
       unlisten?.();
@@ -351,7 +352,7 @@ export function BrowserPane({
           setCanGoBack(back);
           setCanGoForward(fwd);
         })
-        .catch(() => {});
+        .catch((e) => reportDiag("browser.nav", e, { action: "navState" }));
     };
     tick();
     const poll = setInterval(tick, 700);
@@ -366,7 +367,7 @@ export function BrowserPane({
       setProfileMenuOpen(false);
       setAddingProfile(false);
       if (next === profile) return;
-      browserClose(label).catch(() => {});
+      browserClose(label).catch((e) => reportDiag("browser.close", e, { action: "close" }));
       shownRef.current = false;
       setProfile(next);
       onProfileChange?.(next);
@@ -405,8 +406,8 @@ export function BrowserPane({
       // Fire-and-forget but ordered: hide before close so nothing repaints a
       // half-torn-down webview during the async close.
       shownRef.current = false;
-      browserHide(label).catch(() => {});
-      browserClose(label).catch(() => {});
+      browserHide(label).catch((e) => reportDiag("browser.hide", e, { action: "cleanup" }));
+      browserClose(label).catch((e) => reportDiag("browser.close", e, { action: "cleanup" }));
     };
   }, [label]);
 
@@ -415,7 +416,7 @@ export function BrowserPane({
     if (!url) return;
     setCurrent(url);
     setInput(url);
-    if (shownRef.current) browserNavigate(label, url).catch(() => {});
+    if (shownRef.current) browserNavigate(label, url).catch((e) => reportDiag("browser.nav", e, { action: "navigate" }));
   }, [input, label]);
 
   // Drop sink: a file dropped into a browser pane = "show me this in the page".
@@ -429,7 +430,7 @@ export function BrowserPane({
       if (/^https?:\/\//i.test(s)) {
         setCurrent(s);
         setInput(s);
-        browserNavigate(label, s).catch(() => {});
+        browserNavigate(label, s).catch((e) => reportDiag("browser.nav", e, { action: "navigate" }));
         return true;
       }
       // a filesystem path
@@ -437,7 +438,7 @@ export function BrowserPane({
         const url = `file://${encodeURI(s)}`;
         setCurrent(url);
         setInput(url);
-        browserNavigate(label, url).catch(() => {});
+        browserNavigate(label, url).catch((e) => reportDiag("browser.nav", e, { action: "navigate" }));
       } else {
         const name = s.split("/").pop() ?? s;
         openViewerFileInPane(s, name);
@@ -516,7 +517,7 @@ export function BrowserPane({
     (pct: number) => {
       const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, pct));
       setZoom(clamped);
-      browserZoom(label, clamped / 100).catch(() => {});
+      browserZoom(label, clamped / 100).catch((e) => reportDiag("browser.zoom", e, { action: "zoom" }));
     },
     [label],
   );
@@ -524,28 +525,28 @@ export function BrowserPane({
   const toggleDeviceMode = useCallback(() => {
     const next = !deviceMode;
     setDeviceMode(next);
-    browserDeviceMode(label, next).catch(() => {});
+    browserDeviceMode(label, next).catch((e) => reportDiag("browser.device", e, { action: "deviceMode" }));
   }, [deviceMode, label]);
 
   const clearCookies = useCallback(() => {
-    browserClearCookies(label).catch(() => {});
+    browserClearCookies(label).catch((e) => reportDiag("browser.cookies", e, { action: "clearCookies" }));
     setMenuOpen(false);
     showToast("cleared cookies + storage", "success", "browser profile data was cleared for this pane.");
   }, [label, showToast]);
 
   const clearCache = useCallback(() => {
-    browserClearCache(label).catch(() => {});
+    browserClearCache(label).catch((e) => reportDiag("browser.cache", e, { action: "clearCache" }));
     setMenuOpen(false);
     showToast("cleared cache", "success", "disk + memory cache cleared for this pane.");
   }, [label, showToast]);
 
   const forceReload = useCallback(() => {
-    browserForceReload(label).catch(() => {});
+    browserForceReload(label).catch((e) => reportDiag("browser.reload", e, { action: "forceReload" }));
     setMenuOpen(false);
   }, [label]);
 
   const openDevtools = useCallback(() => {
-    browserOpenDevtools(label).catch(() => {});
+    browserOpenDevtools(label).catch((e) => reportDiag("browser.devtools", e, { action: "openDevtools" }));
     setMenuOpen(false);
   }, [label]);
 
@@ -553,7 +554,7 @@ export function BrowserPane({
   const retryLoad = useCallback(() => {
     setLoadError(null);
     const u = current || normalizeUrl(input);
-    if (u && shownRef.current) browserNavigate(label, u).catch(() => {});
+    if (u && shownRef.current) browserNavigate(label, u).catch((e) => reportDiag("browser.nav", e, { action: "navigate" }));
   }, [current, input, label]);
 
   // Run a native find for the current query in the given direction.
@@ -632,7 +633,7 @@ export function BrowserPane({
 
   const exitAnnotate = useCallback(() => {
     setAnnotating(false);
-    browserExitAnnotate(label).catch(() => {});
+    browserExitAnnotate(label).catch((e) => reportDiag("browser.annotate", e, { action: "exit" }));
   }, [label]);
 
   const toggleAnnotate = useCallback(() => {
@@ -646,7 +647,7 @@ export function BrowserPane({
       .then((raw) => {
         lastAnnotRef.current = raw && raw.startsWith(ANNOT_SENTINEL) ? raw : null;
       })
-      .catch(() => {})
+      .catch((e) => reportDiag("browser.clipboard", e, { action: "readClipboard" }))
       .finally(() => {
         setAnnotating(true);
         browserEnterAnnotate(label)
@@ -690,7 +691,7 @@ export function BrowserPane({
   }, [active, annotating, exitAnnotate]);
   useEffect(() => {
     return () => {
-      browserExitAnnotate(label).catch(() => {});
+      browserExitAnnotate(label).catch((e) => reportDiag("browser.annotate", e, { action: "exit" }));
     };
   }, [label]);
 
@@ -700,20 +701,20 @@ export function BrowserPane({
         <NavBtn
           title="Back"
           disabled={!canGoBack}
-          onClick={() => browserBack(label).catch(() => {})}
+          onClick={() => browserBack(label).catch((e) => reportDiag("browser.nav", e, { action: "back" }))}
         >
           <ArrowLeft size={14} />
         </NavBtn>
         <NavBtn
           title="Forward"
           disabled={!canGoForward}
-          onClick={() => browserForward(label).catch(() => {})}
+          onClick={() => browserForward(label).catch((e) => reportDiag("browser.nav", e, { action: "forward" }))}
         >
           <ArrowRight size={14} />
         </NavBtn>
         <NavBtn
           title={loading ? "Stop" : "Reload"}
-          onClick={() => browserReload(label).catch(() => {})}
+          onClick={() => browserReload(label).catch((e) => reportDiag("browser.reload", e, { action: "reload" }))}
         >
           {loading ? <Loader2 size={13} className="animate-spin" /> : <RotateCw size={13} />}
         </NavBtn>
@@ -737,7 +738,7 @@ export function BrowserPane({
         <NavBtn title="Pin this site to the sidebar" onClick={pinSite}>
           <Pin size={13} />
         </NavBtn>
-        <NavBtn title="Open in system browser" onClick={() => openUrl(current).catch(() => {})}>
+        <NavBtn title="Open in system browser" onClick={() => openUrl(current).catch((e) => reportDiag("browser.open", e, { action: "systemBrowser" }))}>
           <ExternalLink size={13} />
         </NavBtn>
         <NavBtn title="Screenshot" onClick={onScreenshot}>

@@ -11,6 +11,14 @@ import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "re
 const MAX_RESULTS = 50;
 
 import { Brain, CornerDownLeft, MessageSquare, Search } from "lucide-react";
+import { reportUsage } from "../lib/diag";
+
+/** Run a palette command + emit a light usage event (kind:"usage") keyed by the
+ *  command id — seeds the "what I use" prioritization. No argument values. */
+function runCommand(c: Command) {
+  reportUsage("command-palette", c.id);
+  c.run();
+}
 
 export interface Command {
   id: string;
@@ -226,7 +234,7 @@ export function CommandPalette({
     const c = results[sel];
     if (!c) return;
     onClose();
-    c.run();
+    runCommand(c);
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -320,7 +328,7 @@ export function CommandPalette({
                       onMouseMove={() => setSel(pos)}
                       onClick={() => {
                         onClose();
-                        c.run();
+                        runCommand(c);
                       }}
                       className={`relative flex w-full items-center gap-3 rounded-[var(--aios-radius-md)] px-2.5 py-2 text-left transition-colors ${
                         active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel-2)]/50"

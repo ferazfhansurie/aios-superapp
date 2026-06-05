@@ -79,6 +79,7 @@ import {
 } from "../lib/idleDashboardLayout";
 import type { AiosNotification } from "../lib/notifications";
 import { IdleControlCenter } from "./IdleControlCenter";
+import { reportDiag } from "../lib/diag";
 
 interface IdleDashboardProps {
   apps: AppDef[];
@@ -149,11 +150,11 @@ export function IdleDashboard({
   useEffect(() => {
     let alive = true;
     const load = () => {
-      usageExtras().then((v) => alive && setExtras(v)).catch(() => {});
-      idleRate().then((v) => alive && setRate(v)).catch(() => {});
-      memoryFocus().then((v) => alive && setFocus(v)).catch(() => {});
-      deviceStats().then((v) => alive && setDevice(v)).catch(() => {});
-      loadMoneyAgentSummaries().then((v) => alive && setMoneyAgents(v)).catch(() => {});
+      usageExtras().then((v) => alive && setExtras(v)).catch((e) => reportDiag("dashboard.load", e, { action: "usageExtras" }));
+      idleRate().then((v) => alive && setRate(v)).catch((e) => reportDiag("dashboard.load", e, { action: "idleRate" }));
+      memoryFocus().then((v) => alive && setFocus(v)).catch((e) => reportDiag("dashboard.load", e, { action: "memoryFocus" }));
+      deviceStats().then((v) => alive && setDevice(v)).catch((e) => reportDiag("dashboard.load", e, { action: "deviceStats" }));
+      loadMoneyAgentSummaries().then((v) => alive && setMoneyAgents(v)).catch((e) => reportDiag("dashboard.load", e, { action: "moneyAgents" }));
     };
     load();
     const t = setInterval(load, 30_000);
@@ -171,7 +172,7 @@ export function IdleDashboard({
       setPulse([]);
       return;
     }
-    const load = () => gitPulse(roots).then((v) => alive && setPulse(v)).catch(() => {});
+    const load = () => gitPulse(roots).then((v) => alive && setPulse(v)).catch((e) => reportDiag("dashboard.load", e, { action: "gitPulse" }));
     load();
     const t = setInterval(load, 30_000);
     return () => {

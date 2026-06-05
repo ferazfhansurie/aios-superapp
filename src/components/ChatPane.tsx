@@ -151,6 +151,7 @@ import {
 } from "../lib/chatScroll";
 import { invoke, isTauriRuntime } from "../lib/tauri";
 import { PaneDropZone } from "./PaneDropZone";
+import { reportDiag } from "../lib/diag";
 
 // ── transcript model ──────────────────────────────────────────────────────
 
@@ -1394,7 +1395,7 @@ export function ChatPane({
             const title = resume?.title ?? "chat";
             // re-keying on a resume fork is bookkeeping, not real activity →
             // don't bump mtime (preserve the session's genuine recency order).
-            recordChatSession(ev.session_id, title, cwd ?? null, m.engine ?? "claude", m.id, false).catch(() => {});
+            recordChatSession(ev.session_id, title, cwd ?? null, m.engine ?? "claude", m.id, false).catch((e) => reportDiag("chat.session", e, { action: "record" }));
           }
           claudeSessionIdRef.current = ev.session_id;
           setOpenSessionId(ev.session_id);
@@ -1487,7 +1488,7 @@ export function ChatPane({
       .then(({ id, busy, engine: liveEngine, model: liveModel }) => {
         if (disposed) {
           // only kill a freshly-spawned session we're abandoning; never a reattach.
-          if (reattach == null) chatStop(id).catch(() => {});
+          if (reattach == null) chatStop(id).catch((e) => reportDiag("chat.stop", e, { action: "stop" }));
           return;
         }
         // Reattach: mark this session bound (so the model re-sync below can't
@@ -1542,7 +1543,7 @@ export function ChatPane({
       sessionIdRef.current = null;
       // Skip the kill when the pane was intentionally detached (kept running in
       // the background) — chat_detach already cleared the sink.
-      if (id != null && !detachedRef.current) chatStop(id).catch(() => {});
+      if (id != null && !detachedRef.current) chatStop(id).catch((e) => reportDiag("chat.stop", e, { action: "cleanup" }));
     };
     // model/permission/effort/resumeId are captured at start; changing them restarts the session
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1558,7 +1559,7 @@ export function ChatPane({
         const id = sessionIdRef.current;
         if (id != null) {
           detachedRef.current = true;
-          chatDetach(id, notify).catch(() => {});
+          chatDetach(id, notify).catch((e) => reportDiag("chat.detach", e, { action: "detach" }));
         }
       },
     });
@@ -1582,7 +1583,7 @@ export function ChatPane({
           rememberUsage(provider, next);
         }
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("chat.load", e, { action: "usage" }));
     return () => {
       alive = false;
     };
@@ -1946,7 +1947,7 @@ export function ChatPane({
           removeQueued(queuedId);
           setTurns((prev) => [...prev, { kind: "user", id: uid(), text: item.text, steered: true }]);
         })
-        .catch(() => {}); // no active turn yet → keep queued for automatic send
+        .catch((e) => reportDiag("chat.steer", e, { action: "queued" })); // no active turn yet → keep queued for automatic send
     },
     [model.engine, removeQueued],
   );
@@ -2023,7 +2024,7 @@ export function ChatPane({
         }
         // Label the backend session for the background tray + done-notification.
         if (sessionIdRef.current != null)
-          chatSetTitle(sessionIdRef.current, stableTitle).catch(() => {});
+          chatSetTitle(sessionIdRef.current, stableTitle).catch((e) => reportDiag("chat.title", e, { action: "setTitle" }));
       }
       setInput("");
       setImages((prev) => {
@@ -2081,7 +2082,7 @@ export function ChatPane({
     // which can be true for a beat while sessionIdRef is being (re)assigned.
     if (sessionIdRef.current == null) return;
     seedSentRef.current = true;
-    void sendTextRef.current(seed).catch(() => {});
+    void sendTextRef.current(seed).catch((e) => reportDiag("chat.send", e, { action: "seed" }));
     // started flips true in the same startup .then() that assigns sessionIdRef,
     // so by the time this re-runs the id is live.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2147,14 +2148,14 @@ export function ChatPane({
         if (mode === "kill-and-restart") {
           sessionIdRef.current = null;
           chatStop(id)
-            .catch(() => {})
+            .catch((e) => reportDiag("chat.stop", e, { action: "killRestart" }))
             .finally(() => {
               setRunEventState(emptyRunEventState());
               setRunEventsKey(null);
               setRestartKey((k) => k + 1);
             });
         } else {
-          chatInterrupt(id).catch(() => {});
+          chatInterrupt(id).catch((e) => reportDiag("chat.interrupt", e, { action: "interrupt" }));
         }
       }
     },

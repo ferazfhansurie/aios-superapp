@@ -7,6 +7,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { FileText } from "lucide-react";
 
 import { convertOfficeToPdf, fileSrc } from "../lib/fs";
+import { reportDiag } from "../lib/diag";
 
 export function OfficePreview({ path, name }: { path: string; name?: string }) {
   const [pdf, setPdf] = useState<string | null>(null);
@@ -30,7 +31,7 @@ export function OfficePreview({ path, name }: { path: string; name?: string }) {
         <FileText size={28} />
         <span className="text-[12px]">couldn't render · {error}</span>
         <button
-          onClick={() => openPath(path).catch(() => {})}
+          onClick={() => openPath(path).catch((e) => reportDiag("office.open", e, { action: "openPath" }))}
           className="rounded-md border border-[var(--color-border)] px-3 py-1 text-[11px] hover:border-[var(--color-accent)]/50"
         >
           open externally

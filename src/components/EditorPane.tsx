@@ -11,6 +11,7 @@ import { fileMtime, readTextFile, SaveConflictError, writeTextFile } from "../li
 import { languageForPath } from "../lib/editorLanguage";
 import { openFileInPane, registerPaneDropSink } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
+import { reportDiag } from "../lib/diag";
 
 // ── ref-counted URI models (STRETCH) ────────────────────────────────────────
 // Anonymous `value`-based models can't see each other, so a single-file TS
@@ -256,7 +257,7 @@ export function EditorPane({
         {dirty && !conflict && <span className="font-mono text-[10px] text-[var(--color-faint)]">⌘S to save</span>}
         <span className="flex-1" />
         <button
-          onClick={() => openPath(path).catch(() => {})}
+          onClick={() => openPath(path).catch((e) => reportDiag("editor.open", e, { action: "openPath" }))}
           className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
           title="open externally"
         >
@@ -302,7 +303,7 @@ export function EditorPane({
             <div className="flex flex-col items-center gap-2">
               <span className="font-mono text-[12px] text-[var(--color-danger)]">{error}</span>
               <button
-                onClick={() => openPath(path).catch(() => {})}
+                onClick={() => openPath(path).catch((e) => reportDiag("editor.open", e, { action: "openPath" }))}
                 className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-[12px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
               >
                 open externally instead

@@ -9,6 +9,7 @@ import {
   titleOf,
   type Note,
 } from "../lib/notes";
+import { reportDiag } from "../lib/diag";
 
 /** Relative "edited" stamp — apple-notes-ish (Today / Yesterday / date). */
 function relTime(unixSec: number): string {
@@ -91,7 +92,7 @@ export function NotesPane({ onSend }: { onSend?: (text: string) => void }) {
       clearInterval(t);
       // best-effort final save on unmount.
       if (dirtyRef.current && selectedRef.current) {
-        saveNote(selectedRef.current, draftRef.current).catch(() => {});
+        saveNote(selectedRef.current, draftRef.current).catch((e) => reportDiag("notes.save", e, { action: "unmountSave" }));
       }
     };
   }, [reload]);
@@ -123,7 +124,7 @@ export function NotesPane({ onSend }: { onSend?: (text: string) => void }) {
         dirtyRef.current = false;
         setStatus("saved");
         // refresh list title/preview/order without yanking the editor.
-        listNotes().then(setNotes).catch(() => {});
+        listNotes().then(setNotes).catch((e) => reportDiag("notes.load", e, { action: "list" }));
       } catch {
         setStatus("idle");
       }

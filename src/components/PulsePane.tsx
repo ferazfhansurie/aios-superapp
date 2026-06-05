@@ -12,6 +12,7 @@ import { Flame, Zap } from "lucide-react";
 import { usageExtras, type UsageExtras } from "../lib/stats";
 import { idleRate, memoryFocus, type IdleRate, type MemoryFocus } from "../lib/dashboard";
 import { Ring, heatColor, fmtNum, shortModel, shortDate } from "./IdleDashboard";
+import { reportDiag } from "../lib/diag";
 
 export function PulsePane() {
   const [extras, setExtras] = useState<UsageExtras | null>(null);
@@ -21,9 +22,9 @@ export function PulsePane() {
   useEffect(() => {
     let alive = true;
     const load = () => {
-      usageExtras().then((v) => alive && setExtras(v)).catch(() => {});
-      idleRate().then((v) => alive && setRate(v)).catch(() => {});
-      memoryFocus().then((v) => alive && setFocus(v)).catch(() => {});
+      usageExtras().then((v) => alive && setExtras(v)).catch((e) => reportDiag("pulse.load", e, { action: "usageExtras" }));
+      idleRate().then((v) => alive && setRate(v)).catch((e) => reportDiag("pulse.load", e, { action: "idleRate" }));
+      memoryFocus().then((v) => alive && setFocus(v)).catch((e) => reportDiag("pulse.load", e, { action: "memoryFocus" }));
     };
     load();
     const t = setInterval(load, 30_000);
