@@ -118,7 +118,10 @@ test("pet pane uses a seeded code-drawn 8-bit game pet", () => {
 });
 
 test("sidebar usage renders a real claude meter (not the spark proxy)", () => {
-  const source = read("src/components/SidebarUsage.tsx");
+  // The usage rendering moved to the shared UsageGlance (components/dashboard);
+  // SidebarUsage is now a thin alias of it. Both surfaces draw from one source.
+  const source = read("src/components/dashboard/UsageGlance.tsx");
+  const sidebar = read("src/components/SidebarUsage.tsx");
 
   // firaz 2026-06-06: replaced the gpt-5.3-codex-spark block with a real claude
   // meter sourced from ~/.aios/state/usage.json (claude_usage → claudeRate).
@@ -126,6 +129,7 @@ test("sidebar usage renders a real claude meter (not the spark proxy)", () => {
   assert.match(source, /claudeRate\(\)/);
   assert.equal(source.includes("gpt-5.3-codex-spark"), false);
   assert.equal(source.includes("idleRate()"), false);
+  assert.match(sidebar, /UsageGlance as SidebarUsage/);
 });
 
 test("browser video fullscreen avoids macos native space transition", () => {
@@ -286,7 +290,6 @@ test("money agents open as chatpane-backed agents", () => {
   assert.match(pane, /control update for all agents/);
   assert.match(pane, /state and evidence/);
   assert.match(idle, /onOpenMoneyAgentChat/);
-  assert.match(idle, /onOpenAgent\(agent\.id, agent\.label\)/);
   assert.match(agents, /buildMoneyAgentChatSeed/);
   assert.match(agents, /buildMoneyAgentRunCommand/);
   assert.match(agents, /shell control plane/);
@@ -296,41 +299,40 @@ test("money agents open as chatpane-backed agents", () => {
   assert.match(agents, /createMoneyAgent/);
 });
 
-test("idle dashboard is a jarvis control center, not launcher widgets", () => {
+test("idle dashboard is a minimal home: clock + command line + usage glance, not lanes", () => {
   const app = read("src/App.tsx");
   const idle = read("src/components/IdleDashboard.tsx");
   const controlCenter = read("src/components/IdleControlCenter.tsx");
-  const pulseBand = read("src/components/dashboard/PulseIdentityBand.tsx");
-  const agentLane = read("src/components/dashboard/AgentOperationsLane.tsx");
-  const notificationLane = read("src/components/dashboard/NotificationCommandLane.tsx");
-  const briefingLane = read("src/components/dashboard/JarvisBriefingLane.tsx");
-  const charts = read("src/components/dashboard/ControlCenterCharts.tsx");
+  const usageGlance = read("src/components/dashboard/UsageGlance.tsx");
+  const sidebarUsage = read("src/components/SidebarUsage.tsx");
 
+  // IdleDashboard is a thin loader that hands data to IdleControlCenter.
   assert.match(idle, /<IdleControlCenter/);
   assert.match(idle, /notifications=\{notifications\}/);
-  assert.match(controlCenter, /PulseIdentityBand/);
-  assert.match(controlCenter, /AgentOperationsLane/);
-  assert.match(controlCenter, /NotificationCommandLane/);
-  assert.match(controlCenter, /JarvisBriefingLane/);
-  assert.match(controlCenter, /talk to jarvis/);
-  assert.match(pulseBand, /day streak/);
-  assert.match(pulseBand, /sessions/);
-  assert.match(pulseBand, /messages/);
-  assert.match(pulseBand, /tokens/);
-  assert.match(pulseBand, /top model/);
-  assert.match(pulseBand, /active since/);
-  assert.match(pulseBand, /70-day activity/);
-  assert.match(pulseBand, /focus/);
-  assert.match(agentLane, /inspect/);
-  assert.match(agentLane, /run pulse/);
-  assert.match(agentLane, /agentRunLabel/);
-  assert.match(notificationLane, /talk to jarvis/);
-  assert.match(notificationLane, /open context/);
-  assert.match(briefingLane, /buildJarvisBriefing/);
-  assert.match(charts, /ActivityHeatmap/);
-  assert.match(charts, /TrendBars/);
-  assert.match(charts, /AgentRunTimeline/);
-  assert.match(charts, /ApprovalAgingBars/);
+
+  // The home is the Option-B layout: hero clock, the seed-a-chat command line,
+  // claude+codex usage via the shared ProviderBlock, recent/quick launch row.
+  assert.match(controlCenter, /HeroClock/);
+  assert.match(controlCenter, /CommandLine/);
+  assert.match(controlCenter, /ProviderBlock/);
+  assert.match(controlCenter, /useUsageRates/);
+  assert.match(controlCenter, /recent/);
+  assert.match(controlCenter, /QuickActions/);
+  assert.match(controlCenter, /PetDashboardCompanion/);
+
+  // The overloaded control-center lanes are gone (deleted, not just hidden).
+  assert.doesNotMatch(controlCenter, /JarvisBriefingLane/);
+  assert.doesNotMatch(controlCenter, /NotificationCommandLane/);
+  assert.doesNotMatch(controlCenter, /AgentOperationsLane/);
+  assert.doesNotMatch(controlCenter, /ControlCenterCharts/);
+  assert.doesNotMatch(controlCenter, /PulseIdentityBand/);
+
+  // usage rendering is shared: SidebarUsage aliases the dashboard UsageGlance,
+  // so the sidebar + home draw the bars from one source.
+  assert.match(usageGlance, /export function ProviderBlock/);
+  assert.match(usageGlance, /export function useUsageRates/);
+  assert.match(sidebarUsage, /UsageGlance as SidebarUsage/);
+
   assert.match(app, /notifications=\{notifications\}/);
 });
 
@@ -379,14 +381,15 @@ test("command palette promotes chatpane intelligence for freeform search", () =>
 
 test("codex usage surfaces pace-risk warnings", () => {
   const chatPane = read("src/components/ChatPane.tsx");
-  const sidebarUsage = read("src/components/SidebarUsage.tsx");
+  // pace-risk rendering lives in the shared UsageGlance (sidebar + idle home).
+  const usageGlance = read("src/components/dashboard/UsageGlance.tsx");
   const usagePace = read("src/lib/usagePace.ts");
 
   assert.match(chatPane, /usagePaceRisk/);
   assert.match(chatPane, /contextLedger/);
   assert.match(chatPane, /est tok/);
-  assert.match(sidebarUsage, /PaceWarning/);
-  assert.match(sidebarUsage, /usagePaceRisk/);
+  assert.match(usageGlance, /PaceWarning/);
+  assert.match(usageGlance, /usagePaceRisk/);
   assert.match(usagePace, /fast pace/);
   assert.match(usagePace, /slow down/);
 });
