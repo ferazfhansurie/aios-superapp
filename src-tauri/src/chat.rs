@@ -97,6 +97,9 @@ impl Engine {
 /// The reader thread forwards through the swappable `sink` and always appends to
 /// `buffer`, so the session keeps running (and buffering) after a pane closes.
 struct ChatSession {
+    /// This session's own numeric id (the key in the sessions map), copied in so
+    /// `ingest_line` can name the session when emitting the `aios-notify` event.
+    id: u32,
     /// Which CLI backend this session drives.
     engine: Engine,
     /// claude → the persistent process; codex/opencode → the in-flight turn's
@@ -653,6 +656,7 @@ pub fn chat_start(
     // Build the session up-front so the reader thread can forward through its
     // swappable sink + buffer (rather than a fixed channel that dies on close).
     let session = Arc::new(ChatSession {
+        id,
         engine: Engine::Claude,
         child: Mutex::new(Some(child)),
         stdin: Mutex::new(Some(stdin)),
@@ -775,6 +779,7 @@ fn start_per_turn(
 ) -> Result<u32, String> {
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let session = Arc::new(ChatSession {
+        id,
         engine,
         child: Mutex::new(None),
         stdin: Mutex::new(None),
@@ -1178,6 +1183,7 @@ fn start_codex_appserver(
 
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let session = Arc::new(ChatSession {
+        id,
         engine: Engine::Codex,
         child: Mutex::new(Some(child)),
         stdin: Mutex::new(Some(stdin)),
@@ -1930,7 +1936,7 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
             } else {
                 title
             };
-            notify_done(app, &label);
+            notify_done(app, sess.id, &label);
         }
         // Live usage tick: right after each claude turn, re-read the statusline's
         // usage.json and push a synthetic `usage` event so the composer's usage
@@ -2053,8 +2059,19 @@ fn extract_json_str(line: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Fires a native OS notification that a backgrounded chat finished.
-fn notify_done(app: &AppHandle, title: &str) {
+/// Payload for the in-app `aios-notify` event. The front-end turns this into a
+/// clickable `AiosNotification` whose target reattaches the chat by session id.
+#[derive(serde::Serialize, Clone)]
+struct AiosNotifyPayload {
+    kind: String,
+    session_id: u32,
+    title: String,
+}
+
+/// Fires a native OS notification AND an in-app `aios-notify` event that a
+/// backgrounded chat finished. The in-app event is what makes the bell + toast
+/// fire and carries the session id so the click can reattach the exact chat.
+fn notify_done(app: &AppHandle, session_id: u32, title: &str) {
     use tauri_plugin_notification::NotificationExt;
     let _ = app
         .notification()
@@ -2062,6 +2079,14 @@ fn notify_done(app: &AppHandle, title: &str) {
         .title("✓ chat finished")
         .body(format!("{title} — done. click to reopen."))
         .show();
+    let _ = app.emit(
+        "aios-notify",
+        AiosNotifyPayload {
+            kind: "chat.done".to_string(),
+            session_id,
+            title: title.to_string(),
+        },
+    );
 }
 
 /// Sends one user turn. For claude: writes a stream-json user line to the live

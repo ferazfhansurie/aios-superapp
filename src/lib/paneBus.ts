@@ -24,6 +24,21 @@ export interface ChatHandle {
 /** Live ChatPanes keyed by pane key — lets App intercept close on a busy chat. */
 export const chatHandles = new Map<string, ChatHandle>();
 
+/** Pane key → backend numeric chat-session id. A ChatPane registers itself here
+ *  once its session id is known, and clears on unmount. Lets a notification click
+ *  resolve "is there an OPEN pane for this backend session?" without the pane
+ *  having to be the literal `reattach` kind (a fresh chat learns its id at
+ *  runtime). Mirrors `chatHandles` lifecycle. */
+export const chatSessions = new Map<string, number>();
+
+/** Find the pane key currently bound to a backend chat-session id, if any. */
+export function paneKeyForChatSession(sessionId: number): string | null {
+  for (const [key, id] of chatSessions) {
+    if (id === sessionId) return key;
+  }
+  return null;
+}
+
 /** Detach every chat pane that is actively generating. Returns how many were
  *  moved to the background. Used by native window-close handling so closing the
  *  cockpit hides the shell instead of killing in-flight ai work. */
@@ -246,6 +261,25 @@ export function registerOpenUrl(
 export function openUrlInPane(url: string, label?: string): boolean {
   if (!openUrlImpl) return false;
   openUrlImpl(url, label);
+  return true;
+}
+
+// ── open-settings-to-section channel ─────────────────────────────────────────
+// Settings owns its active section as local state; a notification click needs to
+// open the overlay AND jump it to a section (e.g. "diagnostics"). App registers a
+// setter; callers use openSettingsTo. Same shape as the file/url openers.
+let openSettingsImpl: ((section: string) => void) | null = null;
+
+export function registerOpenSettings(fn: (section: string) => void): () => void {
+  openSettingsImpl = fn;
+  return () => {
+    if (openSettingsImpl === fn) openSettingsImpl = null;
+  };
+}
+
+export function openSettingsTo(section: string): boolean {
+  if (!openSettingsImpl) return false;
+  openSettingsImpl(section);
   return true;
 }
 

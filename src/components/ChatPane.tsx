@@ -113,6 +113,7 @@ import { usagePaceRisk } from "../lib/usagePace";
 import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
 import {
   chatHandles,
+  chatSessions,
   paneWriters,
   paneSubmitters,
   paneImageDrop,
@@ -153,6 +154,7 @@ import {
 import { invoke, isTauriRuntime } from "../lib/tauri";
 import { PaneDropZone } from "./PaneDropZone";
 import { reportDiag } from "../lib/diag";
+import { pushNotification } from "../lib/notifications";
 
 // ── transcript model ──────────────────────────────────────────────────────
 
@@ -673,6 +675,7 @@ export function ChatPane({
   cwd,
   paneKey,
   active,
+  hidden,
   seed,
   resume,
   reattach,
@@ -686,6 +689,10 @@ export function ChatPane({
   /** True when this is the focused/active pane. Drives composer auto-focus on
    *  becoming active (and on mount) — but never steals focus mid-action. */
   active?: boolean;
+  /** True when the pane is minimized out of the grid (display:none). A hidden
+   *  chat that hits a tool-approval prompt is invisible — so we fire a
+   *  high-priority `chat.needs_input` notification that reattaches on click. */
+  hidden?: boolean;
   seed?: string;
   modelId?: string;
   agentId?: string;
@@ -894,6 +901,10 @@ export function ChatPane({
   const [resumeId, setResumeId] = useState<string | null>(resume?.id ?? null);
   // the title of the resumed session, shown as a note once after resuming
   const [resumedTitle, setResumedTitle] = useState<string | null>(resume?.title ?? null);
+  // best-known human label for THIS chat, mirrored into a ref so the stable-deps
+  // handleEvent closure can name it in a notification without going stale.
+  const chatTitleRef = useRef<string>("");
+  chatTitleRef.current = agentLabel ?? resumedTitle ?? "";
   // reactive mirror of claudeSessionIdRef — the engine session id currently open
   // in THIS pane, so the /resume picker can highlight "the one you're in".
   const [openSessionId, setOpenSessionId] = useState<string | null>(resume?.id ?? null);
@@ -906,6 +917,12 @@ export function ChatPane({
   // set true when the pane is intentionally detached (kept running) — tells the
   // unmount cleanup NOT to kill the claude process.
   const detachedRef = useRef(false);
+  // live mirror of "this chat is out of sight" for the (stable-deps) handleEvent
+  // closure — so a tool-approval landing on a minimized OR detached pane can fire
+  // a notification without re-creating handleEvent. Declared AFTER detachedRef so
+  // it can read it (no TDZ).
+  const hiddenRef = useRef(false);
+  hiddenRef.current = (hidden ?? false) || detachedRef.current;
   // the `reattach` id whose background session this pane is currently bound to
   // AND whose engine/model we auto-synced into `model` state. While set, a
   // session-effect re-fire CAUSED by that auto-resync is a no-op (don't
@@ -1248,6 +1265,23 @@ export function ChatPane({
             },
           ];
         });
+        // If this chat is OUT OF SIGHT (minimized or detached), firaz has no idea
+        // it's blocked waiting on him. Fire a high-priority, clickable notification
+        // that reattaches to the approval card. Foreground chats stay silent — the
+        // inline card is already visible. De-dupe is handled by the store (one live
+        // needs_input per session). Skipped when the backend id isn't known yet.
+        const sid = sessionIdRef.current;
+        if (hiddenRef.current && sid != null && sid > 0) {
+          pushNotification({
+            kind: "chat.needs_input",
+            level: "warning",
+            priority: "high",
+            sourceLabel: "chat",
+            title: "chat needs your input",
+            body: `${chatTitleRef.current || "a background chat"} is waiting to run ${String(toolName)}.`,
+            target: { type: "chat", sessionId: sid, title: chatTitleRef.current || "chat" },
+          });
+        }
       }
       return;
     }
@@ -1519,6 +1553,10 @@ export function ChatPane({
           }
         }
         sessionIdRef.current = id;
+        // Register the pane → backend-session-id binding so a notification click
+        // (chat.done / chat.needs_input) can resolve "is this chat still open?"
+        // and focus it, or reattach it if its pane was closed.
+        if (paneKey && id != null) chatSessions.set(paneKey, id);
         setBackendBusy(busy);
         if (busy && turnStartRef.current == null) {
           const t0 = Date.now();
@@ -1551,6 +1589,7 @@ export function ChatPane({
       reattachBoundRef.current = null;
       const id = sessionIdRef.current;
       sessionIdRef.current = null;
+      if (paneKey) chatSessions.delete(paneKey);
       // Skip the kill when the pane was intentionally detached (kept running in
       // the background) — chat_detach already cleared the sink.
       if (id != null && !detachedRef.current) chatStop(id).catch((e) => reportDiag("chat.stop", e, { action: "cleanup" }));
@@ -1575,6 +1614,7 @@ export function ChatPane({
     });
     return () => {
       chatHandles.delete(paneKey);
+      chatSessions.delete(paneKey);
     };
   }, [paneKey]);
 

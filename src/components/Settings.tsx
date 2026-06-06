@@ -1009,12 +1009,16 @@ function ProjectsSection() {
 export function Settings({
   open,
   onClose,
+  initialSection,
   mirrorUrl,
   mirrorStatus,
   onCopyMirrorUrl,
 }: {
   open: boolean;
   onClose: () => void;
+  /** When set, the overlay jumps to this section on open (e.g. a notification
+   *  deep-linking to "diagnostics"). Consumed once per open. */
+  initialSection?: string | null;
   /** Desktop-mirror pairing url (only present when a mirror is available). */
   mirrorUrl?: string | null;
   /** Pairing status text (e.g. "connected", "waiting"). */
@@ -1030,15 +1034,18 @@ export function Settings({
   const [accent, setLocalAccent] = useState<Accent>(getAccent);
   const [density, setLocalDensity] = useState<Density>(getDensity);
 
-  // re-sync from store each time the window opens.
+  // re-sync from store each time the window opens; honor a deep-linked section.
   useEffect(() => {
     if (open) {
       setS(loadSettings());
       setLocalTheme(getTheme());
       setLocalAccent(getAccent());
       setLocalDensity(getDensity());
+      if (initialSection && NAV.some((n) => n.id === initialSection)) {
+        setSection(initialSection as SectionId);
+      }
     }
-  }, [open]);
+  }, [open, initialSection]);
 
   // reflect theme/accent changes from anywhere (e.g. the header switcher).
   useEffect(() => {

@@ -117,10 +117,14 @@ test("pet pane uses a seeded code-drawn 8-bit game pet", () => {
   assert.match(css, /\.pet-pixel--critical/);
 });
 
-test("sidebar usage does not render claude account usage", () => {
+test("sidebar usage renders a real claude meter (not the spark proxy)", () => {
   const source = read("src/components/SidebarUsage.tsx");
 
-  assert.equal(source.includes('ProviderBlock name="claude"'), false);
+  // firaz 2026-06-06: replaced the gpt-5.3-codex-spark block with a real claude
+  // meter sourced from ~/.aios/state/usage.json (claude_usage → claudeRate).
+  assert.match(source, /ProviderBlock name="claude"/);
+  assert.match(source, /claudeRate\(\)/);
+  assert.equal(source.includes("gpt-5.3-codex-spark"), false);
   assert.equal(source.includes("idleRate()"), false);
 });
 
@@ -235,7 +239,7 @@ test("shell exposes a shared notification center and controls", () => {
   assert.match(app, /NotificationCenter/);
   assert.match(app, /subscribeNotifications/);
   assert.match(app, /openNotificationTarget/);
-  assert.match(app, /open source pane/);
+  assert.match(app, /reattach: t\.sessionId/);
   assert.match(app, /focusPane\(pane\.key\)/);
   assert.match(settings, /notificationNativeMode: NotificationNativeMode/);
   assert.match(settingsPane, /native alerts/);
@@ -428,10 +432,10 @@ test("spark model labeling is explicitly gpt-5.3, never 5.5", () => {
   const source = [chatPane, sidebarUsage, chat].join("\n");
 
   assert.match(chat, /id: "gpt-5\.3-codex-spark"/);
+  // SidebarUsage no longer labels spark (its block became the claude meter);
+  // the spark model labeling now lives only in the chat model picker.
   assert.match(chatPane, /return "gpt-5\.3 spark"/);
-  assert.match(sidebarUsage, /return "gpt-5\.3 spark"/);
   assert.match(chatPane, /\^gpt-5\\\.3-codex-spark\$/);
-  assert.match(sidebarUsage, /\^gpt-5\\\.3-codex-spark\$/);
   assert.doesNotMatch(source, /5\.5[^"\n]*spark|spark[^"\n]*5\.5/i);
   assert.doesNotMatch(chatPane, /return "spark"/);
 }

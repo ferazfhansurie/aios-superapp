@@ -75,7 +75,7 @@ export function summarizeNotifications(notifications: AiosNotification[]): Notif
     .filter((item) => !item.read)
     .sort((a, b) => {
       const importance = Number(important(b)) - Number(important(a));
-      return importance || b.at - a.at;
+      return importance || b.ts - a.ts;
     })
     .slice(0, 5);
 
@@ -100,7 +100,7 @@ export function buildJarvisBriefing({
   const top = notificationSummary.items[0];
   const primaryPrompt = top?.title ?? (fleet.needsControl > 0 ? fleet.headline : focus?.title ?? "aios is monitoring");
   const body = top?.body ? `\n\ncontext:\n${top.body}` : "";
-  const source = top ? `\n\nsource: ${top.sourceLabel ?? top.source}` : "";
+  const source = top ? `\n\nsource: ${top.sourceLabel ?? top.kind}` : "";
 
   return {
     primaryPrompt,

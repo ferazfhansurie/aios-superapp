@@ -93,7 +93,14 @@ import {
   registerOpenEditorFile,
   registerOpenViewerFile,
   registerRevealFile,
+  openEditorFileInPane,
+  openViewerFileInPane,
+  revealFileInPane,
+  openUrlInPane,
   registerOpenUrl,
+  registerOpenSettings,
+  openSettingsTo,
+  paneKeyForChatSession,
   registerSpawnPane,
   type SpawnPaneKind,
   type SpawnCtx,
@@ -137,6 +144,7 @@ import {
   pushNotification,
   subscribeNotifications,
   type AiosNotification,
+  type NotificationTarget,
 } from "./lib/notifications";
 
 import { SPAWN, SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
@@ -379,6 +387,9 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => !(!nativeRuntime && window.matchMedia("(max-width: 1024px)").matches));
   const [splash, setSplash] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // When a notification deep-links to Settings → a section, App opens the overlay
+  // AND hands Settings the section to jump to (consumed once on open).
+  const [settingsSection, setSettingsSection] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [fileFinderOpen, setFileFinderOpen] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
@@ -590,20 +601,14 @@ function App() {
         if (detachedNow === 0 && !alreadyBackgrounded) return;
 
         event.preventDefault();
+        // The flash toast above is the only signal needed here — a backgrounded
+        // chat fires a clickable `chat.done` notification when it actually
+        // finishes (see the "aios-notify" listener), so this is not a notification.
         flash(
           detachedNow > 0
             ? `kept ${detachedNow} chat${detachedNow === 1 ? "" : "s"} running in background`
             : "chat still running in background",
         );
-        pushNotification({
-          source: "chat",
-          level: "info",
-          title: detachedNow > 0 ? "chat running in background" : "chat still running",
-          body:
-            detachedNow > 0
-              ? `${detachedNow} chat${detachedNow === 1 ? "" : "s"} will keep generating after the shell hides.`
-              : "open status to reattach when it finishes.",
-        });
         await win.hide().catch((e) => reportDiag("app.window", e, { action: "hide" }));
       })
       .then((stop) => {
@@ -726,6 +731,41 @@ function App() {
         else unlisten = stop;
       })
       .catch((e) => reportDiag("app.listen", e, { action: "openFileEvent" }));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Backend → in-app notification bridge. The chat backend emits `aios-notify`
+  // when a BACKGROUNDED chat finishes its turn (chat.rs notify_done). We turn it
+  // into a clickable `chat.done` notification whose target reattaches that exact
+  // session — firaz's #1 ask. (The OS toast still fires from the backend; this is
+  // the in-app bell + record. Wiring the OS-toast CLICK is Phase 2.)
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ kind: string; session_id: number; title?: string }>("aios-notify", ({ payload }) => {
+      if (!payload || typeof payload.session_id !== "number") return;
+      const title = payload.title || "chat";
+      if (payload.kind === "chat.done") {
+        pushNotification({
+          kind: "chat.done",
+          level: "success",
+          priority: "high",
+          sourceLabel: "chat",
+          title: "chat finished",
+          body: `${title} — done. click to reopen.`,
+          target: { type: "chat", sessionId: payload.session_id, title },
+        });
+      }
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((e) => reportDiag("app.listen", e, { action: "aiosNotify" }));
     return () => {
       disposed = true;
       unlisten?.();
@@ -866,6 +906,14 @@ function App() {
   useEffect(() => registerRevealFile(revealFile), [revealFile]);
   useEffect(() => registerOpenUrl(openUrl), [openUrl]);
   useEffect(() => registerSpawnPane(spawnPaneFromCtx), [spawnPaneFromCtx]);
+  useEffect(
+    () =>
+      registerOpenSettings((section) => {
+        setSettingsSection(section);
+        setSettingsOpen(true);
+      }),
+    [],
+  );
 
   const handledStartupOpen = useRef(false);
   useEffect(() => {
@@ -1720,10 +1768,38 @@ function App() {
   }, [panes, focusPane, spawn]);
   const openNotificationTarget = useCallback((item: AiosNotification) => {
     markNotificationRead(item.id);
-    if (!item.sourceId) return;
-    const pane = panes.find((p) => p.key === item.sourceId);
-    if (pane) focusPane(pane.key);
-  }, [panes, focusPane]);
+    const t = item.target;
+    if (!t) return;
+    switch (t.type) {
+      case "pane":
+      case "terminal": {
+        const pane = panes.find((p) => p.key === t.key);
+        if (pane) focusPane(pane.key);
+        break;
+      }
+      case "chat": {
+        // The killer case. If a chat pane is still open + bound to this backend
+        // session id, focus it. Else reattach the detached session — the backend
+        // replays its buffer and goes live, so firaz lands back in the exact chat.
+        const boundKey = paneKeyForChatSession(t.sessionId);
+        const open = boundKey ? panes.find((p) => p.key === boundKey) : undefined;
+        if (open) focusPane(open.key);
+        else spawn({ type: "chat", reattach: t.sessionId }, t.title ?? "chat");
+        break;
+      }
+      case "diagnostics":
+        openSettingsTo("diagnostics");
+        break;
+      case "file":
+        if (t.mode === "reveal") revealFileInPane(t.path, t.name ?? t.path);
+        else if (t.mode === "viewer") openViewerFileInPane(t.path, t.name ?? t.path);
+        else openEditorFileInPane(t.path, t.name ?? t.path, t.at);
+        break;
+      case "url":
+        openUrlInPane(t.url, t.label);
+        break;
+    }
+  }, [panes, focusPane, spawn]);
   const askFromPalette = useCallback((query: string) => {
     spawn({ type: "chat", seed: query }, "ask");
   }, [spawn]);
@@ -2119,7 +2195,6 @@ function App() {
               <div className={`flex pb-1 ${iconsOnly ? "justify-center" : "justify-start px-1.5"}`}>
                 {sidebarActions}
               </div>
-              <NavRow icon={SettingsIcon} label="settings" iconsOnly={iconsOnly} onClick={() => setSettingsOpen(true)} />
               <AccountMenu iconsOnly={iconsOnly} onOpenSettings={() => setSettingsOpen(true)} />
             </div>
           </aside>
@@ -2275,13 +2350,9 @@ function App() {
             <div className="mt-4 flex flex-col gap-2">
               <button
                 onClick={() => {
+                  // Ack-of-an-action-just-taken is noise. The real signal — chat
+                  // done — fires later as a clickable `chat.done` notification.
                   chatHandles.get(closePrompt)?.detach(true);
-                  pushNotification({
-                    source: "chat",
-                    level: "info",
-                    title: "chat kept running",
-                    body: "you will get a native alert when it finishes, and this event stays in the shell.",
-                  });
                   closePane(closePrompt);
                   setClosePrompt(null);
                 }}
@@ -2317,7 +2388,11 @@ function App() {
         <Suspense fallback={null}>
           <Settings
             open={settingsOpen}
-            onClose={() => setSettingsOpen(false)}
+            initialSection={settingsSection}
+            onClose={() => {
+              setSettingsOpen(false);
+              setSettingsSection(null);
+            }}
             mirrorUrl={mirrorUrl}
             mirrorStatus={mirrorStatus}
             onCopyMirrorUrl={() => {
@@ -2455,6 +2530,30 @@ function MobileBottomNav({
   );
 }
 
+/** The explicit action verb a notification row shows / its click does, derived
+ *  from the deep-link target (replaces the generic "open pane"). */
+function notificationActionVerb(target: NotificationTarget): string {
+  switch (target.type) {
+    case "chat":
+      return "reopen chat";
+    case "diagnostics":
+      return "open diagnostics";
+    case "terminal":
+      return "go to terminal";
+    case "url":
+      return "open link";
+    case "file":
+      return target.mode === "reveal"
+        ? "reveal file"
+        : target.mode === "viewer"
+          ? "open file"
+          : "open in editor";
+    case "pane":
+    default:
+      return "open pane";
+  }
+}
+
 function NotificationCenter({
   notifications,
   onMarkRead,
@@ -2525,9 +2624,9 @@ function NotificationCenter({
               />
               <button
                 type="button"
-                onClick={() => (item.sourceId ? onOpenTarget(item) : onMarkRead(item.id))}
+                onClick={() => (item.target ? onOpenTarget(item) : onMarkRead(item.id))}
                 className="min-w-0 flex-1 text-left"
-                title={item.sourceId ? "open source pane" : item.read ? "read" : "mark read"}
+                title={item.target ? notificationActionVerb(item.target) : item.read ? "read" : "mark read"}
               >
                 <div className="flex items-center gap-1.5">
                   <span className="truncate text-[12px] font-medium text-[var(--color-text)]">{item.title}</span>
@@ -2539,15 +2638,15 @@ function NotificationCenter({
                   </div>
                 )}
                 <div className="mt-1 flex items-center gap-1.5 text-[9px] uppercase tracking-wide text-[var(--color-faint)]">
-                  <span>{item.sourceLabel ?? item.source}</span>
-                  {item.sourceId && (
+                  <span>{item.sourceLabel ?? item.kind}</span>
+                  {item.target && (
                     <>
                       <span>·</span>
-                      <span>open pane</span>
+                      <span>{notificationActionVerb(item.target)}</span>
                     </>
                   )}
                   <span>·</span>
-                  <span>{new Date(item.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                  <span>{new Date(item.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
                 </div>
               </button>
               <button
@@ -2563,31 +2662,6 @@ function NotificationCenter({
         )}
       </div>
     </div>
-  );
-}
-
-function NavRow({
-  icon: Icon,
-  label,
-  iconsOnly = false,
-  onClick,
-}: {
-  icon: typeof Folder;
-  label: string;
-  iconsOnly?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      title={label}
-      className={`group flex w-full items-center rounded-md py-1.5 text-[13px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)] ${
-        iconsOnly ? "justify-center px-0" : "gap-2.5 px-2.5 text-left"
-      }`}
-    >
-      <Icon size={15} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]" />
-      {!iconsOnly && label}
-    </button>
   );
 }
 
@@ -3857,6 +3931,7 @@ function PaneCard({
             <ChatPane
               paneKey={pane.key}
               active={active}
+              hidden={hidden}
               cwd={chatCwd}
               seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
               modelId={pane.kind.type === "chat" ? pane.kind.modelId : undefined}

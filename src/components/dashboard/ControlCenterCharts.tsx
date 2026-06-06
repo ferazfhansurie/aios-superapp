@@ -85,7 +85,7 @@ export function ApprovalAgingBars({ notifications }: { notifications: AiosNotifi
   return (
     <div className="space-y-2" aria-label="approval aging">
       {values.map((item) => {
-        const ageHours = Math.max(0.25, (now - item.at) / 3_600_000);
+        const ageHours = Math.max(0.25, (now - item.ts) / 3_600_000);
         const pct = Math.min(100, ageHours * 10);
         return (
           <div key={item.id} className="grid grid-cols-[1fr_54px] items-center gap-2 text-[11px]">

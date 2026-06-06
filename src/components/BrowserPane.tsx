@@ -81,7 +81,7 @@ import {
 import { addLink } from "../lib/sidebar";
 import { DEFAULT_PROFILE, addProfile, loadProfiles } from "../lib/profiles";
 import { rememberUrl } from "../lib/browser-mem";
-import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
+import { type NotificationLevel } from "../lib/notifications";
 import { onAiosDrag, openViewerFileInPane, registerPaneDropSink, spawnPane } from "../lib/paneBus";
 import { homeDir } from "../lib/fs";
 import { PaneDropZone } from "./PaneDropZone";
@@ -529,18 +529,15 @@ export function BrowserPane({
     [label, onDropPath],
   );
 
-  const showToast = useCallback((msg: string, level: NotificationLevel = "info", body?: string) => {
+  const showToast = useCallback((msg: string, _level: NotificationLevel = "info", _body?: string) => {
+    // Local toast only. Mirroring every browser toast ("screenshot saved",
+    // "couldn't reveal file", etc.) into the bell was noise — the pane already
+    // shows them. Download-complete as a real, deep-linking notification is wired
+    // separately (Phase 2) off the `browser-download` event, not here.
     setToast(msg);
-    emitPaneNotification({
-      paneId: label,
-      paneLabel: "browser",
-      title: msg,
-      body,
-      level,
-    });
     if (toastTimer.current) clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(null), 2500);
-  }, [label]);
+  }, []);
 
   // Pin the current site to the sidebar (favicon resolved by the store from the
   // host). Label defaults to the hostname; the user can rename it in the rail.
