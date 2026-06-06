@@ -15,6 +15,7 @@ import {
   ChevronUp,
   Crosshair,
   ExternalLink,
+  FolderOpen,
   Loader2,
   MessageSquarePlus,
   MoreVertical,
@@ -64,7 +65,8 @@ import { addLink } from "../lib/sidebar";
 import { DEFAULT_PROFILE, addProfile, loadProfiles } from "../lib/profiles";
 import { rememberUrl } from "../lib/browser-mem";
 import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
-import { onAiosDrag, openViewerFileInPane, registerPaneDropSink } from "../lib/paneBus";
+import { onAiosDrag, openViewerFileInPane, registerPaneDropSink, spawnPane } from "../lib/paneBus";
+import { homeDir } from "../lib/fs";
 import { PaneDropZone } from "./PaneDropZone";
 import { reportDiag } from "../lib/diag";
 
@@ -550,6 +552,15 @@ export function BrowserPane({
     setMenuOpen(false);
   }, [label]);
 
+  // Cross-pane spawn: open a files pane rooted at ~/Downloads (where browser
+  // downloads land), so you can act on what you just downloaded.
+  const openDownloadsInFiles = useCallback(() => {
+    setMenuOpen(false);
+    homeDir()
+      .then((h) => spawnPane("files", { path: `${h}/Downloads` }))
+      .catch(() => spawnPane("files", {}));
+  }, []);
+
   // Retry a failed load by re-navigating to the current url.
   const retryLoad = useCallback(() => {
     setLoadError(null);
@@ -909,6 +920,12 @@ export function BrowserPane({
                   </button>
                 </div>
               </div>
+              <div className="my-1 border-t border-[var(--color-border)]" />
+              <MenuItem
+                icon={<FolderOpen size={13} />}
+                label="Open downloads in files"
+                onClick={openDownloadsInFiles}
+              />
               <div className="my-1 border-t border-[var(--color-border)]" />
               <MenuItem
                 icon={<Trash2 size={13} />}

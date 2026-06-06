@@ -52,11 +52,23 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
-/// Like `read_dir` but for the VS Code-style explorer tree: shows dotfiles
-/// (`.claude`, `.vercel`, …) the way VS Code does, hiding only `.git` and
-/// `.DS_Store`. Same sort (dirs first, alphabetical).
+/// Like `read_dir` but for the VS Code-style explorer tree. Two filter knobs:
+///  - `show_hidden` (default false): when false, dotfiles (`.env`, `.claude`, …)
+///    are hidden like VS Code's default; when true they show. `.git`/`.DS_Store`
+///    are ALWAYS hidden (pure noise).
+///  - `show_all` (default false): when false, heavy build/dep dirs (node_modules,
+///    target, dist, .next, …) are pruned the same way the search backend prunes
+///    them (`is_search_pruned_dir`); when true they show.
+/// Same sort (dirs first, alphabetical). Params are `Option` so old callers that
+/// pass neither get the VS Code-ish default (hidden dotfiles, pruned junk).
 #[tauri::command]
-pub fn read_dir_tree(path: String) -> Result<Vec<DirEntry>, String> {
+pub fn read_dir_tree(
+    path: String,
+    show_hidden: Option<bool>,
+    show_all: Option<bool>,
+) -> Result<Vec<DirEntry>, String> {
+    let show_hidden = show_hidden.unwrap_or(false);
+    let show_all = show_all.unwrap_or(false);
     let p = if path.is_empty() {
         home_dir()
     } else {
@@ -69,7 +81,17 @@ pub fn read_dir_tree(path: String) -> Result<Vec<DirEntry>, String> {
             Err(_) => continue,
         };
         let name = e.file_name().to_string_lossy().to_string();
+        // Always-noise: never surface these.
         if name == ".git" || name == ".DS_Store" {
+            continue;
+        }
+        // Dotfiles hidden by default (VS Code-style); shown only with show_hidden.
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        // Heavy build/dep dirs pruned by default; shown only with show_all. Same
+        // set the file finder / content search prunes, so the tree matches ⌘P.
+        if !show_all && is_search_pruned_dir(&name) {
             continue;
         }
         let meta = e.metadata().ok();

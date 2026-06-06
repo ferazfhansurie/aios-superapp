@@ -1,29 +1,46 @@
 /** Files pane — a VS Code-style explorer tree. Nested expandable folders,
  *  file-type icons, git status decorations (M/A/D/U + folder change-dots),
  *  indent guides. Single-click a file opens it (editor pane for code, viewer
- *  for media). Rows stay draggable → drop onto a terminal/chat to insert the
- *  path. Files open in the Monaco editor now, so there's no inline preview. */
-import { useCallback, useEffect, useMemo, useState } from "react";
+ *  for media). Rows (files AND folders) stay draggable → drop onto a terminal
+ *  to `cd`, onto a files pane to re-root, etc. Files open in the Monaco editor,
+ *  so there's no inline preview.
+ *
+ *  Header affordances:
+ *   - dotfile + junk toggles (persisted): hide `.env`/`.git`/… and prune
+ *     node_modules/target/dist/.next by default, like VS Code.
+ *   - "open project" picker: re-root this pane at any discovered ~/Repo project
+ *     so the pane becomes that workspace (and drives ⌘P/⌘⇧F via finderRoot).
+ *   - "open terminal here": spawn a shell pane rooted at the selected/focused
+ *     directory — the headline cross-pane-spawn example. */
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ChevronRight,
+  Eye,
+  EyeOff,
   FolderClosed,
+  FolderGit2,
   FolderOpen,
+  Globe,
   Home,
   ListCollapse,
   RefreshCw,
   Search,
+  TerminalSquare,
 } from "lucide-react";
 
 import {
+  fileSrc,
   gitStatus,
   homeDir,
   readDirTree,
   type DirEntry,
   type GitCode,
 } from "../lib/fs";
-import { AIOS_PATH_MIME } from "../lib/paneBus";
+import { listProjects, type ProjectInfo } from "../lib/run";
+import { AIOS_DIR_MIME, AIOS_PATH_MIME, spawnPane } from "../lib/paneBus";
 import { fileIcon } from "../lib/fileIcons";
+import { PaneDropZone } from "./PaneDropZone";
 
 const GIT_COLOR: Record<GitCode, string> = {
   M: "#e2b341", // modified — amber
@@ -32,6 +49,24 @@ const GIT_COLOR: Record<GitCode, string> = {
   D: "#e05252", // deleted — red
   R: "#6cb6ff", // renamed — blue
 };
+
+// Persisted toggles (VS Code-style defaults: both hidden).
+const HIDDEN_KEY = "aios.files.showHidden";
+const ALL_KEY = "aios.files.showAll";
+function loadBool(key: string): boolean {
+  try {
+    return localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+function saveBool(key: string, val: boolean) {
+  try {
+    localStorage.setItem(key, val ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
 
 export function FilesPane({
   initialRoot,
@@ -50,11 +85,22 @@ export function FilesPane({
   const [selected, setSelected] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [showHidden, setShowHidden] = useState(() => loadBool(HIDDEN_KEY));
+  const [showAll, setShowAll] = useState(() => loadBool(ALL_KEY));
+  const [projOpen, setProjOpen] = useState(false);
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+
+  // Read the live toggle values inside callbacks without re-creating loadDir on
+  // every toggle (which would otherwise re-run effects). Updated each render.
+  const showHiddenRef = useRef(showHidden);
+  const showAllRef = useRef(showAll);
+  showHiddenRef.current = showHidden;
+  showAllRef.current = showAll;
 
   const loadDir = useCallback(async (path: string) => {
     setLoadingDirs((s) => new Set(s).add(path));
     try {
-      const list = await readDirTree(path);
+      const list = await readDirTree(path, showHiddenRef.current, showAllRef.current);
       setChildren((m) => new Map(m).set(path, list));
       setError(null);
     } catch (e) {
@@ -114,6 +160,14 @@ export function FilesPane({
     })();
   }, [initialRoot, setRootTo]);
 
+  // Re-read every open dir when a filter toggle flips — the backend decides what
+  // to include, so we must re-fetch (children maps cache the old filtered list).
+  const reloadOpenDirs = useCallback(() => {
+    setChildren(new Map());
+    if (root) loadDir(root);
+    for (const p of expanded) if (p !== root) loadDir(p);
+  }, [root, expanded, loadDir]);
+
   const toggle = useCallback(
     (path: string) => {
       setExpanded((prev) => {
@@ -147,8 +201,80 @@ export function FilesPane({
     if (parent !== root) setRootTo(parent);
   };
 
+  const toggleHidden = useCallback(() => {
+    setShowHidden((v) => {
+      const next = !v;
+      saveBool(HIDDEN_KEY, next);
+      return next;
+    });
+  }, []);
+  const toggleAll = useCallback(() => {
+    setShowAll((v) => {
+      const next = !v;
+      saveBool(ALL_KEY, next);
+      return next;
+    });
+  }, []);
+  // Re-fetch the visible tree whenever a toggle changes (refs are updated by
+  // render before this effect runs, so loadDir reads the new values).
+  useEffect(() => {
+    reloadOpenDirs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showHidden, showAll]);
+
+  // The directory a "open terminal here" / "open in browser" acts on: the
+  // selected node (its own dir if it's a folder, else its parent), else root.
+  const focusDir = useMemo(() => {
+    if (!selected) return root;
+    // is the selection a known folder? scan loaded children for a dir match.
+    for (const list of children.values()) {
+      const hit = list.find((e) => e.path === selected);
+      if (hit) return hit.is_dir ? hit.path : selected.slice(0, selected.lastIndexOf("/")) || root;
+    }
+    return selected.slice(0, selected.lastIndexOf("/")) || root;
+  }, [selected, children, root]);
+
+  const openTerminalHere = useCallback(() => {
+    spawnPane("terminal", { cwd: focusDir });
+  }, [focusDir]);
+
+  // "open in browser": the selected FILE → file:// in a browser pane.
+  const openInBrowser = useCallback(() => {
+    if (!selected) return;
+    // only meaningful for files; a folder selection has no file:// target.
+    let isFile = false;
+    for (const list of children.values()) {
+      const hit = list.find((e) => e.path === selected);
+      if (hit) {
+        isFile = !hit.is_dir;
+        break;
+      }
+    }
+    if (!isFile) return;
+    spawnPane("browser", { url: fileSrc(selected) });
+  }, [selected, children]);
+
+  const openProjectPicker = useCallback(() => {
+    setProjOpen((o) => !o);
+    if (projects.length === 0) {
+      listProjects()
+        .then(setProjects)
+        .catch(() => setProjects([]));
+    }
+  }, [projects.length]);
+
   const rootName = root.split("/").filter(Boolean).pop() ?? root;
   const f = filter.trim().toLowerCase();
+
+  // Whether the current selection is a file (enables "open in browser").
+  const selectedIsFile = useMemo(() => {
+    if (!selected) return false;
+    for (const list of children.values()) {
+      const hit = list.find((e) => e.path === selected);
+      if (hit) return !hit.is_dir;
+    }
+    return false;
+  }, [selected, children]);
 
   // flatten the visible tree into rows (respecting expand state + filter)
   const rows = useMemo(() => {
@@ -169,7 +295,7 @@ export function FilesPane({
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)] text-[13px]">
       {/* header: root + actions */}
-      <div className="flex h-9 shrink-0 items-center gap-1 border-b border-[var(--color-border)] px-2 text-[var(--color-muted)]">
+      <div className="relative flex h-9 shrink-0 items-center gap-1 border-b border-[var(--color-border)] px-2 text-[var(--color-muted)]">
         <button onClick={() => homeDir().then(setRootTo)} className="rounded p-1 hover:text-[var(--color-text)]" title="Home">
           <Home size={13} />
         </button>
@@ -186,12 +312,59 @@ export function FilesPane({
           </span>
         )}
         <span className="flex-1" />
+        <button onClick={openTerminalHere} className="rounded p-1 hover:text-[var(--color-text)]" title={`Open terminal here\n${focusDir}`}>
+          <TerminalSquare size={13} />
+        </button>
+        {selectedIsFile && (
+          <button onClick={openInBrowser} className="rounded p-1 hover:text-[var(--color-text)]" title="Open selected file in browser">
+            <Globe size={13} />
+          </button>
+        )}
+        <button onClick={openProjectPicker} className="rounded p-1 hover:text-[var(--color-text)]" title="Open project (re-root this pane)">
+          <FolderGit2 size={13} />
+        </button>
+        <button
+          onClick={toggleHidden}
+          className={`rounded p-1 hover:text-[var(--color-text)] ${showHidden ? "text-[var(--color-accent)]" : ""}`}
+          title={showHidden ? "Hide dotfiles + junk" : "Show dotfiles (.env, .git, …)"}
+        >
+          {showHidden ? <Eye size={13} /> : <EyeOff size={13} />}
+        </button>
         <button onClick={collapseAll} className="rounded p-1 hover:text-[var(--color-text)]" title="Collapse all">
           <ListCollapse size={13} />
         </button>
         <button onClick={refreshAll} className="rounded p-1 hover:text-[var(--color-text)]" title="Refresh">
           <RefreshCw size={12} className={loadingDirs.size ? "animate-spin" : ""} />
         </button>
+
+        {/* project picker dropdown */}
+        {projOpen && (
+          <>
+            <div className="fixed inset-0 z-30" onClick={() => setProjOpen(false)} />
+            <div className="absolute right-2 top-9 z-40 max-h-[60vh] w-64 overflow-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] py-1 shadow-2xl">
+              <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-[var(--color-faint)]">open project</div>
+              {projects.length === 0 ? (
+                <div className="px-3 py-2 text-[12px] text-[var(--color-muted)]">scanning…</div>
+              ) : (
+                projects.map((p) => (
+                  <button
+                    key={p.root}
+                    onClick={() => {
+                      setRootTo(p.root);
+                      setProjOpen(false);
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                    title={p.root}
+                  >
+                    <FolderGit2 size={12} className="shrink-0 text-[var(--color-accent)]/80" />
+                    <span className="min-w-0 flex-1 truncate">{p.name}</span>
+                    <span className="shrink-0 font-mono text-[9px] text-[var(--color-faint)]">{p.kind}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          </>
+        )}
       </div>
 
       {/* filter */}
@@ -203,12 +376,41 @@ export function FilesPane({
           placeholder="filter files…"
           className="min-w-0 flex-1 bg-transparent text-[12px] text-[var(--color-text)] outline-none placeholder:text-[var(--color-faint)]"
         />
+        {showAll ? (
+          <button
+            onClick={toggleAll}
+            className="shrink-0 rounded px-1 text-[9px] uppercase tracking-wide text-[var(--color-accent)]"
+            title="Hide heavy dirs (node_modules, target, dist, .next)"
+          >
+            junk on
+          </button>
+        ) : (
+          <button
+            onClick={toggleAll}
+            className="shrink-0 rounded px-1 text-[9px] uppercase tracking-wide text-[var(--color-faint)] hover:text-[var(--color-muted)]"
+            title="Show heavy dirs (node_modules, target, dist, .next)"
+          >
+            junk off
+          </button>
+        )}
       </div>
 
       {error && <p className="px-3 py-2 text-[12px] text-[var(--color-danger)]">{error}</p>}
 
-      {/* tree */}
-      <div className="min-h-0 flex-1 overflow-auto py-1">
+      {/* tree — dropping a FOLDER here re-roots this pane at it (R-cross-pane). */}
+      <div className="min-h-0 flex-1">
+      <PaneDropZone
+        onDir={(dir) => {
+          setRootTo(dir);
+          return true;
+        }}
+        onPath={(p) => {
+          // a non-dir path dropped → open it as a file in the editor/viewer.
+          onOpenFile?.(p, p.split("/").filter(Boolean).pop() ?? p);
+        }}
+        label="drop folder to set as workspace"
+      >
+      <div className="h-full overflow-auto py-1">
         {rows.map(({ entry, depth }) => (
           <TreeRow
             key={entry.path}
@@ -221,6 +423,7 @@ export function FilesPane({
             folderDirty={entry.is_dir && gitFolders.has(entry.path)}
             onToggle={() => toggle(entry.path)}
             onOpen={() => openFile(entry)}
+            onSelect={() => setSelected(entry.path)}
           />
         ))}
         {!rows.length && (
@@ -228,6 +431,8 @@ export function FilesPane({
             {f ? "no matches" : loadingDirs.size ? "loading…" : "empty"}
           </p>
         )}
+      </div>
+      </PaneDropZone>
       </div>
     </div>
   );
@@ -243,6 +448,7 @@ function TreeRow({
   folderDirty,
   onToggle,
   onOpen,
+  onSelect,
 }: {
   entry: DirEntry;
   depth: number;
@@ -253,6 +459,7 @@ function TreeRow({
   folderDirty: boolean;
   onToggle: () => void;
   onOpen: () => void;
+  onSelect: () => void;
 }) {
   const isDir = entry.is_dir;
   const { Icon, color } = fileIcon(entry.name);
@@ -268,9 +475,16 @@ function TreeRow({
       onDragStart={(ev) => {
         ev.dataTransfer.setData("text/plain", entry.path);
         ev.dataTransfer.setData(AIOS_PATH_MIME, entry.path);
+        // FOLDER rows also flag the dir MIME so drop targets can `cd`/re-root
+        // instead of treating the path as a file.
+        if (isDir) ev.dataTransfer.setData(AIOS_DIR_MIME, entry.path);
         ev.dataTransfer.effectAllowed = "copy";
       }}
-      onClick={() => (isDir ? onToggle() : onOpen())}
+      onClick={() => {
+        onSelect();
+        if (isDir) onToggle();
+        else onOpen();
+      }}
       onDoubleClick={() => !isDir && onOpen()}
       title={entry.path}
       className={`group flex cursor-pointer items-center gap-1 pr-2 transition-colors ${

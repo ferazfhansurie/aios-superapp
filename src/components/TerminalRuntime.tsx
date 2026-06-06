@@ -5,7 +5,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { MessageSquarePlus, RotateCw, X } from "lucide-react";
+import { FolderOpen, MessageSquarePlus, RotateCw, X } from "lucide-react";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Terminal as Xterm } from "@xterm/xterm";
@@ -23,7 +23,7 @@ import {
   spawnTmux,
 } from "../lib/pty";
 import { homeDir, saveImageTemp } from "../lib/fs";
-import { paneWriters, paneSubmitters, openUrlInPane } from "../lib/paneBus";
+import { paneWriters, paneSubmitters, openUrlInPane, spawnPane } from "../lib/paneBus";
 import { isTauriRuntime } from "../lib/tauri";
 
 /** Wrap text in bracketed-paste markers so a TUI (claude code, vim, a shell with
@@ -678,6 +678,11 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const path =
       e.dataTransfer.getData("application/x-aios-path") || e.dataTransfer.getData("text/plain");
     if (!path) return;
+    // a folder → `cd <dir>`; a file → just its quoted path.
+    if (e.dataTransfer.getData("application/x-aios-dir")) {
+      ptyWrite(id, `cd ${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "cdPath" }));
+      return;
+    }
     ptyWrite(id, `${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "insertPath" }));
   };
 
@@ -691,8 +696,18 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     ptyWrite(id, `${quotePath(s)} `).catch((e) => reportDiag("terminal.write", e, { action: "insertPath" }));
   };
 
+  // A FOLDER dropped onto a terminal → prefill a `cd <dir>` at the prompt (no
+  // auto-Enter, so the user confirms). The sensible thing for a dir vs a file.
+  const insertCd = (dir: string): boolean => {
+    const id = sessionIdRef.current;
+    const s = dir.trim();
+    if (id == null || !s) return false;
+    ptyWrite(id, `cd ${quotePath(s)} `).catch((e) => reportDiag("terminal.write", e, { action: "cdPath" }));
+    return true;
+  };
+
   return (
-    <PaneDropZone onPath={insertDroppedPath} label="drop to insert path">
+    <PaneDropZone onPath={insertDroppedPath} onDir={insertCd} label="drop to insert path">
     <div
       className="relative flex h-full min-h-0 w-full flex-col"
       onDragOver={(e) => {
@@ -729,6 +744,15 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
             </div>
           </div>
         )}
+        {/* spawn a files pane rooted at this terminal's cwd ("open files here") */}
+        <button
+          onClick={() => spawnPane("files", { path: paneCwd })}
+          title={`Open files here${paneCwd ? `\n${paneCwd}` : ""}`}
+          className="absolute left-2 top-2 z-20 flex items-center gap-1 rounded-md border border-[var(--color-border-strong)] bg-[var(--color-panel)]/90 px-2 py-1 text-[11px] text-[var(--color-text-2)] opacity-40 backdrop-blur transition-all hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)] hover:opacity-100"
+        >
+          <FolderOpen size={13} />
+          <span>files</span>
+        </button>
         {/* toggle the compose box (chat-grade prompt surface for CLI AIs) */}
         {!composerOpen && (
           <button

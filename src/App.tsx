@@ -94,6 +94,9 @@ import {
   registerOpenViewerFile,
   registerRevealFile,
   registerOpenUrl,
+  registerSpawnPane,
+  type SpawnPaneKind,
+  type SpawnCtx,
   type PayloadKind,
 } from "./lib/paneBus";
 import { containingDir, paneFileTarget } from "./lib/paneOpenActions";
@@ -814,6 +817,32 @@ function App() {
     },
     [spawn],
   );
+
+  // GENERIC cross-pane spawn (paneBus.spawnPane): any pane asks App to open a
+  // fresh pane of a given kind carrying context. Maps (kind, ctx) → PaneContent +
+  // a sensible label, then reuses `spawn` (so exit-fullscreen-on-spawn applies).
+  const spawnPaneFromCtx = useCallback(
+    (kind: SpawnPaneKind, ctx?: SpawnCtx) => {
+      switch (kind) {
+        case "terminal":
+          spawn({ type: "shell", cwd: ctx?.cwd }, ctx?.label ?? "terminal");
+          break;
+        case "files": {
+          const root = ctx?.path;
+          const name = root ? root.split("/").filter(Boolean).pop() ?? root : "files";
+          spawn({ type: "files", root }, ctx?.label ?? `files · ${name}`);
+          break;
+        }
+        case "browser":
+          spawn({ type: "browser", url: ctx?.url }, ctx?.label ?? "browser");
+          break;
+        case "chat":
+          spawn({ type: "chat", cwd: ctx?.cwd }, ctx?.label ?? "chat");
+          break;
+      }
+    },
+    [spawn],
+  );
   // expose openFile to deep children (chat artifact cards) via paneBus, so a
   // produced file opens as an in-app viewer pane instead of the OS app.
   useEffect(() => registerOpenFile(openFile), [openFile]);
@@ -821,6 +850,7 @@ function App() {
   useEffect(() => registerOpenViewerFile(openViewerFile), [openViewerFile]);
   useEffect(() => registerRevealFile(revealFile), [revealFile]);
   useEffect(() => registerOpenUrl(openUrl), [openUrl]);
+  useEffect(() => registerSpawnPane(spawnPaneFromCtx), [spawnPaneFromCtx]);
 
   const handledStartupOpen = useRef(false);
   useEffect(() => {

@@ -182,6 +182,48 @@ export function revealFileInPane(path: string, name: string): boolean {
   return true;
 }
 
+// ── generic spawn-pane channel ───────────────────────────────────────────────
+// The general "any pane can spawn any pane WITH CONTEXT" primitive. App owns pane
+// creation; deep children (FilesPane, BrowserPane, TerminalPane) ask App to open
+// a fresh pane of a given kind, carrying just enough context to root/seed it. App
+// translates the (kind, ctx) into a real PaneContent + label and spawns it
+// (reusing the existing `spawn`, so the exit-fullscreen-on-spawn behavior applies).
+export type SpawnPaneKind = "terminal" | "files" | "browser" | "chat";
+
+/** Context a spawn carries. Only the fields relevant to the target kind are read:
+ *  - terminal → `cwd` (shell starts there)
+ *  - files    → `path` (pane is rooted there)
+ *  - browser  → `url`  (initial url; e.g. a `file://` for a selected file)
+ *  - chat     → `cwd`  (chat working dir) */
+export interface SpawnCtx {
+  cwd?: string;
+  path?: string;
+  url?: string;
+  /** Optional human label override for the new pane. */
+  label?: string;
+}
+
+let spawnPaneImpl: ((kind: SpawnPaneKind, ctx?: SpawnCtx) => void) | null = null;
+
+/** App registers how to spawn a pane of a given kind with context. Returns an
+ *  unregister fn. */
+export function registerSpawnPane(
+  fn: (kind: SpawnPaneKind, ctx?: SpawnCtx) => void,
+): () => void {
+  spawnPaneImpl = fn;
+  return () => {
+    if (spawnPaneImpl === fn) spawnPaneImpl = null;
+  };
+}
+
+/** Spawn a new pane of `kind` carrying `ctx`. Returns false if no impl is wired
+ *  (caller can decide on a fallback; in-app there always is one once App mounts). */
+export function spawnPane(kind: SpawnPaneKind, ctx?: SpawnCtx): boolean {
+  if (!spawnPaneImpl) return false;
+  spawnPaneImpl(kind, ctx);
+  return true;
+}
+
 // ── open-url-in-pane channel ─────────────────────────────────────────────────
 // Same shape as file opening: App owns pane creation, deep markdown renderers can
 // ask for an in-app browser pane without knowing the layout machinery.
@@ -211,6 +253,12 @@ export function openUrlInPane(url: string, label?: string): boolean {
 
 /** The dataTransfer type a draggable pane item must set to be droppable. */
 export const AIOS_PATH_MIME = "application/x-aios-path";
+
+/** Set ALONGSIDE AIOS_PATH_MIME when the dragged item is a DIRECTORY (Files-pane
+ *  folder row). Drop targets read this to do the folder-appropriate thing:
+ *  terminal → `cd <dir>`, files pane → set root to it. Value = the abs dir path
+ *  (same as the path MIME), presence of the type is what flags "this is a dir". */
+export const AIOS_DIR_MIME = "application/x-aios-dir";
 
 type DragListener = (active: boolean) => void;
 const dragListeners = new Set<DragListener>();

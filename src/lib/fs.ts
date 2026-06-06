@@ -26,9 +26,16 @@ export async function readDir(path: string): Promise<DirEntry[]> {
   return invoke<DirEntry[]>("read_dir", { path });
 }
 
-/** Dir listing for the VS Code-style tree — includes dotfiles (hides .git/.DS_Store). */
-export async function readDirTree(path: string): Promise<DirEntry[]> {
-  return invoke<DirEntry[]>("read_dir_tree", { path });
+/** Dir listing for the VS Code-style tree. By default hides dotfiles (VS Code
+ *  style) and prunes heavy build/dep dirs (node_modules, target, dist, .next, …),
+ *  matching what ⌘P searches. `.git`/`.DS_Store` are always hidden. Pass
+ *  `showHidden`/`showAll` to reveal those classes. */
+export async function readDirTree(
+  path: string,
+  showHidden = false,
+  showAll = false,
+): Promise<DirEntry[]> {
+  return invoke<DirEntry[]>("read_dir_tree", { path, showHidden, showAll });
 }
 
 export type GitCode = "M" | "A" | "D" | "R" | "U";

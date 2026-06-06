@@ -6,7 +6,14 @@
  *
  *  Usage: <PaneDropZone onPath={(p) => insert(p)}>…pane content…</PaneDropZone> */
 import { useEffect, useState } from "react";
-import { AIOS_PATH_MIME, onAiosDrag } from "../lib/paneBus";
+import { AIOS_DIR_MIME, AIOS_PATH_MIME, onAiosDrag } from "../lib/paneBus";
+
+/** True when the drag carries our directory marker (a folder row from the Files
+ *  pane). Lets a pane do the folder-appropriate thing (`cd`, re-root) instead of
+ *  treating the path as a file. */
+function isDirDrop(dt: DataTransfer): boolean {
+  return !!dt.getData(AIOS_DIR_MIME);
+}
 
 /** Pull a filesystem path out of a drop — works for in-app pane drags (our
  *  custom mime), Finder/Explorer drags (`text/uri-list` file:// URIs), and
@@ -36,6 +43,7 @@ function extractPath(dt: DataTransfer): string | null {
 export function PaneDropZone({
   onPath,
   onFiles,
+  onDir,
   label = "drop to insert path",
   children,
 }: {
@@ -43,6 +51,10 @@ export function PaneDropZone({
   /** First crack at the drop's actual File objects (e.g. a screenshot). Return
    *  true if consumed — then the path-insert fallback is skipped. */
   onFiles?: (files: FileList) => boolean;
+  /** Called when a FOLDER (Files-pane folder row) is dropped. Return true to
+   *  consume — then the generic path-insert is skipped. Falls through to onPath
+   *  when not provided or it returns false. */
+  onDir?: (dir: string) => boolean;
   label?: string;
   children: React.ReactNode;
 }) {
@@ -84,7 +96,10 @@ export function PaneDropZone({
               return;
             }
             const path = extractPath(e.dataTransfer);
-            if (path) onPath(path);
+            if (!path) return;
+            // a folder drop gets the dir-specific handler first (cd / re-root).
+            if (onDir && isDirDrop(e.dataTransfer) && onDir(path)) return;
+            onPath(path);
           }}
         >
           <span
