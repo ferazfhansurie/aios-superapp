@@ -9,6 +9,7 @@ import {
   Folder,
   Globe,
   MessageSquare,
+  MonitorPlay,
   MonitorUp,
   NotebookPen,
   TerminalSquare,
@@ -21,6 +22,7 @@ export type PaneContent =
   | PaneKind
   | { type: "files"; root?: string }
   | { type: "browser"; url?: string; profile?: string; memKey?: string; transient?: boolean }
+  | { type: "appcast"; windowId?: number }
   | { type: "notes" }
   | { type: "bridges" }
   | { type: "plugins" }
@@ -69,6 +71,9 @@ export const SPAWN: AppDef[] = [
   { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools", firstClass: true },
   { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools", firstClass: true },
   { id: "apps", kind: { type: "apps" }, icon: MonitorUp, label: "apps", group: "tools" },
+  // App-cast (ScreenCaptureKit spike): live-mirror a native macOS window in a
+  // pane. Hidden by default (not firstClass) — reachable via ⌘K. macOS-only.
+  { id: "appcast", kind: { type: "appcast" }, icon: MonitorPlay, label: "app cast", group: "tools" },
 ];
 
 /** Stable id → AppDef, for sidebar render-time lookup. */

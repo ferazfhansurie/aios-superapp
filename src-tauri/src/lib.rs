@@ -1,6 +1,7 @@
 //! AIOS — desktop cockpit. Lean Tauri shell: multi-pane PTY terminals + the
 //! oracle roster (attach to bridge-managed tmux sessions). No IDE cruft.
 
+mod appcast;
 mod bridges;
 mod browser;
 mod browser_store;
@@ -201,6 +202,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(pty::PtyState::new())
+        // App-cast (ScreenCaptureKit "native app as a pane" spike) session map.
+        .manage(appcast::AppCastState::default())
         .setup(|app| {
             // Boot the local-first diagnostics store (Phase 0+1): resolve the
             // per-bundle app-data dir (portable — a fork gets its own dir, no
@@ -336,6 +339,13 @@ pub fn run() {
             browser_store::browser_download_forget,
             browser_store::browser_download_clear,
             browser_store::browser_reveal_in_finder,
+            // App-cast (ScreenCaptureKit native-app-as-a-pane spike, Phase A).
+            appcast::appcast_list_windows,
+            appcast::appcast_start,
+            appcast::appcast_set_bounds,
+            appcast::appcast_hide,
+            appcast::appcast_show,
+            appcast::appcast_close,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

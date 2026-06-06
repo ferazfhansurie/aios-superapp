@@ -170,6 +170,7 @@ const AttachAppsPane = lazy(() =>
 const AppAttachPane = lazy(() =>
   import("./components/AppAttachPane").then((m) => ({ default: m.AppAttachPane })),
 );
+const AppCastPane = lazy(() => import("./components/AppCastPane").then((m) => ({ default: m.AppCastPane })));
 const BridgesPane = lazy(() => import("./components/BridgesPane").then((m) => ({ default: m.BridgesPane })));
 const BrowserPane = lazy(() => import("./components/BrowserPane").then((m) => ({ default: m.BrowserPane })));
 const ChatPane = lazy(() => import("./components/ChatPane").then((m) => ({ default: m.ChatPane })));
@@ -3808,6 +3809,12 @@ function PaneCard({
               onAnnotate={onAnnotate}
               onProfileChange={onProfileChange}
               onVideoFullscreen={onVideoFullscreen}
+            />
+          ) : pane.kind.type === "appcast" ? (
+            <AppCastPane
+              label={pane.key}
+              active={active}
+              initialWindowId={pane.kind.windowId}
             />
           ) : pane.kind.type === "pet" ? (
             <PetPane />
