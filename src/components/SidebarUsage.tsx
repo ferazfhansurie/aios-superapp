@@ -1,12 +1,15 @@
 /**
  * SidebarUsage — a compact, narrow-sidebar rendering of the user's live usage
- * for codex (ChatGPT-sub primary/secondary windows from ~/.codex logs).
+ * for claude (5h/7d rate-limit windows from the statusline) and codex
+ * (ChatGPT-sub primary/secondary windows from ~/.codex).
  *
  * Data paths (both already-wired, defensive Tauri commands; see lib/dashboard):
- *   codex  ← codexRate() → codex_usage   (logs_2.sqlite codex.rate_limits)
+ *   claude ← claudeRate() → claude_usage  (~/.aios/state/usage.json rate_limits)
+ *   codex  ← codexRate()  → codex_usage   (wham endpoint / logs_2.sqlite)
  *
- * A provider block hides itself when it has no data (e.g. codex before its first
- * desktop/TUI turn), so the section never shows empty bars.
+ * A provider block hides itself when it has no data (e.g. claude before the
+ * statusline writes usage.json, or codex before its first desktop/TUI turn), so
+ * the section never shows empty bars.
  *
  * Color thresholds match the idle bar: accent under ~65%, warning to ~85%,
  * danger above.
@@ -14,8 +17,10 @@
 import { useEffect, useState } from "react";
 
 import {
+  claudeRate,
   codexRate,
   resetIn,
+  type ClaudeRate,
   type CodexRate,
 } from "../lib/dashboard";
 import { usagePaceRisk, type UsagePaceRisk } from "../lib/usagePace";
@@ -86,13 +91,6 @@ function topRisk(...risks: Array<UsagePaceRisk | null>): UsagePaceRisk | null {
   return risks.find((risk) => risk?.level === "danger") ?? risks.find(Boolean) ?? null;
 }
 
-function labelModel(name: string): string {
-  if (name === "gpt-5.3-codex-spark") {
-    return "gpt-5.3 spark";
-  }
-  return name;
-}
-
 /** One provider's titled block (e.g. "claude" / "codex") with its 5h + 7d bars. */
 function ProviderBlock({
   name,
@@ -130,11 +128,15 @@ function ProviderBlock({
 }
 
 export function SidebarUsage() {
+  const [claude, setClaude] = useState<ClaudeRate | null>(null);
   const [codex, setCodex] = useState<CodexRate | null>(null);
 
   useEffect(() => {
     let alive = true;
     const load = () => {
+      claudeRate()
+        .then((v) => alive && setClaude(v))
+        .catch((e) => reportDiag("sidebar.load", e, { action: "claudeRate" }));
       codexRate()
         .then((v) => alive && setCodex(v))
         .catch((e) => reportDiag("sidebar.load", e, { action: "codexRate" }));
@@ -147,34 +149,18 @@ export function SidebarUsage() {
     };
   }, []);
 
+  const hasClaude = claude && (claude.fiveHour.pct != null || claude.sevenDay.pct != null);
   const hasCodex = codex && (codex.fiveHour.pct != null || codex.sevenDay.pct != null);
-  const sparkKey = codex
-    ? Object.keys(codex.models).find(
-        (m) => /^gpt-5\.3-codex-spark$/i.test(m),
-      )
-    : undefined;
-  const sparkModel =
-    sparkKey && codex?.models[sparkKey] && codex.models[sparkKey].fiveHour.pct != null
-      ? sparkKey
-      : Object.keys(codex?.models ?? {}).find(
-          (m) => codex?.models[m]?.sevenDay?.pct != null && /\bcodex\b/i.test(m),
-        );
-  const hasSpark = sparkModel != null;
-  if (!hasCodex && !hasSpark) return null;
+  if (!hasClaude && !hasCodex) return null;
 
   return (
     <div className="flex flex-col gap-3 border-t border-[var(--color-border)] pt-3">
       <span className="text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">usage</span>
+      {hasClaude && (
+        <ProviderBlock name="claude" fiveHour={claude!.fiveHour} sevenDay={claude!.sevenDay} />
+      )}
       {hasCodex && (
         <ProviderBlock name="codex" fiveHour={codex!.fiveHour} sevenDay={codex!.sevenDay} showRemaining />
-      )}
-      {hasSpark && sparkModel && codex?.models[sparkModel] && (
-        <ProviderBlock
-          name={labelModel(sparkModel)}
-          fiveHour={codex.models[sparkModel].fiveHour}
-          sevenDay={codex.models[sparkModel].sevenDay}
-          showRemaining
-        />
       )}
     </div>
   );

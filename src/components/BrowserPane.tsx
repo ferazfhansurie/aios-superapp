@@ -953,26 +953,28 @@ export function BrowserPane({
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-2">
-        <NavBtn
-          title="Back"
-          disabled={!canGoBack}
-          onClick={() => browserBack(label).catch((e) => reportDiag("browser.nav", e, { action: "back" }))}
-        >
-          <ArrowLeft size={14} />
-        </NavBtn>
-        <NavBtn
-          title="Forward"
-          disabled={!canGoForward}
-          onClick={() => browserForward(label).catch((e) => reportDiag("browser.nav", e, { action: "forward" }))}
-        >
-          <ArrowRight size={14} />
-        </NavBtn>
-        <NavBtn
-          title={loading ? "Stop" : "Reload"}
-          onClick={() => browserReload(label).catch((e) => reportDiag("browser.reload", e, { action: "reload" }))}
-        >
-          {loading ? <Loader2 size={13} className="animate-spin" /> : <RotateCw size={13} />}
-        </NavBtn>
+        <div className="flex shrink-0 items-center gap-1">
+          <NavBtn
+            title="Back"
+            disabled={!canGoBack}
+            onClick={() => browserBack(label).catch((e) => reportDiag("browser.nav", e, { action: "back" }))}
+          >
+            <ArrowLeft size={14} />
+          </NavBtn>
+          <NavBtn
+            title="Forward"
+            disabled={!canGoForward}
+            onClick={() => browserForward(label).catch((e) => reportDiag("browser.nav", e, { action: "forward" }))}
+          >
+            <ArrowRight size={14} />
+          </NavBtn>
+          <NavBtn
+            title={loading ? "Stop" : "Reload"}
+            onClick={() => browserReload(label).catch((e) => reportDiag("browser.reload", e, { action: "reload" }))}
+          >
+            {loading ? <Loader2 size={13} className="animate-spin" /> : <RotateCw size={13} />}
+          </NavBtn>
+        </div>
         <div className="relative flex min-w-0 flex-1 items-center">
           <form
             onSubmit={(e) => {
@@ -1071,6 +1073,7 @@ export function BrowserPane({
             </div>
           )}
         </div>
+        <div className="flex shrink-0 items-center gap-1">
         <NavBtn title={isBookmarked ? "Remove bookmark" : "Bookmark this page"} onClick={toggleBookmark}>
           <Star size={13} className={isBookmarked ? "fill-[var(--color-accent)] text-[var(--color-accent)]" : ""} />
         </NavBtn>
@@ -1186,41 +1189,9 @@ export function BrowserPane({
             </div>
           )}
         </div>
-        <NavBtn title="Pin this site to the sidebar" onClick={pinSite}>
-          <Pin size={13} />
-        </NavBtn>
-        <NavBtn title="Open in system browser" onClick={() => openUrl(current).catch((e) => reportDiag("browser.open", e, { action: "systemBrowser" }))}>
-          <ExternalLink size={13} />
-        </NavBtn>
-        <NavBtn title="Screenshot" onClick={onScreenshot}>
-          <Camera size={13} />
-        </NavBtn>
-        <NavBtn title="Open DevTools (Web Inspector)" onClick={openDevtools}>
-          <Terminal size={13} />
-        </NavBtn>
         <NavBtn title="Find in page (⌘F)" onClick={openFind}>
           <Search size={13} />
         </NavBtn>
-        <NavBtn title="Send selection to chat" onClick={sendSelection}>
-          <MessageSquarePlus size={14} />
-        </NavBtn>
-        <button
-          type="button"
-          onClick={toggleAnnotate}
-          title={annotating ? "Stop annotating" : "Annotate page → chat"}
-          aria-pressed={annotating}
-          className={
-            annotating
-              ? "rounded p-1.5 bg-[var(--color-accent)]/15 text-[var(--color-accent)] transition-colors"
-              : "rounded p-1.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-          }
-        >
-          {annotating ? (
-            <Crosshair size={14} />
-          ) : (
-            <SquareDashedMousePointer size={14} />
-          )}
-        </button>
         <div ref={profileMenuRef} className="relative">
           <button
             type="button"
@@ -1296,6 +1267,50 @@ export function BrowserPane({
           </NavBtn>
           {menuOpen && (
             <div className="absolute right-0 top-full z-50 mt-1 w-52 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
+              <MenuItem
+                icon={<Camera size={13} />}
+                label="Screenshot"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onScreenshot();
+                }}
+              />
+              <MenuItem
+                icon={<SquareDashedMousePointer size={13} />}
+                label={annotating ? "Stop annotating" : "Annotate page → chat"}
+                trailing={
+                  annotating ? <Crosshair size={12} className="text-[var(--color-accent)]" /> : undefined
+                }
+                onClick={() => {
+                  setMenuOpen(false);
+                  toggleAnnotate();
+                }}
+              />
+              <MenuItem
+                icon={<MessageSquarePlus size={13} />}
+                label="Send selection to chat"
+                onClick={() => {
+                  setMenuOpen(false);
+                  sendSelection();
+                }}
+              />
+              <MenuItem
+                icon={<Pin size={13} />}
+                label="Pin site to sidebar"
+                onClick={() => {
+                  setMenuOpen(false);
+                  pinSite();
+                }}
+              />
+              <MenuItem
+                icon={<ExternalLink size={13} />}
+                label="Open in system browser"
+                onClick={() => {
+                  setMenuOpen(false);
+                  openUrl(current).catch((e) => reportDiag("browser.open", e, { action: "systemBrowser" }));
+                }}
+              />
+              <div className="my-1 border-t border-[var(--color-border)]" />
               <MenuItem
                 icon={<Terminal size={13} />}
                 label="Open DevTools"
@@ -1379,6 +1394,7 @@ export function BrowserPane({
               />
             </div>
           )}
+        </div>
         </div>
       </div>
 

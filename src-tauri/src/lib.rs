@@ -278,6 +278,7 @@ pub fn run() {
             browser::read_clipboard,
             usage::usage_stats,
             usage::codex_usage,
+            usage::claude_usage,
             memory::memory_graph,
             memory::memory_file,
             memory::memory_search,

@@ -19,6 +19,42 @@ pub fn usage_stats() -> Value {
     }
 }
 
+/// Live Claude rate-limit usage parsed directly from `~/.aios/state/usage.json`
+/// (the statusline-written file `usage_stats` reads). Returns a shape that mirrors
+/// `codex_usage` so the sidebar renders both identically:
+///   { "fiveHour": {pct, resetsAt}, "sevenDay": {pct, resetsAt} }
+/// Returns `null` when the file is missing/unwritten so the sidebar block hides
+/// gracefully. Reads + parses the JSON in Rust — no shelling out to node/ccusage
+/// (the GUI-launched app has no node on PATH).
+#[tauri::command]
+pub fn claude_usage() -> Value {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = format!("{home}/.aios/state/usage.json");
+    let s = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Value::Null,
+    };
+    let v: Value = match serde_json::from_str(&s) {
+        Ok(v) => v,
+        Err(_) => return Value::Null,
+    };
+    let rl = match v.get("rate_limits") {
+        Some(rl) => rl,
+        None => return Value::Null,
+    };
+    let win = |k: &str| -> Value {
+        let w = &rl[k];
+        json!({
+            "pct": w.get("used_percentage").and_then(|x| x.as_f64()),
+            "resetsAt": w.get("resets_at").and_then(|x| x.as_i64()),
+        })
+    };
+    json!({
+        "fiveHour": win("five_hour"),
+        "sevenDay": win("seven_day"),
+    })
+}
+
 /// Live Codex (ChatGPT-subscription) rate-limit usage from the same
 /// `/backend-api/wham/usage` endpoint the Codex desktop usage panel calls.
 /// Returns a shape that mirrors `usage_stats`'s rate block so the sidebar renders

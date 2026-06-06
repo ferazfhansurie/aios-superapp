@@ -204,6 +204,43 @@ export async function codexRate(): Promise<CodexRate> {
   }
 }
 
+/**
+ * Live Claude rate-limit usage, parsed from `~/.aios/state/usage.json` by the
+ * `claude_usage` Rust command (the statusline-written file). 5h / 7d windows
+ * mirror codexRate's shape so the sidebar renders both with the same component.
+ * Returns the empty shape when usage.json is missing/unwritten so the block
+ * hides gracefully.
+ */
+export interface ClaudeRate {
+  fiveHour: RateWindow;
+  sevenDay: RateWindow;
+}
+export async function claudeRate(): Promise<ClaudeRate> {
+  const empty: ClaudeRate = {
+    fiveHour: { pct: null, resetsAt: null },
+    sevenDay: { pct: null, resetsAt: null },
+  };
+  try {
+    const u = await invoke<{
+      fiveHour?: { pct?: number | null; resetsAt?: number | null };
+      sevenDay?: { pct?: number | null; resetsAt?: number | null };
+    } | null>("claude_usage");
+    if (!u) return empty;
+    return {
+      fiveHour: {
+        pct: u.fiveHour?.pct ?? null,
+        resetsAt: u.fiveHour?.resetsAt ?? null,
+      },
+      sevenDay: {
+        pct: u.sevenDay?.pct ?? null,
+        resetsAt: u.sevenDay?.resetsAt ?? null,
+      },
+    };
+  } catch {
+    return empty;
+  }
+}
+
 /** "58m" / "6d 22h" / "now" from a unix-seconds reset timestamp. */
 export function resetIn(ts: number | null): string {
   if (!ts) return "";
