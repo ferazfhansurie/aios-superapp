@@ -103,6 +103,18 @@ const ZOOM_STEP = 10;
 // no load-error callback, so this timeout is the only signal we get.
 const LOAD_TIMEOUT_MS = 12000;
 
+/** Origin of a URL, or null if unparseable. Used to tell a main-frame navigation
+ *  from a cross-origin sub-frame (auth/widget iframes like studio.youtube.com or
+ *  ogs.google.com) — `on_navigation` fires for BOTH, but only the main frame
+ *  should drive the address bar + the connection-error timeout. */
+function originOf(u: string): string | null {
+  try {
+    return new URL(u).origin;
+  } catch {
+    return null;
+  }
+}
+
 // Hosts that are dev/loopback → treat as a URL (not a search) AND default to
 // http:// (local dev servers rarely have TLS). `localhost`, `127.0.0.1`,
 // `[::1]`, and any bare `host:port` (a digits-only port after a colon) qualify.
@@ -220,6 +232,11 @@ export function BrowserPane({
   // last url we observed from the live webview — dedupes the poll so we only
   // persist + update the address bar on a real navigation.
   const lastUrlRef = useRef(start);
+  // Origin of the main-frame navigation the user actually initiated. Set on a
+  // user navigation (go / drop-url) and locked in on the first matching `started`.
+  // Cross-origin `started` events (sub-frame auth/widget iframes) are ignored so
+  // a slow/blocked iframe can't falsely "couldn't connect" the whole page.
+  const navTargetOriginRef = useRef<string | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Last clipboard payload we already consumed — so the poll only fires
   // `onAnnotate` once per fresh annotation, never re-emitting stale text.
@@ -344,20 +361,30 @@ export function BrowserPane({
       if (payload.label !== label) return;
       if (payload.phase === "started") {
         const u = payload.url;
-        if (u && u !== "about:blank") {
-          lastUrlRef.current = u;
-          rememberUrl(mem, u);
-          browserHistoryRecord(u).catch(() => {});
-          if (!inputFocusedRef.current) {
-            setCurrent(u);
-            setInput(u);
-          }
+        if (!u || u === "about:blank") return;
+        // Main frame = same origin as the navigation the user initiated. A null
+        // target means we haven't locked one yet (initial load / back-fwd), so the
+        // first started establishes it. Cross-origin starteds = sub-frame iframes
+        // (studio.youtube.com, ogs.google.com, …) → ignore them: they must NOT
+        // hijack the address bar or arm the connection-error timer (the bug where
+        // a slow auth iframe falsely "couldn't connect" the whole loaded page).
+        const origin = originOf(u);
+        const isMainFrame =
+          navTargetOriginRef.current == null || origin === navTargetOriginRef.current;
+        if (!isMainFrame) return;
+        navTargetOriginRef.current = origin; // lock the main-frame origin
+        lastUrlRef.current = u;
+        rememberUrl(mem, u);
+        browserHistoryRecord(u).catch(() => {});
+        if (!inputFocusedRef.current) {
+          setCurrent(u);
+          setInput(u);
         }
         setLoadError(null);
         setLoading(true);
         if (loadTimer.current) clearTimeout(loadTimer.current);
         loadTimer.current = setTimeout(() => {
-          // Started but never finished → treat as a failed connection.
+          // Main frame started but never finished → real connection failure.
           setLoading(false);
           setLoadError(u || lastUrlRef.current);
         }, LOAD_TIMEOUT_MS);
