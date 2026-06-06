@@ -25,6 +25,7 @@ import {
   Eye,
   EyeOff,
   Monitor,
+  MonitorUp,
   Moon,
   PanelLeft,
   Palette,
@@ -1008,9 +1009,18 @@ function ProjectsSection() {
 export function Settings({
   open,
   onClose,
+  mirrorUrl,
+  mirrorStatus,
+  onCopyMirrorUrl,
 }: {
   open: boolean;
   onClose: () => void;
+  /** Desktop-mirror pairing url (only present when a mirror is available). */
+  mirrorUrl?: string | null;
+  /** Pairing status text (e.g. "connected", "waiting"). */
+  mirrorStatus?: string;
+  /** Copy the mirror url to the clipboard (App owns the clipboard + flash). */
+  onCopyMirrorUrl?: () => void;
 }) {
   const [section, setSection] = useState<SectionId>("general");
   const [s, setS] = useState<AppSettings>(loadSettings);
@@ -1170,6 +1180,21 @@ export function Settings({
                       ]}
                     />
                   </Row>
+                  {mirrorUrl && (
+                    <Row
+                      label="desktop mirror link"
+                      sub={`copy the pairing link to view this cockpit elsewhere · ${mirrorStatus ?? "off"}`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => onCopyMirrorUrl?.()}
+                        className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 text-[12px] text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)]"
+                      >
+                        <MonitorUp size={13} />
+                        copy link
+                      </button>
+                    </Row>
+                  )}
                 </>
               )}
 

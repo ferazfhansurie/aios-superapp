@@ -121,6 +121,7 @@ import {
   openUrlInPane,
   openViewerFileInPane,
   revealFileInPane,
+  spawnPane,
 } from "../lib/paneBus";
 import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import {
@@ -599,6 +600,15 @@ function fmtRelativeTime(unixSeconds: number): string {
 
 type ChatFileOpener = (ref: string) => void;
 const ChatFileOpenContext = createContext<ChatFileOpener | null>(null);
+
+/** Session cwd, provided once at the ChatPane root so deep renderers (code-fence
+ *  "run in terminal" affordance) can spawn a terminal rooted in the same dir
+ *  without threading cwd through every layer. */
+const ChatCwdContext = createContext<string | null>(null);
+
+function useChatCwd(): string | null {
+  return useContext(ChatCwdContext);
+}
 
 function useChatFileOpener(): ChatFileOpener {
   const ctx = useContext(ChatFileOpenContext);
@@ -3531,6 +3541,7 @@ export function ChatPane({
   }
 
   return (
+    <ChatCwdContext.Provider value={cwd ?? null}>
     <ChatFileOpenContext.Provider value={openChatFile}>
     <PaneDropZone onPath={insertPath} label="drop to add to message">
     <div
@@ -3662,6 +3673,7 @@ export function ChatPane({
     </div>
     </PaneDropZone>
     </ChatFileOpenContext.Provider>
+    </ChatCwdContext.Provider>
   );
 }
 
@@ -4598,16 +4610,40 @@ function Markdown({
   );
 }
 
+/** Shell-ish fences get a "run in terminal" affordance. Single-statement blocks
+ *  (no embedded newline once trimmed) seed + run directly; multi-line blocks open
+ *  a terminal rooted at the session cwd and let the user run it (we still seed the
+ *  whole block so it's typed in). */
+const SHELL_LANGS = new Set(["bash", "sh", "shell", "zsh", "console", "shell-session"]);
+
 function CodeBlock({ lang, body }: { lang: string; body: string }) {
   // strip a single trailing newline so the block isn't bottom-heavy
   const code = body.replace(/\n$/, "");
+  const cwd = useChatCwd();
+  const isShell = SHELL_LANGS.has(lang.trim().toLowerCase());
+  // Single-line shell snippet → safe to seed + auto-run. Multi-line scripts →
+  // seed the whole block but don't auto-fire (avoid running half a heredoc).
+  const seedCmd = code.includes("\n") ? undefined : code.trim();
   return (
     <div className="overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/70">
       <div className="flex items-center justify-between border-b border-[var(--color-border)] px-3 py-1">
         <span className="font-mono text-[10.5px] text-[var(--color-faint)]">
           {lang || "code"}
         </span>
-        <CopyButton text={code} size={12} title="copy code" />
+        <div className="flex items-center gap-1.5">
+          {isShell && code.trim() && (
+            <button
+              type="button"
+              onClick={() => spawnPane("terminal", { cwd: cwd ?? undefined, cmd: seedCmd })}
+              title={seedCmd ? "run in a new terminal pane" : "open a terminal here (multi-line — run it yourself)"}
+              className="flex items-center gap-1 rounded px-1 py-0.5 text-[10.5px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-accent)]"
+            >
+              <Terminal size={11} />
+              run in terminal
+            </button>
+          )}
+          <CopyButton text={code} size={12} title="copy code" />
+        </div>
       </div>
       <pre className="overflow-x-auto px-3 py-2.5 font-mono text-[12.5px] leading-relaxed text-[var(--color-text)]">
         <code>{code}</code>
@@ -4834,6 +4870,21 @@ function Inline({
               {label}
             </a>,
           );
+          // For real http(s) links, add a small inline "open in browser pane"
+          // affordance — a click spawns a native browser pane (don't auto-open).
+          if (http) {
+            nodes.push(
+              <button
+                key={`au${k++}`}
+                type="button"
+                onClick={() => spawnPane("browser", { url })}
+                title="open in a browser pane"
+                className="ml-0.5 inline-flex translate-y-[1px] items-center rounded p-0.5 align-baseline text-[var(--color-faint)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-accent)]"
+              >
+                <Globe size={11} />
+              </button>,
+            );
+          }
           i = paren + 1;
           continue;
         }

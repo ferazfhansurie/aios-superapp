@@ -199,6 +199,11 @@ export interface SpawnCtx {
   cwd?: string;
   path?: string;
   url?: string;
+  /** terminal only: a command to seed + run in the freshly-spawned shell. Maps
+   *  to the shell pane's startup `cmd`, so it runs as soon as the PTY is ready
+   *  (no need to look the new pane up in paneWriters/paneSubmitters after mount).
+   *  Used by ChatPane's "run in terminal" affordance on bash/sh code fences. */
+  cmd?: string;
   /** Optional human label override for the new pane. */
   label?: string;
 }

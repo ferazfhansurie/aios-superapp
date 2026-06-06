@@ -835,7 +835,11 @@ function App() {
     (kind: SpawnPaneKind, ctx?: SpawnCtx) => {
       switch (kind) {
         case "terminal":
-          spawn({ type: "shell", cwd: ctx?.cwd }, ctx?.label ?? "terminal");
+          // ctx.cmd (when present) seeds + runs a command in the new shell — the
+          // shell pane's startup `cmd` fires once the PTY is ready, so a ChatPane
+          // code-fence "run in terminal" lands its command without needing to look
+          // the freshly-mounted pane up in the paneWriters registry.
+          spawn({ type: "shell", cwd: ctx?.cwd, cmd: ctx?.cmd }, ctx?.label ?? "terminal");
           break;
         case "files": {
           const root = ctx?.path;
@@ -1994,24 +1998,62 @@ function App() {
       </div>
     </div>
   );
+  // Compact action row that lives in the SIDEBAR (the persistent chrome) now that
+  // the hover top-bar pill is gone. Same handlers as the header variant; the
+  // sidebar-toggle is dropped here (redundant inside the sidebar) and the
+  // rarely-used desktop-mirror link moved into Settings → general.
+  const sidebarActions = (
+    <div className={`flex items-center ${iconsOnly ? "flex-col gap-0.5" : "gap-0.5"}`}>
+      <IconBtn title="Command palette (⌘K)" onClick={() => setPaletteOpen(true)}>
+        <Search size={15} />
+      </IconBtn>
+      <IconBtn
+        title="Show all panes"
+        onClick={() => {
+          if (panes.length > 0) setOverviewOpen(true);
+        }}
+        active={overviewOpen}
+      >
+        <Layers size={15} />
+      </IconBtn>
+      <VoiceButton onTranscript={handleTranscript} />
+      <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
+        <Camera size={15} />
+      </IconBtn>
+      <div className="relative" data-no-window-drag>
+        <button
+          type="button"
+          onClick={openNotificationsPane}
+          title="notifications"
+          className={`relative rounded-md p-1.5 transition-colors ${
+            notificationsActive
+              ? "bg-[var(--color-panel-2)] text-[var(--color-accent)]"
+              : "text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+          }`}
+        >
+          <Bell size={15} />
+          {unreadNotifications > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 grid h-3.5 min-w-3.5 place-items-center rounded-full bg-[var(--color-danger)] px-1 text-[8px] font-bold leading-none text-white">
+              {unreadNotifications > 9 ? "9+" : unreadNotifications}
+            </span>
+          )}
+        </button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-[var(--color-bg)] text-[var(--color-text)]">
       {splash && <Splash />}
 
       {topBarHidden ? (
+        // No floating overlay — actions now live in the sidebar. Keep ONLY a thin
+        // top drag strip so the window can still be moved by its top edge.
         <div
-          className="group/topbar absolute left-0 right-0 top-0 z-50 h-5"
+          className="absolute left-0 right-0 top-0 z-40 h-5"
           data-tauri-drag-region
           onMouseDown={startWindowDrag}
-        >
-          <div className="mx-auto mt-1 h-0.5 w-7 rounded-full bg-[var(--color-border-strong)]/45 transition-opacity group-hover/topbar:opacity-0" />
-          <div className="glass pointer-events-auto mx-auto flex h-7 w-fit translate-y-[-30px] items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/90 px-1 opacity-0 shadow-xl transition-all group-hover/topbar:translate-y-[-2px] group-hover/topbar:opacity-100">
-            {topBarLeft}
-            <span className="h-4 w-px bg-[var(--color-border)]" />
-            {topBarRight}
-          </div>
-        </div>
+        />
       ) : (
         <header
           className="glass flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-panel)]/45 pl-20 pr-2"
@@ -2069,6 +2111,9 @@ function App() {
               />
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
+              <div className={`flex pb-1 ${iconsOnly ? "justify-center" : "justify-start px-1.5"}`}>
+                {sidebarActions}
+              </div>
               <NavRow icon={SettingsIcon} label="settings" iconsOnly={iconsOnly} onClick={() => setSettingsOpen(true)} />
               <AccountMenu iconsOnly={iconsOnly} onOpenSettings={() => setSettingsOpen(true)} />
             </div>
@@ -2265,7 +2310,17 @@ function App() {
 
       {settingsOpen && (
         <Suspense fallback={null}>
-          <Settings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+          <Settings
+            open={settingsOpen}
+            onClose={() => setSettingsOpen(false)}
+            mirrorUrl={mirrorUrl}
+            mirrorStatus={mirrorStatus}
+            onCopyMirrorUrl={() => {
+              if (!mirrorUrl) return;
+              navigator.clipboard?.writeText(mirrorUrl).catch((e) => reportDiag("app.clipboard", e, { action: "mirrorUrl" }));
+              flash("mirror link copied");
+            }}
+          />
         </Suspense>
       )}
       <CommandPalette
