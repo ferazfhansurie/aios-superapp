@@ -744,6 +744,11 @@ function App() {
   // always reading the freshest values (assigned in an effect below).
   const panesRef = useRef<Pane[]>([]);
   const focusPaneRef = useRef<(key: string) => void>(() => {});
+  // voice dictation → the focused terminal pane, else clipboard. Declared up
+  // here (not next to focusPane) because the finderRoot useMemo reads
+  // focusedPane.current during render — a later `const` would be in its TDZ
+  // and throw "cannot access before initialization" (black screen on mount).
+  const focusedPane = useRef<string | null>(null);
   const setPanesRef = useRef<typeof setPanes>(setPanes);
 
   // OPEN-FILE DEDUP (panes ARE tabs): if a pane already shows this exact file,
@@ -996,8 +1001,6 @@ function App() {
     }
   }, [flash]);
 
-  // voice dictation → the focused terminal pane, else clipboard.
-  const focusedPane = useRef<string | null>(null);
   // Focus a pane from the "OPEN" rail: restore it if minimized, mark it active
   // so dictation / drops target it (and the rail row highlights).
   const focusPane = useCallback((key: string) => {
