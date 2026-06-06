@@ -62,7 +62,7 @@ objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRu
 # crate) are used so every type unifies with the objc2 0.6 / objc2-* 0.3 stack
 # objc2-web-kit already pins — a divergent objc2 version would make the WKWebView
 # and SCK NSObject worlds incompatible. Requires macOS 12.3+. See SPIKE-screencapturekit.md.
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics"] }
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSColor"] }
 objc2-screen-capture-kit = { version = "0.3", features = ["SCStream", "SCShareableContent", "SCError", "objc2-core-media", "objc2-core-graphics", "block2", "dispatch2"] }
 objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMTime"] }
 objc2-core-video = { version = "0.3", features = ["CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVBuffer", "objc2-io-surface"] }

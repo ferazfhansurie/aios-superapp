@@ -15,8 +15,22 @@
 //!   delegate stream:didOutputSampleBuffer:ofType: gets a CMSampleBuffer
 //!     → CMSampleBufferGetImageBuffer → CVPixelBufferGetIOSurface
 //!     → CALayer.setContents(IOSurface)   (Core Animation composites zero-copy)
-//!   the CALayer backs an NSView added as a child of the main window's contentView,
-//!   bounds-synced to the React slot via appcast_set_bounds (mirrors browser.rs).
+//!   the CALayer backs an NSView that is the contentView of a borderless CHILD
+//!   NSWindow floated over the React slot, NOT a subview of the main window's
+//!   contentView — bounds-synced (in SCREEN coords) via appcast_set_bounds.
+//!
+//! WHY A CHILD WINDOW (and not addSubview):
+//!   tao (the windowing layer wry/Tauri sits on) routes mouseMoved events through
+//!   its OWN NSView, loading a weak ref to that view. Adding a layer-HOSTING NSView
+//!   (setLayer + setWantsLayer) into tao's contentView forces layer-backing to
+//!   propagate up tao's view tree and corrupts that weak ref → tao's
+//!   `mouse_moved` → `objc_loadWeakRetained` deref of null → EXC_BAD_ACCESS the
+//!   moment the mouse moves over the pane (crash report 2026-06-06). BrowserPane
+//!   survives because wry's `add_child` integrates with tao; our raw addSubview
+//!   did not. A separate borderless child NSWindow lives ENTIRELY OUTSIDE tao's
+//!   view hierarchy + event routing, so tao's mouseMoved never touches it. For
+//!   Phase A (no input forwarding yet) the overlay also sets
+//!   `ignoresMouseEvents = true`, so it can't route into any broken path at all.
 //!
 //! Lower-level objc2-* bindings (not the high-level `screencapturekit` crate) so
 //! every NSObject type unifies with the objc2 0.6 / objc2-* 0.3 stack
@@ -48,8 +62,13 @@ mod imp {
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, ProtocolObject};
-    use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::{NSView, NSWindow};
+    use objc2::{
+        define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+        Message,
+    };
+    use objc2_app_kit::{
+        NSBackingStoreType, NSColor, NSView, NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
+    };
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_core_media::CMSampleBuffer;
     use objc2_core_video::CVPixelBufferGetIOSurface;
@@ -130,9 +149,14 @@ mod imp {
         // The delegate must outlive the stream (SCK holds it weakly-ish via the
         // output registration); keep it alive here.
         _output: Retained<ProtocolObject<dyn SCStreamOutput>>,
-        // The layer-hosting NSView added as a child of the main window's
-        // contentView. Removed from its superview on close.
-        view: Retained<NSView>,
+        // The borderless child NSWindow whose contentView's layer we feed frames
+        // into. It lives OUTSIDE tao's view hierarchy (see module doc) — that is
+        // what avoids the mouseMoved crash. Removed as a child + ordered out +
+        // closed on teardown.
+        overlay: Retained<NSWindow>,
+        // The main window the overlay is parented to — kept so close() can
+        // removeChildWindow: it.
+        parent: Retained<NSWindow>,
         layer: Retained<CALayer>,
         pid: i32,
     }
@@ -147,8 +171,9 @@ mod imp {
         sessions: Mutex<std::collections::HashMap<String, AppCastSession>>,
     }
 
-    /// Reach the main window's contentView (NSView) to add capture child views to.
-    fn main_content_view(app: &AppHandle) -> Result<Retained<NSView>, String> {
+    /// Reach the main window's `NSWindow` — both to parent the overlay onto and to
+    /// map slot rects into screen coordinates.
+    fn main_window(app: &AppHandle) -> Result<Retained<NSWindow>, String> {
         let window = app
             .get_window("main")
             .or_else(|| app.windows().into_values().next())
@@ -158,23 +183,43 @@ mod imp {
             return Err("ns_window is null".into());
         }
         // SAFETY: Tauri hands us the real NSWindow pointer for the main window.
+        // Retain it (not just borrow) so the overlay's parent reference is stable
+        // for the session's lifetime.
         let ns_window: &NSWindow = unsafe { &*(ns_window_ptr as *const NSWindow) };
-        ns_window
-            .contentView()
-            .ok_or_else(|| "main window has no contentView".into())
+        Ok(ns_window.retain())
     }
 
     /// Convert a top-left-origin React slot rect (CSS px, == AppKit points since
-    /// Tauri uses logical points) into an AppKit bottom-left-origin frame within
-    /// the contentView. AppKit's contentView is NOT flipped by default, so y must
-    /// be measured from the bottom: ny = parentHeight - (rect.y + rect.height).
-    fn slot_to_frame(parent: &NSView, x: f64, y: f64, width: f64, height: f64) -> CGRect {
-        let parent_h = parent.frame().size.height;
+    /// Tauri uses logical points), measured RELATIVE TO THE MAIN WINDOW's content
+    /// area, into a bottom-left-origin frame in SCREEN coordinates — where a child
+    /// NSWindow's frame lives.
+    ///
+    /// The frontend's `getBoundingClientRect()` is relative to the web view's
+    /// viewport, which fills the main window's content area, so the slot's window-
+    /// local top-left is `(x, y)` measured from the content area's TOP-left.
+    ///
+    /// Screen mapping (AppKit's screen origin is bottom-left):
+    ///   screen_x = window_frame.x + x
+    ///   screen_y = window_frame.y + window_frame.height - (y + height)
+    /// where `window_frame` is the main window's frame in screen coords. Using the
+    /// full window frame (titlebar included) keeps the slot's relative offset
+    /// intact because the web content sits at the window's top edge in this app
+    /// (no native titlebar inset); if a chrome inset is later added, subtract it
+    /// from the height term.
+    fn slot_to_screen_frame(
+        parent: &NSWindow,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> CGRect {
+        let wf = parent.frame();
         let w = width.max(1.0);
         let h = height.max(1.0);
-        let ny = parent_h - (y + h);
+        let sx = wf.origin.x + x;
+        let sy = wf.origin.y + wf.size.height - (y + h);
         CGRect {
-            origin: CGPoint { x, y: ny },
+            origin: CGPoint { x: sx, y: sy },
             size: CGSize { width: w, height: h },
         }
     }
@@ -302,30 +347,69 @@ mod imp {
         };
         let win_frame = unsafe { sc_window.frame() };
 
-        // ── Build the native child view + its CALayer ──
-        let content_view = main_content_view(app)?;
+        // ── Build the overlay child window + its layer-hosting contentView ──
+        let parent = main_window(app)?;
         // Backing scale (Retina): capture at device px so the mirror is sharp.
-        let scale = content_view
-            .window()
-            .map(|w| w.backingScaleFactor())
-            .unwrap_or(2.0);
+        let scale = parent.backingScaleFactor();
 
-        let frame = slot_to_frame(&content_view, x, y, width, height);
-        // NSView is MainThreadOnly. This command is SYNC (see appcast_start), so
-        // Tauri runs it on the main thread — assert + capture the marker for alloc.
+        // Screen-coord frame for the overlay (child NSWindow frames are in screen
+        // space). Mirrors browser.rs slot positioning, just window→screen mapped.
+        let frame = slot_to_screen_frame(&parent, x, y, width, height);
+
+        // NSWindow + NSView are MainThreadOnly. This command is SYNC (see
+        // appcast_start), so Tauri runs it on the main thread — assert + capture
+        // the marker for alloc.
         let mtm = MainThreadMarker::new()
             .ok_or("appcast_start must run on the main thread")?;
+
+        // Borderless overlay window. Buffered backing, deferred creation off.
+        // SAFETY: standard NSWindow designated initializer on a fresh allocation.
+        let overlay: Retained<NSWindow> = unsafe {
+            let alloc = NSWindow::alloc(mtm);
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                alloc,
+                frame,
+                NSWindowStyleMask::Borderless,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        // Transparent overlay: no opaque chrome, clear background so only the
+        // captured layer is visible, and — Phase A has NO input — pass every
+        // mouse event straight through so it can NEVER route into tao's broken
+        // mouseMoved path (belt-and-suspenders on top of the window isolation).
+        overlay.setOpaque(false);
+        overlay.setBackgroundColor(Some(&NSColor::clearColor()));
+        overlay.setIgnoresMouseEvents(true);
+        // Don't auto-release on close — we manage its lifetime via the Retained
+        // handle in the session map and explicitly close() on teardown.
+        // SAFETY: setting the released-when-closed flag; the Retained handle keeps
+        // the window alive regardless, so close() won't dangle.
+        unsafe { overlay.setReleasedWhenClosed(false) };
+
+        // Layer-hosting contentView for the overlay. The overlay's content area is
+        // the full borderless frame, so the capture view fills it at origin (0,0).
+        let view_frame = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: frame.size,
+        };
         // SAFETY: standard NSView designated initializer on a fresh allocation.
         let view: Retained<NSView> = unsafe {
             let alloc = NSView::alloc(mtm);
-            msg_send![alloc, initWithFrame: frame]
+            msg_send![alloc, initWithFrame: view_frame]
         };
         let layer = CALayer::new();
         // Aspect-fit the captured surface inside the slot. kCAGravityResizeAspect.
         layer.setContentsGravity(&NSString::from_str("resizeAspect"));
         view.setLayer(Some(&layer));
         view.setWantsLayer(true);
-        content_view.addSubview(&view);
+        overlay.setContentView(Some(&view));
+
+        // Parent the overlay onto the main window so it moves + orders with it.
+        // NSWindowOrderingMode::Above = stacked in front of the parent.
+        unsafe {
+            parent.addChildWindow_ordered(&overlay, NSWindowOrderingMode::Above);
+        }
 
         // ── SCContentFilter (single window) ──
         let filter: Retained<SCContentFilter> = unsafe {
@@ -400,7 +484,8 @@ mod imp {
             AppCastSession {
                 stream,
                 _output: output_proto,
-                view,
+                overlay,
+                parent,
                 layer,
                 pid,
             },
@@ -416,12 +501,22 @@ mod imp {
         width: f64,
         height: f64,
     ) -> Result<(), String> {
-        let content_view = main_content_view(app)?;
-        let frame = slot_to_frame(&content_view, x, y, width, height);
+        let parent = main_window(app)?;
+        // Map the window-local slot rect to a SCREEN frame for the child window.
+        let frame = slot_to_screen_frame(&parent, x, y, width, height);
         let state = app.state::<AppCastState>();
         let sessions = state.sessions.lock();
         if let Some(s) = sessions.get(&label) {
-            s.view.setFrame(frame);
+            // Reposition the overlay window itself (screen coords)…
+            s.overlay.setFrame_display(frame, false);
+            // …and resize its contentView to fill the new frame so the layer
+            // tracks the slot. (Origin stays (0,0); only size matters.)
+            if let Some(v) = s.overlay.contentView() {
+                v.setFrame(CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: frame.size,
+                });
+            }
         }
         Ok(())
     }
@@ -430,7 +525,7 @@ mod imp {
         let state = app.state::<AppCastState>();
         let sessions = state.sessions.lock();
         if let Some(s) = sessions.get(&label) {
-            s.view.setHidden(true);
+            s.overlay.orderOut(None);
         }
         Ok(())
     }
@@ -439,7 +534,9 @@ mod imp {
         let state = app.state::<AppCastState>();
         let sessions = state.sessions.lock();
         if let Some(s) = sessions.get(&label) {
-            s.view.setHidden(false);
+            // orderFront re-shows; the child-window parenting keeps z-order with
+            // the main window.
+            s.overlay.orderFront(None);
         }
         Ok(())
     }
@@ -449,15 +546,18 @@ mod imp {
         let session = state.sessions.lock().remove(&label);
         if let Some(s) = session {
             // Stop the stream (best-effort, async — we don't wait), drop the
-            // layer contents, and pull the view out of the hierarchy.
+            // layer contents, detach the overlay from the parent + tear it down.
             let stop_handler = RcBlock::new(|_error: *mut objc2_foundation::NSError| {});
             unsafe {
                 s.stream.stopCaptureWithCompletionHandler(Some(&stop_handler));
                 s.layer.setContents(None);
-                s.view.removeFromSuperview();
             }
+            s.parent.removeChildWindow(&s.overlay);
+            s.overlay.orderOut(None);
+            s.overlay.close();
             let _ = s.pid;
-            // `s` (incl. stream + output delegate) drops here, releasing SCK refs.
+            // `s` (incl. stream + output delegate + retained overlay/parent) drops
+            // here, releasing SCK refs and the overlay window.
         }
         Ok(())
     }
