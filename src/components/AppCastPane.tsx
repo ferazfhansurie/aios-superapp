@@ -1,5 +1,7 @@
 /** App-cast pane — live-mirrors ONE native macOS app window inside an AIOS pane
- *  (ScreenCaptureKit spike, Phase A: capture + mirror, NO input forwarding).
+ *  (ScreenCaptureKit). Phase A: capture + mirror. Phase B: input forwarding —
+ *  clicks/scroll/keys on the overlay are mapped to the real window + posted to
+ *  the target app's pid (handled natively in the overlay's event handlers).
  *
  *  Structural clone of BrowserPane: a native child view (here a CALayer-backed
  *  NSView fed by an SCStream's IOSurface frames, not a WKWebView) is floated over
@@ -9,12 +11,14 @@
  *  on first use); selecting a window calls appcast_start; unmount hides+closes.
  *
  *  TDZ NOTE: every ref/state is declared at the top, BEFORE any useCallback /
- *  effect that reads it — referencing a const before its declaration line inside
- *  a synchronously-run hook throws "Cannot access X before initialization" and
- *  black-screens the app (tsc won't catch it). */
-import { useCallback, useEffect, useRef, useState } from "react";
+ *  effect / derived value that reads it — referencing a const before its
+ *  declaration line inside a synchronously-run hook or the render body throws
+ *  "Cannot access X before initialization" and black-screens the app (tsc won't
+ *  catch it). */
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Loader2, MonitorUp, RefreshCw, X } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { Loader2, MonitorUp, RefreshCw, Search, ShieldAlert, X } from "lucide-react";
 
 import {
   appcastClose,
@@ -28,6 +32,32 @@ import {
 import type { Rect } from "../lib/browser";
 import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
 import { reportDiag } from "../lib/diag";
+
+/** macOS deep-link straight to Privacy › Screen Recording. */
+const SCREEN_REC_SETTINGS_URL =
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+
+/** Heuristic: does this error look like the Screen Recording TCC permission was
+ *  declined / not yet granted? (SCK surfaces this a few different ways.) */
+function isTccDeclined(msg: string | null): boolean {
+  if (!msg) return false;
+  const m = msg.toLowerCase();
+  return (
+    m.includes("screen recording") ||
+    m.includes("permission") ||
+    m.includes("declined") ||
+    m.includes("not authorized") ||
+    m.includes("tcc") ||
+    (m.includes("scstream") && m.includes("-3801")) ||
+    m.includes("no capturable windows")
+  );
+}
+
+/** One app's group of windows for the grouped picker. */
+interface AppGroup {
+  app: string;
+  windows: WindowInfo[];
+}
 
 export function AppCastPane({
   label,
@@ -51,6 +81,7 @@ export function AppCastPane({
   // ── refs + state (declare BEFORE any hook that consumes them — TDZ guard) ──
   const slotRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
   // Whether the native capture view has been created for this pane (gates the
   // sync loop between create-on-first-sync and reposition — mirrors BrowserPane
   // shownRef). Reset to false on close so a re-pick recreates it.
@@ -64,6 +95,9 @@ export function AppCastPane({
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // Picker search query + keyboard-nav highlight index (into the FLAT filtered list).
+  const [query, setQuery] = useState("");
+  const [activeIdx, setActiveIdx] = useState(0);
 
   const notify = useCallback(
     (msg: string, level: NotificationLevel = "info") => {
@@ -112,6 +146,7 @@ export function AppCastPane({
   const pickWindow = useCallback(
     (w: WindowInfo) => {
       setPickerOpen(false);
+      setQuery("");
       if (startedRef.current) {
         appcastClose(label).catch((e) => reportDiag("appcast.close", e, { action: "switch" }));
         startedRef.current = false;
@@ -202,7 +237,73 @@ export function AppCastPane({
     return () => document.removeEventListener("mousedown", onDoc);
   }, [pickerOpen]);
 
+  // Focus the search box + reset the query/highlight whenever the picker opens.
+  useEffect(() => {
+    if (pickerOpen) {
+      setActiveIdx(0);
+      const t = setTimeout(() => searchRef.current?.focus(), 0);
+      return () => clearTimeout(t);
+    }
+  }, [pickerOpen]);
+
+  // ── derived (render-body computations — all hooks/state above this line) ──
+  // Case-insensitive filter on app name + window title, then group by app.
+  const groups: AppGroup[] = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const filtered = q
+      ? windows.filter(
+          (w) =>
+            w.app_name.toLowerCase().includes(q) ||
+            w.window_title.toLowerCase().includes(q),
+        )
+      : windows;
+    const byApp = new Map<string, WindowInfo[]>();
+    for (const w of filtered) {
+      const key = w.app_name || "(unknown)";
+      const arr = byApp.get(key);
+      if (arr) arr.push(w);
+      else byApp.set(key, [w]);
+    }
+    return Array.from(byApp.entries())
+      .map(([app, wins]) => ({ app, windows: wins }))
+      .sort((a, b) => a.app.localeCompare(b.app));
+  }, [windows, query]);
+
+  // Flattened filtered windows in display (grouped) order — the index space the
+  // arrow keys + Enter navigate over.
+  const flat: WindowInfo[] = useMemo(() => groups.flatMap((g) => g.windows), [groups]);
+
+  // Keep the highlight index in range as the filter narrows.
+  useEffect(() => {
+    setActiveIdx((i) => (flat.length === 0 ? 0 : Math.min(i, flat.length - 1)));
+  }, [flat.length]);
+
+  // Arrow up/down + Enter in the search box drive selection.
+  const onSearchKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActiveIdx((i) => (flat.length === 0 ? 0 : (i + 1) % flat.length));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActiveIdx((i) => (flat.length === 0 ? 0 : (i - 1 + flat.length) % flat.length));
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const w = flat[activeIdx];
+        if (w) pickWindow(w);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        setPickerOpen(false);
+      }
+    },
+    [flat, activeIdx, pickWindow],
+  );
+
   const pickedWin = windows.find((w) => w.window_id === picked) ?? null;
+  const tccDeclined = isTccDeclined(error);
+
+  // Running flat index so each rendered row knows its nav position.
+  let flatCursor = -1;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
@@ -226,11 +327,22 @@ export function AppCastPane({
             {starting && <Loader2 size={12} className="shrink-0 animate-spin text-[var(--color-accent)]" />}
           </button>
           {pickerOpen && (
-            <div className="absolute left-0 right-0 top-full z-[70] mt-1 max-h-96 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] shadow-2xl">
-              <div className="flex items-center justify-between px-3 py-1">
-                <span className="text-[10px] uppercase tracking-wide text-[var(--color-faint)]">
-                  capturable windows
-                </span>
+            <div className="absolute left-0 right-0 top-full z-[70] mt-1 flex max-h-96 flex-col rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] text-[12px] shadow-2xl">
+              {/* search + refresh header (sticky) */}
+              <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-2.5 py-1.5">
+                <Search size={12} className="shrink-0 text-[var(--color-faint)]" />
+                <input
+                  ref={searchRef}
+                  type="text"
+                  value={query}
+                  onChange={(e) => {
+                    setQuery(e.target.value);
+                    setActiveIdx(0);
+                  }}
+                  onKeyDown={onSearchKeyDown}
+                  placeholder="filter by app or window…"
+                  className="min-w-0 flex-1 bg-transparent text-[12px] text-[var(--color-text)] outline-none placeholder:text-[var(--color-faint)]"
+                />
                 <button
                   type="button"
                   title="Refresh list"
@@ -238,43 +350,98 @@ export function AppCastPane({
                     e.stopPropagation();
                     refreshWindows();
                   }}
-                  className="rounded p-0.5 text-[var(--color-faint)] hover:text-[var(--color-text)]"
+                  className="shrink-0 rounded p-0.5 text-[var(--color-faint)] hover:text-[var(--color-text)]"
                 >
                   {loadingList ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
                 </button>
               </div>
-              {windows.length === 0 ? (
-                <div className="px-3 py-2 text-[11px] text-[var(--color-faint)]">
-                  {loadingList ? "scanning…" : "no windows — check Screen Recording permission"}
-                </div>
-              ) : (
-                windows.map((w) => (
-                  <button
-                    key={w.window_id}
-                    type="button"
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      pickWindow(w);
-                    }}
-                    className={
-                      "flex w-full items-center gap-2 px-3 py-1.5 text-left " +
-                      (w.window_id === picked
-                        ? "bg-[var(--color-accent)]/15 text-[var(--color-text)]"
-                        : "text-[var(--color-text)] hover:bg-[var(--color-panel)]")
-                    }
-                  >
-                    <span className="min-w-0 flex-1 truncate">
-                      <span className="text-[var(--color-text)]">{w.app_name}</span>
-                      {w.window_title && (
-                        <span className="ml-2 text-[var(--color-faint)]">{w.window_title}</span>
-                      )}
-                    </span>
-                    <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">
-                      #{w.window_id}
-                    </span>
-                  </button>
-                ))
-              )}
+
+              <div className="min-h-0 flex-1 overflow-y-auto py-1">
+                {/* TCC-declined → friendly enable prompt instead of a raw error. */}
+                {tccDeclined ? (
+                  <div className="px-3 py-3 text-[11px]">
+                    <div className="mb-1 flex items-center gap-1.5 text-[var(--color-text)]">
+                      <ShieldAlert size={13} className="text-[var(--color-danger)]" />
+                      <span className="font-medium">Screen Recording not enabled</span>
+                    </div>
+                    <p className="leading-relaxed text-[var(--color-faint)]">
+                      Enable Screen Recording for AIOS in System Settings › Privacy & Security, then
+                      retry.
+                    </p>
+                    <div className="mt-2 flex gap-2">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openUrl(SCREEN_REC_SETTINGS_URL).catch((err) =>
+                            reportDiag("appcast.openSettings", err, { action: "openSettings" }),
+                          );
+                        }}
+                        className="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[11px] font-medium text-white"
+                      >
+                        open settings
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          refreshWindows();
+                        }}
+                        className="rounded-md border border-[var(--color-border)] px-2.5 py-1 text-[11px] text-[var(--color-text)] hover:border-[var(--color-accent)]/50"
+                      >
+                        retry
+                      </button>
+                    </div>
+                  </div>
+                ) : flat.length === 0 ? (
+                  <div className="px-3 py-2 text-[11px] text-[var(--color-faint)]">
+                    {loadingList
+                      ? "scanning…"
+                      : query.trim()
+                        ? "no windows match"
+                        : "no app windows found"}
+                  </div>
+                ) : (
+                  groups.map((g) => (
+                    <div key={g.app} className="mb-0.5">
+                      <div className="px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-faint)]">
+                        {g.app}
+                      </div>
+                      {g.windows.map((w) => {
+                        flatCursor += 1;
+                        const idx = flatCursor;
+                        const isActive = idx === activeIdx;
+                        return (
+                          <button
+                            key={w.window_id}
+                            type="button"
+                            onMouseEnter={() => setActiveIdx(idx)}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              pickWindow(w);
+                            }}
+                            className={
+                              "flex w-full items-center gap-2 px-3 py-1.5 pl-5 text-left " +
+                              (isActive
+                                ? "bg-[var(--color-accent)]/15 text-[var(--color-text)]"
+                                : w.window_id === picked
+                                  ? "bg-[var(--color-accent)]/10 text-[var(--color-text)]"
+                                  : "text-[var(--color-text)] hover:bg-[var(--color-panel)]")
+                            }
+                          >
+                            <span className="min-w-0 flex-1 truncate text-[var(--color-text)]">
+                              {w.window_title || <span className="text-[var(--color-faint)]">untitled window</span>}
+                            </span>
+                            <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">
+                              #{w.window_id}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -282,25 +449,59 @@ export function AppCastPane({
 
       {/* Slot — the native capture view is composited OVER this rect (bounds-sync). */}
       <div ref={slotRef} className="relative min-h-0 flex-1">
-        {error ? (
+        {error && !pickerOpen ? (
           <div className="absolute inset-0 z-[55] grid place-items-center bg-[var(--color-pane)] px-6 text-center">
             <div className="max-w-sm">
-              <div className="text-[13px] font-medium text-[var(--color-text)]">couldn't mirror window</div>
-              <div className="mt-1 break-words font-mono text-[11px] text-[var(--color-muted)]">{error}</div>
-              <p className="mt-2 text-[11px] leading-relaxed text-[var(--color-faint)]">
-                first capture prompts for Screen Recording. if you dismissed it, enable AIOS under
-                System Settings › Privacy &amp; Security › Screen Recording, then retry.
-              </p>
-              <button
-                type="button"
-                onClick={() => {
-                  setError(null);
-                  refreshWindows();
-                }}
-                className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
-              >
-                retry
-              </button>
+              {tccDeclined ? (
+                <>
+                  <div className="flex items-center justify-center gap-1.5 text-[13px] font-medium text-[var(--color-text)]">
+                    <ShieldAlert size={14} className="text-[var(--color-danger)]" />
+                    Screen Recording not enabled
+                  </div>
+                  <p className="mt-2 text-[11px] leading-relaxed text-[var(--color-faint)]">
+                    Enable Screen Recording for AIOS in System Settings › Privacy & Security, then
+                    retry.
+                  </p>
+                  <div className="mt-3 flex justify-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openUrl(SCREEN_REC_SETTINGS_URL).catch((err) =>
+                          reportDiag("appcast.openSettings", err, { action: "openSettings" }),
+                        )
+                      }
+                      className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                    >
+                      open settings
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setError(null);
+                        refreshWindows();
+                      }}
+                      className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-[12px] text-[var(--color-text)] hover:border-[var(--color-accent)]/50"
+                    >
+                      retry
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-[13px] font-medium text-[var(--color-text)]">couldn't mirror window</div>
+                  <div className="mt-1 break-words font-mono text-[11px] text-[var(--color-muted)]">{error}</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setError(null);
+                      refreshWindows();
+                    }}
+                    className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                  >
+                    retry
+                  </button>
+                </>
+              )}
             </div>
           </div>
         ) : picked == null ? (
@@ -309,7 +510,7 @@ export function AppCastPane({
           </div>
         ) : (
           <div className="pointer-events-none absolute inset-0 grid place-items-center px-6 text-center text-[11px] text-[var(--color-faint)]">
-            {starting ? "starting capture…" : "live mirror (view-only — input forwarding is Phase B)"}
+            {starting ? "starting capture…" : "live mirror — click + type to control the app"}
           </div>
         )}
         {toast && (

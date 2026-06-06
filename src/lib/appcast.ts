@@ -14,6 +14,8 @@ export interface WindowInfo {
   window_title: string;
   window_id: number;
   pid: number;
+  /** Owning app's bundle id (may be empty if SCK didn't expose one). */
+  bundle_id: string;
 }
 
 /** Enumerate capturable windows (on-screen, non-trivial size, not AIOS itself).

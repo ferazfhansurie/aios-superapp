@@ -62,7 +62,7 @@ objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRu
 # crate) are used so every type unifies with the objc2 0.6 / objc2-* 0.3 stack
 # objc2-web-kit already pins — a divergent objc2 version would make the WKWebView
 # and SCK NSObject worlds incompatible. Requires macOS 12.3+. See SPIKE-screencapturekit.md.
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSColor"] }
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSColor", "NSEvent"] }
 objc2-screen-capture-kit = { version = "0.3", features = ["SCStream", "SCShareableContent", "SCError", "objc2-core-media", "objc2-core-graphics", "block2", "dispatch2"] }
 objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMTime"] }
 objc2-core-video = { version = "0.3", features = ["CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVBuffer", "objc2-io-surface"] }
@@ -70,3 +70,10 @@ objc2-io-surface = { version = "0.3", features = ["IOSurface", "IOSurfaceRef", "
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "objc2-core-foundation"] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
 dispatch2 = "0.3"
+# Phase B input forwarding (appcast.rs): synthesize + post CGEvents to the
+# captured app's process. Already in the tree transitively (via web-kit/ICU);
+# pulled in directly so we can enable the `elcapitan` feature (CGEventPostToPid /
+# `post_to_pid`) and `highsierra` (CGEventCreateScrollWheelEvent2 / scroll). The
+# high-level `CGEvent` wrapper is its own foreign_type — we only touch its
+# geometry::CGPoint at the post boundary, everything else stays objc2.
+core-graphics = { version = "0.25", features = ["elcapitan", "highsierra"] }

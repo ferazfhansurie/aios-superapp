@@ -24,6 +24,7 @@ dependencies = [
  "base64 0.22.1",
  "block2",
  "chrono",
+ "core-graphics",
  "dispatch2",
  "ignore",
  "objc2",
