@@ -329,15 +329,17 @@ function PetSprite({
   visualMood,
   style,
   compact = false,
+  waving = false,
 }: {
   variant: PetVariant;
   visualMood: string;
   style: CSSProperties;
   compact?: boolean;
+  waving?: boolean;
 }) {
   return (
     <div
-      className={`pet-pixel ${compact ? "pet-pixel--starter" : ""} pet-pixel--${visualMood}`}
+      className={`pet-pixel ${compact ? "pet-pixel--starter" : ""} ${waving ? "pet-pixel--waving" : ""} pet-pixel--${visualMood}`}
       style={style}
       aria-hidden={compact}
       aria-label={compact ? undefined : `aios pixel pet mood ${visualMood}`}
@@ -345,6 +347,9 @@ function PetSprite({
       <div className="pet-pixel-shadow" />
       <div className={`pet-pixel-tail pet-pixel-tail--${variant.tail}`} />
       <div className={`pet-pixel-body pet-pixel-body--${variant.shape}`}>
+        <div className="pet-pixel-arm" aria-hidden="true">
+          <span className="pet-pixel-arm-hand" />
+        </div>
         <div className={`pet-pixel-topper pet-pixel-topper--${variant.topper}`} />
         <div className="pet-pixel-ear pet-pixel-ear-left" />
         <div className="pet-pixel-ear pet-pixel-ear-right" />
@@ -595,7 +600,7 @@ export function PetDashboardCompanion({
             <span className="pet-job-z pet-job-z-b" />
           </div>
           <div className={`pet-world-avatar pet-world-avatar--${activity.activity}`}>
-            <PetSprite variant={variant} visualMood={visualMood} style={spriteStyle} />
+            <PetSprite variant={variant} visualMood={visualMood} style={spriteStyle} waving={!needsCare} />
           </div>
           <div className="pet-world-floor">
             <span />

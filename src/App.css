@@ -1698,6 +1698,63 @@ html, body, #root {
   box-shadow: inset -7px -7px 0 var(--pet-shadow);
 }
 
+/* raised waving arm — same chunky pixel-block tone as the body, pivots at the
+   shoulder. hidden by default, only the dashboard companion raises it. */
+.pet-pixel-arm {
+  position: absolute;
+  z-index: 0;
+  left: -22px;
+  top: 18%;
+  width: 22px;
+  height: 56px;
+  background: var(--pet-primary);
+  border: 7px solid var(--pet-outline);
+  box-shadow: inset 7px -7px 0 var(--pet-shadow);
+  transform-origin: 50% 92%;
+  transform: rotate(0deg);
+  display: none;
+}
+
+.pet-pixel-arm-hand {
+  position: absolute;
+  left: -8px;
+  top: -10px;
+  width: 24px;
+  height: 22px;
+  background: var(--pet-accent);
+  border: 6px solid var(--pet-outline);
+  box-shadow: inset -5px -5px 0 var(--pet-shadow);
+}
+
+.pet-pixel--starter .pet-pixel-arm {
+  left: -10px;
+  width: 11px;
+  height: 26px;
+  border-width: 3px;
+}
+
+.pet-pixel--starter .pet-pixel-arm-hand {
+  left: -5px;
+  top: -6px;
+  width: 12px;
+  height: 11px;
+  border-width: 3px;
+}
+
+/* welcoming 8-bit wave: discrete stepped poses (no smooth sweep), holds raised
+   then pivots the forearm a few chunky frames, then rests — ambient, not frantic. */
+.pet-pixel--waving .pet-pixel-arm {
+  display: block;
+  animation: pet-pixel-wave 4.6s steps(1, end) infinite;
+}
+
+/* reduce-motion: no wave. arm holds a static raised "hello" pose instead of
+   animating, honoring both the app toggle and the OS preference. */
+[data-reduce-motion="true"] .pet-pixel--waving .pet-pixel-arm {
+  animation: none;
+  transform: rotate(-134deg);
+}
+
 .pet-pixel--happy .pet-pixel-eye {
   height: 10px;
   transform: translateY(4px);
@@ -2016,4 +2073,27 @@ html, body, #root {
 @keyframes pet-shake {
   from { transform: translateX(-1px) rotate(-0.4deg); }
   to { transform: translateX(1px) rotate(0.4deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-pixel--waving .pet-pixel-arm {
+    animation: none;
+    transform: rotate(-134deg);
+  }
+}
+
+/* 8-bit wave: 4 discrete arm poses with steps(1) so it snaps between frames
+   like a retro sprite, not a smooth rotation. arm rests, raises, waves L/R a
+   few times, then rests again before the next cycle. */
+@keyframes pet-pixel-wave {
+  0% { transform: rotate(8deg); }
+  6% { transform: rotate(-118deg); }
+  12% { transform: rotate(-150deg); }
+  18% { transform: rotate(-118deg); }
+  24% { transform: rotate(-150deg); }
+  30% { transform: rotate(-118deg); }
+  36% { transform: rotate(-150deg); }
+  44% { transform: rotate(-118deg); }
+  52% { transform: rotate(8deg); }
+  100% { transform: rotate(8deg); }
 }
