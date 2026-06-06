@@ -3,6 +3,7 @@
 
 mod bridges;
 mod browser;
+mod browser_store;
 mod chat;
 mod device;
 mod diag;
@@ -209,7 +210,11 @@ pub fn run() {
             // resolve we just skip diag (never block startup).
             if let Ok(dir) = app.path().app_data_dir() {
                 let version = app.package_info().version.to_string();
-                diag::init(dir, version);
+                diag::init(dir.clone(), version);
+                // Persistent browser history/bookmarks/downloads store (same
+                // app-data dir, JSON files — see browser_store.rs for the
+                // "why JSON not sqlite" rationale). Soft-fail if dir missing.
+                browser_store::init(dir);
             }
 
             // Install the native macOS menu so cockpit accelerators (⌘F/⌘W/⌘1-9/…)
@@ -319,6 +324,17 @@ pub fn run() {
             browser::browser_clear_cache,
             browser::browser_hide,
             browser::browser_close,
+            browser_store::browser_history_record,
+            browser_store::browser_history_query,
+            browser_store::browser_history_clear,
+            browser_store::browser_bookmark_add,
+            browser_store::browser_bookmark_remove,
+            browser_store::browser_bookmark_list,
+            browser_store::browser_download_record,
+            browser_store::browser_download_list,
+            browser_store::browser_download_forget,
+            browser_store::browser_download_clear,
+            browser_store::browser_reveal_in_finder,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

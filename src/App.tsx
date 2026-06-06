@@ -48,7 +48,7 @@ import {
   X,
 } from "lucide-react";
 
-import { recallUrl } from "./lib/browser-mem";
+import { recallUrl, recallPaneUrl, forgetUrl } from "./lib/browser-mem";
 import { browserOpenDevtools, setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
 import { CommandPalette, type Command } from "./components/CommandPalette";
@@ -301,6 +301,16 @@ function loadLayout(): Pane[] {
       // the restored index so a future nextKey() can't collide.
       const key = typeof p.key === "string" && p.key ? p.key : nextKey();
       reserveKeySeq(key);
+      // Session restore (item 4): a browser pane reopens at the LAST url it was
+      // on, not its original landing page. BrowserPane records its live url under
+      // its pane key (the same key persisted here, B1) via browser-mem, so we
+      // read it back and seed the restored pane's url. Falls back to the
+      // persisted url (e.g. a pinned-site deep-link) when there's no memory.
+      if (p.kind.type === "browser") {
+        const last = recallPaneUrl(key) ?? recallPaneUrl(p.kind.memKey);
+        const kind = last ? { ...p.kind, url: last } : p.kind;
+        return { key, label: p.label, kind };
+      }
       return { key, label: p.label, kind: p.kind };
     });
   } catch {
@@ -918,6 +928,11 @@ function App() {
     });
     if (prevMaxRef.current === key) prevMaxRef.current = null;
     if (focusedPane.current === key) focusedPane.current = null;
+    // Drop any session-restore memory for this pane key — a pane closed on
+    // purpose shouldn't have its last url linger in the browser-mem map (it
+    // also won't be in the next layout, so this just keeps the map from
+    // accumulating dead entries). No-op for non-browser keys.
+    forgetUrl(key);
     setPanes((p) => p.filter((x) => x.key !== key));
     setHiddenKeys((h) => h.filter((k) => k !== key));
     setActiveKey((a) => (a === key ? null : a));

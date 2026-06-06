@@ -13,9 +13,13 @@ import {
   Camera,
   ChevronDown,
   ChevronUp,
+  Clock,
   Crosshair,
+  Download,
   ExternalLink,
+  Folder,
   FolderOpen,
+  Globe,
   Loader2,
   MessageSquarePlus,
   MoreVertical,
@@ -26,6 +30,7 @@ import {
   Search,
   Smartphone,
   SquareDashedMousePointer,
+  Star,
   Terminal,
   Trash2,
   Users,
@@ -57,8 +62,20 @@ import {
   browserSetBounds,
   browserShow,
   browserZoom,
+  browserHistoryRecord,
+  browserHistoryQuery,
+  browserBookmarkAdd,
+  browserBookmarkRemove,
+  browserBookmarkList,
+  browserDownloadList,
+  browserDownloadForget,
+  browserDownloadClear,
+  browserRevealInFinder,
   readClipboard,
   type BrowserAnnotation,
+  type Bookmark,
+  type DownloadRecord,
+  type HistoryEntry,
   type Rect,
 } from "../lib/browser";
 import { addLink } from "../lib/sidebar";
@@ -146,6 +163,12 @@ export function BrowserPane({
   const slotRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const profileMenuRef = useRef<HTMLDivElement>(null);
+  // Memory key for "resume where I left off". A pinned site passes its stable
+  // sidebar id as `memKey`; a generic browser pane has none, so fall back to the
+  // pane `label` (= the pane key, which the layout persists + reuses on restore —
+  // App.tsx B1). Either way the pane's last url is recorded under this key, and
+  // App reads it back via recallPaneUrl on restore so the pane reopens in place.
+  const mem = memKey ?? label;
   const start = initialUrl ? normalizeUrl(initialUrl) : DEFAULT_URL;
   const [input, setInput] = useState(start);
   const [current, setCurrent] = useState(start);
@@ -177,6 +200,21 @@ export function BrowserPane({
   const [findQuery, setFindQuery] = useState("");
   const [findMiss, setFindMiss] = useState(false);
   const findInputRef = useRef<HTMLInputElement>(null);
+  // Address-bar autocomplete (item 1): history matches for the current input,
+  // a dropdown open flag, and the highlighted row index (↑/↓ navigation).
+  const [suggestions, setSuggestions] = useState<HistoryEntry[]>([]);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+  const [suggestIdx, setSuggestIdx] = useState(-1);
+  const suggestTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bookmarks (item 2): the full list + whether the CURRENT page is bookmarked
+  // (drives the star fill), plus the bookmarks dropdown open flag.
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [bookmarksOpen, setBookmarksOpen] = useState(false);
+  const bookmarksRef = useRef<HTMLDivElement>(null);
+  // Downloads (item 3): the persisted list + the panel open flag.
+  const [downloads, setDownloads] = useState<DownloadRecord[]>([]);
+  const [downloadsOpen, setDownloadsOpen] = useState(false);
+  const downloadsRef = useRef<HTMLDivElement>(null);
   const shownRef = useRef(false);
   const inputFocusedRef = useRef(false);
   // last url we observed from the live webview — dedupes the poll so we only
@@ -257,7 +295,10 @@ export function BrowserPane({
         .then((u) => {
           if (!u || u === "about:blank" || u === lastUrlRef.current) return;
           lastUrlRef.current = u;
-          rememberUrl(memKey, u);
+          rememberUrl(mem, u);
+          // Record to persistent history (title best-effort; the load-finished
+          // path fills a better one in). Dedup is server-side (bumps visit_count).
+          browserHistoryRecord(u).catch(() => {});
           if (!inputFocusedRef.current) {
             setCurrent(u);
             setInput(u);
@@ -267,7 +308,7 @@ export function BrowserPane({
     };
     const poll = setInterval(tick, 1500);
     return () => clearInterval(poll);
-  }, [active, label, memKey]);
+  }, [active, label, mem]);
 
   // Poll WKWebView element-fullscreen state. A child webview's HTML fullscreen
   // only fills its own rect, so on enter we ask the app for TRUE fullscreen
@@ -305,7 +346,8 @@ export function BrowserPane({
         const u = payload.url;
         if (u && u !== "about:blank") {
           lastUrlRef.current = u;
-          rememberUrl(memKey, u);
+          rememberUrl(mem, u);
+          browserHistoryRecord(u).catch(() => {});
           if (!inputFocusedRef.current) {
             setCurrent(u);
             setInput(u);
@@ -341,7 +383,7 @@ export function BrowserPane({
         loadTimer.current = null;
       }
     };
-  }, [active, label, memKey]);
+  }, [active, label, mem]);
 
   // Poll the live WKWebView back/forward history so the toolbar buttons disable
   // when there's nowhere to go (they were always-enabled no-ops before).
@@ -416,6 +458,8 @@ export function BrowserPane({
   const go = useCallback(() => {
     const url = normalizeUrl(input);
     if (!url) return;
+    setSuggestOpen(false);
+    setSuggestIdx(-1);
     setCurrent(url);
     setInput(url);
     if (shownRef.current) browserNavigate(label, url).catch((e) => reportDiag("browser.nav", e, { action: "navigate" }));
@@ -486,9 +530,182 @@ export function BrowserPane({
     showToast(`pinned ${host} to sidebar`, "success", url);
   }, [current, input, showToast]);
 
+  // ── Bookmarks (item 2) ──────────────────────────────────────────────────
+  // Load once on mount so the star reflects state immediately.
+  useEffect(() => {
+    browserBookmarkList()
+      .then(setBookmarks)
+      .catch((e) => reportDiag("browser.bookmark", e, { action: "list" }));
+  }, []);
+
+  // Is the CURRENT page bookmarked? (drives the star fill). Computed from the
+  // live list + current url — no extra round-trip.
+  const isBookmarked = bookmarks.some((b) => b.url === current);
+
+  // Star toggle: bookmark the current page, or remove it if already bookmarked.
+  const toggleBookmark = useCallback(() => {
+    const url = current || normalizeUrl(input);
+    if (!url || url === "about:blank") return;
+    let host = url;
+    try {
+      host = new URL(url).hostname.replace(/^www\./, "");
+    } catch {
+      /* keep raw */
+    }
+    const already = bookmarks.some((b) => b.url === url);
+    if (already) {
+      browserBookmarkRemove({ url })
+        .then(setBookmarks)
+        .catch((e) => reportDiag("browser.bookmark", e, { action: "remove" }));
+      showToast(`removed bookmark`, "info");
+    } else {
+      browserBookmarkAdd(url, host)
+        .then(setBookmarks)
+        .catch((e) => reportDiag("browser.bookmark", e, { action: "add" }));
+      showToast(`bookmarked ${host}`, "success", url);
+    }
+  }, [bookmarks, current, input, showToast]);
+
+  // Open a bookmark in THIS pane (matches the tab=pane convention — a fresh pane
+  // is one ⌘T away; a bookmark click navigates the current pane).
+  const openBookmark = useCallback(
+    (url: string) => {
+      setBookmarksOpen(false);
+      setCurrent(url);
+      setInput(url);
+      if (shownRef.current) browserNavigate(label, url).catch((e) => reportDiag("browser.nav", e, { action: "openBookmark" }));
+    },
+    [label],
+  );
+
+  const removeBookmark = useCallback((bm: Bookmark) => {
+    browserBookmarkRemove({ id: bm.id })
+      .then(setBookmarks)
+      .catch((e) => reportDiag("browser.bookmark", e, { action: "remove" }));
+  }, []);
+
+  // Close the bookmarks dropdown on outside click.
+  useEffect(() => {
+    if (!bookmarksOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (bookmarksRef.current && !bookmarksRef.current.contains(e.target as Node)) {
+        setBookmarksOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [bookmarksOpen]);
+
+  // ── Downloads (item 3) ──────────────────────────────────────────────────
+  // Load the persisted list on mount.
+  useEffect(() => {
+    browserDownloadList()
+      .then(setDownloads)
+      .catch((e) => reportDiag("browser.download", e, { action: "list" }));
+  }, []);
+
+  // Refresh the downloads list whenever a new download finishes (the backend
+  // emits `browser-download` after persisting it). Any pane refreshes — the
+  // store is global — so the panel is live regardless of which pane downloaded.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen<{ path: string; name?: string }>("browser-download", () => {
+      browserDownloadList()
+        .then(setDownloads)
+        .catch(() => {});
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((e) => reportDiag("browser.download", e, { action: "listen" }));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const revealDownload = useCallback(
+    (d: DownloadRecord) => {
+      browserRevealInFinder(d.path).catch((e) =>
+        showToast(typeof e === "string" ? e : "couldn't reveal file", "error"),
+      );
+    },
+    [showToast],
+  );
+
+  const openDownload = useCallback((d: DownloadRecord) => {
+    setDownloadsOpen(false);
+    const name = d.name || d.path.split("/").pop() || d.path;
+    openViewerFileInPane(d.path, name);
+  }, []);
+
+  const forgetDownload = useCallback((id: string) => {
+    browserDownloadForget(id)
+      .then(setDownloads)
+      .catch((e) => reportDiag("browser.download", e, { action: "forget" }));
+  }, []);
+
+  const clearDownloads = useCallback(() => {
+    browserDownloadClear()
+      .then(() => setDownloads([]))
+      .catch((e) => reportDiag("browser.download", e, { action: "clear" }));
+  }, []);
+
+  // Open the containing folder of a download in a files pane (cross-pane spawn).
+  const openDownloadInFiles = useCallback((d: DownloadRecord) => {
+    setDownloadsOpen(false);
+    const dir = d.path.replace(/\/[^/]*$/, "");
+    spawnPane("files", { path: dir || d.path });
+  }, []);
+
+  // Close the downloads panel on outside click.
+  useEffect(() => {
+    if (!downloadsOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (downloadsRef.current && !downloadsRef.current.contains(e.target as Node)) {
+        setDownloadsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [downloadsOpen]);
+
+  // ── Address-bar autocomplete (item 1) ───────────────────────────────────
+  // Query history as the user types (debounced). Only when the input is focused
+  // AND differs from the committed url (i.e. actually editing). The dropdown
+  // closes on blur/escape/enter.
+  const refreshSuggestions = useCallback((q: string) => {
+    browserHistoryQuery(q, 8)
+      .then((rows) => {
+        setSuggestions(rows);
+        setSuggestOpen(rows.length > 0);
+        setSuggestIdx(-1);
+      })
+      .catch(() => {
+        setSuggestions([]);
+        setSuggestOpen(false);
+      });
+  }, []);
+
+  // Pick a suggestion: navigate to its url immediately.
+  const pickSuggestion = useCallback(
+    (url: string) => {
+      setSuggestOpen(false);
+      setSuggestIdx(-1);
+      const norm = normalizeUrl(url);
+      setCurrent(norm);
+      setInput(norm);
+      if (shownRef.current) browserNavigate(label, norm).catch((e) => reportDiag("browser.nav", e, { action: "pickSuggestion" }));
+    },
+    [label],
+  );
+
   useEffect(() => {
     return () => {
       if (toastTimer.current) clearTimeout(toastTimer.current);
+      if (suggestTimer.current) clearTimeout(suggestTimer.current);
     };
   }, []);
 
@@ -729,23 +946,219 @@ export function BrowserPane({
         >
           {loading ? <Loader2 size={13} className="animate-spin" /> : <RotateCw size={13} />}
         </NavBtn>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            go();
-          }}
-          className="flex min-w-0 flex-1 items-center"
-        >
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onFocus={() => (inputFocusedRef.current = true)}
-            onBlur={() => (inputFocusedRef.current = false)}
-            spellCheck={false}
-            className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1 font-mono text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/50"
-            placeholder="search or enter url"
-          />
-        </form>
+        <div className="relative flex min-w-0 flex-1 items-center">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              // If a suggestion is highlighted, pick it; else navigate the input.
+              if (suggestOpen && suggestIdx >= 0 && suggestions[suggestIdx]) {
+                pickSuggestion(suggestions[suggestIdx].url);
+              } else {
+                go();
+              }
+            }}
+            className="flex min-w-0 flex-1 items-center"
+          >
+            <input
+              value={input}
+              onChange={(e) => {
+                const v = e.target.value;
+                setInput(v);
+                // Debounce the history query so each keystroke isn't a round-trip.
+                if (suggestTimer.current) clearTimeout(suggestTimer.current);
+                suggestTimer.current = setTimeout(() => refreshSuggestions(v), 90);
+              }}
+              onFocus={(e) => {
+                inputFocusedRef.current = true;
+                e.target.select();
+                refreshSuggestions(e.target.value);
+              }}
+              onBlur={() => {
+                inputFocusedRef.current = false;
+                // Delay close so a mousedown on a suggestion row still registers.
+                setTimeout(() => setSuggestOpen(false), 150);
+              }}
+              onKeyDown={(e) => {
+                if (!suggestOpen || suggestions.length === 0) return;
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setSuggestIdx((i) => (i + 1) % suggestions.length);
+                } else if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setSuggestIdx((i) => (i <= 0 ? suggestions.length - 1 : i - 1));
+                } else if (e.key === "Escape") {
+                  setSuggestOpen(false);
+                  setSuggestIdx(-1);
+                }
+              }}
+              spellCheck={false}
+              className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1 font-mono text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/50"
+              placeholder="search or enter url"
+            />
+          </form>
+          {suggestOpen && suggestions.length > 0 && (
+            <div className="absolute left-0 right-0 top-full z-[70] mt-1 max-h-80 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] shadow-2xl">
+              {suggestions.map((s, i) => {
+                let host = s.url;
+                try {
+                  host = new URL(s.url).hostname.replace(/^www\./, "");
+                } catch {
+                  /* keep raw */
+                }
+                return (
+                  <button
+                    key={s.url}
+                    type="button"
+                    // onMouseDown (not onClick) so it fires before the input blur closes us.
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      pickSuggestion(s.url);
+                    }}
+                    onMouseEnter={() => setSuggestIdx(i)}
+                    className={
+                      "flex w-full items-center gap-2 px-3 py-1.5 text-left " +
+                      (i === suggestIdx
+                        ? "bg-[var(--color-accent)]/15 text-[var(--color-text)]"
+                        : "text-[var(--color-text)] hover:bg-[var(--color-panel)]")
+                    }
+                  >
+                    <Clock size={12} className="shrink-0 text-[var(--color-faint)]" />
+                    <span className="min-w-0 flex-1 truncate">
+                      {s.title ? (
+                        <>
+                          <span className="text-[var(--color-text)]">{s.title}</span>
+                          <span className="ml-2 text-[var(--color-faint)]">{host}</span>
+                        </>
+                      ) : (
+                        <span className="font-mono text-[11px] text-[var(--color-muted)]">{s.url}</span>
+                      )}
+                    </span>
+                    {s.visit_count > 1 && (
+                      <span className="shrink-0 text-[10px] tabular-nums text-[var(--color-faint)]">
+                        {s.visit_count}×
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        <NavBtn title={isBookmarked ? "Remove bookmark" : "Bookmark this page"} onClick={toggleBookmark}>
+          <Star size={13} className={isBookmarked ? "fill-[var(--color-accent)] text-[var(--color-accent)]" : ""} />
+        </NavBtn>
+        <div ref={bookmarksRef} className="relative">
+          <NavBtn title="Bookmarks" onClick={() => { setBookmarksOpen((o) => !o); setDownloadsOpen(false); }}>
+            <Globe size={13} />
+          </NavBtn>
+          {bookmarksOpen && (
+            <div className="absolute right-0 top-full z-[70] mt-1 max-h-96 w-72 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] shadow-2xl">
+              <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-[var(--color-faint)]">
+                bookmarks
+              </div>
+              {bookmarks.length === 0 ? (
+                <div className="px-3 py-2 text-[11px] text-[var(--color-faint)]">no bookmarks yet — star a page</div>
+              ) : (
+                bookmarks.map((bm) => {
+                  let host = bm.url;
+                  try {
+                    host = new URL(bm.url).hostname.replace(/^www\./, "");
+                  } catch {
+                    /* keep raw */
+                  }
+                  return (
+                    <div
+                      key={bm.id}
+                      className="group flex items-center gap-2 px-3 py-1.5 hover:bg-[var(--color-panel)]"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => openBookmark(bm.url)}
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      >
+                        <Star size={11} className="shrink-0 fill-[var(--color-accent)] text-[var(--color-accent)]" />
+                        <span className="min-w-0 flex-1 truncate text-[var(--color-text)]">
+                          {bm.title || host}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        title="Remove"
+                        onClick={() => removeBookmark(bm)}
+                        className="shrink-0 rounded p-0.5 text-[var(--color-faint)] opacity-0 transition-opacity hover:text-[var(--color-danger)] group-hover:opacity-100"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </div>
+        <div ref={downloadsRef} className="relative">
+          <NavBtn title="Downloads" onClick={() => { setDownloadsOpen((o) => !o); setBookmarksOpen(false); }}>
+            <Download size={13} />
+          </NavBtn>
+          {downloadsOpen && (
+            <div className="absolute right-0 top-full z-[70] mt-1 max-h-96 w-80 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] shadow-2xl">
+              <div className="flex items-center justify-between px-3 py-1">
+                <span className="text-[10px] uppercase tracking-wide text-[var(--color-faint)]">downloads</span>
+                {downloads.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={clearDownloads}
+                    className="text-[10px] text-[var(--color-faint)] hover:text-[var(--color-danger)]"
+                  >
+                    clear all
+                  </button>
+                )}
+              </div>
+              {downloads.length === 0 ? (
+                <div className="px-3 py-2 text-[11px] text-[var(--color-faint)]">no downloads yet</div>
+              ) : (
+                downloads.map((d) => (
+                  <div key={d.id} className="group flex items-center gap-2 px-3 py-1.5 hover:bg-[var(--color-panel)]">
+                    <Download size={12} className="shrink-0 text-[var(--color-faint)]" />
+                    <button
+                      type="button"
+                      onClick={() => openDownload(d)}
+                      title="Open"
+                      className="flex min-w-0 flex-1 flex-col text-left"
+                    >
+                      <span className="truncate text-[var(--color-text)]">{d.name}</span>
+                      <span className="truncate font-mono text-[10px] text-[var(--color-faint)]">{d.path}</span>
+                    </button>
+                    <button
+                      type="button"
+                      title="Reveal in Finder"
+                      onClick={() => revealDownload(d)}
+                      className="shrink-0 rounded p-1 text-[var(--color-faint)] opacity-0 transition-opacity hover:text-[var(--color-text)] group-hover:opacity-100"
+                    >
+                      <FolderOpen size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      title="Open folder in files pane"
+                      onClick={() => openDownloadInFiles(d)}
+                      className="shrink-0 rounded p-1 text-[var(--color-faint)] opacity-0 transition-opacity hover:text-[var(--color-text)] group-hover:opacity-100"
+                    >
+                      <Folder size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      title="Remove from list"
+                      onClick={() => forgetDownload(d.id)}
+                      className="shrink-0 rounded p-1 text-[var(--color-faint)] opacity-0 transition-opacity hover:text-[var(--color-danger)] group-hover:opacity-100"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
         <NavBtn title="Pin this site to the sidebar" onClick={pinSite}>
           <Pin size={13} />
         </NavBtn>

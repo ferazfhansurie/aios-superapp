@@ -268,6 +268,12 @@ pub async fn browser_show(
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .map(|s| s.to_string());
+                            // Persist to the downloads store (survives restart;
+                            // the downloads panel reads this back). Best-effort.
+                            let _ = crate::browser_store::browser_download_record(
+                                p.to_string_lossy().to_string(),
+                                name.clone(),
+                            );
                             let _ = dl_app.emit(
                                 "browser-download",
                                 serde_json::json!({

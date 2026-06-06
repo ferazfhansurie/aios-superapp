@@ -61,6 +61,58 @@ export const browserCopySelection = (label: string) =>
   invoke("browser_copy_selection", { label });
 export const readClipboard = () => invoke<string>("read_clipboard");
 
+// ─── Persistent history / bookmarks / downloads ─────────────────────────────
+// Backed by JSON stores under the Tauri app-data dir (browser_store.rs). See
+// that module for the "JSON not sqlite" rationale.
+
+export interface HistoryEntry {
+  url: string;
+  title: string;
+  /** Last-visited timestamp (unix ms). */
+  ts: number;
+  visit_count: number;
+}
+
+/** Record (or bump) a committed navigation. Best-effort — never rejects-fatal. */
+export const browserHistoryRecord = (url: string, title?: string) =>
+  invoke("browser_history_record", { url, title: title ?? null });
+/** Autocomplete query against history, ranked recency × frequency. Empty query
+ *  returns the most-recently-visited entries. */
+export const browserHistoryQuery = (query: string, limit?: number) =>
+  invoke<HistoryEntry[]>("browser_history_query", { query, limit: limit ?? null });
+export const browserHistoryClear = () => invoke("browser_history_clear");
+
+export interface Bookmark {
+  id: string;
+  url: string;
+  title: string;
+  ts: number;
+}
+
+/** Add/refresh a bookmark (idempotent on url). Returns the full list, newest first. */
+export const browserBookmarkAdd = (url: string, title?: string) =>
+  invoke<Bookmark[]>("browser_bookmark_add", { url, title: title ?? null });
+/** Remove a bookmark by url (the star-off path) or id. Returns the updated list. */
+export const browserBookmarkRemove = (opts: { url?: string; id?: string }) =>
+  invoke<Bookmark[]>("browser_bookmark_remove", { url: opts.url ?? null, id: opts.id ?? null });
+export const browserBookmarkList = () => invoke<Bookmark[]>("browser_bookmark_list");
+
+export interface DownloadRecord {
+  id: string;
+  path: string;
+  name: string;
+  state: string;
+  ts: number;
+}
+
+export const browserDownloadList = () => invoke<DownloadRecord[]>("browser_download_list");
+export const browserDownloadForget = (id: string) =>
+  invoke<DownloadRecord[]>("browser_download_forget", { id });
+export const browserDownloadClear = () => invoke("browser_download_clear");
+/** Reveal a downloaded file in Finder/Explorer, selecting it. */
+export const browserRevealInFinder = (path: string) =>
+  invoke("browser_reveal_in_finder", { path });
+
 /** Shape the injected annotator (and selection-copy) serialize into the
  *  clipboard behind the `AIOS_ANNOT:` sentinel. */
 export interface BrowserAnnotation {
