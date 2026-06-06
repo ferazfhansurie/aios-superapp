@@ -30,7 +30,7 @@ import {
   type WindowInfo,
 } from "../lib/appcast";
 import type { Rect } from "../lib/browser";
-import { emitPaneNotification, type NotificationLevel } from "../lib/notifications";
+import { type NotificationLevel } from "../lib/notifications";
 import { reportDiag } from "../lib/diag";
 
 /** macOS deep-link straight to Privacy › Screen Recording. */
@@ -101,9 +101,11 @@ export function AppCastPane({
 
   const notify = useCallback(
     (msg: string, level: NotificationLevel = "info") => {
+      // Local in-pane status only (toast + parent toast surface). Do NOT fire a
+      // global pane notification on cast-start: it's a foreground action the user
+      // is looking right at, and it was spamming the notification center.
       setToast(msg);
       onNotify?.(msg, level);
-      emitPaneNotification({ paneId: label, paneLabel: "app-cast", title: msg, level });
       if (toastTimer.current) clearTimeout(toastTimer.current);
       toastTimer.current = setTimeout(() => setToast(null), 2500);
     },
@@ -167,6 +169,14 @@ export function AppCastPane({
       if (startedRef.current) appcastHide(label).catch((e) => reportDiag("appcast.hide", e, { action: "hide" }));
       return;
     }
+    // Picker dropdown open → the native capture overlay paints ON TOP of the
+    // React dropdown and clips it, so hide the mirror while the user is choosing
+    // (mirrors the BrowserPane "hide webview when a menu/modal is open" pattern).
+    // The pickerOpen effect below shows + re-syncs bounds again on close.
+    if (pickerOpen) {
+      if (startedRef.current) appcastHide(label).catch((e) => reportDiag("appcast.hide", e, { action: "picker" }));
+      return;
+    }
     if (picked == null) return;
 
     let raf = 0;
@@ -203,7 +213,7 @@ export function AppCastPane({
       window.removeEventListener("resize", sync);
       clearInterval(poll);
     };
-  }, [active, picked, label, rect]);
+  }, [active, picked, label, rect, pickerOpen]);
 
   // Teardown on unmount: hide then close (stops capture + drops the view).
   useEffect(() => {

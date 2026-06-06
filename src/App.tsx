@@ -2192,7 +2192,7 @@ function App() {
               />
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
-              <div className={`flex pb-1 ${iconsOnly ? "justify-center" : "justify-start px-1.5"}`}>
+              <div className={`flex pb-1 ${iconsOnly ? "justify-center" : "justify-center px-1.5"}`}>
                 {sidebarActions}
               </div>
               <AccountMenu iconsOnly={iconsOnly} onOpenSettings={() => setSettingsOpen(true)} />
