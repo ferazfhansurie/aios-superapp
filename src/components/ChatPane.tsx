@@ -176,6 +176,65 @@ type RenderBlock =
 
 let _uid = 0;
 const uid = () => `t${++_uid}`;
+
+/** Debounced localStorage persist. `serialize` returns the string to write, or
+ *  null to remove the key. Trailing debounce coalesces rapid changes into one
+ *  write — critical for state that updates per stream-token (serializing the
+ *  run-event log on every token was a major source of streaming jank). Always
+ *  flushes the latest value on unmount so nothing is lost. */
+function useDebouncedPersist<T>(
+  key: string | null,
+  value: T,
+  serialize: (v: T) => string | null,
+  delayMs: number,
+) {
+  const ref = useRef<{
+    timer: ReturnType<typeof setTimeout> | null;
+    key: string | null;
+    value: T;
+    serialize: (v: T) => string | null;
+  }>({ timer: null, key, value, serialize });
+  ref.current.key = key;
+  ref.current.value = value;
+  ref.current.serialize = serialize;
+
+  const flush = () => {
+    const r = ref.current;
+    if (!r.key) return;
+    try {
+      const s = r.serialize(r.value);
+      if (s == null) localStorage.removeItem(r.key);
+      else localStorage.setItem(r.key, s);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    if (!key) return;
+    const r = ref.current;
+    if (r.timer != null) return; // a flush is already scheduled; it reads latest
+    r.timer = setTimeout(() => {
+      r.timer = null;
+      flush();
+    }, delayMs);
+    // value/key tracked via ref; effect just (re)arms the trailing timer
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, value, delayMs]);
+
+  useEffect(
+    () => () => {
+      const r = ref.current;
+      if (r.timer != null) {
+        clearTimeout(r.timer);
+        r.timer = null;
+      }
+      flush();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+}
 type ChatUsageRate = Awaited<ReturnType<typeof codexRate>>;
 type UsageWin = { pct: number | null; resetsAt: number | null };
 type UsageSnapshot = { fiveHour: UsageWin; sevenDay: UsageWin };
@@ -746,18 +805,15 @@ export function ChatPane({
       /* ignore */
     }
   }, [runEventsKey]);
-  useEffect(() => {
-    if (!runEventsKey) return;
-    try {
-      if (runEventState.events.length > 0) {
-        localStorage.setItem(runEventsKey, serializeRunEventState(runEventState));
-      } else {
-        localStorage.removeItem(runEventsKey);
-      }
-    } catch {
-      /* ignore */
-    }
-  }, [runEventsKey, runEventState]);
+  // runEventState changes on every stream token and serializeRunEventState does
+  // a full JSON.stringify of the (growing) event log — writing it synchronously
+  // per token was the single biggest source of streaming lag. Debounce it.
+  useDebouncedPersist(
+    runEventsKey,
+    runEventState,
+    (s) => (s.events.length > 0 ? serializeRunEventState(s) : null),
+    500,
+  );
   // composer draft persists per pane so /clear, a restart, or a remount never
   // loses what you were typing. Keyed by paneKey; seed (e.g. notes "send to AI")
   // still wins on first mount.
@@ -773,16 +829,9 @@ export function ChatPane({
     }
     return "";
   });
-  // persist the draft as it changes (cleared on send).
-  useEffect(() => {
-    if (!draftKey) return;
-    try {
-      if (input) localStorage.setItem(draftKey, input);
-      else localStorage.removeItem(draftKey);
-    } catch {
-      /* ignore */
-    }
-  }, [input, draftKey]);
+  // persist the draft as it changes (cleared on send) — debounced so we don't
+  // hit localStorage synchronously on every keystroke.
+  useDebouncedPersist(draftKey, input, (v) => (v ? v : null), 300);
   const [isComposerCollapsed, setComposerCollapsed] = useState(false);
 
   const [streaming, setStreaming] = useState(false);
