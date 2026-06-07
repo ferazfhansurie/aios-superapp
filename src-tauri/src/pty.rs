@@ -120,6 +120,9 @@ fn spawn_internal(
                         }
                     }
                 }
+                // EINTR is a transient signal interruption, not EOF — retry the
+                // read rather than tearing down a live PTY session.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }

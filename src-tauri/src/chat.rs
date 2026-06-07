@@ -706,6 +706,11 @@ pub fn chat_start(
                         ingest_line(&sess, &app_rdr, trimmed);
                     }
                 }
+                // A transient EINTR is NOT end-of-stream: a signal interrupted the
+                // blocking read mid-call. Retry instead of tearing down a live
+                // session (which would synthesize a bogus error result). Only real
+                // I/O errors / EOF (`Ok(0)`) end the loop.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
@@ -755,6 +760,8 @@ pub fn chat_start(
                             ingest_line(&sess, &app_err, &ev);
                         }
                     }
+                    // EINTR on the stderr pipe is transient too — keep draining.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
@@ -943,6 +950,8 @@ fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<
                         }
                     }
                 }
+                // Transient EINTR — retry rather than prematurely ending the turn.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
@@ -1289,6 +1298,8 @@ fn start_codex_appserver(
                         }
                     }
                 }
+                // Transient EINTR — retry rather than tearing down the session.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
@@ -2027,10 +2038,22 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
         // Claude usage source as the sidebar (OAuth first, statusline fallback)
         // and push a synthetic `usage` event so the composer moves as you talk.
         // Codex pushes its own `account/rateLimits/updated`.
+        //
+        // The usage read does BLOCKING I/O (OAuth file read, possibly shelling out
+        // to a node `ccusage` CLI). Running it inline here would stall THIS session's
+        // stdout reader thread at every turn-end — stdout backs up while usage is
+        // fetched. So offload to a short-lived detached thread: the reader continues
+        // immediately, and the synthetic `usage` event fans out a few ms later
+        // (timing slack is fine). Clone the AppHandle + session Arc in so the
+        // closure is `Send + 'static`.
         if matches!(sess.engine, Engine::Claude) {
-            if let Some(u) = claude_usage_event(app) {
-                fan_out(sess, &u);
-            }
+            let app_usage = app.clone();
+            let sess_usage = Arc::clone(sess);
+            thread::spawn(move || {
+                if let Some(u) = claude_usage_event(&app_usage) {
+                    fan_out(&sess_usage, &u);
+                }
+            });
         }
     }
 }
