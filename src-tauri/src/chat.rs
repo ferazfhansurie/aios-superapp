@@ -39,7 +39,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -51,6 +51,13 @@ use tauri::{AppHandle, Emitter};
 /// How many raw output lines a detached session keeps for replay on reattach.
 /// Generous enough to reconstruct a long agentic run; oldest lines drop first.
 const REPLAY_CAP: usize = 6000;
+
+/// Approximate BYTE budget for the replay buffer, evicted alongside `REPLAY_CAP`.
+/// A line-count cap alone can't bound memory: one huge line (a big tool output,
+/// or a base64 image if the slimming path is ever bypassed) counts as 1 line yet
+/// holds many MB. We sum line lengths and evict oldest until under BOTH caps.
+/// 12 MB is generous for a long agentic transcript while still capping a runaway.
+const REPLAY_BYTE_CAP: usize = 12 * 1024 * 1024;
 
 fn detach_child_process(cmd: &mut Command) {
     #[cfg(unix)]
@@ -121,6 +128,10 @@ struct ChatSession {
     sink: Mutex<Option<Channel<String>>>,
     /// Ring buffer of recent raw lines, replayed verbatim on reattach.
     buffer: Mutex<VecDeque<String>>,
+    /// Approximate total bytes currently held in `buffer` (sum of line lengths).
+    /// Tracked so a BYTE budget (REPLAY_BYTE_CAP) can evict oldest lines even when
+    /// the line COUNT is far under REPLAY_CAP — one huge line must not pin MBs.
+    buffer_bytes: AtomicUsize,
     /// claude's own session uuid (from the init event) — used to match a
     /// reopened pane back to this live process.
     claude_id: Mutex<Option<String>>,
@@ -517,6 +528,43 @@ fn user_line_with_images(text: &str, image_paths: &[String]) -> String {
     format!("{line}\n")
 }
 
+/// Given a parsed `user` message line that may carry base64 `image` content
+/// blocks, returns a SLIMMED replacement line safe to keep in the replay buffer:
+/// image blocks are dropped (or replaced by a tiny `[image]` text note) so the
+/// megabytes of base64 never persist in RAM or get re-sent on reattach. Returns
+/// `None` when the line carries no image block (nothing to slim — keep it as-is).
+///
+/// The live turn is unaffected — only the BUFFERED copy is slimmed. The frontend
+/// renders the user bubble client-side (and from the transcript on resume), not
+/// from this echoed line, so dropping the image bytes here loses no rendering.
+fn slim_user_image_line(parsed: &Value) -> Option<String> {
+    if parsed.get("type").and_then(|x| x.as_str()) != Some("user") {
+        return None;
+    }
+    let content = parsed
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())?;
+    let has_image = content
+        .iter()
+        .any(|b| b.get("type").and_then(|x| x.as_str()) == Some("image"));
+    if !has_image {
+        return None;
+    }
+    // Rebuild content keeping text blocks verbatim, replacing each image with a
+    // short `[image]` text note so the transcript still shows an image was sent.
+    let mut slim: Vec<Value> = Vec::with_capacity(content.len());
+    for b in content {
+        match b.get("type").and_then(|x| x.as_str()) {
+            Some("image") => slim.push(json!({ "type": "text", "text": "[image]" })),
+            _ => slim.push(b.clone()),
+        }
+    }
+    // Stored WITHOUT a trailing newline: buffered lines are trimmed before ingest
+    // (the reader strips `\n`/`\r`), and `fan_out`/replay append no newline.
+    Some(json!({ "type": "user", "message": { "role": "user", "content": slim } }).to_string())
+}
+
 /// Writes one already-formed line to a live session's stdin, flushing it. Shared
 /// by every "push a line to claude" path (turns, interrupts, control replies).
 /// `line` should already end in `\n`. No-op error text if the session is gone.
@@ -666,6 +714,7 @@ pub fn chat_start(
         effort: Mutex::new(None), // claude passes effort as a CLI flag, not per turn
         sink: Mutex::new(Some(on_event)),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
+        buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
         title: Mutex::new(String::new()),
         busy: AtomicBool::new(false),
@@ -796,6 +845,7 @@ fn start_per_turn(
         effort: Mutex::new(None), // opencode effort handled per-turn at send
         sink: Mutex::new(Some(on_event)),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
+        buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
         title: Mutex::new(String::new()),
         busy: AtomicBool::new(false),
@@ -817,13 +867,7 @@ fn start_per_turn(
 
 /// Buffers + forwards a line on a session that has no AppHandle context (startup).
 fn ingest_line_arc(sess: &Arc<ChatSession>, line: &str) {
-    {
-        let mut b = sess.buffer.lock();
-        if b.len() >= REPLAY_CAP {
-            b.pop_front();
-        }
-        b.push_back(line.to_string());
-    }
+    buffer_push(sess, line);
     if let Some(ch) = sess.sink.lock().as_ref() {
         let _ = ch.send(line.to_string());
     }
@@ -1207,6 +1251,7 @@ fn start_codex_appserver(
         effort: Mutex::new(effort.filter(|s| !s.is_empty())),
         sink: Mutex::new(Some(on_event)),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
+        buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
         title: Mutex::new(String::new()),
         busy: AtomicBool::new(false),
@@ -1967,19 +2012,46 @@ fn adapt_opencode_line(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
     out
 }
 
+/// Pushes one line into the replay ring buffer, evicting oldest lines until the
+/// buffer is under BOTH the line-count cap (REPLAY_CAP) and the byte budget
+/// (REPLAY_BYTE_CAP). `buffer_bytes` is kept in sync with the popped/pushed line
+/// lengths so the byte check is O(1). Shared by every buffer-push path.
+fn buffer_push(sess: &Arc<ChatSession>, line: &str) {
+    let mut b = sess.buffer.lock();
+    let incoming = line.len();
+    // Evict oldest while over EITHER cap. Always keep at least the incoming line
+    // even if it alone exceeds the byte budget (so the turn isn't lost entirely).
+    while !b.is_empty()
+        && (b.len() >= REPLAY_CAP
+            || sess.buffer_bytes.load(Ordering::Relaxed) + incoming > REPLAY_BYTE_CAP)
+    {
+        if let Some(old) = b.pop_front() {
+            sess.buffer_bytes.fetch_sub(old.len(), Ordering::Relaxed);
+        }
+    }
+    b.push_back(line.to_string());
+    sess.buffer_bytes.fetch_add(incoming, Ordering::Relaxed);
+}
+
 /// Appends one line to the replay buffer AND forwards it to the live sink (if a
 /// pane is attached). The low-level fan-out shared by `ingest_line` and by
 /// synthetic lines we inject (e.g. the live `usage` tick after a turn).
 fn fan_out(sess: &Arc<ChatSession>, line: &str) {
-    {
-        let mut b = sess.buffer.lock();
-        if b.len() >= REPLAY_CAP {
-            b.pop_front();
-        }
-        b.push_back(line.to_string());
-    }
+    buffer_push(sess, line);
     if let Some(ch) = sess.sink.lock().as_ref() {
         let _ = ch.send(line.to_string());
+    }
+}
+
+/// Like `fan_out` but stores a DIFFERENT (slimmed) copy in the replay buffer than
+/// the one sent live. Used for image-bearing user lines: the LIVE sink gets the
+/// real line (claude needs the base64 this turn) while the buffer keeps only a
+/// lightweight placeholder, so a pasted screenshot isn't retained in RAM for the
+/// whole session and re-sent on every reattach/replay.
+fn fan_out_split(sess: &Arc<ChatSession>, live: &str, buffered: &str) {
+    buffer_push(sess, buffered);
+    if let Some(ch) = sess.sink.lock().as_ref() {
+        let _ = ch.send(live.to_string());
     }
 }
 
@@ -1995,7 +2067,12 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
     // close a turn or hijack the session id.
     let want_session_id = sess.claude_id.lock().is_none() && line.contains("session_id");
     let want_result = line.contains("result");
-    let parsed: Option<Value> = if want_session_id || want_result {
+    // claude echoes the user turn back on stdout; an image-bearing echo embeds
+    // base64 (`"type":"image"`). Detect it cheaply so we can slim the BUFFERED
+    // copy (FIX 1) instead of pinning the megabytes for the whole session. Hot
+    // delta/text lines never contain this needle, so the parse stays gated.
+    let want_user_image = line.contains("\"type\":\"image\"") || line.contains("\"type\": \"image\"");
+    let parsed: Option<Value> = if want_session_id || want_result || want_user_image {
         serde_json::from_str::<Value>(line).ok()
     } else {
         None
@@ -2019,8 +2096,18 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
         .unwrap_or(false);
 
     // Forward the line itself first (buffer + live sink), so the pane sees the
-    // turn close before the usage tick that follows it.
-    fan_out(sess, line);
+    // turn close before the usage tick that follows it. For an image-bearing
+    // user echo, send the REAL line live but buffer only a slimmed placeholder
+    // (FIX 1) so base64 image bytes aren't retained / re-replayed for the session.
+    let slimmed = if want_user_image {
+        parsed.as_ref().and_then(slim_user_image_line)
+    } else {
+        None
+    };
+    match slimmed {
+        Some(buffered) => fan_out_split(sess, line, &buffered),
+        None => fan_out(sess, line),
+    }
 
     if is_result {
         sess.busy.store(false, Ordering::SeqCst);
@@ -2218,7 +2305,24 @@ pub fn chat_send(
                 .join(" ");
             if text.is_empty() { paths } else { format!("{paths} {text}") }
         };
-        return run_per_turn(s, app, merged);
+        // FIX 3: `busy` was set true above. If the per-turn spawn fails BEFORE the
+        // reader thread starts, no EOF-fallback `result` ever fires (there's no
+        // thread), so the session would be wedged busy=true forever and the
+        // composer never re-enables. On the spawn-error path, clear busy and emit
+        // a synthetic error `result` (the same surfacing pattern the reader's EOF
+        // fallback uses) so the composer frees and the failure is visible.
+        if let Err(e) = run_per_turn(Arc::clone(&s), app.clone(), merged) {
+            s.busy.store(false, Ordering::SeqCst);
+            let tid = s.thread_id.lock().clone().unwrap_or_default();
+            let result = format!(
+                "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"text\":\"{}\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
+                json_escape(&e),
+                json_escape(&tid)
+            );
+            ingest_line(&s, &app, &result);
+            return Err(e);
+        }
+        return Ok(());
     }
     if images.is_empty() {
         write_line(session_id, &user_line(&text))
@@ -3049,12 +3153,14 @@ fn parse_codex_rollout(text: &str) -> Vec<ChatTurn> {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapt_codex_appserver_frame, codex_config_without_mcp_servers, discover_codex_sessions,
-        find_codex_rollout_in_home, infer_session_engine, ChatSession, Engine,
+        adapt_codex_appserver_frame, buffer_push, codex_config_without_mcp_servers,
+        discover_codex_sessions, find_codex_rollout_in_home, infer_session_engine,
+        slim_user_image_line, ChatSession, Engine, REPLAY_BYTE_CAP,
     };
+    use serde_json::json;
     use parking_lot::Mutex;
     use std::collections::{HashMap, VecDeque};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn test_codex_session() -> Arc<ChatSession> {
@@ -3069,6 +3175,7 @@ mod tests {
             effort: Mutex::new(None),
             sink: Mutex::new(None),
             buffer: Mutex::new(VecDeque::new()),
+            buffer_bytes: AtomicUsize::new(0),
             claude_id: Mutex::new(None),
             title: Mutex::new(String::new()),
             busy: AtomicBool::new(false),
@@ -3228,5 +3335,46 @@ js_repl = false
         assert_eq!(sessions[0].title, "make resume and buttons commercial ready");
         assert_eq!(sessions[0].cwd, "/Users/firazfhansurie/Repo/firaz/aios/shell");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn slim_user_image_line_replaces_base64_with_placeholder() {
+        let line = json!({
+            "type": "user",
+            "message": { "role": "user", "content": [
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAA_huge_base64_AAAA" } },
+                { "type": "text", "text": "what is this" }
+            ]}
+        });
+        let slim = slim_user_image_line(&line).expect("image line should slim");
+        assert!(!slim.contains("AAAA_huge_base64_AAAA"), "base64 must be dropped: {slim}");
+        assert!(!slim.contains("base64"), "no image source retained: {slim}");
+        assert!(slim.contains("[image]"), "placeholder kept: {slim}");
+        assert!(slim.contains("what is this"), "user text kept: {slim}");
+    }
+
+    #[test]
+    fn slim_user_image_line_ignores_text_only_user_lines() {
+        let line = json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "hi" }] }
+        });
+        assert!(slim_user_image_line(&line).is_none());
+    }
+
+    #[test]
+    fn buffer_push_evicts_under_byte_budget() {
+        let sess = test_codex_session();
+        // One line a touch over half the byte cap; the third push must evict the
+        // oldest so total bytes stay under REPLAY_BYTE_CAP.
+        let big = "x".repeat(REPLAY_BYTE_CAP / 2 + 1024);
+        buffer_push(&sess, &big);
+        buffer_push(&sess, &big);
+        buffer_push(&sess, &big);
+        let bytes = sess.buffer_bytes.load(Ordering::Relaxed);
+        assert!(bytes <= REPLAY_BYTE_CAP, "over byte cap: {bytes}");
+        // Accounting matches the actual buffered content.
+        let actual: usize = sess.buffer.lock().iter().map(|l| l.len()).sum();
+        assert_eq!(actual, bytes, "byte counter drifted from buffer");
     }
 }
