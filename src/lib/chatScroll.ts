@@ -40,7 +40,11 @@ export function nextAutoscrollPaused(
   paused: boolean,
   metrics: ScrollMetrics,
   intent: ScrollIntent,
-  thresholdPx: number = BOTTOM_STICKY_THRESHOLD_PX,
+  // Resume/un-pause uses the WIDE 96px stick threshold (same as
+  // `shouldAutoscroll`), not the crisp 8px pause threshold: a fast stream grows
+  // `scrollHeight` between layout passes, so an 8px window almost never passes
+  // mid-stream and autoscroll never re-stuck after the user scrolled back down.
+  thresholdPx: number = AUTOSCROLL_STICK_THRESHOLD_PX,
 ): boolean {
   if (intent === "up") return true;
   if (distanceFromBottom(metrics) < thresholdPx) return false;

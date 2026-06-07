@@ -49,8 +49,53 @@ test("reduceChatStreamEvent closes a streamed assistant final without duplicatin
     { now: 200, uid },
   ).state;
 
-  assert.deepEqual(final.turns, [{ kind: "assistant", id: "t1", text: "hello", streaming: true }]);
+  // The final text block overwrites the streamed bubble with the authoritative
+  // text (identical here) AND settles it — streaming flips to false, no dupe.
+  assert.deepEqual(final.turns, [{ kind: "assistant", id: "t1", text: "hello", streaming: false }]);
   assert.equal(final.streamingTurnId, null);
+});
+
+test("reduceChatStreamEvent overwrites streamed text with the authoritative final when deltas were lost", () => {
+  n = 0;
+  const base = { turns: [], streamingTurnId: null, thinkingTurnId: null };
+  // Deltas arrive but are lost/coalesced — the bubble only ever shows "he llo".
+  const d1 = reduceChatStreamEvent(
+    base,
+    { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "he " } } },
+    { now: 100, uid },
+  ).state;
+  const d2 = reduceChatStreamEvent(
+    d1,
+    { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "llo" } } },
+    { now: 110, uid },
+  ).state;
+  // The authoritative final is LONGER than the concatenated deltas.
+  const final = reduceChatStreamEvent(
+    d2,
+    {
+      type: "assistant",
+      message: { content: [{ type: "text", text: "hello there, full reply" }] },
+    },
+    { now: 200, uid },
+  ).state;
+
+  assert.deepEqual(final.turns, [
+    { kind: "assistant", id: "t1", text: "hello there, full reply", streaming: false },
+  ]);
+  assert.equal(final.streamingTurnId, null);
+});
+
+test("reduceChatStreamEvent ignores undefined delta.text without a phantom turn", () => {
+  n = 0;
+  const result = reduceChatStreamEvent(
+    { turns: [], streamingTurnId: null, thinkingTurnId: null },
+    { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta" } } },
+    { now: 100, uid },
+  );
+
+  assert.equal(result.handled, true);
+  assert.deepEqual(result.state.turns, []);
+  assert.equal(result.state.streamingTurnId, null);
 });
 
 test("reduceChatStreamEvent settles thinking and adds tool cards on assistant final", () => {
