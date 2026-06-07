@@ -449,7 +449,11 @@ pub fn pty_resize(state: State<PtyState>, id: u32, cols: u16, rows: u16) -> Resu
 pub fn pty_kill(state: State<PtyState>, id: u32) -> Result<(), String> {
     let removed = state.sessions.lock().remove(&id);
     if let Some(s) = removed {
-        let _ = s.child.lock().kill();
+        let mut child = s.child.lock();
+        let _ = child.kill();
+        // Reap so the killed child (the `tmux attach` client, usually) doesn't
+        // linger as a zombie — portable_pty's Child trait exposes wait().
+        let _ = child.wait();
     }
     Ok(())
 }

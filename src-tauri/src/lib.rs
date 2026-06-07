@@ -364,6 +364,18 @@ pub fn run() {
                 api.prevent_exit();
                 show_main_window(app);
             }
+            // Exit is actually proceeding here (no busy session blocked it above).
+            // Reap every spawned chat child NOW — `detach_child_process` puts them
+            // in their own process group so the OS won't signal them on our quit,
+            // and they'd otherwise keep running forever (burning tokens/memory).
+            // `RunEvent::Exit` is the final lifecycle event; kill there too as a
+            // belt-and-braces catch for exit paths that skip ExitRequested.
+            tauri::RunEvent::ExitRequested { .. } => {
+                chat::kill_all_sessions();
+            }
+            tauri::RunEvent::Exit => {
+                chat::kill_all_sessions();
+            }
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
                 show_main_window(app);

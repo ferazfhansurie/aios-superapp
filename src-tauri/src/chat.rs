@@ -952,6 +952,11 @@ fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<
                 ingest_line(&rsess, &app, &out);
             }
         }
+        // Reap the finished turn's child before nulling it — dropping the Child
+        // alone never wait()s it, leaking a zombie until the next turn replaces it.
+        if let Some(child) = rsess.child.lock().as_mut() {
+            let _ = child.wait();
+        }
         *rsess.child.lock() = None;
         // Fallback close: if the engine never emitted a turn-end (crash / kill /
         // an engine that just EOFs), synthesize a result so the composer frees.
@@ -1970,15 +1975,37 @@ fn fan_out(sess: &Arc<ChatSession>, line: &str) {
 /// Handles one complete output line: append to the replay buffer, update session
 /// state (claude id, busy, done-notification), and forward to the live sink.
 fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
-    // Learn claude's session uuid once, from the init event.
-    if sess.claude_id.lock().is_none() {
-        if let Some(sid) = extract_json_str(line, "session_id") {
-            *sess.claude_id.lock() = Some(sid);
+    // Parse the line ONCE — but only when a cheap substring pre-check says it
+    // could matter (a `result` close, or a `session_id` we haven't learned yet).
+    // This keeps the hot delta path (token streams) allocation-free: those lines
+    // contain neither needle so we never touch serde_json. Parsing at the TOP
+    // level (rather than raw `line.contains`) means model output that merely
+    // ECHOES `"type":"result"` / `"session_id"` inside its own text can't falsely
+    // close a turn or hijack the session id.
+    let want_session_id = sess.claude_id.lock().is_none() && line.contains("session_id");
+    let want_result = line.contains("result");
+    let parsed: Option<Value> = if want_session_id || want_result {
+        serde_json::from_str::<Value>(line).ok()
+    } else {
+        None
+    };
+
+    // Learn claude's session uuid once, from the init event (top-level field only).
+    if want_session_id {
+        if let Some(sid) = parsed
+            .as_ref()
+            .and_then(|v| v.get("session_id"))
+            .and_then(|x| x.as_str())
+        {
+            *sess.claude_id.lock() = Some(sid.to_string());
         }
     }
 
-    // A `result` event ends the current turn.
-    let is_result = line.contains("\"type\":\"result\"");
+    // A `result` event ends the current turn — match the TOP-LEVEL `type` only.
+    let is_result = parsed
+        .as_ref()
+        .map(|v| v.get("type").and_then(|x| x.as_str()) == Some("result"))
+        .unwrap_or(false);
 
     // Forward the line itself first (buffer + live sink), so the pane sees the
     // turn close before the usage tick that follows it.
@@ -2104,16 +2131,6 @@ fn codex_usage_to_claude(usage: Option<&serde_json::Value>) -> String {
         "output_tokens": output,
     })
     .to_string()
-}
-
-/// Cheap extractor for a top-level `"key":"value"` string field — avoids pulling
-/// a JSON parser into the hot path for the one field we need (`session_id`).
-fn extract_json_str(line: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = line.find(&needle)? + needle.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
 }
 
 /// Payload for the in-app `aios-notify` event. The front-end turns this into a
@@ -2294,6 +2311,25 @@ pub fn has_busy_sessions() -> bool {
     with_sessions(|m| m.values().any(|s| s.busy.load(Ordering::SeqCst)))
 }
 
+/// App-exit reaper: kills + reaps EVERY live chat session's child. Called from
+/// the lib.rs exit handler ONLY on the path where exit actually proceeds (no busy
+/// session blocked it). Without this, `detach_child_process` reparents the spawned
+/// `claude`/`codex`/`opencode` children out of the cockpit's process group, so on
+/// a normal quit they'd keep running forever — burning tokens + memory. We kill
+/// then wait() so nothing is left as a zombie either. Idempotent: an already-dead
+/// child's kill/wait errors are ignored.
+pub fn kill_all_sessions() {
+    with_sessions(|m| {
+        for s in m.values() {
+            if let Some(c) = s.child.lock().as_mut() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        m.clear();
+    });
+}
+
 /// Interrupts the in-flight turn of a live chat session.
 ///
 /// Uses claude's stream-json **control protocol** (verified live against claude
@@ -2319,6 +2355,10 @@ pub fn chat_interrupt(session_id: u32) -> Result<(), String> {
         if s.engine.per_turn() {
             if let Some(child) = s.child.lock().as_mut() {
                 let _ = child.kill();
+                // Reap immediately so the killed turn's process doesn't linger as
+                // a zombie until the next turn (the reader thread's `child = None`
+                // drops the handle without waiting, so wait() here).
+                let _ = child.wait();
             }
             return Ok(());
         }
