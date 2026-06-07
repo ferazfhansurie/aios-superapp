@@ -223,11 +223,28 @@ function reduceToolResultEvent(state: ChatStreamState, ev: ChatEvent): ChatStrea
     if (block.type !== "tool_result") continue;
     const ref = block.tool_use_id;
     const text = resultToText(block.content);
-    turns = turns.map((turn) =>
-      turn.kind === "tool" && turn.id === ref
-        ? { ...turn, result: text, isError: block.is_error }
-        : turn,
-    );
+    // Primary match: a tool turn whose id equals tool_use_id.
+    let targetIdx = ref != null ? turns.findIndex((t) => t.kind === "tool" && t.id === ref) : -1;
+    // Order-based fallback: codex/opencode normalized output sometimes omits
+    // block.id on tool_use (so the turn got a random uid) or sends a
+    // tool_use_id that lines up with nothing. Rather than silently dropping the
+    // result, attach it to the most recent tool turn that has no result yet.
+    // Only target result-less turns so we never overwrite an already-attached
+    // result via the fallback.
+    if (targetIdx < 0) {
+      for (let i = turns.length - 1; i >= 0; i--) {
+        const turn = turns[i];
+        if (turn.kind === "tool" && turn.result == null) {
+          targetIdx = i;
+          break;
+        }
+      }
+    }
+    if (targetIdx < 0) continue; // genuinely no pending tool turn — leave unchanged
+    const next = [...turns];
+    const turn = next[targetIdx] as Extract<ChatTurn, { kind: "tool" }>;
+    next[targetIdx] = { ...turn, result: text, isError: block.is_error };
+    turns = next;
   }
   return { ...state, turns };
 }

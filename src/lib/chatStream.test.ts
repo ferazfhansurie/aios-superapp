@@ -152,6 +152,121 @@ test("reduceChatStreamEvent patches tool results by tool_use_id", () => {
   ]);
 });
 
+test("tool_use without an id still gets its result attached via fallback", () => {
+  // Engine omits block.id — the tool_use turn gets a random uid (t1 here).
+  n = 0;
+  const afterToolUse = reduceChatStreamEvent(
+    { turns: [], streamingTurnId: null, thinkingTurnId: null },
+    {
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Bash", input: { command: "ls" } }] },
+    },
+    { now: 100, uid },
+  ).state;
+  // result references a totally different id — would never match by id.
+  const next = reduceChatStreamEvent(
+    afterToolUse,
+    {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "some-other-id", content: "files", is_error: false }] },
+    },
+    { now: 200, uid },
+  ).state;
+
+  assert.equal(next.turns.length, 1);
+  assert.deepEqual(next.turns[0], {
+    kind: "tool",
+    id: "t1",
+    name: "Bash",
+    input: { command: "ls" },
+    result: "files",
+    isError: false,
+  });
+});
+
+test("unmatched tool_result attaches to the pending tool turn", () => {
+  const state = {
+    streamingTurnId: null,
+    thinkingTurnId: null,
+    turns: [{ kind: "tool", id: "tool-A", name: "Read", input: { file_path: "a.ts" } }],
+  };
+  const next = reduceChatStreamEvent(
+    state,
+    {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "nope", content: "contents", is_error: false }] },
+    },
+    { now: 0, uid },
+  ).state;
+
+  assert.deepEqual(next.turns, [
+    { kind: "tool", id: "tool-A", name: "Read", input: { file_path: "a.ts" }, result: "contents", isError: false },
+  ]);
+});
+
+test("unmatched tool_result with no pending tool turn leaves state unchanged", () => {
+  const state = {
+    streamingTurnId: null,
+    thinkingTurnId: null,
+    turns: [{ kind: "assistant", id: "a1", text: "hi", streaming: false }],
+  };
+  const result = reduceChatStreamEvent(
+    state,
+    {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "ghost", content: "orphan", is_error: false }] },
+    },
+    { now: 0, uid },
+  );
+
+  assert.equal(result.handled, true);
+  assert.deepEqual(result.state.turns, [{ kind: "assistant", id: "a1", text: "hi", streaming: false }]);
+});
+
+test("matched tool_use+tool_result by id still works (regression)", () => {
+  const state = {
+    streamingTurnId: null,
+    thinkingTurnId: null,
+    turns: [{ kind: "tool", id: "tool-1", name: "Bash", input: { command: "pwd" } }],
+  };
+  const next = reduceChatStreamEvent(
+    state,
+    {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: "done", is_error: false }] },
+    },
+    { now: 0, uid },
+  ).state;
+
+  assert.deepEqual(next.turns, [
+    { kind: "tool", id: "tool-1", name: "Bash", input: { command: "pwd" }, result: "done", isError: false },
+  ]);
+});
+
+test("unmatched tool_result attaches to most recent pending tool turn, not an already-resolved one", () => {
+  const state = {
+    streamingTurnId: null,
+    thinkingTurnId: null,
+    turns: [
+      { kind: "tool", id: "tool-1", name: "Read", input: { file_path: "a.ts" }, result: "first", isError: false },
+      { kind: "tool", id: "tool-2", name: "Read", input: { file_path: "b.ts" } },
+    ],
+  };
+  const next = reduceChatStreamEvent(
+    state,
+    {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "unmatched", content: "second", is_error: false }] },
+    },
+    { now: 0, uid },
+  ).state;
+
+  assert.deepEqual(next.turns, [
+    { kind: "tool", id: "tool-1", name: "Read", input: { file_path: "a.ts" }, result: "first", isError: false },
+    { kind: "tool", id: "tool-2", name: "Read", input: { file_path: "b.ts" }, result: "second", isError: false },
+  ]);
+});
+
 test("finalizeStreamingTurns closes live assistant and thinking blocks", () => {
   const next = finalizeStreamingTurns(
     {
