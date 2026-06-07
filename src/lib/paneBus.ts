@@ -203,17 +203,19 @@ export function revealFileInPane(path: string, name: string): boolean {
 // a fresh pane of a given kind, carrying just enough context to root/seed it. App
 // translates the (kind, ctx) into a real PaneContent + label and spawns it
 // (reusing the existing `spawn`, so the exit-fullscreen-on-spawn behavior applies).
-export type SpawnPaneKind = "terminal" | "files" | "browser" | "chat";
+export type SpawnPaneKind = "terminal" | "files" | "browser" | "chat" | "memory" | "git";
 
 /** Context a spawn carries. Only the fields relevant to the target kind are read:
  *  - terminal → `cwd` (shell starts there)
  *  - files    → `path` (pane is rooted there)
  *  - browser  → `url`  (initial url; e.g. a `file://` for a selected file)
- *  - chat     → `cwd`  (chat working dir) */
+ *  - chat     → `cwd` + `seed` (chat working dir and optional opening prompt)
+ *  - git      → `path` / `cwd` (repo path to inspect) */
 export interface SpawnCtx {
   cwd?: string;
   path?: string;
   url?: string;
+  seed?: string;
   /** terminal only: a command to seed + run in the freshly-spawned shell. Maps
    *  to the shell pane's startup `cmd`, so it runs as soon as the PTY is ready
    *  (no need to look the new pane up in paneWriters/paneSubmitters after mount).

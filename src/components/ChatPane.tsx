@@ -22,7 +22,7 @@
  *   7. `/` slash menu (clear / plan / model / help)
  *   8. `@` file-mention picker sourced from cwd
  */
-import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
@@ -94,6 +94,7 @@ import { fileSrc, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
 import { idleRate, codexRate, resetIn } from "../lib/dashboard";
 import {
+  buildChatContextCapsule,
   composerContextChips,
   contextLedger,
   cycleQueueSelection,
@@ -106,6 +107,8 @@ import {
   stopStrategy,
   updateQueuedMessage,
   usageStack,
+  type ChatContextTurn,
+  type ChatWorkspaceContext,
   type ContextBudgetMode,
   type QueuedMessage,
 } from "../lib/chatPaneState";
@@ -138,12 +141,6 @@ import {
   type ChatTurn,
 } from "../lib/chatStream";
 import { memorySearch, type MemoryHit } from "../lib/memory";
-import {
-  onPetResult,
-  onPetError,
-  onPetUsage,
-  onPetUserMessage,
-} from "../lib/pet";
 import {
   AUTOSCROLL_STICK_THRESHOLD_PX,
   distanceFromBottom,
@@ -290,6 +287,19 @@ function memoryContextBlock(memories: MemoryHit[]): string {
       return `${i + 1}. ${m.title} [${m.type}] — ${m.description || m.preview}${reasons}`;
     })
     .join("\n")}\n\n`;
+}
+
+function recentTurnsForContext(turns: Turn[]): ChatContextTurn[] {
+  return turns
+    .filter(
+      (turn): turn is Extract<Turn, { kind: "user" | "assistant" | "result" }> =>
+        turn.kind === "user" || turn.kind === "assistant" || turn.kind === "result",
+    )
+    .map((turn) => ({
+      kind: turn.kind,
+      text: turn.text,
+    }))
+    .slice(-8);
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -682,6 +692,7 @@ export function ChatPane({
   modelId,
   agentId,
   agentLabel,
+  workspaceContext,
   onOpenUrl,
 }: {
   cwd?: string;
@@ -697,6 +708,7 @@ export function ChatPane({
   modelId?: string;
   agentId?: string;
   agentLabel?: string;
+  workspaceContext?: ChatWorkspaceContext;
   /** Resume a prior chat session on mount (from the idle "continue" rail).
    *  engine/model carry the saved session's backend so a resumed codex thread
    *  boots on codex (not the default claude) — otherwise --resume sends a codex
@@ -840,13 +852,18 @@ export function ChatPane({
   const [memoryPanelOpen, setMemoryPanelOpen] = useState(false);
   const [handoffPanelOpen, setHandoffPanelOpen] = useState(false);
   const [memoryHits, setMemoryHits] = useState<MemoryHit[]>([]);
-  const [attachedMemoryIds, setAttachedMemoryIds] = useState<string[]>([]);
+  const [attachedMemoryPaths, setAttachedMemoryPaths] = useState<string[]>([]);
+  const [lastAutoMemories, setLastAutoMemories] = useState<MemoryHit[]>([]);
+  const [memoryContextStatus, setMemoryContextStatus] = useState<"ready" | "searching" | "error">("ready");
   const attachedMemories = useMemo(
-    () => attachedMemoryIds
-      .map((id) => memoryHits.find((hit) => hit.id === id))
+    () => attachedMemoryPaths
+      .map((path) => memoryHits.find((hit) => hit.path === path))
       .filter((hit): hit is MemoryHit => Boolean(hit)),
-    [attachedMemoryIds, memoryHits],
+    [attachedMemoryPaths, memoryHits],
   );
+  const openMemoryPane = useCallback(() => {
+    spawnPane("memory", { label: "memory" });
+  }, []);
 
   useEffect(() => {
     if (!memoryPanelOpen) {
@@ -864,7 +881,7 @@ export function ChatPane({
         .then((hits) => {
           if (cancelled) return;
           setMemoryHits(hits);
-          setAttachedMemoryIds((ids) => ids.filter((id) => hits.some((h) => h.id === id)));
+          setAttachedMemoryPaths((paths) => paths.filter((path) => hits.some((h) => h.path === path)));
         })
         .catch(() => {
           if (!cancelled) setMemoryHits([]);
@@ -888,6 +905,7 @@ export function ChatPane({
   const [overlayIdx, setOverlayIdx] = useState(0);
   const [mentionItems, setMentionItems] = useState<DirEntry[]>([]);
   const [mentionQuery, setMentionQuery] = useState("");
+  const [mentionPrefix, setMentionPrefix] = useState("");
 
   // /resume picker: past chat sessions, a typed filter, and a loading flag
   const [resumeSessions, setResumeSessions] = useState<ChatSessionInfo[]>([]);
@@ -975,9 +993,11 @@ export function ChatPane({
   // "Working… 0:42" timer and is the fallback duration if claude's result event
   // doesn't carry one.
   const turnStartRef = useRef<number | null>(null);
+  // wall-clock ms the in-flight turn began (null = idle). Changes at most once
+  // per turn — NOT every second. The 1Hz "Working… m:ss" tick lives entirely
+  // inside the <WorkingLine>/<ActivityGroup> leaves (useLiveElapsed) so the
+  // running clock re-renders ONLY that subtree, never the whole message list.
   const [liveStart, setLiveStart] = useState<number | null>(null);
-  // 1Hz tick so the running timer re-renders while streaming
-  const [now, setNow] = useState(() => Date.now());
   // keep the latest input in a ref so the unmount writer-cleanup never goes stale
   const inputRef = useRef(input);
   inputRef.current = input;
@@ -1061,18 +1081,33 @@ export function ChatPane({
   const [images, setImages] = useState<ImageChip[]>([]);
   // Live mirror of `images` so an async send can read the freshest paths after
   // awaiting in-flight saves (the closure-captured `images` would be stale).
+  // SYNCHRONOUS mirror via setImagesSync: the old effect-synced ref lagged React
+  // state by one commit, so a paste→Enter race could resolve the save (clearing
+  // pendingSavesRef) before the effect copied the path into imagesRef — and
+  // sendText then filtered the null-path chip out and shipped a text-only turn
+  // (the "image never reaches the model" bug). Updating the ref inside the same
+  // call that updates state removes that window entirely.
   const imagesRef = useRef<ImageChip[]>([]);
-  useEffect(() => {
-    imagesRef.current = images;
-  }, [images]);
+  const setImagesSync = useCallback(
+    (updater: (prev: ImageChip[]) => ImageChip[]) => {
+      setImages((prev) => {
+        const next = updater(prev);
+        imagesRef.current = next;
+        return next;
+      });
+    },
+    [],
+  );
   // In-flight disk-save promises, keyed by chip id. send() awaits these so a
   // fast paste→Enter can't ship the turn before the image finishes saving.
   const pendingSavesRef = useRef<Map<string, Promise<void>>>(new Map());
   const imgInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const addImage = useCallback(async (file: Blob, mime: string) => {
     const id = `img${++_imgSeq}`;
     const url = URL.createObjectURL(file);
-    setImages((prev) => [...prev, { id, url, path: null }]);
+    reportDiag("chat.image", "addImage:start", { id, mime, size: file.size });
+    setImagesSync((prev) => [...prev, { id, url, path: null }]);
     const save = (async () => {
       try {
         const buf = await file.arrayBuffer();
@@ -1083,11 +1118,13 @@ export function ChatPane({
           bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
         }
         const path = await saveImageTemp(btoa(bin), extFromMime(mime));
-        setImages((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
-      } catch {
+        reportDiag("chat.image", "addImage:saved", { id, path });
+        setImagesSync((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
+      } catch (e) {
+        reportDiag("chat.image", e, { action: "addImage:saveFailed", id });
         // surface the failure instead of vanishing the thumbnail silently —
         // otherwise the user thinks the image attached when it didn't.
-        setImages((prev) => {
+        setImagesSync((prev) => {
           const gone = prev.find((im) => im.id === id);
           if (gone) URL.revokeObjectURL(gone.url);
           return prev.filter((im) => im.id !== id);
@@ -1102,14 +1139,14 @@ export function ChatPane({
     })();
     pendingSavesRef.current.set(id, save);
     await save;
-  }, []);
+  }, [setImagesSync]);
   const removeImage = useCallback((id: string) => {
-    setImages((prev) => {
+    setImagesSync((prev) => {
       const gone = prev.find((im) => im.id === id);
       if (gone) URL.revokeObjectURL(gone.url);
       return prev.filter((im) => im.id !== id);
     });
-  }, []);
+  }, [setImagesSync]);
 
   // Attach an image that already lives on disk (an OS file drop from Finder /
   // the desktop). Tauri's native drag-drop hands us a path, not a Blob, so we
@@ -1117,8 +1154,9 @@ export function ChatPane({
   // the asset-protocol URL, and `path` is set immediately (already on disk).
   const addImageByPath = useCallback((path: string) => {
     const id = `img${++_imgSeq}`;
-    setImages((prev) => [...prev, { id, url: fileSrc(path), path }]);
-  }, []);
+    reportDiag("chat.image", "addImageByPath", { id, path });
+    setImagesSync((prev) => [...prev, { id, url: fileSrc(path), path }]);
+  }, [setImagesSync]);
 
   // Register this chat pane's IMAGE-drop sink so App's native OS drag-drop
   // handler routes dropped image files here as thumbnail chips (instead of
@@ -1166,6 +1204,32 @@ export function ChatPane({
       return took;
     },
     [addImage],
+  );
+  const attachPickedFiles = useCallback(
+    (files: FileList | null) => {
+      if (!files) return;
+      let missingPath = 0;
+      for (const f of Array.from(files)) {
+        if (f.type.startsWith("image/")) {
+          void addImage(f, f.type);
+          continue;
+        }
+        const path = (f as File & { path?: string }).path;
+        if (path) insertPath(path);
+        else missingPath += 1;
+      }
+      if (missingPath > 0) {
+        setTurns((prev) => [
+          ...prev,
+          {
+            kind: "result",
+            id: uid(),
+            text: "couldn't attach that file directly. drag it from files/finder into the chatpane, or mention it with @path.",
+          },
+        ]);
+      }
+    },
+    [addImage, insertPath],
   );
   // ── voice dictation: click mic → inline waveform + timer → transcript ───────
   // Ported from TerminalComposer (the polished one). Records via lib/voice, swaps
@@ -1360,11 +1424,6 @@ export function ChatPane({
         const foot = [resultText, dur, tokStr].filter(Boolean).join(" · ");
         // always emit a result turn (carries durationMs for the activity line),
         // even if the human-readable footer would be empty.
-        onPetResult({
-          tokens,
-          durationMs,
-          ok: !Boolean(ev.is_error),
-        });
         setTurns((prev) => [
           ...prev,
           { kind: "result", id: uid(), text: foot, cost: costNum, tokens, durationMs },
@@ -1374,7 +1433,6 @@ export function ChatPane({
 
       // surface a backend stderr line (missing binary / not logged in / bad flag)
       case "aios_stderr": {
-        if (ev.text) onPetError(ev.text);
         if (ev.text) {
           setTurns((prev) => [
             ...prev,
@@ -1398,10 +1456,6 @@ export function ChatPane({
           void codexRate().then((r) => {
             const snap = codexUsageForModel(r, current);
             if (hasUsageData(snap)) {
-              onPetUsage({
-                provider: "codex",
-                pct: snap.fiveHour.pct,
-              });
               rememberUsage(usageProviderKey(current), snap);
             }
           });
@@ -1409,15 +1463,6 @@ export function ChatPane({
         }
         const fh = ev.five_hour ?? {};
         const sd = ev.seven_day ?? {};
-        onPetUsage({
-          provider: ev.provider ?? "claude",
-          pct:
-            typeof fh.pct === "number"
-              ? fh.pct
-              : typeof sd.pct === "number"
-                ? sd.pct
-                : null,
-        });
         rememberUsage(ev.provider ?? "claude", {
           fiveHour: { pct: fh.pct ?? null, resetsAt: fh.resets_at ?? null },
           sevenDay: { pct: sd.pct ?? null, resetsAt: sd.resets_at ?? null },
@@ -1562,7 +1607,6 @@ export function ChatPane({
           const t0 = Date.now();
           turnStartRef.current = t0;
           setLiveStart(t0);
-          setNow(t0);
         }
         setStarted(true);
       })
@@ -1640,9 +1684,16 @@ export function ChatPane({
   }, [model.engine, model.id, rememberUsage]);
 
   // Queue flush: when a turn finishes (streaming → false) and messages are
-  // queued, fire the next one. dispatch via a ref so this effect isn't a dep of
-  // the (changing) dispatch closure. One per turn → the queue drains in order.
+  // queued, fire the next one. Routed through refs so this effect isn't a dep of
+  // the (changing) dispatch/sendText closures. One per turn → the queue drains
+  // in order — ChatGPT-style "stack the next message while one streams".
   const dispatchRef = useRef<(text: string) => void>(() => {});
+  // The queued message goes back through the FULL send path (sendText), not the
+  // raw dispatch — so a queued claude message gets the same context capsule,
+  // auto-memory, and session recording a normally-typed message would. Routing
+  // queued sends through the bare `dispatch` was the "claude queue sucks" gap:
+  // the follow-up landed without any of that context.
+  const flushSendRef = useRef<(text: string) => void>(() => {});
   useEffect(() => {
     if (streaming) return;
     if (!started) return;
@@ -1651,8 +1702,8 @@ export function ChatPane({
     const [next, ...rest] = queuedRef.current;
     setQueued(rest);
     setQueuedIdx((idx) => (rest.length === 0 ? 0 : Math.min(idx, rest.length - 1)));
-    dispatchRef.current(next.text);
-  }, [streaming]);
+    flushSendRef.current(next.text);
+  }, [streaming, started]);
 
   // autoscroll on new content — but with a STICKY pause. The moment you scroll
   // up (wheel, scrollbar, touch) we stop yanking you down and hold there until
@@ -1778,12 +1829,8 @@ export function ChatPane({
     ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`;
   }, [input]);
 
-  // tick the live "Working… m:ss" timer once a second while a turn is in flight
-  useEffect(() => {
-    if (liveStart == null) return;
-    const iv = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(iv);
-  }, [liveStart]);
+  // (the 1Hz "Working…" tick now lives in the WorkingLine/ActivityGroup leaves
+  // via useLiveElapsed — no parent-level timer that re-renders the whole list.)
 
   // ── approval resolution ─────────────────────────────────────────────────────
 
@@ -1834,11 +1881,6 @@ export function ChatPane({
       lastSentRef.current = display;
       // feed the autocomplete history (dedup, newest first, capped).
       if (display.trim()) {
-        onPetUserMessage({
-          textLength: display.trim().length,
-          memoryCount: attachedMemories.length,
-          imageCount: images.length,
-        });
         try {
           const h = [display, ...historyRef.current.filter((x) => x !== display)].slice(0, 200);
           historyRef.current = h;
@@ -1858,7 +1900,6 @@ export function ChatPane({
       const t0 = Date.now();
       turnStartRef.current = t0;
       setLiveStart(t0);
-      setNow(t0);
       // plan-mode is a per-message instruction; clear it after firing
       if (planMode) setPlanMode(false);
       if (webChatRuntime) {
@@ -2008,10 +2049,15 @@ export function ChatPane({
   const sendText = useCallback(
     async (raw: string) => {
       const text = raw.trim();
-      // If any attached image is still saving to disk, wait it out before we
-      // collect paths — a fast paste→Enter used to filter out the pending image
-      // and ship the turn without it (the "image send is buggy" report).
-      if (imagesRef.current.some((im) => im.path == null) && pendingSavesRef.current.size) {
+      // Always drain in-flight disk saves before collecting paths. The old guard
+      // (`some(path==null) && pendingSavesRef.size`) had a race: a save could
+      // resolve (clearing pendingSavesRef) a beat before its path landed in
+      // imagesRef, so the guard short-circuited and the null-path chip got
+      // filtered out below — shipping a text-only turn with the image silently
+      // dropped (the "image never reaches the model" bug). Awaiting
+      // unconditionally + reading the synchronously-mirrored imagesRef AFTER the
+      // await closes that window entirely.
+      if (pendingSavesRef.current.size) {
         await Promise.allSettled([...pendingSavesRef.current.values()]);
       }
       // attached images are sent as REAL image content blocks (the backend reads
@@ -2020,8 +2066,32 @@ export function ChatPane({
       const imgPaths = imagesRef.current
         .filter((im) => im.path)
         .map((im) => im.path as string);
+      reportDiag("chat.image", "sendText:collect", {
+        total: imagesRef.current.length,
+        withPath: imgPaths.length,
+      });
       if (!text && imgPaths.length === 0) return;
-      if (streaming) return;
+      // Submitting while a turn is still streaming → queue it (ChatGPT-style),
+      // don't silently drop. Text queues + auto-fires when the turn finishes
+      // (the flush effect routes it back through here). Images can't ride a
+      // text-only queue entry, so a still-streaming send WITH an attachment is
+      // surfaced rather than swallowed.
+      if (streaming) {
+        if (text) {
+          enqueue(text);
+          if (imgPaths.length > 0) {
+            setTurns((prev) => [
+              ...prev,
+              {
+                kind: "result",
+                id: uid(),
+                text: "queued your message — attached image(s) stay in the composer; resend them once the current turn finishes.",
+              },
+            ]);
+          }
+        }
+        return;
+      }
       if (sessionIdRef.current == null) {
         if (imgPaths.length === 0) {
           enqueue(text);
@@ -2077,19 +2147,54 @@ export function ChatPane({
           chatSetTitle(sessionIdRef.current, stableTitle).catch((e) => reportDiag("chat.title", e, { action: "setTitle" }));
       }
       setInput("");
-      setImages((prev) => {
+      setImagesSync((prev) => {
         prev.forEach((im) => URL.revokeObjectURL(im.url));
         return [];
       });
       setOverlay(null);
       const attachedMemoryBlock = memoryContextBlock(attachedMemories);
-      setAttachedMemoryIds([]);
+      let autoMemories: MemoryHit[] = [];
+      const autoLimit = effectiveBudget === "lean" ? 1 : effectiveBudget === "ultracode" ? 6 : 3;
+      if (text) {
+        setMemoryContextStatus("searching");
+        try {
+          const attachedPaths = new Set(attachedMemories.map((memory) => memory.path));
+          autoMemories = (await memorySearch(text, cwd ?? null, autoLimit + attachedPaths.size))
+            .filter((memory) => !attachedPaths.has(memory.path))
+            .slice(0, autoLimit);
+          setLastAutoMemories(autoMemories);
+          setMemoryContextStatus("ready");
+        } catch (e) {
+          setLastAutoMemories([]);
+          setMemoryContextStatus("error");
+          reportDiag("memory.search", e, { action: "autoContext" });
+        }
+      } else {
+        setLastAutoMemories([]);
+        setMemoryContextStatus("ready");
+      }
+      const contextCapsule = buildChatContextCapsule({
+        cwd,
+        engine,
+        modelLabel: model.label,
+        contextBudget: effectiveBudget,
+        userText: text,
+        memories: autoMemories,
+        attachedMemoryCount: attachedMemories.length,
+        recentTurns: recentTurnsForContext(turnsRef.current),
+        workspace: workspaceContext ?? null,
+        runPhase: runEventState.phase,
+      });
+      setAttachedMemoryPaths([]);
       // images ride as native content blocks (opts.imagePaths), not text paths —
       // the user bubble shows the text and a "[n image(s)]" hint when text-empty.
       const bubble = text || (imgPaths.length ? `[${imgPaths.length} image${imgPaths.length > 1 ? "s" : ""}]` : "");
-      dispatch(bubble, { wirePrefix: attachedMemoryBlock, imagePaths: imgPaths });
+      dispatch(bubble, { wirePrefix: `${contextCapsule}${attachedMemoryBlock}`, imagePaths: imgPaths });
     },
-    [streaming, dispatch, cwd, images, model, attachedMemories],
+    // `images` intentionally NOT a dep: sendText reads the synchronously-mirrored
+    // imagesRef.current (fresh after the pending-save await), so depending on the
+    // images STATE would only re-create this closure on every attach for nothing.
+    [streaming, dispatch, cwd, model, attachedMemories, effectiveBudget, workspaceContext, runEventState.phase, setImagesSync],
   );
 
   const send = useCallback(() => sendText(input), [sendText, input]);
@@ -2111,6 +2216,12 @@ export function ChatPane({
   // paneKey) always calls the latest closure without re-registering.
   const sendTextRef = useRef(sendText);
   sendTextRef.current = sendText;
+  // The queue-flush effect (declared earlier) fires queued messages through the
+  // full send path so they get the same context capsule / memory / recording a
+  // freshly-typed message gets.
+  flushSendRef.current = (text: string) => {
+    void sendText(text).catch((e) => reportDiag("chat.send", e, { action: "queueFlush" }));
+  };
 
   // ── launcher seed: auto-send as the first turn ─────────────────────────────
   // The idle page hands over the prompt you typed as `seed`; fire it once the
@@ -2161,6 +2272,18 @@ export function ChatPane({
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seed]);
+
+  // Stable handler for an assistant message's `[[btn:…]]` choice. Routes through
+  // dispatchRef + streamingRef (kept fresh below) so its identity NEVER changes
+  // across renders — otherwise every streamed token recreates this closure and
+  // breaks React.memo on every AssistantBubble in the list (the re-render storm).
+  const streamingRef = useRef(false);
+  streamingRef.current = streaming;
+  const handleAssistantButton = useCallback((label: string) => {
+    if (!streamingRef.current && sessionIdRef.current != null) {
+      dispatchRef.current(label);
+    }
+  }, []);
 
   // regenerate: replay the last user turn (no extra user bubble)
   const regenerate = useCallback(() => {
@@ -2446,15 +2569,35 @@ export function ChatPane({
     [clearSession, loadResumeSessions, sendText, goal],
   );
 
-  // load dir entries for the @-mention picker (lazy, on first open)
-  const loadMentions = useCallback(async () => {
+  // load dir entries for the @-mention picker. Plain @foo searches cwd; path
+  // prefixes like @src/ or @/Applications/ browse that directory.
+  const loadMentions = useCallback(async (query = "") => {
     const root = cwd;
     if (!root) {
       setMentionItems([]);
       return;
     }
+    const slash = query.lastIndexOf("/");
+    const leaf = slash >= 0 ? query.slice(slash + 1) : query;
+    const prefix = slash >= 0 ? query.slice(0, slash + 1) : "";
+    const candidates =
+      slash < 0
+        ? [root]
+        : prefix.startsWith("/")
+          ? [prefix || "/"]
+          : [`${root.replace(/\/$/, "")}/${prefix}`, `/${prefix}`];
     try {
-      const entries = await readDir(root);
+      let entries: DirEntry[] = [];
+      let resolvedPrefix = prefix;
+      for (const dir of candidates) {
+        try {
+          entries = await readDir(dir);
+          resolvedPrefix = slash >= 0 ? (dir.endsWith("/") ? dir : `${dir}/`) : "";
+          break;
+        } catch {
+          /* try next candidate */
+        }
+      }
       // dirs first, then files; cap to keep the popover tight
       entries.sort((a, b) =>
         a.is_dir === b.is_dir
@@ -2463,8 +2606,12 @@ export function ChatPane({
             ? -1
             : 1,
       );
+      setMentionPrefix(resolvedPrefix);
+      setMentionQuery(leaf);
       setMentionItems(entries.slice(0, 200));
     } catch {
+      setMentionPrefix(prefix);
+      setMentionQuery(leaf);
       setMentionItems([]);
     }
   }, [cwd]);
@@ -2481,12 +2628,13 @@ export function ChatPane({
       // @-mention: last token before caret begins with @
       const m = value.match(/(?:^|\s)@([^\s]*)$/);
       if (m) {
-        setMentionQuery(m[1] ?? "");
+        const query = m[1] ?? "";
+        setMentionQuery(query.includes("/") ? query.slice(query.lastIndexOf("/") + 1) : query);
         if (overlay !== "mention") {
           setOverlay("mention");
           setOverlayIdx(0);
-          void loadMentions();
         }
+        void loadMentions(query);
         return;
       }
       if (overlay) setOverlay(null);
@@ -2540,12 +2688,13 @@ export function ChatPane({
 
   const pickMention = useCallback(
     (entry: DirEntry) => {
-      const insert = entry.is_dir ? `${entry.name}/` : entry.name;
+      const base = mentionPrefix || "";
+      const insert = entry.is_dir ? `${base}${entry.name}/` : `${base}${entry.name}`;
       setInput((v) => v.replace(/(^|\s)@([^\s]*)$/, `$1@${insert} `));
       setOverlay(null);
       taRef.current?.focus();
     },
-    [],
+    [mentionPrefix],
   );
 
   const closeResume = useCallback(() => {
@@ -2825,11 +2974,45 @@ export function ChatPane({
                 <span className="truncate">run: {runPhase}</span>
               </span>
             )}
+            <button
+              type="button"
+              onClick={openMemoryPane}
+              className={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
+                memoryContextStatus === "error"
+                  ? "border-[color-mix(in_srgb,var(--color-danger)_45%,transparent)] bg-[color-mix(in_srgb,var(--color-danger)_10%,transparent)] text-[var(--color-danger)]"
+                  : lastAutoMemories.length > 0
+                    ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
+                    : "border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 text-[var(--color-text-2)] hover:border-[var(--color-accent)]/45 hover:text-[var(--color-accent)]"
+              }`}
+              title={
+                memoryContextStatus === "searching"
+                  ? "searching memory for this send"
+                  : lastAutoMemories.length > 0
+                    ? `auto memory used: ${lastAutoMemories.map((m) => m.title).join("; ")}`
+                    : "auto memory is on. click to open memory pane"
+              }
+            >
+              <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
+              <span className="truncate">
+                {memoryContextStatus === "searching"
+                  ? "memory searching"
+                  : memoryContextStatus === "error"
+                    ? "memory error"
+                    : lastAutoMemories.length > 0
+                      ? `${lastAutoMemories.length} auto memories`
+                      : "memory on"}
+              </span>
+            </button>
             {attachedMemories.length > 0 && (
-              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text)]">
+              <button
+                type="button"
+                onClick={openMemoryPane}
+                className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text)]"
+                title="open memory pane"
+              >
                 <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
                 <span className="truncate">{attachedMemories.length} memories attached</span>
-              </span>
+              </button>
             )}
           </div>
         )}
@@ -2873,14 +3056,14 @@ export function ChatPane({
               <div className="px-2 py-2 text-[11.5px] text-[var(--color-muted)]">no memory matches</div>
             ) : (
               memoryHits.slice(0, 5).map((hit) => {
-                const attached = attachedMemoryIds.includes(hit.id);
+                const attached = attachedMemoryPaths.includes(hit.path);
                 return (
                   <button
-                    key={hit.id}
+                    key={hit.path}
                     type="button"
                     onClick={() =>
-                      setAttachedMemoryIds((ids) =>
-                        attached ? ids.filter((id) => id !== hit.id) : [...ids, hit.id],
+                      setAttachedMemoryPaths((paths) =>
+                        attached ? paths.filter((path) => path !== hit.path) : [...paths, hit.path],
                       )
                     }
                     className={`flex min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left font-sans text-[11.5px] transition-colors ${
@@ -2970,8 +3153,39 @@ export function ChatPane({
                 no working directory for this pane
               </div>
             ) : mentionFiltered.length === 0 ? (
-              <div className="px-3 py-2 font-mono text-[11.5px] text-[var(--color-faint)]">
-                no matches in {baseName(cwd)}
+              <div className="flex flex-col gap-2 px-3 py-2 font-sans text-[11.5px] text-[var(--color-muted)]">
+                <div className="flex items-center gap-2">
+                  <Search size={13} className="text-[var(--color-faint)]" />
+                  <span className="min-w-0 flex-1 truncate">
+                    no matches in {mentionPrefix ? mentionPrefix : baseName(cwd)}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInput((v) => v.replace(/(^|\s)@([^\s]*)$/, "$1@/Applications/"));
+                      setMentionQuery("");
+                      void loadMentions("/Applications/");
+                      taRef.current?.focus();
+                    }}
+                    className="rounded-md border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-text-2)] hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+                  >
+                    browse /applications
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInput((v) => v.replace(/(^|\s)@([^\s]*)$/, "$1@/"));
+                      setMentionQuery("");
+                      void loadMentions("/");
+                      taRef.current?.focus();
+                    }}
+                    className="rounded-md border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-text-2)] hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+                  >
+                    browse root
+                  </button>
+                </div>
               </div>
             ) : (
               mentionFiltered
@@ -3149,6 +3363,16 @@ export function ChatPane({
               e.target.value = "";
             }}
           />
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              attachPickedFiles(e.target.files);
+              e.target.value = "";
+            }}
+          />
           <style>{WAVE_KEYFRAMES}</style>
           {recording ? (
             <div className="flex items-center gap-3 px-4 pt-4 pb-2">
@@ -3261,6 +3485,16 @@ export function ChatPane({
               >
                 <span className="flex items-center gap-2">
                   <ImageIcon size={13} /> attach image
+                </span>
+              </MenuItem>
+              <MenuItem
+                onClick={() => {
+                  fileInputRef.current?.click();
+                  setOpenMenu(null);
+                }}
+              >
+                <span className="flex items-center gap-2">
+                  <FileText size={13} /> attach file/doc
                 </span>
               </MenuItem>
               <MenuItem
@@ -3448,8 +3682,11 @@ export function ChatPane({
       action,
       contextChips,
       memoryHits,
-      attachedMemoryIds,
+      lastAutoMemories,
+      memoryContextStatus,
+      attachedMemoryPaths,
       attachedMemories,
+      openMemoryPane,
       handoffPanelOpen,
       hasDraft,
       send,
@@ -3606,7 +3843,10 @@ export function ChatPane({
                 // live only on the final activity group, while a turn is in
                 // flight and it hasn't been closed by a result yet
                 live={streaming && b.durationMs == null && i === lastActivityIdx}
-                elapsedMs={liveStart != null ? now - liveStart : 0}
+                // pass the START timestamp (stable per-turn), not a per-second
+                // elapsed value — the leaf owns its own 1Hz tick so this prop
+                // change doesn't re-render the whole list every second.
+                liveStart={liveStart}
               />
             ) : b.kind === "user" ? (
               <UserBubble
@@ -3619,9 +3859,7 @@ export function ChatPane({
               <AssistantBubble
                 key={b.id}
                 turn={b.turn}
-                onButton={(label) => {
-                  if (!streaming && sessionIdRef.current != null) dispatch(label);
-                }}
+                onButton={handleAssistantButton}
                 disabled={streaming}
                 onOpenUrl={onOpenUrl}
               />
@@ -3646,7 +3884,7 @@ export function ChatPane({
               (blocks[lastActivityIdx] as Extract<RenderBlock, { kind: "activity" }>)
                 .durationMs == null
             ) && (
-              <WorkingLine elapsedMs={liveStart != null ? now - liveStart : 0} />
+              <WorkingLine liveStart={liveStart} />
             )}
         </div>
       </div>
@@ -3812,27 +4050,55 @@ function UsageStrip({
 // ── sub-views ────────────────────────────────────────────────────────────────
 
 /**
+ * The 1Hz "Working… m:ss" tick, owned BY THE LEAF that shows it. Given the turn's
+ * start timestamp (`liveStart`, which changes at most once per turn), it runs its
+ * own per-second interval and returns the elapsed ms — so the running clock
+ * re-renders only this tiny component, never the whole message list. When
+ * `liveStart` is null (idle) no interval runs and it returns 0.
+ */
+function useLiveElapsed(liveStart: number | null): number {
+  const [elapsed, setElapsed] = useState(() =>
+    liveStart != null ? Date.now() - liveStart : 0,
+  );
+  useEffect(() => {
+    if (liveStart == null) {
+      setElapsed(0);
+      return;
+    }
+    // paint immediately, then tick each second
+    setElapsed(Date.now() - liveStart);
+    const iv = setInterval(() => setElapsed(Date.now() - liveStart), 1000);
+    return () => clearInterval(iv);
+  }, [liveStart]);
+  return elapsed;
+}
+
+/**
  * Codex-style activity group: one subtle, hairline-free line — "Worked for Xs ›"
  * (or a live "Working… m:ss" with a shimmer while the turn is in flight) — that
  * collapses an entire run of tool calls. Click to expand the tight step list;
  * each step is one line (icon + verb + truncated target). Any files the steps
  * wrote (Write/Edit/NotebookEdit) surface as artifact cards beneath the list.
  */
-function ActivityGroup({
+const ActivityGroup = memo(function ActivityGroup({
   tools,
   durationMs,
   live,
-  elapsedMs,
+  liveStart,
 }: {
   tools: ToolTurn[];
   durationMs?: number;
   live: boolean;
-  elapsedMs: number;
+  /** Turn-start timestamp; the live timer ticks internally off this leaf. */
+  liveStart: number | null;
 }) {
   // expanded while the turn is live (so you watch tools run in real time), then
   // auto-collapses to "Worked for Xs ›" when done — unless the user toggled it.
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
   const open = userToggled ?? live;
+  // own the 1Hz tick here (only while THIS group is live) so the running clock
+  // doesn't re-render the parent / the rest of the transcript.
+  const elapsedMs = useLiveElapsed(live ? liveStart : null);
 
   // dedup artifacts by path (an Edit + later Write on the same file → one card)
   const artifacts = useMemo(() => {
@@ -3891,7 +4157,7 @@ function ActivityGroup({
       )}
     </div>
   );
-}
+});
 
 /** One activity step: tool icon + verb + truncated target, expandable to its
  *  full input detail (Bash command, Edit diff, Todo checklist, or args) + result.
@@ -4261,8 +4527,11 @@ function ArtifactActionButton({
   );
 }
 
-/** The bare live working line when a turn is in flight before any tool runs. */
-function WorkingLine({ elapsedMs }: { elapsedMs: number }) {
+/** The bare live working line when a turn is in flight before any tool runs.
+ *  Owns its own 1Hz tick (useLiveElapsed off the turn-start timestamp) so the
+ *  running clock re-renders ONLY this leaf, not the whole transcript. */
+function WorkingLine({ liveStart }: { liveStart: number | null }) {
+  const elapsedMs = useLiveElapsed(liveStart);
   return (
     <div className="flex items-center gap-1.5 font-sans text-[12.5px] text-[var(--color-muted)]">
       <Loader2 size={13} className="shrink-0 animate-spin text-[var(--color-accent)]" />
@@ -4272,13 +4541,17 @@ function WorkingLine({ elapsedMs }: { elapsedMs: number }) {
 }
 
 /** Faint, centered turn footer — tokens · cost · (duration on text-only turns). */
-function ResultFooter({ turn }: { turn: Extract<Turn, { kind: "result" }> }) {
+const ResultFooter = memo(function ResultFooter({
+  turn,
+}: {
+  turn: Extract<Turn, { kind: "result" }>;
+}) {
   return (
     <div className="text-center font-mono text-[10.5px] text-[var(--color-faint)]">
       {turn.text}
     </div>
   );
-}
+});
 
 /** Copy-to-clipboard button with a brief check confirmation. */
 function CopyButton({
@@ -4320,7 +4593,7 @@ function CopyButton({
   );
 }
 
-function UserBubble({
+const UserBubble = memo(function UserBubble({
   turn,
   streaming,
   onRegenerate,
@@ -4353,7 +4626,7 @@ function UserBubble({
       </div>
     </div>
   );
-}
+});
 
 /** Parse the WA-style `[[btn: a | b | c]]` choice sentinel out of an assistant
  *  message: returns the prose with the sentinel stripped + up to 3 button
@@ -4373,7 +4646,11 @@ function parseButtons(text: string): { body: string; buttons: string[] } {
 /** The model's extended-thinking trace — dim + collapsible. Auto-expanded while
  *  the tokens are streaming in (so you read the reasoning live), then collapses
  *  to a faint "Thought ›" line you can re-open. Mirrors claude-code's quiet trace. */
-function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) {
+const ThinkingBlock = memo(function ThinkingBlock({
+  turn,
+}: {
+  turn: Extract<Turn, { kind: "thinking" }>;
+}) {
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
   const open = userToggled ?? turn.streaming;
   return (
@@ -4404,7 +4681,7 @@ function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) 
       )}
     </div>
   );
-}
+});
 
 function CadencedShimmer({ children }: { children: string }) {
   const ref = useRef<HTMLSpanElement>(null);
@@ -4442,7 +4719,7 @@ function CadencedShimmer({ children }: { children: string }) {
   );
 }
 
-function AssistantBubble({
+const AssistantBubble = memo(function AssistantBubble({
   turn,
   onButton,
   disabled,
@@ -4488,7 +4765,7 @@ function AssistantBubble({
       )}
     </div>
   );
-}
+});
 
 /**
  * Inline tool-approval card for a `can_use_tool` control request (non-bypass
@@ -4496,7 +4773,7 @@ function AssistantBubble({
  * (buildApprovalLine in chat.ts owns the exact shape). Once resolved the card
  * collapses to a one-line verdict so the transcript stays clean.
  */
-function ApprovalCard({
+const ApprovalCard = memo(function ApprovalCard({
   turn,
   onResolve,
 }: {
@@ -4577,7 +4854,7 @@ function ApprovalCard({
       </div>
     </div>
   );
-}
+});
 
 // ── markdown renderer (dependency-free, partial-stream safe) ──────────────────
 //
@@ -4629,7 +4906,7 @@ function splitFences(
   return out;
 }
 
-function Markdown({
+const Markdown = memo(function Markdown({
   text,
   onOpenUrl,
 }: {
@@ -4648,7 +4925,7 @@ function Markdown({
       )}
     </div>
   );
-}
+});
 
 /** Shell-ish fences get a "run in terminal" affordance. Single-statement blocks
  *  (no embedded newline once trimmed) seed + run directly; multi-line blocks open
@@ -4693,113 +4970,119 @@ function CodeBlock({ lang, body }: { lang: string; body: string }) {
 }
 
 /** Render the non-code body: split into block-level lines (headings / lists /
- *  paragraphs), each with inline formatting. */
-function MarkdownBlocks({
+ *  paragraphs), each with inline formatting. The whole line-split + per-line
+ *  regex parse is memoized on [text, onOpenUrl] and the component is React.memo'd,
+ *  so an unchanged old message never re-parses its markdown when the parent
+ *  re-renders (e.g. while a LATER message streams or the 1Hz clock ticks). */
+const MarkdownBlocks = memo(function MarkdownBlocks({
   text,
   onOpenUrl,
 }: {
   text: string;
   onOpenUrl?: (url: string) => void;
 }) {
-  if (!text.trim()) return null;
-  const lines = text.split("\n");
-  const out: React.ReactNode[] = [];
-  let listBuf: { ordered: boolean; items: string[] } | null = null;
-  let key = 0;
+  const out = useMemo<React.ReactNode[]>(() => {
+    if (!text.trim()) return [];
+    const lines = text.split("\n");
+    const nodes: React.ReactNode[] = [];
+    let listBuf: { ordered: boolean; items: string[] } | null = null;
+    let key = 0;
 
-  const flushList = () => {
-    if (!listBuf) return;
-    const { ordered, items } = listBuf;
-    const cls =
-      "my-0.5 flex flex-col gap-1 pl-1 " +
-      (ordered ? "" : "");
-    out.push(
-      ordered ? (
-        <ol key={`l${key++}`} className={cls}>
-          {items.map((it, j) => (
-            <li key={j} className="flex gap-2">
-              <span className="select-none text-[var(--color-faint)]">{j + 1}.</span>
-              <span className="flex-1">
-                <Inline text={it} onOpenUrl={onOpenUrl} />
-              </span>
-            </li>
-          ))}
-        </ol>
-      ) : (
-        <ul key={`l${key++}`} className={cls}>
-          {items.map((it, j) => (
-            <li key={j} className="flex gap-2">
-              <span className="select-none text-[var(--color-accent)]">•</span>
-              <span className="flex-1">
-                <Inline text={it} onOpenUrl={onOpenUrl} />
-              </span>
-            </li>
-          ))}
-        </ul>
-      ),
-    );
-    listBuf = null;
-  };
-
-  for (const raw of lines) {
-    const line = raw;
-    // headings
-    const h = line.match(/^(#{1,4})\s+(.*)$/);
-    if (h) {
-      flushList();
-      const level = h[1].length;
-      const size =
-        level === 1
-          ? "text-[17px]"
-          : level === 2
-            ? "text-[15.5px]"
-            : "text-[14.5px]";
-      out.push(
-        <div
-          key={`h${key++}`}
-          className={`mt-1 font-sans font-semibold text-[var(--color-text)] ${size}`}
-        >
-          <Inline text={h[2]} onOpenUrl={onOpenUrl} />
-        </div>,
+    const flushList = () => {
+      if (!listBuf) return;
+      const { ordered, items } = listBuf;
+      const cls = "my-0.5 flex flex-col gap-1 pl-1 ";
+      nodes.push(
+        ordered ? (
+          <ol key={`l${key++}`} className={cls}>
+            {items.map((it, j) => (
+              <li key={j} className="flex gap-2">
+                <span className="select-none text-[var(--color-faint)]">{j + 1}.</span>
+                <span className="flex-1">
+                  <Inline text={it} onOpenUrl={onOpenUrl} />
+                </span>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <ul key={`l${key++}`} className={cls}>
+            {items.map((it, j) => (
+              <li key={j} className="flex gap-2">
+                <span className="select-none text-[var(--color-accent)]">•</span>
+                <span className="flex-1">
+                  <Inline text={it} onOpenUrl={onOpenUrl} />
+                </span>
+              </li>
+            ))}
+          </ul>
+        ),
       );
-      continue;
-    }
-    // unordered list
-    const ul = line.match(/^\s*[-*]\s+(.*)$/);
-    if (ul) {
-      if (!listBuf || listBuf.ordered) {
+      listBuf = null;
+    };
+
+    for (const raw of lines) {
+      const line = raw;
+      // headings
+      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      if (h) {
         flushList();
-        listBuf = { ordered: false, items: [] };
+        const level = h[1].length;
+        const size =
+          level === 1
+            ? "text-[17px]"
+            : level === 2
+              ? "text-[15.5px]"
+              : "text-[14.5px]";
+        nodes.push(
+          <div
+            key={`h${key++}`}
+            className={`mt-1 font-sans font-semibold text-[var(--color-text)] ${size}`}
+          >
+            <Inline text={h[2]} onOpenUrl={onOpenUrl} />
+          </div>,
+        );
+        continue;
       }
-      listBuf.items.push(ul[1]);
-      continue;
-    }
-    // ordered list
-    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
-    if (ol) {
-      if (!listBuf || !listBuf.ordered) {
+      // unordered list
+      const ul = line.match(/^\s*[-*]\s+(.*)$/);
+      if (ul) {
+        if (!listBuf || listBuf.ordered) {
+          flushList();
+          listBuf = { ordered: false, items: [] };
+        }
+        listBuf.items.push(ul[1]);
+        continue;
+      }
+      // ordered list
+      const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+      if (ol) {
+        if (!listBuf || !listBuf.ordered) {
+          flushList();
+          listBuf = { ordered: true, items: [] };
+        }
+        listBuf.items.push(ol[1]);
+        continue;
+      }
+      // blank line → paragraph break
+      if (!line.trim()) {
         flushList();
-        listBuf = { ordered: true, items: [] };
+        continue;
       }
-      listBuf.items.push(ol[1]);
-      continue;
-    }
-    // blank line → paragraph break
-    if (!line.trim()) {
+      // plain paragraph line
       flushList();
-      continue;
+      nodes.push(
+        <p key={`p${key++}`} className="whitespace-pre-wrap break-words">
+          <Inline text={line} onOpenUrl={onOpenUrl} />
+        </p>,
+      );
     }
-    // plain paragraph line
     flushList();
-    out.push(
-      <p key={`p${key++}`} className="whitespace-pre-wrap break-words">
-        <Inline text={line} onOpenUrl={onOpenUrl} />
-      </p>,
-    );
-  }
-  flushList();
+    return nodes;
+  }, [text, onOpenUrl]);
+
+  if (out.length === 0) return null;
   return <>{out}</>;
-}
+});
 
 /** Inline span formatting: `code`, **bold**, *italic* / _italic_, [text](url).
  *  Single-pass tokenizer — partial markers (e.g. a lone trailing `**` during
@@ -5265,11 +5548,10 @@ function ResumeRow({
   const when = session.mtime ? fmtRelativeTime(session.mtime) : "";
   const engine = session.engine || "claude";
   const model = session.model || "";
-  const shortId = session.id ? session.id.slice(0, 8) : "";
   const preview = (session.last_user || "").trim();
   const engineColor = engineColorVar(engine);
   const sourceLabel =
-    engine === "codex" ? "codex terminal/chat" : engine === "opencode" ? "opencode" : "chatpane";
+    engine === "codex" ? "codex" : engine === "opencode" ? "opencode" : "chat";
   return (
     <button
       type="button"
@@ -5331,20 +5613,22 @@ function ResumeRow({
           )}
           {model && <span className="text-[var(--color-border-strong)]">·</span>}
           {model && <span className="truncate">{model}</span>}
-          {shortId && <span className="text-[var(--color-border-strong)]">·</span>}
-          {shortId && <span className="font-mono">{shortId}</span>}
         </span>
       </span>
       <span className="hidden shrink-0 items-center gap-1.5 pt-0.5 sm:flex">
-        <span className="rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-faint)]">
+        <span className="rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-muted)]">
           {sourceLabel}
         </span>
-        {active && (
-          <span className="inline-flex items-center gap-1 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-panel)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-text-2)]">
-            resume
-            <CornerDownLeft size={11} />
-          </span>
-        )}
+        <span
+          className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-sans text-[10px] ${
+            active
+              ? "border-[var(--color-accent)]/40 bg-[var(--color-panel)] text-[var(--color-text-2)]"
+              : "border-transparent text-[var(--color-faint)]"
+          }`}
+        >
+          resume
+          <CornerDownLeft size={11} />
+        </span>
       </span>
     </button>
   );

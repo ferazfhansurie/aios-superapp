@@ -9,6 +9,7 @@ mod chat;
 mod device;
 mod diag;
 mod files;
+mod global_monitor;
 mod mac_apps;
 mod memory;
 mod monitor;
@@ -225,6 +226,7 @@ pub fn run() {
             if let Err(e) = build_app_menu(app.handle()) {
                 eprintln!("[aios menu] failed to install app menu: {e}");
             }
+            global_monitor::start(app.handle().clone());
             Ok(())
         })
         .on_menu_event(|app, event| handle_menu_event(app, event.id().0.as_str()))
@@ -247,14 +249,19 @@ pub fn run() {
             pty::pty_reap_terminals,
             oracles::list_oracles,
             oracles::list_tmux_sessions,
+            oracles::list_roster,
             oracles::create_oracle,
             oracles::rename_oracle,
             oracles::delete_oracle,
             oracles::kill_tmux_session,
             oracles::appshot,
+            oracles::appshot_capture,
             files::read_dir,
             files::read_dir_tree,
             files::git_status,
+            files::git_snapshot,
+            files::git_checkout,
+            files::git_commit,
             files::git_pulse,
             files::shell_source_status,
             files::detect_project,
@@ -278,6 +285,7 @@ pub fn run() {
             browser::browser_enter_annotate,
             browser::browser_exit_annotate,
             browser::browser_copy_selection,
+            browser::browser_install_context_probe,
             browser::read_clipboard,
             usage::usage_stats,
             usage::codex_usage,
@@ -286,7 +294,9 @@ pub fn run() {
             memory::memory_file,
             memory::memory_search,
             memory::memory_save,
+            memory::memory_save_raw,
             memory::memory_delete,
+            memory::memory_delete_path,
             memory::memory_focus,
             stats::usage_extras,
             device::device_stats,

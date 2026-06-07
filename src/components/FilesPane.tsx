@@ -12,18 +12,22 @@
  *     so the pane becomes that workspace (and drives ⌘P/⌘⇧F via finderRoot).
  *   - "open terminal here": spawn a shell pane rooted at the selected/focused
  *     directory — the headline cross-pane-spawn example. */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 
 import {
   ChevronRight,
+  Copy,
   Eye,
   EyeOff,
   FolderClosed,
   FolderGit2,
   FolderOpen,
+  GitBranch,
   Globe,
   Home,
   ListCollapse,
+  MessageSquare,
+  Play,
   RefreshCw,
   Search,
   TerminalSquare,
@@ -37,7 +41,7 @@ import {
   type DirEntry,
   type GitCode,
 } from "../lib/fs";
-import { listProjects, type ProjectInfo } from "../lib/run";
+import { detectProject, listProjects, type ProjectInfo } from "../lib/run";
 import { AIOS_DIR_MIME, AIOS_PATH_MIME, spawnPane } from "../lib/paneBus";
 import { fileIcon } from "../lib/fileIcons";
 import { PaneDropZone } from "./PaneDropZone";
@@ -68,6 +72,14 @@ function saveBool(key: string, val: boolean) {
   }
 }
 
+function containingDir(path: string): string {
+  return path.slice(0, path.lastIndexOf("/")) || "/";
+}
+
+function entryDir(entry: DirEntry): string {
+  return entry.is_dir ? entry.path : containingDir(entry.path);
+}
+
 export function FilesPane({
   initialRoot,
   onOpenFile,
@@ -89,6 +101,7 @@ export function FilesPane({
   const [showAll, setShowAll] = useState(() => loadBool(ALL_KEY));
   const [projOpen, setProjOpen] = useState(false);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: DirEntry } | null>(null);
 
   // Read the live toggle values inside callbacks without re-creating loadDir on
   // every toggle (which would otherwise re-run effects). Updated each render.
@@ -263,7 +276,71 @@ export function FilesPane({
     }
   }, [projects.length]);
 
+  const closeContextMenu = useCallback(() => setContextMenu(null), []);
+
+  const copyPath = useCallback(() => {
+    const path = contextMenu?.entry.path;
+    if (!path) return;
+    navigator.clipboard?.writeText(path).catch(() => {});
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu]);
+
+  const openContextTerminal = useCallback(() => {
+    const entry = contextMenu?.entry;
+    if (!entry) return;
+    spawnPane("terminal", { cwd: entryDir(entry), label: "terminal · project" });
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu]);
+
+  const openContextBrowser = useCallback(() => {
+    const entry = contextMenu?.entry;
+    if (!entry || entry.is_dir) return;
+    spawnPane("browser", { url: fileSrc(entry.path), label: entry.name });
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu]);
+
+  const openContextChat = useCallback(() => {
+    const entry = contextMenu?.entry;
+    if (!entry) return;
+    spawnPane("chat", { cwd: entryDir(entry), label: `chat · ${entry.name}` });
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu]);
+
+  const openContextGit = useCallback(() => {
+    const entry = contextMenu?.entry;
+    if (!entry) return;
+    spawnPane("git", { path: entryDir(entry), label: `git · ${entry.name}` });
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu]);
+
+  const openContainingFilesPane = useCallback(() => {
+    const entry = contextMenu?.entry;
+    if (!entry) return;
+    spawnPane("files", { path: entryDir(entry), label: `files · ${entry.name}` });
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu]);
+
+  const runContextProject = useCallback(async () => {
+    const entry = contextMenu?.entry;
+    if (!entry) return;
+    closeContextMenu();
+    const project = await detectProject(entry.path).catch(() => null);
+    const command = project?.commands[0];
+    if (!project?.root || !command) {
+      spawnPane("terminal", { cwd: entryDir(entry), label: "terminal · project" });
+      return;
+    }
+    spawnPane("terminal", {
+      cwd: project.root,
+      cmd: command.cmd,
+      label: `run · ${command.label}`,
+    });
+  }, [closeContextMenu, contextMenu]);
+
   const rootName = root.split("/").filter(Boolean).pop() ?? root;
+  const openGitPane = useCallback(() => {
+    spawnPane("git", { path: gitRoot ?? root, label: `git · ${rootName}` });
+  }, [gitRoot, root, rootName]);
   const f = filter.trim().toLowerCase();
 
   // Whether the current selection is a file (enables "open in browser").
@@ -312,6 +389,9 @@ export function FilesPane({
           </span>
         )}
         <span className="flex-1" />
+        <button onClick={openGitPane} className="rounded p-1 hover:text-[var(--color-text)]" title={`Open source control\n${gitRoot ?? root}`}>
+          <GitBranch size={13} />
+        </button>
         <button onClick={openTerminalHere} className="rounded p-1 hover:text-[var(--color-text)]" title={`Open terminal here\n${focusDir}`}>
           <TerminalSquare size={13} />
         </button>
@@ -424,6 +504,12 @@ export function FilesPane({
             onToggle={() => toggle(entry.path)}
             onOpen={() => openFile(entry)}
             onSelect={() => setSelected(entry.path)}
+            onContextMenu={(ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              setSelected(entry.path);
+              setContextMenu({ x: ev.clientX, y: ev.clientY, entry });
+            }}
           />
         ))}
         {!rows.length && (
@@ -434,7 +520,58 @@ export function FilesPane({
       </div>
       </PaneDropZone>
       </div>
+      {contextMenu && (
+        <>
+          <div
+            className="fixed inset-0 z-40"
+            onClick={closeContextMenu}
+            onContextMenu={(ev) => {
+              ev.preventDefault();
+              closeContextMenu();
+            }}
+          />
+          <div
+            className="fixed z-50 w-56 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] py-1 shadow-2xl"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            <div className="border-b border-[var(--color-border)] px-3 py-2">
+              <div className="truncate text-[12px] font-medium text-[var(--color-text)]">{contextMenu.entry.name}</div>
+              <div className="truncate font-mono text-[9.5px] text-[var(--color-faint)]">{entryDir(contextMenu.entry)}</div>
+            </div>
+            <ContextAction icon={<TerminalSquare size={13} />} label="open terminal here" onClick={openContextTerminal} />
+            <ContextAction icon={<Play size={13} />} label="run detected project" onClick={runContextProject} />
+            {!contextMenu.entry.is_dir && (
+              <ContextAction icon={<Globe size={13} />} label="open in browser" onClick={openContextBrowser} />
+            )}
+            <ContextAction icon={<FolderOpen size={13} />} label="open containing files pane" onClick={openContainingFilesPane} />
+            <ContextAction icon={<MessageSquare size={13} />} label="open chat here" onClick={openContextChat} />
+            <ContextAction icon={<GitBranch size={13} />} label="open source control" onClick={openContextGit} />
+            <ContextAction icon={<Copy size={13} />} label="copy path" onClick={copyPath} />
+          </div>
+        </>
+      )}
     </div>
+  );
+}
+
+function ContextAction({
+  icon,
+  label,
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+    >
+      <span className="text-[var(--color-muted)]">{icon}</span>
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+    </button>
   );
 }
 
@@ -449,6 +586,7 @@ function TreeRow({
   onToggle,
   onOpen,
   onSelect,
+  onContextMenu,
 }: {
   entry: DirEntry;
   depth: number;
@@ -460,6 +598,7 @@ function TreeRow({
   onToggle: () => void;
   onOpen: () => void;
   onSelect: () => void;
+  onContextMenu: (ev: ReactMouseEvent<HTMLDivElement>) => void;
 }) {
   const isDir = entry.is_dir;
   const { Icon, color } = fileIcon(entry.name);
@@ -486,6 +625,7 @@ function TreeRow({
         else onOpen();
       }}
       onDoubleClick={() => !isDir && onOpen()}
+      onContextMenu={onContextMenu}
       title={entry.path}
       className={`group flex cursor-pointer items-center gap-1 pr-2 transition-colors ${
         selected ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel-2)]"

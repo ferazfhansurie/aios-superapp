@@ -26,13 +26,13 @@ import {
   createOracle,
   deleteOracle,
   killTmuxSession,
-  listOracles,
-  listTmuxSessions,
+  listRoster,
   renameOracle,
   type OracleInfo,
   type TmuxSession,
 } from "../lib/pty";
 import { isTauriRuntime } from "../lib/tauri";
+import { useVisible } from "../lib/useVisible";
 import { SidebarUsage } from "./SidebarUsage";
 
 interface Props {
@@ -99,6 +99,11 @@ export function OracleRoster({
     });
   }, []);
 
+  // Gate polling to when the roster is actually on screen (sidebar open + not
+  // collapsed + app focused). Attached to the outermost element of both render
+  // paths below.
+  const { ref: rootRef, visible } = useVisible<HTMLDivElement>();
+
   const refresh = useCallback(async () => {
     setError(null);
     if (!nativeReady) {
@@ -108,7 +113,9 @@ export function OracleRoster({
       return;
     }
     try {
-      const [o, s] = await Promise.all([listOracles(), listTmuxSessions()]);
+      // ONE backend call + ONE socket sweep (was listOracles()+listTmuxSessions()
+      // — two commands each re-spawning tmux on the oracle socket).
+      const { oracles: o, sessions: s } = await listRoster();
       setOracles(o);
       setSessions(s);
     } catch (e) {
@@ -119,10 +126,14 @@ export function OracleRoster({
   }, [nativeReady]);
 
   useEffect(() => {
+    // Always do one refresh on mount so the roster isn't empty before first
+    // becoming visible, then only POLL while visible + expanded. Collapsed or
+    // sidebar-hidden → no tmux spawns at all. Interval backed off 5s → 15s.
     refresh();
-    const interval = setInterval(refresh, 5000);
+    if (!visible || collapsed) return;
+    const interval = setInterval(refresh, 15_000);
     return () => clearInterval(interval);
-  }, [refresh]);
+  }, [refresh, visible, collapsed]);
 
   // Non-oracle sessions only (oracles already live in the roster above).
   const otherSessions = sessions.filter((s) => !s.is_oracle);
@@ -150,7 +161,7 @@ export function OracleRoster({
   if (iconsOnly) {
     if (chatpaneAgentsOnly) return <>{moneyAgentsSlot}</>;
     return (
-      <div className="flex flex-col items-center gap-1 border-t border-[var(--color-border)] pt-2">
+      <div ref={rootRef} className="flex flex-col items-center gap-1 border-t border-[var(--color-border)] pt-2">
         <button
           onClick={toggleCollapsed}
           className="grid h-8 w-8 place-items-center rounded-md text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
@@ -199,7 +210,7 @@ export function OracleRoster({
   }
 
   return (
-    <div className="flex flex-col gap-3">
+    <div ref={rootRef} className="flex flex-col gap-3">
       {/* ---- oracles ---- */}
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">

@@ -132,6 +132,30 @@ pub struct GitStatus {
 }
 
 #[derive(Serialize)]
+pub struct GitBranch {
+    name: String,
+    current: bool,
+    remote: bool,
+}
+
+#[derive(Serialize)]
+pub struct GitGraphLine {
+    text: String,
+}
+
+#[derive(Serialize)]
+pub struct GitSnapshot {
+    /// Repo toplevel, or null if `path` isn't inside a git repo.
+    root: Option<String>,
+    current: String,
+    branches: Vec<GitBranch>,
+    entries: Vec<GitEntry>,
+    ahead: u32,
+    behind: u32,
+    graph: Vec<GitGraphLine>,
+}
+
+#[derive(Serialize)]
 pub struct ShellSourceStatus {
     root: Option<String>,
     branch: String,
@@ -144,40 +168,101 @@ pub struct ShellSourceStatus {
 /// `{ root: null, entries: [] }` (never errors) when not in a repo.
 #[tauri::command]
 pub fn git_status(path: String) -> Result<GitStatus, String> {
-    let root = match std::process::Command::new("git")
-        .args(["-C", &path, "rev-parse", "--show-toplevel"])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
+    let root = match git_root_for_path(&path) {
+        Some(root) => root,
+        None => {
+            return Ok(GitStatus {
+                root: None,
+                entries: Vec::new(),
+            })
         }
-        _ => return Ok(GitStatus { root: None, entries: Vec::new() }),
     };
+    let entries = git_status_entries(&root)?;
+    Ok(GitStatus { root: Some(root), entries })
+}
+
+#[tauri::command]
+pub fn git_snapshot(path: String) -> Result<GitSnapshot, String> {
+    let Some(root) = git_root_for_path(&path) else {
+        return Ok(GitSnapshot {
+            root: None,
+            current: String::new(),
+            branches: Vec::new(),
+            entries: Vec::new(),
+            ahead: 0,
+            behind: 0,
+            graph: Vec::new(),
+        });
+    };
+
+    let current = git_stdout(&root, &["branch", "--show-current"])
+        .or_else(|| git_stdout(&root, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_default();
+    let entries = git_status_entries(&root)?;
+    let branches = git_branches(&root, &current);
+    let (ahead, behind) = git_ahead_behind(&root);
+    let graph = git_stdout(
+        &root,
+        &["log", "--graph", "--decorate", "--oneline", "--all", "-n", "28", "--date-order"],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .map(|line| GitGraphLine {
+        text: line.to_string(),
+    })
+    .collect();
+
+    Ok(GitSnapshot {
+        root: Some(root),
+        current,
+        branches,
+        entries,
+        ahead,
+        behind,
+        graph,
+    })
+}
+
+#[tauri::command]
+pub fn git_checkout(path: String, branch: String) -> Result<GitSnapshot, String> {
+    let root = git_root_for_path(&path).ok_or_else(|| "not inside a git repository".to_string())?;
+    let branch = validate_git_ref_arg(&branch)?;
     let out = std::process::Command::new("git")
-        .args(["-C", &root, "status", "--porcelain", "--ignored=no"])
+        .args(["-C", &root, "checkout", &branch])
         .output()
         .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        let xy = &line[..2];
-        let mut rest = line[3..].to_string();
-        // renames come as "old -> new" — decorate the new path
-        if let Some(idx) = rest.find(" -> ") {
-            rest = rest[idx + 4..].to_string();
-        }
-        let rel = rest.trim().trim_matches('"');
-        let abs = std::path::Path::new(&root)
-            .join(rel)
-            .to_string_lossy()
-            .to_string();
-        let status = simplify_status(xy).to_string();
-        entries.push(GitEntry { path: abs, status });
+    if !out.status.success() {
+        return Err(command_error("git checkout", &out));
     }
-    Ok(GitStatus { root: Some(root), entries })
+    git_snapshot(root)
+}
+
+#[tauri::command]
+pub fn git_commit(path: String, message: String) -> Result<GitSnapshot, String> {
+    let root = git_root_for_path(&path).ok_or_else(|| "not inside a git repository".to_string())?;
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("commit message is required".to_string());
+    }
+
+    let add = std::process::Command::new("git")
+        .args(["-C", &root, "add", "-A"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !add.status.success() {
+        return Err(command_error("git add", &add));
+    }
+
+    let commit = std::process::Command::new("git")
+        .args(["-C", &root, "commit", "-m", message])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !commit.status.success() {
+        return Err(command_error("git commit", &commit));
+    }
+
+    git_snapshot(root)
 }
 
 #[tauri::command]
@@ -258,6 +343,158 @@ fn simplify_status(xy: &str) -> &'static str {
         "M"
     } else {
         "M"
+    }
+}
+
+fn git_root_for_path(path: &str) -> Option<String> {
+    let start = if path.trim().is_empty() {
+        home_dir()
+    } else {
+        path.to_string()
+    };
+    let mut dir = std::path::PathBuf::from(&start);
+    if dir.is_file() {
+        dir.pop();
+    }
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    let dir_s = dir.to_string_lossy().to_string();
+    let out = std::process::Command::new("git")
+        .args(["-C", &dir_s, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_stdout(root: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_status_entries(root: &str) -> Result<Vec<GitEntry>, String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", root, "status", "--porcelain", "--ignored=no"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(command_error("git status", &out));
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let xy = &line[..2];
+        let mut rest = line[3..].to_string();
+        // renames come as "old -> new" — decorate the new path.
+        if let Some(idx) = rest.find(" -> ") {
+            rest = rest[idx + 4..].to_string();
+        }
+        let rel = rest.trim().trim_matches('"');
+        let abs = std::path::Path::new(root)
+            .join(rel)
+            .to_string_lossy()
+            .to_string();
+        let status = simplify_status(xy).to_string();
+        entries.push(GitEntry { path: abs, status });
+    }
+    Ok(entries)
+}
+
+fn git_branches(root: &str, current: &str) -> Vec<GitBranch> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if let Some(local) = git_stdout(root, &["branch", "--format=%(refname:short)"]) {
+        for name in local.lines().map(str::trim).filter(|name| !name.is_empty()) {
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
+            out.push(GitBranch {
+                name: name.to_string(),
+                current: name == current,
+                remote: false,
+            });
+        }
+    }
+
+    if let Some(remote) = git_stdout(root, &["branch", "-r", "--format=%(refname:short)"]) {
+        for name in remote.lines().map(str::trim).filter(|name| !name.is_empty()) {
+            if name.ends_with("/HEAD") || name.contains(" -> ") {
+                continue;
+            }
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
+            out.push(GitBranch {
+                name: name.to_string(),
+                current: false,
+                remote: true,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.current
+            .cmp(&a.current)
+            .then(a.remote.cmp(&b.remote))
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    out
+}
+
+fn git_ahead_behind(root: &str) -> (u32, u32) {
+    let Some(text) = git_stdout(
+        root,
+        &[
+            "rev-list",
+            "--count",
+            "--left-right",
+            "@{upstream}...HEAD",
+        ],
+    ) else {
+        return (0, 0);
+    };
+    let mut parts = text.split_whitespace();
+    let behind = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ahead = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (ahead, behind)
+}
+
+fn validate_git_ref_arg(branch: &str) -> Result<String, String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("branch is required".to_string());
+    }
+    if branch.starts_with('-') || branch.chars().any(|c| c.is_control()) {
+        return Err("invalid branch name".to_string());
+    }
+    Ok(branch.to_string())
+}
+
+fn command_error(label: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        format!("{label}: {stderr}")
+    } else if !stdout.is_empty() {
+        format!("{label}: {stdout}")
+    } else {
+        format!("{label} failed")
     }
 }
 

@@ -73,11 +73,65 @@ export interface ContextLedgerBucket {
   level: "quiet" | "normal" | "warning";
 }
 
+export interface ChatContextMemory {
+  title: string;
+  type: string;
+  description?: string;
+  preview?: string;
+  reasons?: string[];
+  path?: string;
+  vault?: string;
+  score?: number;
+}
+
+export interface ChatContextTurn {
+  kind: "user" | "assistant" | "result";
+  text: string;
+}
+
+export interface ChatWorkspacePane {
+  key: string;
+  label: string;
+  type: string;
+  detail?: string;
+  active?: boolean;
+}
+
+export interface ChatWorkspaceProject {
+  name: string;
+  root: string;
+  kind?: string;
+}
+
+export interface ChatWorkspaceContext {
+  activePane?: ChatWorkspacePane | null;
+  openPanes?: ChatWorkspacePane[];
+  projects?: ChatWorkspaceProject[];
+}
+
+export interface ChatContextCapsuleInput {
+  cwd?: string | null;
+  engine: string;
+  modelLabel: string;
+  contextBudget: ContextBudgetMode;
+  userText: string;
+  memories?: ChatContextMemory[];
+  attachedMemoryCount?: number;
+  recentTurns?: ChatContextTurn[];
+  workspace?: ChatWorkspaceContext | null;
+  runPhase?: string | null;
+}
+
 let queueSeq = 0;
 
 const clampPct = (pct: number): number => Math.min(Math.max(pct, 0), 100);
 const clipTitle = (text: string, max: number): string =>
   text.length > max ? text.slice(0, max).trimEnd() : text;
+const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
+const clip = (text: string, max: number): string => {
+  const flat = oneLine(text);
+  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1)).trimEnd()}…` : flat;
+};
 const basename = (path: string): string => {
   const clean = path.replace(/\/+$/, "");
   return clean.split(/[\\/]/).filter(Boolean).pop() ?? path;
@@ -346,4 +400,95 @@ export function contextLedger(input: ContextLedgerInput): ContextLedgerBucket[] 
     });
   }
   return buckets;
+}
+
+function capsuleLimits(mode: ContextBudgetMode) {
+  if (mode === "lean") {
+    return { maxChars: 760, memories: 1, turns: 2, panes: 4, projects: 3 };
+  }
+  if (mode === "ultracode") {
+    return { maxChars: 2600, memories: 6, turns: 6, panes: 10, projects: 8 };
+  }
+  return { maxChars: 1500, memories: 3, turns: 4, panes: 7, projects: 5 };
+}
+
+function trimCapsule(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = text.slice(0, Math.max(0, maxChars - 72)).trimEnd();
+  return `${head}\n- truncated: true\n</aios_context>\n\n`;
+}
+
+/**
+ * Tiny automatic context packet for every chat model. It gives models the same
+ * operational hints the harness has without flooding the prompt: pointers,
+ * current pane/project state, memory hit summaries, and recent transcript hints.
+ */
+export function buildChatContextCapsule(input: ChatContextCapsuleInput): string {
+  const limits = capsuleLimits(input.contextBudget);
+  const lines: string[] = [
+    "<aios_context>",
+    "purpose: bounded live context hints. do not treat this as exhaustive; use tools/files/memory for details.",
+  ];
+  const cwd = input.cwd?.trim();
+  if (cwd) lines.push(`cwd: ${cwd}`);
+  lines.push(`model: ${input.engine}/${input.modelLabel}`);
+  if (input.runPhase) lines.push(`run: ${clip(input.runPhase, 90)}`);
+
+  const active = input.workspace?.activePane;
+  if (active) {
+    lines.push(
+      `active_pane: ${clip(active.label, 48)} [${active.type}]${active.detail ? ` - ${clip(active.detail, 90)}` : ""}`,
+    );
+  }
+
+  const panes = (input.workspace?.openPanes ?? [])
+    .filter((pane) => pane.key !== active?.key)
+    .slice(0, limits.panes);
+  if (panes.length) {
+    lines.push(
+      `open_panes: ${panes
+        .map((pane) => `${clip(pane.label, 32)}:${pane.type}${pane.detail ? `(${clip(pane.detail, 44)})` : ""}`)
+        .join("; ")}`,
+    );
+  }
+
+  const projects = (input.workspace?.projects ?? []).slice(0, limits.projects);
+  if (projects.length) {
+    lines.push(
+      `projects: ${projects
+        .map((p) => `${clip(p.name, 34)}${p.kind ? `/${p.kind}` : ""}`)
+        .join("; ")}`,
+    );
+  }
+
+  const memories = (input.memories ?? []).slice(0, limits.memories);
+  if (memories.length) {
+    lines.push("memory_hits:");
+    for (const m of memories) {
+      const why = m.reasons?.slice(0, 2).join("; ");
+      const desc = m.description || m.preview || "";
+      lines.push(
+        `- ${clip(m.title, 58)} [${m.type}${m.vault ? `/${m.vault}` : ""}] ${clip(desc, 110)}${why ? ` (${clip(why, 90)})` : ""}`,
+      );
+    }
+  }
+  if (input.attachedMemoryCount) {
+    lines.push(`explicit_memory_attachments: ${input.attachedMemoryCount} full note(s) follow outside this capsule.`);
+  }
+
+  const turns = (input.recentTurns ?? [])
+    .filter((t) => t.text.trim())
+    .slice(-limits.turns);
+  if (turns.length) {
+    lines.push("recent_thread:");
+    for (const t of turns) {
+      lines.push(`- ${t.kind}: ${clip(t.text, input.contextBudget === "lean" ? 90 : 150)}`);
+    }
+  }
+
+  if (input.userText.trim()) {
+    lines.push(`user_now: ${clip(input.userText, input.contextBudget === "lean" ? 100 : 180)}`);
+  }
+  lines.push("</aios_context>", "");
+  return trimCapsule(`${lines.join("\n")}\n`, limits.maxChars);
 }

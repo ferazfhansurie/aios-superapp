@@ -11,7 +11,6 @@
  * of the clock (the shared UsageGlance ProviderBlock — ONE source with the
  * sidebar). One launch row near the bottom — recent projects + quick actions +
  * pinned chips + a thin status footer — is the "jump back into work" affordance.
- * A tiny ambient pet sits in the top-right corner as the one playful touch.
  *
  * Everything else the old control center carried (jarvis lane, notification
  * cards, the agent-ops grid, charts, the 8-metric vanity band, the duplicate
@@ -32,8 +31,6 @@
  * the command-line local state only.
  */
 import {
-  lazy,
-  Suspense,
   useCallback,
   useEffect,
   useRef,
@@ -62,10 +59,6 @@ import type { SidebarItem, SidebarState } from "../lib/sidebar";
 import type { UsageExtras } from "../lib/stats";
 import { ProviderBlock, useUsageRates } from "./dashboard/UsageGlance";
 
-const PetDashboardCompanion = lazy(() =>
-  import("./PetPane").then((mod) => ({ default: mod.PetDashboardCompanion })),
-);
-
 export function IdleControlCenter({
   projects,
   sidebar,
@@ -80,7 +73,6 @@ export function IdleControlCenter({
   onOpenSidebarItem,
   onRevealSidebar,
   onOpenMoneyAgents,
-  onOpenPet,
   onOpenPalette,
   onTalkToJarvis,
 }: {
@@ -98,7 +90,6 @@ export function IdleControlCenter({
   onOpenSidebarItem: (item: SidebarItem) => void;
   onRevealSidebar: () => void;
   onOpenMoneyAgents: () => void;
-  onOpenPet: () => void;
   onOpenPalette: () => void;
   /** seed a fresh chat pane with the command-line text (spawns a chat). */
   onTalkToJarvis: (seed: string) => void;
@@ -135,28 +126,10 @@ export function IdleControlCenter({
         />
       </div>
 
-      {/* tiny ambient pet — top-right corner, low-key. Scaled down via
-          .aios-pet-mini (hides the head/actions, shrinks the world). The whole
-          tile is the click target → opens the full pet pane, since the inner
-          inspect button is hidden in the mini variant. */}
-      <div
-        role="button"
-        tabIndex={0}
-        onClick={onOpenPet}
-        onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onOpenPet())}
-        title="open the pet pane"
-        className="aios-pet-mini aios-fade-in pointer-events-auto absolute right-5 top-5 z-20 hidden cursor-pointer sm:block"
-        style={{ animationDelay: "260ms" }}
-      >
-        <Suspense fallback={null}>
-          <PetDashboardCompanion onOpenPet={onOpenPet} onTalkToJarvis={onTalkToJarvis} />
-        </Suspense>
-      </div>
-
       {/* ── centred hero stack: clock → command → usage. Generous breathing room.
           Caps at a comfortable reading width and floats slightly above centre. */}
       <div className="relative z-10 flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-6 py-8">
-        <div className="flex w-full max-w-[760px] flex-col items-center gap-9">
+        <div className="flex w-full max-w-[760px] flex-col items-center gap-7">
           {/* greeting + clock — the focal point */}
           <div className="flex flex-col items-center gap-3 text-center">
             <Greeting />
@@ -171,12 +144,12 @@ export function IdleControlCenter({
             <div className="aios-fade-in flex w-full flex-wrap items-start justify-center gap-x-12 gap-y-4" style={{ animationDelay: "120ms" }}>
               {hasClaude && (
                 <div className="min-w-[200px] flex-1 sm:max-w-[280px]">
-                  <ProviderBlock name="claude" fiveHour={claude!.fiveHour} sevenDay={claude!.sevenDay} showRemaining />
+                  <ProviderBlock name="claude" fiveHour={claude!.fiveHour} sevenDay={claude!.sevenDay} />
                 </div>
               )}
               {hasCodex && (
                 <div className="min-w-[200px] flex-1 sm:max-w-[280px]">
-                  <ProviderBlock name="codex" fiveHour={codex!.fiveHour} sevenDay={codex!.sevenDay} showRemaining />
+                  <ProviderBlock name="codex" fiveHour={codex!.fiveHour} sevenDay={codex!.sevenDay} />
                 </div>
               )}
             </div>
@@ -231,13 +204,34 @@ export function IdleControlCenter({
 
 // ── greeting + clock ─────────────────────────────────────────────────────────
 
-/** Time-of-day greeting + lowercased date. 30s tick — cheap, isolated. */
+/** Whole-window visibility. The home screen is full-viewport when shown, so the
+ *  clock/greeting ticks only matter while the app window is actually visible —
+ *  no point re-rendering 1×/sec into a minimized/occluded window. Returns true
+ *  on the server / when the Page Visibility API is unavailable. */
+function useWindowVisible(): boolean {
+  const [vis, setVis] = useState(
+    typeof document === "undefined" ? true : document.visibilityState !== "hidden",
+  );
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVis = () => setVis(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+  return vis;
+}
+
+/** Time-of-day greeting + lowercased date. 30s tick — cheap, isolated, paused
+ *  while the window is hidden. */
 function Greeting() {
   const [now, setNow] = useState(() => new Date());
+  const visible = useWindowVisible();
   useEffect(() => {
+    if (!visible) return;
+    setNow(new Date()); // snap on re-show
     const t = setInterval(() => setNow(new Date()), 30_000);
     return () => clearInterval(t);
-  }, []);
+  }, [visible]);
   const h = now.getHours();
   const part =
     h < 5 ? "still up" : h < 12 ? "good morning" : h < 18 ? "good afternoon" : "good evening";
@@ -258,10 +252,15 @@ function Greeting() {
  *  seconds demoted to a quiet trailing tick. clamp() scales it across windows. */
 function HeroClock() {
   const [now, setNow] = useState(() => new Date());
+  const visible = useWindowVisible();
   useEffect(() => {
+    // Pause the 1Hz tick while the window is hidden; snap to current time the
+    // instant it's shown again so the clock is never stale on return.
+    if (!visible) return;
+    setNow(new Date());
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [visible]);
   const hh = String(now.getHours()).padStart(2, "0");
   const mm = String(now.getMinutes()).padStart(2, "0");
   const ss = String(now.getSeconds()).padStart(2, "0");

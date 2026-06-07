@@ -27,6 +27,32 @@ test("reduceChatStreamEvent appends text deltas into one streaming assistant tur
   assert.equal(second.streamingTurnId, "t1");
 });
 
+test("reduceChatStreamEvent closes a streamed assistant final without duplicating text", () => {
+  n = 0;
+  const base = { turns: [], streamingTurnId: null, thinkingTurnId: null };
+  const first = reduceChatStreamEvent(
+    base,
+    { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "hel" } } },
+    { now: 100, uid },
+  ).state;
+  const streamed = reduceChatStreamEvent(
+    first,
+    { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } },
+    { now: 110, uid },
+  ).state;
+  const final = reduceChatStreamEvent(
+    streamed,
+    {
+      type: "assistant",
+      message: { content: [{ type: "text", text: "hello" }] },
+    },
+    { now: 200, uid },
+  ).state;
+
+  assert.deepEqual(final.turns, [{ kind: "assistant", id: "t1", text: "hello", streaming: true }]);
+  assert.equal(final.streamingTurnId, null);
+});
+
 test("reduceChatStreamEvent settles thinking and adds tool cards on assistant final", () => {
   n = 0;
   const thinking = reduceChatStreamEvent(

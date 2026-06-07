@@ -3,7 +3,7 @@
  *  component is just the chrome (url bar + nav) plus a placeholder div whose
  *  on-screen rect the webview tracks. `active=false` (a modal is open, or the
  *  pane is hidden) shrinks the webview to 0 so HTML modals aren't occluded. */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -25,6 +25,7 @@ import {
   MoreVertical,
   Pin,
   Check,
+  Copy,
   Plus,
   RotateCw,
   Search,
@@ -63,6 +64,7 @@ import {
   browserShow,
   browserZoom,
   browserHistoryRecord,
+  browserInstallContextProbe,
   browserHistoryQuery,
   browserBookmarkAdd,
   browserBookmarkRemove,
@@ -73,6 +75,7 @@ import {
   browserRevealInFinder,
   readClipboard,
   type BrowserAnnotation,
+  type BrowserContextPayload,
   type Bookmark,
   type DownloadRecord,
   type HistoryEntry,
@@ -92,6 +95,7 @@ import { reportDiag } from "../lib/diag";
 const BROWSER_VIEWABLE = /\.(pdf|html?|svg|png|jpe?g|gif|webp|txt|md|json|xml|css|js)$/i;
 
 const ANNOT_SENTINEL = "AIOS_ANNOT:";
+const CONTEXT_SENTINEL = "AIOS_CONTEXT:";
 const ANNOT_POLL_MS = 700;
 
 const ZOOM_MIN = 50;
@@ -102,6 +106,14 @@ const ZOOM_STEP = 10;
 // as a connection failure (dead localhost port / DNS fail). wry/tauri 2.11 has
 // no load-error callback, so this timeout is the only signal we get.
 const LOAD_TIMEOUT_MS = 12000;
+const SUGGESTION_RESERVE_PX = 320;
+
+type OmniboxRow =
+  | { type: "search"; query: string }
+  | { type: "go"; url: string; label: string }
+  | { type: "bookmark"; bookmark: Bookmark }
+  | { type: "history"; entry: HistoryEntry }
+  | { type: "action"; action: "new-pane" | "send-chat" | "curl-terminal" | "downloads"; label: string; detail: string };
 
 /** Origin of a URL, or null if unparseable. Used to tell a main-frame navigation
  *  from a cross-origin sub-frame (auth/widget iframes like studio.youtube.com or
@@ -141,6 +153,40 @@ function normalizeUrl(input: string): string {
 }
 
 const DEFAULT_URL = "https://google.com";
+
+function isLikelySearch(input: string): boolean {
+  const t = input.trim();
+  if (!t) return false;
+  if (/^https?:\/\//i.test(t)) return false;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t) || /^about:/i.test(t)) return false;
+  if (LOOPBACK_HOST.test(t) || BARE_IP.test(t) || HOST_PORT.test(t)) return false;
+  if (/^[\w-]+(\.[\w-]+)+/.test(t)) return false;
+  return true;
+}
+
+function escapeShellSingleQuote(input: string): string {
+  return `'${input.replace(/'/g, `'\\''`)}'`;
+}
+
+const SEARCH_SUGGESTIONS = [
+  "google meet",
+  "google drive",
+  "google sheets",
+  "gmail",
+  "youtube",
+  "whatsapp web",
+  "github",
+  "product hunt",
+  "neon console",
+  "cloudflare dashboard",
+  "vercel dashboard",
+];
+
+function suggestedSearchesFor(input: string): string[] {
+  const q = input.trim().toLowerCase();
+  if (!q || q.length < 2) return [];
+  return SEARCH_SUGGESTIONS.filter((item) => item.includes(q) && item !== q).slice(0, 4);
+}
 
 export function BrowserPane({
   label,
@@ -241,6 +287,8 @@ export function BrowserPane({
   // Last clipboard payload we already consumed — so the poll only fires
   // `onAnnotate` once per fresh annotation, never re-emitting stale text.
   const lastAnnotRef = useRef<string | null>(null);
+  const lastContextRef = useRef<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<BrowserContextPayload | null>(null);
   // Latest `onAnnotate` without making it a poll-effect dependency.
   const onAnnotateRef = useRef(onAnnotate);
   onAnnotateRef.current = onAnnotate;
@@ -265,21 +313,41 @@ export function BrowserPane({
     return { x: r.x, y: r.y, width: r.width, height: r.height };
   }, []);
 
+  // Any toolbar dropdown / omnibox open ⇒ the native webview (a top-most native
+  // view) would paint OVER the panel and clip it — the exact "buttons up here
+  // don't work" bug: the panel opens but is invisible behind the page. AppCastPane
+  // hit the identical problem with its window-picker and solved it by hiding the
+  // native view while the picker is open; we do the same. Cheap: the page is
+  // preserved (hide = shrink to 0×0), restored the instant you dismiss.
+  //   findOpen is intentionally NOT here — the find-bar is a chrome row that
+  //   pushes the slot DOWN (it never overlaps the page), and hiding the webview
+  //   would hide the very matches you're searching for.
+  const overlayOpen =
+    bookmarksOpen || downloadsOpen || menuOpen || profileMenuOpen || suggestOpen;
+
   useEffect(() => {
-    if (!active || dragArmed || loadError) {
+    if (!active || dragArmed || loadError || contextMenu || overlayOpen) {
       // loadError → shrink the webview so the React "couldn't connect" card
       // underneath is visible (the native view otherwise paints over it).
+      // overlayOpen → same reason: let a toolbar dropdown show through.
       if (shownRef.current) browserHide(label).catch((e) => reportDiag("browser.hide", e, { action: "hide" }));
       return;
     }
     let raf = 0;
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const settleTimers: ReturnType<typeof setTimeout>[] = [];
     const sync = () => {
       const r = rect();
       if (!r) return;
       if (!shownRef.current) {
         shownRef.current = true;
         browserShow(label, current, r, profile)
-          .then(() => setShowError(null))
+          .then(() => {
+            setShowError(null);
+            browserInstallContextProbe(label).catch((e) =>
+              reportDiag("browser.context", e, { action: "installProbe" }),
+            );
+          })
           .catch((e) => {
             shownRef.current = false; // allow a retry on the next sync tick
             setShowError(typeof e === "string" ? e : String(e));
@@ -288,18 +356,37 @@ export function BrowserPane({
         browserSetBounds(label, r).catch((e) => reportDiag("browser.bounds", e, { action: "setBounds" }));
       }
     };
+    // Resize/fullscreen changes are bursty (one per animation frame during a
+    // window drag). Debounce so we fire ONE bounds-sync after motion settles
+    // instead of a setTimeout storm per event — the storm is a big lag source and
+    // makes the webview visibly judder as it chases the rect mid-drag.
+    const syncSettled = () => {
+      sync(); // immediate, so the webview tracks during the drag
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(sync, 120); // one final settle after motion stops
+    };
     raf = requestAnimationFrame(() => requestAnimationFrame(sync));
+    // The ResizeObserver already fires on every real slot-size change, so it —
+    // not a tight interval — is the primary bounds driver. The old 250ms poll
+    // hammered a browser_set_bounds IPC ~4×/sec FOREVER even when nothing moved
+    // (pure lag with no benefit). A slow 1s safety poll catches the rare case a
+    // layout shift moves the slot's screen position without resizing it (e.g. a
+    // sibling pane closing) which the RO can't see.
     const ro = new ResizeObserver(sync);
     if (slotRef.current) ro.observe(slotRef.current);
-    window.addEventListener("resize", sync);
-    const poll = setInterval(sync, 300);
+    window.addEventListener("resize", syncSettled);
+    document.addEventListener("fullscreenchange", syncSettled);
+    const poll = setInterval(sync, 1000);
     return () => {
       cancelAnimationFrame(raf);
+      if (resizeTimer) clearTimeout(resizeTimer);
+      settleTimers.forEach(clearTimeout);
       ro.disconnect();
-      window.removeEventListener("resize", sync);
+      window.removeEventListener("resize", syncSettled);
+      document.removeEventListener("fullscreenchange", syncSettled);
       clearInterval(poll);
     };
-  }, [active, dragArmed, loadError, current, label, profile, rect]);
+  }, [active, dragArmed, loadError, contextMenu, overlayOpen, current, label, profile, rect]);
 
   // Poll the webview's REAL url (catches in-page navigation the address bar never
   // sees). On a real change: remember it (pinned sites resume here) and sync the
@@ -348,6 +435,57 @@ export function BrowserPane({
     return () => clearInterval(poll);
   }, [active, label]);
 
+  const trimmedInput = input.trim();
+  const omniboxRows = useMemo<OmniboxRow[]>(() => {
+    if (!suggestOpen) return [];
+    const q = trimmedInput;
+    const qLower = q.toLowerCase();
+    const rows: OmniboxRow[] = [];
+
+    if (isLikelySearch(q)) {
+      rows.push({ type: "search", query: q });
+      for (const suggested of suggestedSearchesFor(q)) {
+        rows.push({ type: "search", query: suggested });
+      }
+    } else if (q) {
+      const url = normalizeUrl(q);
+      if (url && url !== current) rows.push({ type: "go", url, label: q });
+    }
+
+    const seen = new Set<string>();
+    for (const s of suggestions) {
+      seen.add(s.url);
+    }
+    for (const b of bookmarks) {
+      if (!qLower) break;
+      const title = (b.title || "").toLowerCase();
+      const url = b.url.toLowerCase();
+      if (!title.includes(qLower) && !url.includes(qLower)) continue;
+      if (seen.has(b.url)) continue;
+      rows.push({ type: "bookmark", bookmark: b });
+      seen.add(b.url);
+      if (rows.filter((r) => r.type === "bookmark").length >= 3) break;
+    }
+
+    for (const entry of suggestions) {
+      rows.push({ type: "history", entry });
+    }
+
+    if (current && current !== "about:blank") {
+      rows.push(
+        { type: "action", action: "new-pane", label: "open current page in new browser", detail: current },
+        { type: "action", action: "send-chat", label: "send current page to chat", detail: current },
+        { type: "action", action: "curl-terminal", label: "inspect page in terminal", detail: "curl -L current url" },
+      );
+    }
+    rows.push({ type: "action", action: "downloads", label: "open downloads in files", detail: "~/downloads" });
+
+    return rows.slice(0, 12);
+  }, [bookmarks, current, suggestions, suggestOpen, trimmedInput]);
+  const visibleSuggestionCount = omniboxRows.length;
+  const suggestionsVisible = suggestOpen && visibleSuggestionCount > 0;
+  const suggestionReserveHeight = suggestionsVisible ? Math.min(SUGGESTION_RESERVE_PX, 50 + visibleSuggestionCount * 38) : 0;
+
   // Load progress + error state (item 5). The backend emits `browser-load` with
   // {label, phase: started|finished, url} on every navigation. On `started` we
   // reflect the url to the address bar IMMEDIATELY (no more 1500ms poll lag),
@@ -391,6 +529,9 @@ export function BrowserPane({
       } else if (payload.phase === "finished") {
         setLoading(false);
         setLoadError(null);
+        browserInstallContextProbe(label).catch((e) =>
+          reportDiag("browser.context", e, { action: "installProbe" }),
+        );
         if (loadTimer.current) {
           clearTimeout(loadTimer.current);
           loadTimer.current = null;
@@ -631,7 +772,11 @@ export function BrowserPane({
   // Refresh the downloads list whenever a new download finishes (the backend
   // emits `browser-download` after persisting it). Any pane refreshes — the
   // store is global — so the panel is live regardless of which pane downloaded.
+  // Gated on `active`: an inactive/hidden pane can't download, and the panel
+  // re-loads fresh on mount + on becoming active, so an idle pane needn't keep a
+  // live event subscription burning (background-work discipline).
   useEffect(() => {
+    if (!active) return;
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void listen<{ path: string; name?: string }>("browser-download", () => {
@@ -648,7 +793,7 @@ export function BrowserPane({
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [active]);
 
   const revealDownload = useCallback(
     (d: DownloadRecord) => {
@@ -704,12 +849,12 @@ export function BrowserPane({
     browserHistoryQuery(q, 8)
       .then((rows) => {
         setSuggestions(rows);
-        setSuggestOpen(rows.length > 0);
+        setSuggestOpen(rows.length > 0 || q.trim().length > 0);
         setSuggestIdx(-1);
       })
       .catch(() => {
         setSuggestions([]);
-        setSuggestOpen(false);
+        setSuggestOpen(q.trim().length > 0);
       });
   }, []);
 
@@ -725,6 +870,75 @@ export function BrowserPane({
     },
     [label],
   );
+
+  const sendCurrentPageToChat = useCallback(() => {
+    const url = current || normalizeUrl(input);
+    if (!url || url === "about:blank") return;
+    onAnnotateRef.current?.(`browser page: ${url}`);
+    showToast("page sent to chat", "success");
+  }, [current, input, showToast]);
+
+  const openCurrentInNewPane = useCallback(() => {
+    const url = current || normalizeUrl(input);
+    if (!url || url === "about:blank") return;
+    spawnPane("browser", { url, label: "browser" });
+    showToast("opened page in new browser", "success");
+  }, [current, input, showToast]);
+
+  const inspectCurrentInTerminal = useCallback(() => {
+    const url = current || normalizeUrl(input);
+    if (!url || url === "about:blank") return;
+    spawnPane("terminal", {
+      cmd: `curl -L ${escapeShellSingleQuote(url)} | sed -n '1,160p'`,
+      label: "terminal · web inspect",
+    });
+    showToast("opened terminal inspector", "success");
+  }, [current, input, showToast]);
+
+  const openUrlInNewPane = useCallback(
+    (url: string) => {
+      if (!url || url === "about:blank") return;
+      spawnPane("browser", { url, label: "browser" });
+      setContextMenu(null);
+      showToast("opened link in new browser", "success");
+    },
+    [showToast],
+  );
+
+  const sendContextToChat = useCallback(
+    (ctx: BrowserContextPayload) => {
+      const target = ctx.linkUrl || ctx.url;
+      const text = ctx.text ? `\nselection: "${ctx.text}"` : "";
+      onAnnotateRef.current?.(`browser context: ${target}${text}`);
+      setContextMenu(null);
+      showToast("context sent to chat", "success");
+    },
+    [showToast],
+  );
+
+  const inspectUrlInTerminal = useCallback(
+    (url: string) => {
+      if (!url || url === "about:blank") return;
+      spawnPane("terminal", {
+        cmd: `curl -L ${escapeShellSingleQuote(url)} | sed -n '1,160p'`,
+        label: "terminal · web inspect",
+      });
+      setContextMenu(null);
+      showToast("opened terminal inspector", "success");
+    },
+    [showToast],
+  );
+
+  const copyContextTarget = useCallback(
+    (ctx: BrowserContextPayload) => {
+      const target = ctx.text || ctx.linkUrl || ctx.url;
+      navigator.clipboard?.writeText(target).catch((e) => reportDiag("browser.clipboard", e, { action: "copyContext" }));
+      setContextMenu(null);
+      showToast("copied", "success");
+    },
+    [showToast],
+  );
+
 
   useEffect(() => {
     return () => {
@@ -802,6 +1016,33 @@ export function BrowserPane({
       .catch(() => spawnPane("files", {}));
   }, []);
 
+  const runOmniboxRow = useCallback(
+    (row: OmniboxRow) => {
+      setSuggestOpen(false);
+      setSuggestIdx(-1);
+      switch (row.type) {
+        case "search":
+          pickSuggestion(normalizeUrl(row.query));
+          return;
+        case "go":
+          pickSuggestion(row.url);
+          return;
+        case "bookmark":
+          pickSuggestion(row.bookmark.url);
+          return;
+        case "history":
+          pickSuggestion(row.entry.url);
+          return;
+        case "action":
+          if (row.action === "new-pane") openCurrentInNewPane();
+          else if (row.action === "send-chat") sendCurrentPageToChat();
+          else if (row.action === "curl-terminal") inspectCurrentInTerminal();
+          else openDownloadsInFiles();
+      }
+    },
+    [inspectCurrentInTerminal, openCurrentInNewPane, openDownloadsInFiles, pickSuggestion, sendCurrentPageToChat],
+  );
+
   // Retry a failed load by re-navigating to the current url.
   const retryLoad = useCallback(() => {
     setLoadError(null);
@@ -835,6 +1076,48 @@ export function BrowserPane({
     setFindOpen(false);
     setFindMiss(false);
   }, []);
+
+  const consumeContextPayload = useCallback((): Promise<boolean> => {
+    return readClipboard()
+      .then((raw) => {
+        if (!raw || !raw.startsWith(CONTEXT_SENTINEL)) return false;
+        if (raw === lastContextRef.current) return false;
+        lastContextRef.current = raw;
+        try {
+          setContextMenu(JSON.parse(raw.slice(CONTEXT_SENTINEL.length)) as BrowserContextPayload);
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .catch(() => false);
+  }, []);
+
+  useEffect(() => {
+    if (!active) return;
+    let stop = false;
+    const id = setInterval(() => {
+      if (!stop) consumeContextPayload();
+    }, 220);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [active, consumeContextPayload]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu]);
 
   // ⌘F opens find-in-page when THIS browser pane is the active one. App.tsx
   // detects "active pane is a browser" (the native ⌘F menu accelerator + the
@@ -948,7 +1231,7 @@ export function BrowserPane({
   }, [label]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
+    <div className="relative flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-[var(--color-border)] bg-[var(--color-panel)] px-2">
         <div className="flex shrink-0 items-center gap-1">
           <NavBtn
@@ -977,8 +1260,13 @@ export function BrowserPane({
             onSubmit={(e) => {
               e.preventDefault();
               // If a suggestion is highlighted, pick it; else navigate the input.
-              if (suggestOpen && suggestIdx >= 0 && suggestions[suggestIdx]) {
-                pickSuggestion(suggestions[suggestIdx].url);
+              if (suggestionsVisible && suggestIdx >= 0) {
+                const row = omniboxRows[suggestIdx];
+                if (row) {
+                  runOmniboxRow(row);
+                  return;
+                }
+                go();
               } else {
                 go();
               }
@@ -1005,13 +1293,13 @@ export function BrowserPane({
                 setTimeout(() => setSuggestOpen(false), 150);
               }}
               onKeyDown={(e) => {
-                if (!suggestOpen || suggestions.length === 0) return;
+                if (!suggestionsVisible || visibleSuggestionCount === 0) return;
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
-                  setSuggestIdx((i) => (i + 1) % suggestions.length);
+                  setSuggestIdx((i) => (i + 1) % visibleSuggestionCount);
                 } else if (e.key === "ArrowUp") {
                   e.preventDefault();
-                  setSuggestIdx((i) => (i <= 0 ? suggestions.length - 1 : i - 1));
+                  setSuggestIdx((i) => (i <= 0 ? visibleSuggestionCount - 1 : i - 1));
                 } else if (e.key === "Escape") {
                   setSuggestOpen(false);
                   setSuggestIdx(-1);
@@ -1022,48 +1310,63 @@ export function BrowserPane({
               placeholder="search or enter url"
             />
           </form>
-          {suggestOpen && suggestions.length > 0 && (
+          {suggestionsVisible && (
             <div className="absolute left-0 right-0 top-full z-[70] mt-1 max-h-80 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] shadow-2xl">
-              {suggestions.map((s, i) => {
-                let host = s.url;
-                try {
-                  host = new URL(s.url).hostname.replace(/^www\./, "");
-                } catch {
-                  /* keep raw */
+              {omniboxRows.map((row, rowIndex) => {
+                const activeRow = rowIndex === suggestIdx;
+                let icon = <Search size={12} className="shrink-0 text-[var(--color-faint)]" />;
+                let primary = "";
+                let secondary = "";
+                let meta: string | null = null;
+
+                if (row.type === "search") {
+                  primary = "search google";
+                  secondary = row.query;
+                } else if (row.type === "go") {
+                  icon = <Globe size={12} className="shrink-0 text-[var(--color-faint)]" />;
+                  primary = "go to";
+                  secondary = row.label;
+                } else if (row.type === "bookmark") {
+                  icon = <Star size={12} className="shrink-0 text-[var(--color-accent)]" />;
+                  primary = row.bookmark.title || "bookmark";
+                  secondary = row.bookmark.url;
+                } else if (row.type === "history") {
+                  icon = <Clock size={12} className="shrink-0 text-[var(--color-faint)]" />;
+                  primary = row.entry.title || row.entry.url;
+                  secondary = row.entry.title ? row.entry.url : "";
+                  meta = row.entry.visit_count > 1 ? `${row.entry.visit_count}x` : null;
+                } else {
+                  if (row.action === "new-pane") icon = <Plus size={12} className="shrink-0 text-[var(--color-faint)]" />;
+                  if (row.action === "send-chat") icon = <MessageSquarePlus size={12} className="shrink-0 text-[var(--color-faint)]" />;
+                  if (row.action === "curl-terminal") icon = <Terminal size={12} className="shrink-0 text-[var(--color-faint)]" />;
+                  if (row.action === "downloads") icon = <Folder size={12} className="shrink-0 text-[var(--color-faint)]" />;
+                  primary = row.label;
+                  secondary = row.detail;
                 }
+
                 return (
                   <button
-                    key={s.url}
+                    key={`${row.type}-${rowIndex}-${primary}-${secondary}`}
                     type="button"
                     // onMouseDown (not onClick) so it fires before the input blur closes us.
                     onMouseDown={(e) => {
                       e.preventDefault();
-                      pickSuggestion(s.url);
+                      runOmniboxRow(row);
                     }}
-                    onMouseEnter={() => setSuggestIdx(i)}
+                    onMouseEnter={() => setSuggestIdx(rowIndex)}
                     className={
-                      "flex w-full items-center gap-2 px-3 py-1.5 text-left " +
-                      (i === suggestIdx
+                      "flex w-full items-center gap-2 px-3 py-2 text-left " +
+                      (activeRow
                         ? "bg-[var(--color-accent)]/15 text-[var(--color-text)]"
                         : "text-[var(--color-text)] hover:bg-[var(--color-panel)]")
                     }
                   >
-                    <Clock size={12} className="shrink-0 text-[var(--color-faint)]" />
+                    {icon}
                     <span className="min-w-0 flex-1 truncate">
-                      {s.title ? (
-                        <>
-                          <span className="text-[var(--color-text)]">{s.title}</span>
-                          <span className="ml-2 text-[var(--color-faint)]">{host}</span>
-                        </>
-                      ) : (
-                        <span className="font-mono text-[11px] text-[var(--color-muted)]">{s.url}</span>
-                      )}
+                      <span className="text-[var(--color-text)]">{primary}</span>
+                      {secondary && <span className="ml-2 font-mono text-[11px] text-[var(--color-faint)]">{secondary}</span>}
                     </span>
-                    {s.visit_count > 1 && (
-                      <span className="shrink-0 text-[10px] tabular-nums text-[var(--color-faint)]">
-                        {s.visit_count}×
-                      </span>
-                    )}
+                    {meta && <span className="shrink-0 text-[10px] tabular-nums text-[var(--color-faint)]">{meta}</span>}
                   </button>
                 );
               })}
@@ -1071,15 +1374,36 @@ export function BrowserPane({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
-        <NavBtn title={isBookmarked ? "Remove bookmark" : "Bookmark this page"} onClick={toggleBookmark}>
-          <Star size={13} className={isBookmarked ? "fill-[var(--color-accent)] text-[var(--color-accent)]" : ""} />
-        </NavBtn>
+        {/* ONE bookmark control (was two: a star toggle + a confusing globe-icon
+            list). The star fills when the current page is bookmarked; clicking
+            opens the panel whose first row toggles this page, with the saved list
+            below. Fewer, clearer buttons — Firaz's ask. */}
         <div ref={bookmarksRef} className="relative">
-          <NavBtn title="Bookmarks" onClick={() => { setBookmarksOpen((o) => !o); setDownloadsOpen(false); }}>
-            <Globe size={13} />
+          <NavBtn
+            title="Bookmarks"
+            onClick={() => { setBookmarksOpen((o) => !o); setDownloadsOpen(false); }}
+          >
+            <Star
+              size={13}
+              className={isBookmarked ? "fill-[var(--color-accent)] text-[var(--color-accent)]" : ""}
+            />
           </NavBtn>
           {bookmarksOpen && (
             <div className="absolute right-0 top-full z-[70] mt-1 max-h-96 w-72 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] shadow-2xl">
+              <button
+                type="button"
+                onClick={toggleBookmark}
+                className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[var(--color-panel)]"
+              >
+                <Star
+                  size={13}
+                  className={"shrink-0 " + (isBookmarked ? "fill-[var(--color-accent)] text-[var(--color-accent)]" : "text-[var(--color-muted)]")}
+                />
+                <span className="text-[var(--color-text)]">
+                  {isBookmarked ? "remove this page" : "bookmark this page"}
+                </span>
+              </button>
+              <div className="my-1 border-t border-[var(--color-border)]" />
               <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-[var(--color-faint)]">
                 bookmarks
               </div>
@@ -1186,9 +1510,8 @@ export function BrowserPane({
             </div>
           )}
         </div>
-        <NavBtn title="Find in page (⌘F)" onClick={openFind}>
-          <Search size={13} />
-        </NavBtn>
+        {/* Standalone Find button removed — redundant with ⌘F and the "Find in
+            page" item already in the ⋮ menu. Fewer toolbar buttons. */}
         <div ref={profileMenuRef} className="relative">
           <button
             type="button"
@@ -1395,6 +1718,14 @@ export function BrowserPane({
         </div>
       </div>
 
+      {suggestionsVisible && (
+        <div
+          aria-hidden="true"
+          className="shrink-0 border-b border-[var(--color-border)] bg-[var(--color-pane)]"
+          style={{ height: suggestionReserveHeight }}
+        />
+      )}
+
       {/* Find-in-page bar — lives in REACT chrome (a row under the toolbar), not
           over the native webview, so it's always visible regardless of the
           webview compositing above the React layer. */}
@@ -1488,6 +1819,69 @@ export function BrowserPane({
           <div className="pointer-events-none absolute left-1/2 top-2 z-50 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-panel-2)] px-3 py-1 text-[11px] text-[var(--color-accent)] shadow-lg">
             <Crosshair size={12} />
             annotating… click an element, then describe it
+          </div>
+        )}
+        {contextMenu && (
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            className="absolute z-[80] w-64 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-2xl"
+            style={{
+              left: Math.min(Math.max(contextMenu.x, 8), Math.max(8, (slotRef.current?.clientWidth ?? 280) - 272)),
+              top: Math.min(Math.max(contextMenu.y, 8), Math.max(8, (slotRef.current?.clientHeight ?? 280) - 238)),
+            }}
+          >
+            <div className="border-b border-[var(--color-border)] px-3 py-2">
+              <div className="truncate text-[11px] font-medium text-[var(--color-text)]">
+                {contextMenu.linkUrl ? "link actions" : contextMenu.text ? "selection actions" : "page actions"}
+              </div>
+              <div className="mt-0.5 truncate font-mono text-[10px] text-[var(--color-faint)]">
+                {contextMenu.text || contextMenu.linkUrl || contextMenu.url}
+              </div>
+            </div>
+            {(contextMenu.linkUrl || contextMenu.url) && (
+              <MenuItem
+                icon={<Plus size={13} />}
+                label={contextMenu.linkUrl ? "Open link in new browser pane" : "Open page in new browser pane"}
+                onClick={() => openUrlInNewPane(contextMenu.linkUrl || contextMenu.url)}
+              />
+            )}
+            {(contextMenu.linkUrl || contextMenu.url) && (
+              <MenuItem
+                icon={<Globe size={13} />}
+                label={contextMenu.linkUrl ? "Open link in this pane" : "Reload this page"}
+                onClick={() => {
+                  const target = contextMenu.linkUrl || contextMenu.url;
+                  setContextMenu(null);
+                  pickSuggestion(target);
+                }}
+              />
+            )}
+            <MenuItem
+              icon={<MessageSquarePlus size={13} />}
+              label="Send context to chat"
+              onClick={() => sendContextToChat(contextMenu)}
+            />
+            {(contextMenu.linkUrl || contextMenu.url) && (
+              <MenuItem
+                icon={<Terminal size={13} />}
+                label="Inspect with terminal"
+                onClick={() => inspectUrlInTerminal(contextMenu.linkUrl || contextMenu.url)}
+              />
+            )}
+            <MenuItem
+              icon={<FolderOpen size={13} />}
+              label="Open downloads in files"
+              onClick={() => {
+                setContextMenu(null);
+                openDownloadsInFiles();
+              }}
+            />
+            <div className="my-1 border-t border-[var(--color-border)]" />
+            <MenuItem
+              icon={<Copy size={13} />}
+              label={contextMenu.text ? "Copy selection" : contextMenu.linkUrl ? "Copy link" : "Copy page url"}
+              onClick={() => copyContextTarget(contextMenu)}
+            />
           </div>
         )}
         {toast && (

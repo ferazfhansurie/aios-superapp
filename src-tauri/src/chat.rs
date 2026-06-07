@@ -1436,12 +1436,7 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                 // Only the final-answer item streams as the REPLY; reasoning and
                 // preamble/status agentMessages stream into the thinking block so
                 // they don't look identical to the answer.
-                let item_id = params
-                    .and_then(|p| p.get("itemId"))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                let is_answer =
-                    !m.contains("reasoning") && sess.answer_item.lock().as_deref() == Some(item_id);
+                let is_answer = codex_delta_is_answer(sess, m, params);
                 if is_answer {
                     // Record that THIS answer item streamed live → item/completed
                     // must suppress its duplicate full line (one source of truth).
@@ -1462,9 +1457,15 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                     && !matches!(phase, "preamble" | "status" | "reasoning");
                 if is_final_answer {
                     if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
+                        let streamed_before_id = sess.answer_item.lock().is_none()
+                            && sess.answer_streamed.load(Ordering::SeqCst);
                         *sess.answer_item.lock() = Some(id.to_string());
-                        // fresh answer item → it hasn't streamed yet.
-                        sess.answer_streamed.store(false, Ordering::SeqCst);
+                        // Fresh answer item → it hasn't streamed yet. If codex
+                        // sent answer deltas before the id, keep the streamed
+                        // flag so completed/full-text doesn't duplicate it.
+                        if !streamed_before_id {
+                            sess.answer_streamed.store(false, Ordering::SeqCst);
+                        }
                     }
                 }
                 if codex_is_action_item(item) {
@@ -1496,10 +1497,13 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
                         // streamed — e.g. a short answer — fall through and emit
                         // the full line so the answer isn't dropped.)
                         let completed_id = item.get("id").and_then(|x| x.as_str());
+                        let answer_item = sess.answer_item.lock().clone();
                         let already_streamed = is_final
-                            && completed_id.is_some()
-                            && sess.answer_item.lock().as_deref() == completed_id
-                            && sess.answer_streamed.load(Ordering::SeqCst);
+                            && sess.answer_streamed.load(Ordering::SeqCst)
+                            && match (completed_id, answer_item.as_deref()) {
+                                (Some(done), Some(tracked)) => done == tracked,
+                                (None, _) | (_, None) => true,
+                            };
                         if !already_streamed {
                             if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
                                 if !t.is_empty() {
@@ -1695,6 +1699,60 @@ fn codex_item_id(item: &Value) -> String {
         .or_else(|| item.get("callId").and_then(|x| x.as_str()))
         .unwrap_or("codex-action")
         .to_string()
+}
+
+fn codex_agent_message_method(method: &str) -> bool {
+    method.contains("agentMessage") || method.contains("agent_message")
+}
+
+fn codex_delta_item_id(params: Option<&Value>) -> Option<&str> {
+    params
+        .and_then(|p| p.get("itemId"))
+        .and_then(|x| x.as_str())
+        .or_else(|| {
+            params
+                .and_then(|p| p.get("item_id"))
+                .and_then(|x| x.as_str())
+        })
+        .or_else(|| params.and_then(|p| p.get("id")).and_then(|x| x.as_str()))
+        .or_else(|| {
+            params
+                .and_then(|p| p.get("item"))
+                .and_then(|i| i.get("id"))
+                .and_then(|x| x.as_str())
+        })
+}
+
+fn codex_delta_phase(params: Option<&Value>) -> Option<&str> {
+    params
+        .and_then(|p| p.get("phase"))
+        .and_then(|x| x.as_str())
+        .or_else(|| {
+            params
+                .and_then(|p| p.get("item"))
+                .and_then(|i| i.get("phase"))
+                .and_then(|x| x.as_str())
+        })
+}
+
+fn codex_delta_is_answer(sess: &Arc<ChatSession>, method: &str, params: Option<&Value>) -> bool {
+    if method.contains("reasoning")
+        || matches!(
+            codex_delta_phase(params),
+            Some("preamble" | "status" | "reasoning")
+        )
+    {
+        return false;
+    }
+    if !codex_agent_message_method(method) {
+        return false;
+    }
+    let item_id = codex_delta_item_id(params);
+    let answer_item = sess.answer_item.lock().clone();
+    if let (Some(done), Some(tracked)) = (item_id, answer_item.as_deref()) {
+        return done == tracked;
+    }
+    item_id.is_none() || matches!(codex_delta_phase(params), Some("final_answer"))
 }
 
 fn codex_item_type(item: &Value) -> &str {
@@ -1938,39 +1996,38 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
             };
             notify_done(app, sess.id, &label);
         }
-        // Live usage tick: right after each claude turn, re-read the statusline's
-        // usage.json and push a synthetic `usage` event so the composer's usage
-        // bar moves AS YOU TALK. Codex pushes its own `account/rateLimits/updated`
-        // (handled in the app-server adapter), so only claude needs this poll.
+        // Live usage tick: right after each claude turn, read the same unified
+        // Claude usage source as the sidebar (OAuth first, statusline fallback)
+        // and push a synthetic `usage` event so the composer moves as you talk.
+        // Codex pushes its own `account/rateLimits/updated`.
         if matches!(sess.engine, Engine::Claude) {
-            if let Some(u) = claude_usage_event() {
+            if let Some(u) = claude_usage_event(app) {
                 fan_out(sess, &u);
             }
         }
     }
 }
 
-/// Reads the statusline's `~/.aios/state/usage.json` and builds a claude-shaped
-/// `usage` event line (5h/7d windows), or `None` if it's not written yet.
-fn claude_usage_event() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = format!("{home}/.aios/state/usage.json");
-    let s = std::fs::read_to_string(&path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-    let rl = v.get("rate_limits")?;
+/// Builds a claude-shaped `usage` event line (5h/7d windows), or `None` if no
+/// usage source is available.
+fn claude_usage_event(app: &AppHandle) -> Option<String> {
+    let v = crate::usage::claude_usage_value(Some(app));
+    if v.is_null() {
+        return None;
+    }
     let win = |k: &str| -> serde_json::Value {
-        let w = &rl[k];
+        let w = &v[k];
         json!({
-            "pct": w.get("used_percentage").and_then(|x| x.as_f64()),
-            "resets_at": w.get("resets_at").and_then(|x| x.as_i64()),
+            "pct": w.get("pct").and_then(|x| x.as_f64()),
+            "resets_at": w.get("resetsAt").and_then(|x| x.as_i64()),
         })
     };
     Some(
         json!({
             "type": "usage",
             "provider": "claude",
-            "five_hour": win("five_hour"),
-            "seven_day": win("seven_day"),
+            "five_hour": win("fiveHour"),
+            "seven_day": win("sevenDay"),
         })
         .to_string(),
     )
@@ -2929,9 +2986,86 @@ fn parse_codex_rollout(text: &str) -> Vec<ChatTurn> {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_config_without_mcp_servers, discover_codex_sessions, find_codex_rollout_in_home,
-        infer_session_engine,
+        adapt_codex_appserver_frame, codex_config_without_mcp_servers, discover_codex_sessions,
+        find_codex_rollout_in_home, infer_session_engine, ChatSession, Engine,
     };
+    use parking_lot::Mutex;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    fn test_codex_session() -> Arc<ChatSession> {
+        Arc::new(ChatSession {
+            id: 0,
+            engine: Engine::Codex,
+            child: Mutex::new(None),
+            stdin: Mutex::new(None),
+            thread_id: Mutex::new(None),
+            cwd: Mutex::new(None),
+            model: Mutex::new(None),
+            effort: Mutex::new(None),
+            sink: Mutex::new(None),
+            buffer: Mutex::new(VecDeque::new()),
+            claude_id: Mutex::new(None),
+            title: Mutex::new(String::new()),
+            busy: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
+            notify_on_done: AtomicBool::new(false),
+            rpc_id: AtomicU64::new(1),
+            pending_turn: Mutex::new(None),
+            active_turn: Mutex::new(None),
+            answer_item: Mutex::new(None),
+            answer_streamed: AtomicBool::new(false),
+            pending_approvals: Mutex::new(HashMap::new()),
+        })
+    }
+
+    #[test]
+    fn codex_appserver_streams_agent_message_delta_without_item_id_as_answer() {
+        let sess = test_codex_session();
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hello"}}"#,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("\"text_delta\""));
+        assert!(out[0].contains("hello"));
+        assert!(sess.answer_streamed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn codex_appserver_streams_agent_message_delta_with_snake_item_id_as_answer() {
+        let sess = test_codex_session();
+        let _ = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"ans-1","type":"agentMessage","phase":"final_answer"}}}"#,
+        );
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"item_id":"ans-1","delta":"hello"}}"#,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("\"text_delta\""));
+        assert!(out[0].contains("hello"));
+        assert!(sess.answer_streamed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn codex_appserver_suppresses_completed_answer_after_streamed_delta_without_item_id() {
+        let sess = test_codex_session();
+        let _ = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hello"}}"#,
+        );
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","phase":"final_answer","text":"hello"}}}"#,
+        );
+
+        assert!(out.is_empty(), "{out:?}");
+    }
 
     #[test]
     fn codex_chat_config_keeps_terminal_defaults_but_strips_mcp_servers() {

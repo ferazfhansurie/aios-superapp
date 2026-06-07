@@ -51,8 +51,8 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSDate", "NSSet", "NSArray", "NSError"] }
-objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKFindConfiguration", "WKFindResult", "WKWebsiteDataStore", "WKWebsiteDataRecord", "block2"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDate", "NSSet", "NSArray", "NSError", "NSHTTPCookie"] }
+objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKFindConfiguration", "WKFindResult", "WKWebsiteDataStore", "WKWebsiteDataRecord", "WKHTTPCookieStore", "block2"] }
 
 # ── ScreenCaptureKit "native app as a pane" spike (appcast.rs) ───────────────
 # Live-mirror a single foreign macOS window into an AIOS pane: SCK captures the
@@ -77,3 +77,4 @@ dispatch2 = "0.3"
 # high-level `CGEvent` wrapper is its own foreign_type — we only touch its
 # geometry::CGPoint at the post boundary, everything else stays objc2.
 core-graphics = { version = "0.25", features = ["elcapitan", "highsierra"] }
+core-foundation = "0.10"

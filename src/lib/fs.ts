@@ -48,6 +48,26 @@ export interface GitStatus {
   entries: GitEntry[];
 }
 
+export interface GitBranch {
+  name: string;
+  current: boolean;
+  remote: boolean;
+}
+
+export interface GitGraphLine {
+  text: string;
+}
+
+export interface GitSnapshot {
+  root: string | null;
+  current: string;
+  branches: GitBranch[];
+  entries: GitEntry[];
+  ahead: number;
+  behind: number;
+  graph: GitGraphLine[];
+}
+
 export interface ShellSourceStatus {
   root: string | null;
   branch: string;
@@ -58,6 +78,18 @@ export interface ShellSourceStatus {
 /** Git status for the repo containing `path` (absolute path → status letter). */
 export async function gitStatus(path: string): Promise<GitStatus> {
   return invoke<GitStatus>("git_status", { path });
+}
+
+export async function gitSnapshot(path: string): Promise<GitSnapshot> {
+  return invoke<GitSnapshot>("git_snapshot", { path });
+}
+
+export async function gitCheckout(path: string, branch: string): Promise<GitSnapshot> {
+  return invoke<GitSnapshot>("git_checkout", { path, branch });
+}
+
+export async function gitCommit(path: string, message: string): Promise<GitSnapshot> {
+  return invoke<GitSnapshot>("git_commit", { path, message });
 }
 
 export async function shellSourceStatus(): Promise<ShellSourceStatus> {

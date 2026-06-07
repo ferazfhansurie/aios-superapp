@@ -1006,6 +1006,54 @@ pub fn browser_exit_annotate(app: AppHandle, label: String) -> Result<(), String
     Ok(())
 }
 
+/// Installs the right-click pane-router bridge inside the page. Native child
+/// webviews cannot call Tauri IPC directly, so this mirrors the annotation path:
+/// capture contextmenu, serialize the useful target data to the clipboard behind
+/// an `AIOS_CONTEXT:` sentinel, and let the React chrome poll it.
+#[tauri::command]
+pub fn browser_install_context_probe(app: AppHandle, label: String) -> Result<(), String> {
+    let wv = app.get_webview(&label).ok_or("browser not open")?;
+    let _ = wv.eval(
+        r#"(function(){
+  try{
+    if(window.__aiosContextProbe&&window.__aiosContextProbe.teardown){window.__aiosContextProbe.teardown();}
+    var SENT='AIOS_CONTEXT:';
+    function closestLink(el){
+      while(el&&el!==document.documentElement){
+        if(el.tagName&&el.tagName.toLowerCase()==='a'&&el.href)return el.href;
+        el=el.parentElement;
+      }
+      return '';
+    }
+    function handler(e){
+      try{
+        var el=document.elementFromPoint(e.clientX,e.clientY)||e.target;
+        var payload={
+          x:Math.round(e.clientX),
+          y:Math.round(e.clientY),
+          url:location.href,
+          linkUrl:closestLink(el),
+          text:(window.getSelection?window.getSelection().toString():'').trim().slice(0,1000)
+        };
+        e.preventDefault();
+        e.stopPropagation();
+        try{navigator.clipboard.writeText(SENT+JSON.stringify(payload));}catch(_){window.__aiosContextPayload=payload;}
+        window.__aiosContextPayload=payload;
+      }catch(_){}
+    }
+    document.addEventListener('contextmenu',handler,true);
+    window.__aiosContextProbe={
+      teardown:function(){
+        try{document.removeEventListener('contextmenu',handler,true);}catch(_){}
+        try{delete window.__aiosContextProbe;}catch(_){window.__aiosContextProbe=null;}
+      }
+    };
+  }catch(e){}
+})()"#,
+    );
+    Ok(())
+}
+
 /// Evals a copy of the current text selection into the clipboard with the
 /// `AIOS_ANNOT:` sentinel so the frontend's existing poll picks it up. Used by
 /// the "send selection to chat" button. The payload shape mirrors the annotator

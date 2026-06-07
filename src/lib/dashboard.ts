@@ -205,11 +205,10 @@ export async function codexRate(): Promise<CodexRate> {
 }
 
 /**
- * Live Claude rate-limit usage, parsed from `~/.aios/state/usage.json` by the
- * `claude_usage` Rust command (the statusline-written file). 5h / 7d windows
+ * Live Claude rate-limit usage, fetched from the logged-in claude.ai web pane
+ * first, then Anthropic OAuth API, then the old statusline file. 5h / 7d windows
  * mirror codexRate's shape so the sidebar renders both with the same component.
- * Returns the empty shape when usage.json is missing/unwritten so the block
- * hides gracefully.
+ * Returns the empty shape when no source is available.
  */
 export interface ClaudeRate {
   fiveHour: RateWindow;

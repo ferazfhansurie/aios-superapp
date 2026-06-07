@@ -39,12 +39,10 @@ function UsageBar({
   label,
   pct,
   resetsAt,
-  showRemaining = false,
 }: {
   label: string;
   pct: number | null;
   resetsAt: number | null;
-  showRemaining?: boolean;
 }) {
   if (pct == null) return null;
   const clamped = Math.min(Math.max(pct, 0), 100);
@@ -56,7 +54,7 @@ function UsageBar({
         <span className="flex items-baseline gap-1.5">
           {reset && <span className="text-[var(--color-faint)]">resets {reset}</span>}
           <span className="font-mono text-[var(--color-text-2)]">
-            {Math.round(showRemaining ? 100 - pct : pct)}%{showRemaining ? " left" : ""}
+            {Math.round(pct)}% used
           </span>
         </span>
       </div>
@@ -95,12 +93,10 @@ export function ProviderBlock({
   name,
   fiveHour,
   sevenDay,
-  showRemaining = false,
 }: {
   name: string;
   fiveHour: { pct: number | null; resetsAt: number | null };
   sevenDay: { pct: number | null; resetsAt: number | null };
-  showRemaining?: boolean;
 }) {
   if (fiveHour.pct == null && sevenDay.pct == null) return null;
   const fiveHourRisk = usagePaceRisk({
@@ -119,8 +115,8 @@ export function ProviderBlock({
       <span className="text-[10px] font-medium lowercase tracking-wide text-[var(--color-text-2)]">
         {name}
       </span>
-      <UsageBar label="5h" pct={fiveHour.pct} resetsAt={fiveHour.resetsAt} showRemaining={showRemaining} />
-      <UsageBar label="7d" pct={sevenDay.pct} resetsAt={sevenDay.resetsAt} showRemaining={showRemaining} />
+      <UsageBar label="5h" pct={fiveHour.pct} resetsAt={fiveHour.resetsAt} />
+      <UsageBar label="7d" pct={sevenDay.pct} resetsAt={sevenDay.resetsAt} />
       <PaceWarning risk={risk} />
     </div>
   );
@@ -167,10 +163,10 @@ export function UsageGlance() {
     <div className="flex flex-col gap-3 border-t border-[var(--color-border)] pt-3">
       <span className="text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">usage</span>
       {hasClaude && (
-        <ProviderBlock name="claude" fiveHour={claude!.fiveHour} sevenDay={claude!.sevenDay} showRemaining />
+        <ProviderBlock name="claude" fiveHour={claude!.fiveHour} sevenDay={claude!.sevenDay} />
       )}
       {hasCodex && (
-        <ProviderBlock name="codex" fiveHour={codex!.fiveHour} sevenDay={codex!.sevenDay} showRemaining />
+        <ProviderBlock name="codex" fiveHour={codex!.fiveHour} sevenDay={codex!.sevenDay} />
       )}
     </div>
   );

@@ -43,7 +43,6 @@ interface IdleDashboardProps {
   onOpenSidebarItem: (item: SidebarItem) => void;
   onRevealSidebar: () => void;
   onOpenMoneyAgents: () => void;
-  onOpenPet: () => void;
   onOpenMoneyAgentChat: (id: string, label: string, command?: string) => void;
   onOpenPalette: () => void;
   notifications: AiosNotification[];
@@ -60,7 +59,6 @@ export function IdleDashboard({
   onOpenSidebarItem,
   onRevealSidebar,
   onOpenMoneyAgents,
-  onOpenPet,
   onOpenPalette,
   notifications,
   onTalkToJarvis,
@@ -70,6 +68,21 @@ export function IdleDashboard({
   const [focus, setFocus] = useState<MemoryFocus | null>(null);
   const [pulse, setPulse] = useState<RepoPulse[]>([]);
   const [moneyAgents, setMoneyAgents] = useState<MoneyAgentSummary[]>([]);
+
+  // Whole-window visibility gate. IdleDashboard only mounts as the full-viewport
+  // home screen, so "on screen" == "app window visible" — no IntersectionObserver
+  // needed. When AIOS is minimized / occluded these 30s polls (which read sqlite
+  // usage, claude rate, memory, money-agent files + `git` per recent repo) would
+  // otherwise keep firing into a window nobody's looking at.
+  const [windowVisible, setWindowVisible] = useState(
+    typeof document === "undefined" ? true : document.visibilityState !== "hidden",
+  );
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVis = () => setWindowVisible(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
 
   // top recent projects by dir mtime — also the set the git-pulse reports on.
   // Declared before the effects that read it (TDZ-safe ordering).
@@ -83,15 +96,18 @@ export function IdleDashboard({
       memoryFocus().then((v) => alive && setFocus(v)).catch((e) => reportDiag("dashboard.load", e, { action: "memoryFocus" }));
       loadMoneyAgentSummaries().then((v) => alive && setMoneyAgents(v)).catch((e) => reportDiag("dashboard.load", e, { action: "moneyAgents" }));
     };
+    // Always load once on mount (so a freshly-shown home isn't blank), then only
+    // poll while the window is visible.
     load();
+    if (!windowVisible) return () => { alive = false; };
     const t = setInterval(load, 30_000);
     return () => {
       alive = false;
       clearInterval(t);
     };
-  }, []);
+  }, [windowVisible]);
 
-  // git summary for the recent projects (refreshes on the set + 30s).
+  // git summary for the recent projects (refreshes on the set + 30s, visible only).
   useEffect(() => {
     let alive = true;
     const roots = recent.map((p) => p.root);
@@ -101,13 +117,14 @@ export function IdleDashboard({
     }
     const load = () => gitPulse(roots).then((v) => alive && setPulse(v)).catch((e) => reportDiag("dashboard.load", e, { action: "gitPulse" }));
     load();
+    if (!windowVisible) return () => { alive = false; };
     const t = setInterval(load, 30_000);
     return () => {
       alive = false;
       clearInterval(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recent.map((p) => p.root).join("|")]);
+  }, [recent.map((p) => p.root).join("|"), windowVisible]);
 
   return (
     <IdleControlCenter
@@ -124,7 +141,6 @@ export function IdleDashboard({
       onOpenSidebarItem={onOpenSidebarItem}
       onRevealSidebar={onRevealSidebar}
       onOpenMoneyAgents={onOpenMoneyAgents}
-      onOpenPet={onOpenPet}
       onOpenPalette={onOpenPalette}
       onTalkToJarvis={onTalkToJarvis}
     />

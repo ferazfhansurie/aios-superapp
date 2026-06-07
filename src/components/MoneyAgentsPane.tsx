@@ -7,6 +7,7 @@ import {
   loadMoneyAgentDetails,
   type MoneyAgentDetail,
 } from "../lib/moneyAgents";
+import { useVisible } from "../lib/useVisible";
 
 interface Props {
   onOpenAgentChat: (id: string, label: string, command?: string) => void;
@@ -30,6 +31,9 @@ export function MoneyAgentsPane({ onOpenAgentChat }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [steerAll, setSteerAll] = useState("");
+  // Gate the health-check poll (spawns an agent/CLI check) to when the pane is
+  // visible — hidden panes stay mounted in the cockpit, so this fired forever.
+  const { ref: rootRef, visible } = useVisible<HTMLDivElement>();
 
   const refresh = () => {
     setLoading(true);
@@ -41,10 +45,15 @@ export function MoneyAgentsPane({ onOpenAgentChat }: Props) {
   };
 
   useEffect(() => {
+    // One load on mount, then poll only while visible. Interval backed off
+    // 20s → 60s (an agent health check is heavier than a UI refresh).
     refresh();
-    const interval = setInterval(refresh, 20_000);
+    if (!visible) return;
+    const interval = setInterval(refresh, 60_000);
     return () => clearInterval(interval);
-  }, []);
+    // refresh is stable enough for this mount/visibility-gated poll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
 
   const earning = agents.filter((agent) => agent.health === "running" || agent.health === "scheduled").length;
   const steer = agents.filter((agent) => agent.health === "needs-steer" || agent.health === "failed").length;
@@ -68,7 +77,7 @@ export function MoneyAgentsPane({ onOpenAgentChat }: Props) {
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
+    <div ref={rootRef} className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       <div className="flex h-10 shrink-0 items-center justify-between border-b border-[var(--color-border)] px-3">
         <div className="flex items-center gap-2">
           <Target size={14} className="text-[var(--color-success)]" />

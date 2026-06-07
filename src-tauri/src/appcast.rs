@@ -63,6 +63,10 @@ mod imp {
     use std::time::Duration;
 
     use block2::RcBlock;
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use objc2::rc::Retained;
@@ -90,6 +94,29 @@ mod imp {
     /// kCVPixelFormatType_32BGRA — a CALayer.contents IOSurface must be BGRA so
     /// Core Animation composites it directly. FourCC 'BGRA' = 0x42475241.
     const PIXEL_FORMAT_BGRA: u32 = 0x42475241;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+        fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
+    }
+
+    fn accessibility_trusted() -> bool {
+        unsafe { AXIsProcessTrusted() }
+    }
+
+    fn accessibility_trusted_or_prompt() -> bool {
+        if accessibility_trusted() {
+            return true;
+        }
+
+        let prompt_key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
+        let prompt_value = CFBoolean::true_value();
+        let options: CFDictionary<CFString, CFBoolean> =
+            CFDictionary::from_CFType_pairs(&[(prompt_key, prompt_value)]);
+
+        unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) }
+    }
 
     // ── The SCStreamOutput delegate ─────────────────────────────────────────
     //
@@ -620,6 +647,12 @@ mod imp {
         width: f64,
         height: f64,
     ) -> Result<(), String> {
+        if !accessibility_trusted_or_prompt() {
+            return Err(
+                "Accessibility not enabled: macOS opened the prompt. enable AIOS in System Settings > Privacy & Security > Accessibility, then retry controlling the mirrored window."
+                    .into(),
+            );
+        }
         // Already running for this label? just reposition.
         {
             let state = app.state::<AppCastState>();

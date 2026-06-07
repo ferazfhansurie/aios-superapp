@@ -212,12 +212,12 @@ export function buildAppCommands(deps: AppCommandDeps): PaletteCommand[] {
     {
       command: createCommand({
         id: "oracle.appshot",
-        label: "appshot - screenshot to oracle",
+        label: "appshot - attach to chat",
         description: "⌘⌘",
         scope: "global",
         danger: "external",
         icon: createElement(Camera, { size: 14 }),
-        keywords: ["screenshot", "capture", "oracle"],
+        keywords: ["screenshot", "capture", "chat", "vision"],
         run: deps.fireAppshot,
       }),
       group: "actions",

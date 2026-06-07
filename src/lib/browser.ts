@@ -59,6 +59,8 @@ export const browserExitAnnotate = (label: string) =>
   invoke("browser_exit_annotate", { label });
 export const browserCopySelection = (label: string) =>
   invoke("browser_copy_selection", { label });
+export const browserInstallContextProbe = (label: string) =>
+  invoke("browser_install_context_probe", { label });
 export const readClipboard = () => invoke<string>("read_clipboard");
 
 // ─── Persistent history / bookmarks / downloads ─────────────────────────────
@@ -122,4 +124,12 @@ export interface BrowserAnnotation {
   note: string;
   rect: { x: number; y: number; width: number; height: number } | null;
   url: string;
+}
+
+export interface BrowserContextPayload {
+  x: number;
+  y: number;
+  url: string;
+  linkUrl: string;
+  text: string;
 }

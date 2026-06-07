@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildChatContextCapsule,
   composerContextChips,
   contextLedger,
   cycleQueueSelection,
@@ -21,6 +22,69 @@ import {
   resolvePaneFileTarget,
   targetLabel,
 } from "./paneRouting.ts";
+
+test("buildChatContextCapsule keeps live context compact and factual", () => {
+  const capsule = buildChatContextCapsule({
+    cwd: "/Users/firazfhansurie/Repo/firaz/aios-shell",
+    engine: "codex",
+    modelLabel: "gpt-5.5",
+    contextBudget: "agent",
+    userText: "make chatpane know what i mean without bloating every prompt",
+    workspace: {
+      activePane: { key: "p1", label: "chat", type: "chat", detail: "aios-shell" },
+      openPanes: [
+        { key: "p1", label: "chat", type: "chat", detail: "aios-shell" },
+        { key: "p2", label: "browser", type: "browser", detail: "https://claude.ai" },
+        { key: "p3", label: "files", type: "files", detail: "/Users/firazfhansurie/Repo/firaz/aios-shell" },
+      ],
+      projects: [
+        { name: "aios-shell", root: "/Users/firazfhansurie/Repo/firaz/aios-shell", kind: "tauri" },
+      ],
+    },
+    memories: [
+      {
+        title: "more better philosophy",
+        type: "preference",
+        description: "firaz wants more and better until density hurts",
+        reasons: ["title matches `better`"],
+        vault: "home",
+      },
+    ],
+    recentTurns: [
+      { kind: "user", text: "browser still doesnt show suggested sites" },
+      { kind: "assistant", text: "fixed the browser suggestions" },
+    ],
+  });
+
+  assert.match(capsule, /^<aios_context>/);
+  assert.match(capsule, /active_pane: chat \[chat\]/);
+  assert.match(capsule, /memory_hits:/);
+  assert.match(capsule, /projects: aios-shell\/tauri/);
+  assert.match(capsule, /recent_thread:/);
+  assert.ok(capsule.length <= 1500);
+});
+
+test("buildChatContextCapsule hard-trims lean mode", () => {
+  const capsule = buildChatContextCapsule({
+    cwd: "/repo",
+    engine: "claude",
+    modelLabel: "opus",
+    contextBudget: "lean",
+    userText: "x".repeat(5000),
+    memories: Array.from({ length: 20 }, (_, i) => ({
+      title: `memory ${i}`,
+      type: "reference",
+      preview: "y".repeat(500),
+    })),
+    recentTurns: Array.from({ length: 20 }, (_, i) => ({
+      kind: i % 2 ? "assistant" : "user",
+      text: "z".repeat(500),
+    })) as any,
+  });
+
+  assert.ok(capsule.length <= 760);
+  assert.match(capsule, /truncated: true|<\/aios_context>/);
+});
 
 test("usageStack separates the pre-chat baseline from this chat delta", () => {
   assert.deepEqual(usageStack(64, 61), {

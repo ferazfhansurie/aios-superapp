@@ -35,6 +35,17 @@ export async function listTmuxSessions(): Promise<TmuxSession[]> {
   return invoke<TmuxSession[]>("list_tmux_sessions");
 }
 
+/** Combined roster (oracles + all-tmux sessions) from a SINGLE backend socket
+ *  sweep — one IPC round-trip instead of listOracles()+listTmuxSessions() each
+ *  re-spawning tmux on the oracle socket. Used by the roster's poll. */
+export interface RosterSnapshot {
+  oracles: OracleInfo[];
+  sessions: TmuxSession[];
+}
+export async function listRoster(): Promise<RosterSnapshot> {
+  return invoke<RosterSnapshot>("list_roster");
+}
+
 /** Creates a new oracle session `aios-<identity>`; optional startup command. */
 export async function createOracle(identity: string, command?: string): Promise<string> {
   return invoke<string>("create_oracle", { identity, command: command ?? null });
@@ -59,9 +70,14 @@ export async function killTmuxSession(socket: string, session: string): Promise<
   return invoke("kill_tmux_session", { socket, session });
 }
 
-/** ⌘⌘ appshot: screenshot → routed into an oracle (defaults to master). */
+/** Legacy appshot: screenshot → routed into an oracle (defaults to master). */
 export async function appshot(identity?: string): Promise<string> {
   return invoke<string>("appshot", { identity: identity ?? null });
+}
+
+/** ⌘⌘ appshot: screenshot capture only; the shell attaches it to chat. */
+export async function appshotCapture(): Promise<string> {
+  return invoke<string>("appshot_capture");
 }
 
 /** Spawns the user's login shell in a new PTY. Returns the session id. */

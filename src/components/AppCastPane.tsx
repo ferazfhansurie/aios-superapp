@@ -36,21 +36,30 @@ import { reportDiag } from "../lib/diag";
 /** macOS deep-link straight to Privacy › Screen Recording. */
 const SCREEN_REC_SETTINGS_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+/** macOS deep-link straight to Privacy › Accessibility. */
+const ACCESSIBILITY_SETTINGS_URL =
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
 /** Heuristic: does this error look like the Screen Recording TCC permission was
  *  declined / not yet granted? (SCK surfaces this a few different ways.) */
 function isTccDeclined(msg: string | null): boolean {
   if (!msg) return false;
   const m = msg.toLowerCase();
+  if (m.includes("accessibility")) return false;
   return (
     m.includes("screen recording") ||
     m.includes("permission") ||
     m.includes("declined") ||
     m.includes("not authorized") ||
     m.includes("tcc") ||
-    (m.includes("scstream") && m.includes("-3801")) ||
-    m.includes("no capturable windows")
+    (m.includes("scstream") && m.includes("-3801"))
   );
+}
+
+function isAccessibilityDeclined(msg: string | null): boolean {
+  if (!msg) return false;
+  const m = msg.toLowerCase();
+  return m.includes("accessibility") || m.includes("control mirrored windows");
 }
 
 /** One app's group of windows for the grouped picker. */
@@ -131,7 +140,7 @@ export function AppCastPane({
         setWindows(rows);
         if (rows.length === 0) {
           setError(
-            "no capturable windows found — grant Screen Recording in System Settings › Privacy & Security, then retry",
+            "no mirrorable windows found — open a normal app window, then retry",
           );
         }
       })
@@ -180,12 +189,22 @@ export function AppCastPane({
     if (picked == null) return;
 
     let raf = 0;
-    const sync = () => {
+    const settleTimers: ReturnType<typeof setTimeout>[] = [];
+    // Last bounds we actually pushed over IPC. The 250ms→1s catch-all poll
+    // re-ran appcastSetBounds 4×/sec FOREVER even when nothing moved; dedup so a
+    // steady-state mirror does ZERO IPC on the poll ticks (rAF + ResizeObserver +
+    // resize/fullscreen listeners still fire setBounds the instant geometry
+    // actually changes — this just kills the idle re-push).
+    let lastBounds: Rect | null = null;
+    const sameRect = (a: Rect | null, b: Rect | null) =>
+      !!a && !!b && a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+    const sync = (force = false) => {
       const r = rect();
       if (!r) return;
       if (!startedRef.current) {
         startedRef.current = true;
         setStarting(true);
+        lastBounds = r;
         appcastStart(label, picked, r)
           .then(() => {
             setError(null);
@@ -196,21 +215,37 @@ export function AppCastPane({
             setStarting(false);
             setError(typeof e === "string" ? e : String(e));
           });
-      } else {
-        // Re-show in case it was hidden while inactive, then reposition.
+      } else if (force || !sameRect(r, lastBounds)) {
+        // Re-show in case it was hidden while inactive, then reposition — but
+        // only when the rect actually changed (or a forced re-show settle tick).
+        lastBounds = r;
         appcastShow(label).catch(() => {});
         appcastSetBounds(label, r).catch((e) => reportDiag("appcast.bounds", e, { action: "setBounds" }));
       }
     };
-    raf = requestAnimationFrame(() => requestAnimationFrame(sync));
-    const ro = new ResizeObserver(sync);
+    // Resize / fullscreen → force a re-show + reposition through the settle
+    // window (the view may have been hidden), bypassing the dedup.
+    const syncSettled = () => {
+      sync(true);
+      for (const delay of [40, 120, 260, 520, 900]) {
+        settleTimers.push(setTimeout(() => sync(true), delay));
+      }
+    };
+    raf = requestAnimationFrame(() => requestAnimationFrame(() => sync(true)));
+    const ro = new ResizeObserver(() => sync());
     if (slotRef.current) ro.observe(slotRef.current);
-    window.addEventListener("resize", sync);
-    const poll = setInterval(sync, 300);
+    window.addEventListener("resize", syncSettled);
+    document.addEventListener("fullscreenchange", syncSettled);
+    // Backed off 250ms → 1s, and deduped: a steady mirror does no IPC on these
+    // ticks. This is now only a safety net for layout shifts the observers miss
+    // (e.g. a sibling flexbox pane resizing without firing OUR slot's RO).
+    const poll = setInterval(() => sync(), 1000);
     return () => {
       cancelAnimationFrame(raf);
+      settleTimers.forEach(clearTimeout);
       ro.disconnect();
-      window.removeEventListener("resize", sync);
+      window.removeEventListener("resize", syncSettled);
+      document.removeEventListener("fullscreenchange", syncSettled);
       clearInterval(poll);
     };
   }, [active, picked, label, rect, pickerOpen]);
@@ -311,6 +346,7 @@ export function AppCastPane({
 
   const pickedWin = windows.find((w) => w.window_id === picked) ?? null;
   const tccDeclined = isTccDeclined(error);
+  const accessibilityDeclined = isAccessibilityDeclined(error);
 
   // Running flat index so each rendered row knows its nav position.
   let flatCursor = -1;
@@ -478,6 +514,40 @@ export function AppCastPane({
                       onClick={() =>
                         openUrl(SCREEN_REC_SETTINGS_URL).catch((err) =>
                           reportDiag("appcast.openSettings", err, { action: "openSettings" }),
+                        )
+                      }
+                      className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                    >
+                      open settings
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setError(null);
+                        refreshWindows();
+                      }}
+                      className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-[12px] text-[var(--color-text)] hover:border-[var(--color-accent)]/50"
+                    >
+                      retry
+                    </button>
+                  </div>
+                </>
+              ) : accessibilityDeclined ? (
+                <>
+                  <div className="flex items-center justify-center gap-1.5 text-[13px] font-medium text-[var(--color-text)]">
+                    <ShieldAlert size={14} className="text-[var(--color-danger)]" />
+                    Accessibility not enabled
+                  </div>
+                  <p className="mt-2 text-[11px] leading-relaxed text-[var(--color-faint)]">
+                    Enable Accessibility for AIOS in System Settings › Privacy & Security so clicks
+                    and keys can control mirrored windows.
+                  </p>
+                  <div className="mt-3 flex justify-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openUrl(ACCESSIBILITY_SETTINGS_URL).catch((err) =>
+                          reportDiag("appcast.openSettings", err, { action: "openAccessibility" }),
                         )
                       }
                       className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"

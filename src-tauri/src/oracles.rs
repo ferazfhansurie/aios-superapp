@@ -212,52 +212,159 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
     }
 }
 
+/// One tmux server's sessions, in a single `list-sessions` invocation. Returns
+/// `(socket, rows)` where each row carries the fields both `list_tmux_sessions`
+/// and `list_oracles` need, so a SINGLE sweep can feed both surfaces.
+///
+/// Idle-CPU note: each tmux socket is its own server process, so tmux genuinely
+/// cannot enumerate across sockets in one call — the irreducible minimum is one
+/// spawn per LIVE socket. We at least scan every socket exactly ONCE here and
+/// reuse the result, instead of the old path that swept the oracle socket twice
+/// (once in `list_oracles`, once in `list_tmux_sessions`) per roster poll.
+#[cfg(unix)]
+fn scan_sockets() -> Vec<TmuxRaw> {
+    let oracle_sock = oracle_socket();
+    let mut rows: Vec<TmuxRaw> = Vec::new();
+    for socket in known_sockets() {
+        let output = std::process::Command::new(tmux_bin())
+            .args([
+                "-L",
+                socket.as_str(),
+                "list-sessions",
+                "-F",
+                "#{session_name}|#{session_attached}|#{session_windows}",
+            ])
+            .output();
+        let Ok(out) = output else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut p = line.splitn(3, '|');
+            let name = p.next().unwrap_or("").trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let attached = p.next().unwrap_or("0").trim() != "0";
+            let windows = p.next().unwrap_or("1").trim().parse().unwrap_or(1);
+            let is_oracle = socket == oracle_sock && name.starts_with("aios-");
+            rows.push(TmuxRaw {
+                socket: socket.clone(),
+                name,
+                attached,
+                windows,
+                is_oracle,
+            });
+        }
+    }
+    rows
+}
+
+/// Internal row from a single socket sweep (pre-classification).
+#[cfg(unix)]
+struct TmuxRaw {
+    socket: String,
+    name: String,
+    attached: bool,
+    windows: u32,
+    is_oracle: bool,
+}
+
+/// Builds the oracle roster from a pre-fetched socket sweep (no extra spawns).
+/// Mirrors the filtering in `list_oracles` (real `aios-<identity>`, excluding the
+/// shell's own `aios-term-*` panes).
+#[cfg(unix)]
+fn oracles_from_rows(rows: &[TmuxRaw], oracle_sock: &str) -> Vec<OracleInfo> {
+    let instances = read_instances();
+    let mut oracles: Vec<OracleInfo> = rows
+        .iter()
+        .filter(|r| {
+            r.socket == oracle_sock
+                && r.name.starts_with("aios-")
+                && !r.name.starts_with("aios-term-")
+        })
+        .map(|r| {
+            let identity = r.name.trim_start_matches("aios-").to_string();
+            let display_name = display_name_for(&identity, &r.name, &instances);
+            OracleInfo {
+                socket: r.socket.clone(),
+                is_master: false,
+                running: true,
+                identity,
+                session: r.name.clone(),
+                display_name,
+                attached: r.attached,
+            }
+        })
+        .collect();
+    oracles.sort_by(|a, b| b.attached.cmp(&a.attached).then(a.identity.cmp(&b.identity)));
+    oracles
+}
+
+/// Combined roster payload — both lists from ONE socket sweep, so the frontend
+/// roster poll does a single IPC round-trip + scans the oracle socket once
+/// (down from two separate commands each re-spawning tmux).
+#[derive(Debug, Clone, Serialize)]
+pub struct RosterSnapshot {
+    pub oracles: Vec<OracleInfo>,
+    pub sessions: Vec<TmuxSession>,
+}
+
 /// Lists EVERY live tmux session across the known sockets — the all-tmux attach
 /// surface. Sessions absent → simply skipped (no error).
 #[tauri::command]
 pub fn list_tmux_sessions() -> Result<Vec<TmuxSession>, String> {
     #[cfg(unix)]
     {
-        let mut sessions = Vec::new();
-        let oracle_sock = oracle_socket();
-        for socket in known_sockets() {
-            let output = std::process::Command::new(tmux_bin())
-                .args([
-                    "-L",
-                    socket.as_str(),
-                    "list-sessions",
-                    "-F",
-                    "#{session_name}|#{session_attached}|#{session_windows}",
-                ])
-                .output();
-            let Ok(out) = output else { continue };
-            if !out.status.success() {
-                continue;
-            }
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let mut p = line.splitn(3, '|');
-                let name = p.next().unwrap_or("").trim().to_string();
-                if name.is_empty() {
-                    continue;
-                }
-                let attached = p.next().unwrap_or("0").trim() != "0";
-                let windows = p.next().unwrap_or("1").trim().parse().unwrap_or(1);
-                let is_oracle = socket == oracle_sock && name.starts_with("aios-");
-                sessions.push(TmuxSession {
-                    socket: socket.clone(),
-                    name,
-                    attached,
-                    windows,
-                    is_oracle,
-                });
-            }
-        }
+        let sessions = scan_sockets()
+            .into_iter()
+            .map(|r| TmuxSession {
+                socket: r.socket,
+                name: r.name,
+                attached: r.attached,
+                windows: r.windows,
+                is_oracle: r.is_oracle,
+            })
+            .collect();
         Ok(sessions)
     }
 
     #[cfg(not(unix))]
     {
         Ok(Vec::new())
+    }
+}
+
+/// One-shot roster: oracles + all-tmux sessions from a SINGLE socket sweep.
+/// The cockpit roster uses this so a refresh is one IPC call + one tmux spawn
+/// per live socket — not two commands that each independently spawn tmux on the
+/// oracle socket.
+#[tauri::command]
+pub fn list_roster() -> Result<RosterSnapshot, String> {
+    #[cfg(unix)]
+    {
+        let oracle_sock = oracle_socket();
+        let rows = scan_sockets();
+        let oracles = oracles_from_rows(&rows, &oracle_sock);
+        let sessions = rows
+            .into_iter()
+            .map(|r| TmuxSession {
+                socket: r.socket,
+                name: r.name,
+                attached: r.attached,
+                windows: r.windows,
+                is_oracle: r.is_oracle,
+            })
+            .collect();
+        Ok(RosterSnapshot { oracles, sessions })
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(RosterSnapshot {
+            oracles: Vec::new(),
+            sessions: Vec::new(),
+        })
     }
 }
 
@@ -345,11 +452,7 @@ pub fn rename_oracle(from: String, to: String) -> Result<String, String> {
     Ok(to_session)
 }
 
-/// Appshot: captures the screen to a PNG and sends its path into an oracle's
-/// tmux session (defaults to master) — the ⌘⌘ "screenshot → aios" flow. Returns
-/// the saved path. No Enter is sent, so the user can add context first.
-#[tauri::command]
-pub fn appshot(identity: Option<String>) -> Result<String, String> {
+fn capture_appshot_png() -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -363,6 +466,22 @@ pub fn appshot(identity: Option<String>) -> Result<String, String> {
     if !status.success() {
         return Err("screencapture returned non-zero".into());
     }
+    Ok(path)
+}
+
+/// Capture-only appshot for the chat pane. The frontend decides whether to
+/// attach the PNG to an existing chat or open a new one.
+#[tauri::command]
+pub fn appshot_capture() -> Result<String, String> {
+    capture_appshot_png()
+}
+
+/// Appshot: captures the screen to a PNG and sends its path into an oracle's
+/// tmux session (defaults to master) — the legacy "screenshot → oracle" flow.
+/// Returns the saved path. No Enter is sent, so the user can add context first.
+#[tauri::command]
+pub fn appshot(identity: Option<String>) -> Result<String, String> {
+    let path = capture_appshot_png()?;
     // Route into the chosen oracle, or the master (root) session by default.
     // `-l` sends the path literally (no key interpretation), no Enter.
     let keys = format!("{path} ");

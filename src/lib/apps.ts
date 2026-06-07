@@ -5,8 +5,9 @@
 
 import {
   Bot,
-  Bug,
+  Brain,
   Folder,
+  GitBranch,
   Globe,
   MessageSquare,
   MonitorPlay,
@@ -21,9 +22,11 @@ import type { PaneKind } from "../components/TerminalPane";
 export type PaneContent =
   | PaneKind
   | { type: "files"; root?: string }
+  | { type: "git"; root?: string }
   | { type: "browser"; url?: string; profile?: string; memKey?: string; transient?: boolean }
   | { type: "appcast"; windowId?: number }
   | { type: "notes" }
+  | { type: "memory" }
   | { type: "bridges" }
   | { type: "plugins" }
   | { type: "pulse" }
@@ -41,7 +44,6 @@ export type PaneContent =
       agentId?: string;
       agentLabel?: string;
     }
-  | { type: "pet" }
   | { type: "file"; path: string; name: string }
   | { type: "editor"; path: string; name: string; line?: number; col?: number };
 
@@ -63,12 +65,13 @@ export type AppDef = {
 /** Default app catalog — order here == the seeded default sidebar order. */
 export const SPAWN: AppDef[] = [
   { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "tools", firstClass: true },
-  { id: "pet", kind: { type: "pet" }, icon: Bug, label: "pet", group: "tools" },
   { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "tools", firstClass: true },
   { id: "codex-code", kind: { type: "shell", cmd: "codex --model gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" }, icon: Bot, label: "codex", group: "tools", firstClass: true },
   { id: "claude-code", kind: { type: "shell", cmd: "claude --dangerously-skip-permissions" }, icon: Bot, label: "claude code", group: "tools" },
   { id: "notes", kind: { type: "notes" }, icon: NotebookPen, label: "notes", group: "tools", firstClass: true },
+  { id: "memory", kind: { type: "memory" }, icon: Brain, label: "memory", group: "tools", firstClass: true },
   { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools", firstClass: true },
+  { id: "git", kind: { type: "git" }, icon: GitBranch, label: "git", group: "tools", firstClass: true },
   { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools", firstClass: true },
   { id: "apps", kind: { type: "apps" }, icon: MonitorUp, label: "apps", group: "tools" },
   // App-cast (ScreenCaptureKit spike): live-mirror a native macOS window in a

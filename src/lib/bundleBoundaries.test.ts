@@ -1,11 +1,12 @@
 // @ts-nocheck -- source-boundary regression checks run directly in node.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
 const root = process.cwd();
 const read = (path: string) => readFileSync(join(root, path), "utf8");
+const exists = (path: string) => existsSync(join(root, path));
 const hasRuntimeImport = (source: string, specifier: string) => {
   const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`^import(?!\\\\s+type)[^\\n]*from\\\\s+["']${escaped}["']`, "m").test(source);
@@ -48,73 +49,41 @@ test("terminal pane keeps xterm behind terminal runtime", () => {
   assert.match(runtime, /@xterm\/xterm/);
 });
 
-test("pet pane uses a seeded code-drawn 8-bit game pet", () => {
-  const pane = read("src/components/PetPane.tsx");
-  const idle = read("src/components/IdleControlCenter.tsx");
-  const css = read("src/App.css");
+test("pet system stays removed from shell surfaces", () => {
+  const removedFiles = [
+    "src/components/PetPane.tsx",
+    "src/components/DesktopPetOverlay.tsx",
+    "src/lib/pet.ts",
+    "src/lib/desktopPet.ts",
+    "public/pets/aios-bot/pet.json",
+    "public/pets/aios-bot/spritesheet.svg",
+    "public/pets/aios-bot/spritesheet.png",
+    "docs/pet-concepts/aios-robot-concept-sheet.png",
+  ];
+  for (const file of removedFiles) {
+    assert.equal(exists(file), false, `${file} should not exist`);
+  }
 
-  assert.match(pane, /PET_VARIANT_KEY/);
-  assert.match(pane, /PET_LEGACY_VARIANT_KEY/);
-  assert.match(pane, /PET_REROLL_DAILY_LIMIT/);
-  assert.match(pane, /PET_REROLL_KEY/);
-  assert.match(pane, /PET_ONBOARDING_KEY/);
-  assert.match(pane, /ACCENT_ORDER/);
-  assert.match(pane, /setAccent/);
-  assert.match(pane, /accentToHex/);
-  assert.match(pane, /subscribeAccent/);
-  assert.match(pane, /THEME_TONES/);
-  assert.match(pane, /theme locked/);
-  assert.match(pane, /first hatch/);
-  assert.match(pane, /chooseStarter/);
-  assert.match(pane, /makeVariant/);
-  assert.match(pane, /TOPPERS/);
-  assert.match(pane, /PATTERNS/);
-  assert.match(pane, /TAILS/);
-  assert.match(pane, /variant\.tone/);
-  assert.match(pane, /variant\.eyes/);
-  assert.match(pane, /variant\.legs/);
-  assert.match(pane, /variant\.environment/);
-  assert.match(pane, /variant\.topper/);
-  assert.match(pane, /variant\.pattern/);
-  assert.match(pane, /variant\.tail/);
-  assert.match(pane, /ACTIVITY_BY_MOOD/);
-  assert.match(pane, /pet-pixel/);
-  assert.match(pane, /pet-pixel-body/);
-  assert.match(pane, /pet-pixel-pattern/);
-  assert.match(pane, /pet-pixel-tail/);
-  assert.match(pane, /pet-world/);
-  assert.match(pane, /pet-job/);
-  assert.match(pane, /hatch roll/);
-  assert.match(pane, /PetDashboardCompanion/);
-  assert.match(pane, /pet-dashboard/);
-  assert.match(pane, /ask jarvis/);
-  assert.match(idle, /PetDashboardCompanion/);
-  assert.match(idle, /onOpenPet/);
-  assert.match(pane, /disabled=\{rerollsLeft <= 0\}/);
-  assert.doesNotMatch(pane, /pet-antenna/);
-  assert.doesNotMatch(pane, /<img/);
-  assert.match(css, /seeded code-drawn 8-bit game pet/);
-  assert.match(css, /\.pet-reroll-bank/);
-  assert.match(css, /\.pet-action-btn:disabled/);
-  assert.match(css, /\.pet-dashboard/);
-  assert.match(css, /\.pet-dashboard-canvas/);
-  assert.match(css, /\.pet-hatch-onboarding/);
-  assert.match(css, /\.pet-hatch-swatch/);
-  assert.match(css, /\.pet-starter-card/);
-  assert.match(css, /\.pet-pixel--starter/);
-  assert.match(css, /\.pet-canvas--arcade/);
-  assert.match(css, /\.pet-canvas--lagoon/);
-  assert.match(css, /--pet-room-glow/);
-  assert.match(css, /\.pet-world-avatar/);
-  assert.match(css, /\.pet-job--coding/);
-  assert.match(css, /\.pet-pixel-topper--horns/);
-  assert.match(css, /\.pet-pixel-tail--spark/);
-  assert.match(css, /\.pet-pixel-pattern--stripe/);
-  assert.match(css, /\.pet-pixel/);
-  assert.match(css, /image-rendering: pixelated/);
-  assert.match(css, /grid-template-columns: repeat\(var\(--pet-leg-count\), 1fr\)/);
-  assert.match(css, /\.pet-pixel--happy/);
-  assert.match(css, /\.pet-pixel--critical/);
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const main = read("src/main.tsx");
+  const idle = read("src/components/IdleControlCenter.tsx");
+  const dashboard = read("src/components/IdleDashboard.tsx");
+  const chat = read("src/components/ChatPane.tsx");
+  const css = read("src/App.css");
+  const capabilities = read("src-tauri/capabilities/default.json");
+  const tauriConfig = read("src-tauri/tauri.conf.json");
+
+  assert.doesNotMatch(apps, /\{ type: "pet" \}/);
+  assert.doesNotMatch(apps, /id: "pet"/);
+  assert.doesNotMatch(app, /PetPane|type: "pet"|onOpenPet/);
+  assert.doesNotMatch(main, /DesktopPetOverlay|pet-overlay/);
+  assert.doesNotMatch(idle, /PetDashboardCompanion|PetPane|onOpenPet|aios-mascot|pet pane/);
+  assert.doesNotMatch(dashboard, /onOpenPet/);
+  assert.doesNotMatch(chat, /onPet|"\.\.\/lib\/pet"/);
+  assert.doesNotMatch(css, /\.pet-|\.aios-pet-|\.aios-mascot-|aios-bot/);
+  assert.doesNotMatch(capabilities, /aios-pet-overlay|allow-create|allow-set-always-on-top/);
+  assert.doesNotMatch(tauriConfig, /macOSPrivateApi/);
 });
 
 test("sidebar usage renders a real claude meter (not the spark proxy)", () => {
@@ -127,6 +96,8 @@ test("sidebar usage renders a real claude meter (not the spark proxy)", () => {
   // meter sourced from ~/.aios/state/usage.json (claude_usage → claudeRate).
   assert.match(source, /ProviderBlock name="claude"/);
   assert.match(source, /claudeRate\(\)/);
+  assert.match(source, /% used/);
+  assert.doesNotMatch(source, /showRemaining/);
   assert.equal(source.includes("gpt-5.3-codex-spark"), false);
   assert.equal(source.includes("idleRate()"), false);
   assert.match(sidebar, /UsageGlance as SidebarUsage/);
@@ -318,7 +289,7 @@ test("idle dashboard is a minimal home: clock + command line + usage glance, not
   assert.match(controlCenter, /useUsageRates/);
   assert.match(controlCenter, /recent/);
   assert.match(controlCenter, /QuickActions/);
-  assert.match(controlCenter, /PetDashboardCompanion/);
+  assert.doesNotMatch(controlCenter, /PetDashboardCompanion/);
 
   // The overloaded control-center lanes are gone (deleted, not just hidden).
   assert.doesNotMatch(controlCenter, /JarvisBriefingLane/);
@@ -469,6 +440,68 @@ test("chatpane memory search is explicit slash command only", () => {
   assert.doesNotMatch(chatPane, /q\.length < 4/);
 });
 
+test("memory is a first-class pane backed by the vault commands", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const pane = read("src/components/MemoryPane.tsx");
+  const bridge = read("src/lib/memory.ts");
+  const rust = read("src-tauri/src/memory.rs");
+  const lib = read("src-tauri/src/lib.rs");
+
+  assert.match(apps, /id: "memory"/);
+  assert.match(app, /MemoryPane/);
+  assert.match(pane, /memoryGraph\(\)/);
+  assert.match(pane, /memorySearch\(/);
+  assert.match(pane, /memorySaveRaw/);
+  assert.match(pane, /MemoryGraphView/);
+  assert.match(pane, /viewMode/);
+  assert.match(pane, /onSelect\(node\.path\)/);
+  assert.match(pane, /MemoryInspector/);
+  assert.match(pane, /graphFilter/);
+  assert.match(pane, /suggested_links/);
+  assert.match(pane, /backlinks/);
+  assert.match(pane, /orphaned/);
+  assert.match(pane, /neural/);
+  assert.match(pane, /memory-graph-cluster/);
+  assert.match(pane, /memory-graph-node/);
+  assert.match(pane, /memory-graph-html-node/);
+  assert.match(pane, /memory-graph-html-edge/);
+  assert.match(pane, /memory-graph-pan-surface/);
+  assert.match(pane, /memory-graph-camera/);
+  assert.match(pane, /visibleNodes/);
+  assert.match(pane, /graphOnly/);
+  assert.match(pane, /onPointerDown/);
+  assert.match(pane, /onWheel/);
+  assert.match(bridge, /memory_delete_path/);
+  assert.match(rust, /fn vault_dirs\(\)/);
+  assert.match(rust, /build_memory_graph/);
+  assert.match(rust, /suggested_links/);
+  assert.match(rust, /backlinks/);
+  assert.match(rust, /normalize_link_key/);
+  assert.match(rust, /pub fn memory_save_raw/);
+  assert.match(lib, /memory::memory_save_raw/);
+});
+
+test("claude usage prefers live claude web session before stale local fallbacks", () => {
+  const usage = read("src-tauri/src/usage.rs");
+  const dashboard = read("src/lib/dashboard.ts");
+
+  assert.match(usage, /claude_usage_from_webview/);
+  assert.match(usage, /claude_usage_from_helper/);
+  assert.match(usage, /getAllCookies/);
+  assert.match(usage, /claude\.ai\/api\/organizations/);
+  assert.match(usage, /api\.anthropic\.com\/api\/oauth\/usage/);
+  assert.match(usage, /CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.match(usage, /oauth-2025-04-20/);
+  assert.match(dashboard, /Anthropic OAuth API/);
+  const webFirst = usage.indexOf("claude_usage_from_webview(app)");
+  const oauthSecond = usage.indexOf("claude_usage_from_oauth()");
+  const helperThird = usage.indexOf("claude_usage_from_helper()");
+  assert.ok(webFirst >= 0, "claude webview usage source must exist");
+  assert.ok(oauthSecond > webFirst, "oauth fallback must come after the live web source");
+  assert.ok(helperThird > oauthSecond, "helper fallback must not mask oauth usage");
+});
+
 test("shell still surfaces source build state via the source-status backend", () => {
   const chatRust = read("src-tauri/src/chat.rs");
 
@@ -508,6 +541,130 @@ test("shell exposes running mac apps as attachable pane targets", () => {
   assert.match(lib, /mac_apps::mac_list_apps/);
   assert.match(lib, /mac_apps::mac_focus_app/);
   assert.match(lib, /mac_apps::mac_capture_app/);
+});
+
+test("appcast separates screen recording from accessibility control", () => {
+  const pane = read("src/components/AppCastPane.tsx");
+  const rust = read("src-tauri/src/appcast.rs");
+
+  assert.match(pane, /ACCESSIBILITY_SETTINGS_URL/);
+  assert.match(pane, /Privacy_Accessibility/);
+  assert.match(pane, /isAccessibilityDeclined/);
+  assert.match(pane, /no mirrorable windows found/);
+  assert.doesNotMatch(pane, /m\.includes\("no capturable windows"\)/);
+  assert.match(pane, /Accessibility not enabled/);
+  assert.match(pane, /control mirrored windows/);
+  assert.match(rust, /AXIsProcessTrusted/);
+  assert.match(rust, /AXIsProcessTrustedWithOptions/);
+  assert.match(rust, /AXTrustedCheckOptionPrompt/);
+  assert.match(rust, /accessibility_trusted/);
+  assert.match(rust, /accessibility_trusted_or_prompt/);
+  assert.match(rust, /Accessibility not enabled/);
+});
+
+test("local mac install keeps a stable tcc identity", () => {
+  const pkg = read("package.json");
+  const script = read("scripts/install-mac-local.sh");
+
+  assert.match(pkg, /"install:mac-local": "bash scripts\/install-mac-local\.sh"/);
+  assert.match(script, /tauri -- build --bundles app --no-sign/);
+  assert.match(script, /stable_requirement='=designated => identifier "com\.adletic\.aios"'/);
+  assert.match(script, /codesign --force --deep --sign - --requirements "\$stable_requirement"/);
+  assert.match(script, /codesign --verify --deep --strict "\$installed_app"/);
+});
+
+test("native browser and appcast panes resync through fullscreen settle", () => {
+  const browser = read("src/components/BrowserPane.tsx");
+  const appcast = read("src/components/AppCastPane.tsx");
+
+  for (const source of [browser, appcast]) {
+    assert.match(source, /syncSettled/);
+    assert.match(source, /fullscreenchange/);
+    assert.match(source, /\[40, 120, 260, 520, 900\]/);
+    assert.match(source, /setInterval\(sync, 250\)/);
+  }
+});
+
+test("files pane exposes ide-grade workspace context actions", () => {
+  const files = read("src/components/FilesPane.tsx");
+
+  assert.match(files, /detectProject/);
+  assert.match(files, /contextMenu/);
+  assert.match(files, /onContextMenu/);
+  assert.match(files, /runContextProject/);
+  assert.match(files, /copyPath/);
+  assert.match(files, /openContextTerminal/);
+  assert.match(files, /openContextBrowser/);
+  assert.match(files, /openContextChat/);
+  assert.match(files, /openContextGit/);
+  assert.match(files, /openGitPane/);
+  assert.match(files, /spawnPane\("git"/);
+  assert.match(files, /open containing files pane/);
+});
+
+test("git pane exposes branch switching, changed files, and chat handoff", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const paneBus = read("src/lib/paneBus.ts");
+  const fs = read("src/lib/fs.ts");
+  const tauriFiles = read("src-tauri/src/files.rs");
+  const tauriLib = read("src-tauri/src/lib.rs");
+
+  assert.equal(exists("src/components/GitPane.tsx"), true);
+  const gitPane = read("src/components/GitPane.tsx");
+
+  assert.match(apps, /id: "git"/);
+  assert.match(apps, /type: "git"/);
+  assert.match(app, /GitPane/);
+  assert.match(app, /pane\.kind\.type === "git"/);
+  assert.match(paneBus, /"git"/);
+  assert.match(paneBus, /seed\?: string/);
+  assert.match(app, /type: "chat", cwd: ctx\?\.cwd, seed: ctx\?\.seed/);
+
+  assert.match(fs, /export interface GitSnapshot/);
+  assert.match(fs, /gitSnapshot/);
+  assert.match(fs, /gitCheckout/);
+  assert.match(tauriFiles, /pub fn git_snapshot/);
+  assert.match(tauriFiles, /pub fn git_checkout/);
+  assert.match(tauriLib, /files::git_snapshot/);
+  assert.match(tauriLib, /files::git_checkout/);
+
+  assert.match(gitPane, /gitSnapshot/);
+  assert.match(gitPane, /gitCheckout/);
+  assert.match(gitPane, /branches/);
+  assert.match(gitPane, /switchBranch/);
+  assert.match(gitPane, /openEditorFileInPane/);
+  assert.match(gitPane, /spawnPane\("chat"/);
+  assert.match(gitPane, /buildGitChatSeed/);
+});
+
+test("global appshot attaches to chat instead of only the focused webview", () => {
+  const app = read("src/App.tsx");
+  const pty = read("src/lib/pty.ts");
+  const oracles = read("src-tauri/src/oracles.rs");
+  const lib = read("src-tauri/src/lib.rs");
+  const commands = read("src/lib/appCommands.ts");
+
+  assert.equal(exists("src-tauri/src/global_monitor.rs"), true);
+  assert.match(lib, /mod global_monitor/);
+  assert.match(lib, /global_monitor::start\(app\.handle\(\)\.clone\(\)\)/);
+  assert.match(lib, /oracles::appshot_capture/);
+  assert.match(oracles, /pub fn appshot_capture/);
+  assert.match(pty, /export async function appshotCapture/);
+  assert.match(app, /import \{ appshotCapture/);
+  assert.match(app, /listen<\{ source: string \}>\("global-appshot"/);
+  assert.match(app, /paneImageDrop\.get\(key\)/);
+  assert.match(app, /appshot attached to chat/);
+  assert.match(commands, /appshot - attach to chat/);
+  assert.doesNotMatch(commands, /screenshot to oracle/);
+});
+
+test("closing panes is visually instant even for busy chats", () => {
+  const app = read("src/App.tsx");
+
+  assert.match(app, /if \(handle\?\.busy\(\)\) handle\.detach\(true\);[\s\S]*closePane\(key\)/);
+  assert.doesNotMatch(app, /setClosePrompt\(key\)/);
+  assert.doesNotMatch(app, /this chat is still working/);
 });
 
 test("chatpane autoscroll follows live output until user scrolls away", () => {

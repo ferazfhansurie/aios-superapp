@@ -23,6 +23,7 @@ import {
   FileText,
   Folder,
   FolderPlus,
+  GitBranch,
   Globe,
   GripVertical,
   Layers,
@@ -66,7 +67,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import { appshot, listOracles, reapTerminals, type OracleInfo } from "./lib/pty";
+import { appshotCapture, listOracles, reapTerminals, type OracleInfo } from "./lib/pty";
 import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } from "./lib/chat";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
@@ -99,6 +100,7 @@ import {
   openUrlInPane,
   registerOpenUrl,
   registerOpenSettings,
+  spawnPane as requestSpawnPane,
   openSettingsTo,
   paneKeyForChatSession,
   registerSpawnPane,
@@ -114,6 +116,7 @@ import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/proje
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
 import { buildAppCommands } from "./lib/appCommands";
 import type { AgentAction } from "./lib/agentActions";
+import type { ChatWorkspaceContext } from "./lib/chatPaneState";
 import { isTauriRuntime } from "./lib/tauri";
 import { reportDiag, reportUsage } from "./lib/diag";
 import {
@@ -171,7 +174,6 @@ import {
 // `import { AppDef } from "../App"` path working without churn.
 export type { AppDef, PaneContent };
 
-const PetPane = lazy(() => import("./components/PetPane").then((m) => ({ default: m.PetPane })));
 const AttachAppsPane = lazy(() =>
   import("./components/AttachAppsPane").then((m) => ({ default: m.AttachAppsPane })),
 );
@@ -184,12 +186,14 @@ const BrowserPane = lazy(() => import("./components/BrowserPane").then((m) => ({
 const ChatPane = lazy(() => import("./components/ChatPane").then((m) => ({ default: m.ChatPane })));
 const EditorPane = lazy(() => import("./components/EditorPane").then((m) => ({ default: m.EditorPane })));
 const FilesPane = lazy(() => import("./components/FilesPane").then((m) => ({ default: m.FilesPane })));
+const GitPane = lazy(() => import("./components/GitPane").then((m) => ({ default: m.GitPane })));
 const FileViewerPane = lazy(() =>
   import("./components/FileViewerPane").then((m) => ({ default: m.FileViewerPane })),
 );
 const MoneyAgentsPane = lazy(() =>
   import("./components/MoneyAgentsPane").then((m) => ({ default: m.MoneyAgentsPane })),
 );
+const MemoryPane = lazy(() => import("./components/MemoryPane").then((m) => ({ default: m.MemoryPane })));
 const NotesPane = lazy(() => import("./components/NotesPane").then((m) => ({ default: m.NotesPane })));
 const PluginsPane = lazy(() => import("./components/PluginsPane").then((m) => ({ default: m.PluginsPane })));
 const PulsePane = lazy(() => import("./components/PulsePane").then((m) => ({ default: m.PulsePane })));
@@ -206,6 +210,61 @@ interface Pane {
 
 const isTerminal = (k: PaneContent): k is PaneKind =>
   k.type === "shell" || k.type === "oracle" || k.type === "tmux";
+
+function paneContextDetail(kind: PaneContent): string | undefined {
+  switch (kind.type) {
+    case "shell":
+      return [kind.cwd, kind.cmd].filter(Boolean).join(" · ") || undefined;
+    case "oracle":
+      return kind.identity;
+    case "tmux":
+      return `${kind.socket}/${kind.session}`;
+    case "files":
+      return kind.root;
+    case "git":
+      return kind.root;
+    case "browser":
+      return kind.url;
+    case "appcast":
+      return kind.windowId != null ? `window ${kind.windowId}` : undefined;
+    case "chat":
+      return kind.cwd ?? kind.resume?.title ?? kind.agentLabel;
+    case "file":
+    case "editor":
+      return kind.path;
+    case "app":
+      return kind.bundleId ?? kind.name;
+    default:
+      return undefined;
+  }
+}
+
+function buildWorkspaceContext(
+  current: Pane,
+  panes: Pane[],
+  projects: ProjectInfo[],
+  activeKey: string | null,
+  hiddenKeys: string[],
+): ChatWorkspaceContext {
+  const visible = panes.filter((pane) => !hiddenKeys.includes(pane.key));
+  const toPane = (pane: Pane, active = false) => ({
+    key: pane.key,
+    label: pane.label,
+    type: pane.kind.type,
+    detail: paneContextDetail(pane.kind),
+    active,
+  });
+  const activePane = visible.find((pane) => pane.key === activeKey) ?? current;
+  return {
+    activePane: toPane(activePane, true),
+    openPanes: visible.slice(0, 12).map((pane) => toPane(pane, pane.key === activePane.key)),
+    projects: projects.slice(0, 10).map((project) => ({
+      name: project.name,
+      root: project.root,
+      kind: project.kind,
+    })),
+  };
+}
 
 // Files that render in the viewer (images / pdf / office / binary); everything
 // else opens in the Monaco editor pane (the editor itself falls back to "open
@@ -416,7 +475,6 @@ function App() {
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   // pane key pending a close-confirm (busy chat: keep-running vs kill).
-  const [closePrompt, setClosePrompt] = useState<string | null>(null);
   // pane currently under a native OS file drag (for the drop highlight).
   const [dropTargetKey, setDropTargetKey] = useState<string | null>(null);
   // per-pane window controls. The maximized pane escapes the CSS grid to fill
@@ -888,11 +946,20 @@ function App() {
           spawn({ type: "files", root }, ctx?.label ?? `files · ${name}`);
           break;
         }
+        case "git": {
+          const root = ctx?.path ?? ctx?.cwd;
+          const name = root ? root.split("/").filter(Boolean).pop() ?? root : "git";
+          spawn({ type: "git", root }, ctx?.label ?? `git · ${name}`);
+          break;
+        }
         case "browser":
           spawn({ type: "browser", url: ctx?.url }, ctx?.label ?? "browser");
           break;
         case "chat":
-          spawn({ type: "chat", cwd: ctx?.cwd }, ctx?.label ?? "chat");
+          spawn({ type: "chat", cwd: ctx?.cwd, seed: ctx?.seed }, ctx?.label ?? "chat");
+          break;
+        case "memory":
+          spawn({ type: "memory" }, ctx?.label ?? "memory");
           break;
       }
     },
@@ -990,15 +1057,13 @@ function App() {
     setHiddenKeys((h) => h.filter((k) => k !== key));
     setActiveKey((a) => (a === key ? null : a));
   }, []);
-  // Closing a chat pane whose claude is mid-task → prompt to keep it running in
-  // the background (with optional done-notification) instead of killing it.
+  // Closing must be visually instant. If a chat is still running, detach it in
+  // the background with the existing completion notification, then remove the
+  // pane immediately so the grid can fall back to idle without a modal pause.
   const requestClose = useCallback(
     (key: string) => {
       const handle = chatHandles.get(key);
-      if (handle?.busy()) {
-        setClosePrompt(key);
-        return;
-      }
+      if (handle?.busy()) handle.detach(true);
       closePane(key);
     },
     [closePane],
@@ -1029,17 +1094,49 @@ function App() {
   const [home, setHome] = useState<string>("");
   useEffect(() => {
     let alive = true;
-    const load = () => {
+    const loadOracles = () =>
       listOracles().then((v) => alive && setOracles(v)).catch((e) => reportDiag("app.load", e, { action: "oracles" }));
+    const loadSessions = () =>
       listChatSessions(12).then((v) => alive && setChats(v)).catch((e) => reportDiag("app.load", e, { action: "chatSessions" }));
+    const loadLive = () =>
       listChatLive().then((v) => alive && setLiveChats(v)).catch((e) => reportDiag("app.load", e, { action: "chatLive" }));
+    const bumpAgents = () => {
       if (alive) setMoneyAgentSessionVersion(Date.now());
     };
-    load();
-    const t = setInterval(load, 30_000);
+
+    // First paint: fetch everything once so the idle homescreen + palette aren't
+    // empty. After that, STAGGER the pollers across separate intervals + phase
+    // offsets so the ~4 IPC/subprocess calls never fire in the same frame —
+    // bunching them every 30s caused a periodic hitch. Spread out, each cycle is
+    // a single cheap call instead of a synchronized burst.
+    loadOracles();
+    loadSessions();
+    loadLive();
+    bumpAgents();
+
+    const timers: number[] = [];
+    // (delayMs, periodMs, fn) — phase offsets keep them from realigning.
+    const schedule = (delay: number, period: number, fn: () => void) => {
+      const kick = window.setTimeout(() => {
+        if (!alive) return;
+        fn();
+        timers.push(window.setInterval(fn, period));
+      }, delay);
+      timers.push(kick);
+    };
+    schedule(30_000, 30_000, loadOracles);   // fleet roster — moderate churn
+    schedule(7_000, 45_000, loadSessions);   // resume list — slow churn, offset
+    schedule(15_000, 20_000, loadLive);      // live/reattach — most dynamic
+    schedule(22_000, 60_000, bumpAgents);    // cheap version bump — offset
+
     return () => {
       alive = false;
-      clearInterval(t);
+      // ids hold both timeouts (the initial phase-offset kicks) and intervals;
+      // clear both ways (the DOM timer id namespace is shared, but be explicit).
+      timers.forEach((t) => {
+        window.clearTimeout(t);
+        window.clearInterval(t);
+      });
     };
   }, []);
 
@@ -1062,14 +1159,17 @@ function App() {
   }, [loadProjects]);
 
   // Root for ⌘P file-finder + ⌘⇧F global search. Priority: the active/focused
-  // files pane's root → the dir of the last-opened file → $HOME. So the finder
+  // files/git pane root → the dir of the last-opened file → $HOME. So the finder
   // searches the project you're actually working in, like VS Code's workspace.
   const finderRoot = useMemo(() => {
     const k = activeKey ?? focusedPane.current;
     const active = k ? panes.find((p) => p.key === k) : null;
     if (active?.kind.type === "files" && active.kind.root) return active.kind.root;
+    if (active?.kind.type === "git" && active.kind.root) return active.kind.root;
     const filesPane = panes.find((p) => p.kind.type === "files" && p.kind.root);
     if (filesPane && filesPane.kind.type === "files" && filesPane.kind.root) return filesPane.kind.root;
+    const gitPane = panes.find((p) => p.kind.type === "git" && p.kind.root);
+    if (gitPane && gitPane.kind.type === "git" && gitPane.kind.root) return gitPane.kind.root;
     if (lastOpenPath.current) return containingDir(lastOpenPath.current);
     return home;
   }, [panes, activeKey, home]);
@@ -1091,13 +1191,81 @@ function App() {
   );
 
   const fireAppshot = useCallback(async () => {
+    const attachToChat = (key: string, path: string) =>
+      new Promise<boolean>((resolve) => {
+        const note = "appshot attached. use this image as visual context.";
+        const tryAttach = () => {
+          const imgSink = paneImageDrop.get(key);
+          if (!imgSink) return false;
+          imgSink([path]);
+          paneWriters.get(key)?.(note);
+          return true;
+        };
+
+        if (tryAttach()) {
+          resolve(true);
+          return;
+        }
+
+        const started = Date.now();
+        const tick = () => {
+          if (tryAttach()) {
+            resolve(true);
+            return;
+          }
+          if (Date.now() - started > 1200) {
+            paneWriters.get(key)?.(`${note} ${path} `);
+            resolve(false);
+            return;
+          }
+          window.setTimeout(tick, 40);
+        };
+        window.setTimeout(tick, 40);
+      });
+
     try {
-      const path = await appshot();
-      flash(`appshot → master oracle · ${path.split("/").pop()}`);
+      const path = await appshotCapture();
+      const selectedKey = focusedPane.current ?? activeKey;
+      const selectedChat = selectedKey
+        ? panes.find((p) => p.key === selectedKey && p.kind.type === "chat")
+        : null;
+      const key =
+        selectedChat?.key ??
+        panes.find((p) => p.kind.type === "chat")?.key ??
+        spawn({ type: "chat" }, "chat");
+
+      setHiddenKeys((h) => h.filter((k) => k !== key));
+      focusedPane.current = key;
+      setActiveKey(key);
+
+      const attached = await attachToChat(key, path);
+      flash(
+        attached
+          ? `appshot attached to chat · ${path.split("/").pop()}`
+          : `appshot path inserted in chat · ${path.split("/").pop()}`,
+      );
     } catch (e) {
       flash(`appshot failed: ${e}`);
     }
-  }, [flash]);
+  }, [activeKey, panes, spawn, flash]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ source: string }>("global-appshot", () => {
+      void fireAppshot();
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((e) => reportDiag("app.listen", e, { action: "globalAppshot" }));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [fireAppshot]);
 
   // Focus a pane from the "OPEN" rail: restore it if minimized, mark it active
   // so dictation / drops target it (and the rail row highlights).
@@ -2051,7 +2219,7 @@ function App() {
         </IconBtn>
       )}
       <VoiceButton onTranscript={handleTranscript} />
-      <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
+      <IconBtn title="Appshot — attach to chat (⌘⌘)" onClick={fireAppshot}>
         <Camera size={15} />
       </IconBtn>
       <div className="relative" data-no-window-drag>
@@ -2094,7 +2262,7 @@ function App() {
         <Layers size={15} />
       </IconBtn>
       <VoiceButton onTranscript={handleTranscript} />
-      <IconBtn title="Appshot — screenshot to oracle (⌘⌘)" onClick={fireAppshot}>
+      <IconBtn title="Appshot — attach to chat (⌘⌘)" onClick={fireAppshot}>
         <Camera size={15} />
       </IconBtn>
       <div className="relative" data-no-window-drag>
@@ -2224,7 +2392,6 @@ function App() {
                 onOpenSidebarItem={spawnSidebarItem}
                 onRevealSidebar={() => setSidebarOpen(true)}
                 onOpenMoneyAgents={() => spawn({ type: "money-agents" }, "agents")}
-                onOpenPet={() => spawn({ type: "pet" }, "pet")}
                 onOpenMoneyAgentChat={openMoneyAgentChat}
                 onOpenPalette={() => setPaletteOpen(true)}
                 notifications={notifications}
@@ -2274,6 +2441,7 @@ function App() {
                   }}
                   onAnnotate={routeToChat}
                   onSendToAi={sendToAi}
+                  workspaceContext={buildWorkspaceContext(pane, panes, projects, activeKey, hiddenKeys)}
                   onOpenFile={openFile}
                   onOpenEditorFile={openEditorFile}
                   onOpenViewerFile={openViewerFile}
@@ -2319,7 +2487,6 @@ function App() {
           onNewChat={() => spawn({ type: "chat" }, "chat")}
           onOpenPalette={() => setPaletteOpen(true)}
           onOpenBrowser={() => spawn({ type: "browser" }, "browser")}
-          onOpenPet={() => spawn({ type: "pet" }, "pet")}
           onShowPanes={() => {
             if (panes.length > 0) setOverviewOpen(true);
           }}
@@ -2335,54 +2502,6 @@ function App() {
 
       {/* minimized panes now live in the sidebar "OPEN" list (OpenPanesList) —
           no floating overlay. Restore / hide / close all happen from the rail. */}
-
-      {/* close a busy chat: keep running in background, or kill */}
-      {closePrompt && (
-        <div className="absolute inset-0 z-50 grid place-items-center bg-black/50" onClick={() => setClosePrompt(null)}>
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="modal-in w-[400px] rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-4 shadow-2xl"
-          >
-            <div className="text-[13px] font-medium text-[var(--color-text)]">this chat is still working</div>
-            <p className="mt-1 text-[12px] leading-relaxed text-[var(--color-muted)]">
-              keep it running in the background so it finishes the task, or stop it?
-            </p>
-            <div className="mt-4 flex flex-col gap-2">
-              <button
-                onClick={() => {
-                  // Ack-of-an-action-just-taken is noise. The real signal — chat
-                  // done — fires later as a clickable `chat.done` notification.
-                  chatHandles.get(closePrompt)?.detach(true);
-                  closePane(closePrompt);
-                  setClosePrompt(null);
-                }}
-                className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
-              >
-                keep running + notify me when done
-              </button>
-              <button
-                onClick={() => {
-                  chatHandles.get(closePrompt)?.detach(false);
-                  closePane(closePrompt);
-                  setClosePrompt(null);
-                }}
-                className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-[12px] hover:border-[var(--color-accent)]/50"
-              >
-                keep running (no notification)
-              </button>
-              <button
-                onClick={() => {
-                  closePane(closePrompt);
-                  setClosePrompt(null);
-                }}
-                className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-[12px] text-[var(--color-danger)] hover:border-[var(--color-danger)]/50"
-              >
-                stop &amp; close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {settingsOpen && (
         <Suspense fallback={null}>
@@ -2481,7 +2600,6 @@ function MobileBottomNav({
   onNewChat,
   onOpenPalette,
   onOpenBrowser,
-  onOpenPet,
   onShowPanes,
   onOpenSettings,
 }: {
@@ -2489,7 +2607,6 @@ function MobileBottomNav({
   onNewChat: () => void;
   onOpenPalette: () => void;
   onOpenBrowser: () => void;
-  onOpenPet: () => void;
   onShowPanes: () => void;
   onOpenSettings: () => void;
 }) {
@@ -2497,7 +2614,7 @@ function MobileBottomNav({
     { label: "chat", icon: MessageSquare, action: onNewChat },
     { label: "search", icon: Search, action: onOpenPalette },
     { label: "web", icon: Globe, action: onOpenBrowser },
-    { label: panesCount > 0 ? "panes" : "pet", icon: panesCount > 0 ? Layers : Bot, action: panesCount > 0 ? onShowPanes : onOpenPet },
+    { label: "panes", icon: Layers, action: panesCount > 0 ? onShowPanes : onOpenPalette },
     { label: "settings", icon: SettingsIcon, action: onOpenSettings },
   ];
   return (
@@ -3286,6 +3403,7 @@ const PANE_GLYPH: Record<string, typeof Folder> = {
   oracle: Bot,
   tmux: TerminalSquare,
   files: Folder,
+  git: GitBranch,
   browser: Globe,
   notes: NotebookPen,
   bridges: Radio,
@@ -3446,15 +3564,16 @@ const DOT: Record<string, string> = {
   tmux: "status-dot--dormant",
   shell: "status-dot--idle",
   files: "status-dot--cold",
+  git: "status-dot--active",
   browser: "status-dot--cold",
   notes: "status-dot--cold",
   bridges: "status-dot--cold",
   plugins: "status-dot--cold",
-  pet: "status-dot--active",
   pulse: "status-dot--active",
   apps: "status-dot--cold",
   chat: "status-dot--active",
   file: "status-dot--cold",
+  editor: "status-dot--cold",
 };
 
 function PaneLoading() {
@@ -3629,6 +3748,7 @@ function PaneCard({
   onFocus,
   onAnnotate,
   onSendToAi,
+  workspaceContext,
   onOpenFile,
   onOpenEditorFile,
   onOpenViewerFile,
@@ -3661,6 +3781,7 @@ function PaneCard({
   onFocus: () => void;
   onAnnotate: (text: string) => void;
   onSendToAi: (text: string) => void;
+  workspaceContext: ChatWorkspaceContext;
   onOpenFile: (path: string, name: string) => void;
   onOpenEditorFile: (path: string, name: string) => void;
   onOpenViewerFile: (path: string, name: string) => void;
@@ -3685,8 +3806,7 @@ function PaneCard({
   const wrapRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const canAccept = (_kind: PayloadKind): boolean => {
-      // pet/clock-style decorative panes accept nothing; everything else does.
-      return t !== "pet";
+      return true;
     };
     return registerPane({
       key: pane.key,
@@ -3709,6 +3829,18 @@ function PaneCard({
   const [mon, setMon] = useState(false);
   const [openAsOpen, setOpenAsOpen] = useState(false);
   const fileTarget = paneFileTarget(pane.kind);
+  const paneCwd =
+    pane.kind.type === "shell"
+      ? pane.kind.cwd
+      : pane.kind.type === "chat"
+        ? (pane.kind.cwd ?? defaultCwd)
+        : pane.kind.type === "files"
+          ? (pane.kind.root ?? defaultCwd)
+          : pane.kind.type === "git"
+            ? (pane.kind.root ?? defaultCwd)
+          : fileTarget
+            ? containingDir(fileTarget.path)
+            : defaultCwd;
   const toggleMon = () => {
     if (!monTarget) return;
     if (mon) monitorStop(monTarget.session).catch((e) => reportDiag("app.monitor", e, { action: "stop" }));
@@ -3766,7 +3898,7 @@ function PaneCard({
             </button>
             {openAsOpen && (
               <div
-                className="absolute right-0 top-6 z-30 w-36 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] py-1 text-[12px] shadow-2xl"
+                className="absolute right-0 top-6 z-30 w-44 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] py-1 text-[12px] shadow-2xl"
                 onMouseDown={(e) => e.stopPropagation()}
               >
                 {fileTarget && (
@@ -3802,6 +3934,39 @@ function PaneCard({
                   label="duplicate pane"
                   onClick={() => {
                     onDuplicate();
+                    setOpenAsOpen(false);
+                  }}
+                />
+                <div className="my-1 border-t border-[var(--color-border)]" />
+                <PaneActionItem
+                  icon={<Globe size={13} />}
+                  label="new browser"
+                  onClick={() => {
+                    requestSpawnPane("browser", { url: "https://google.com", label: "browser" });
+                    setOpenAsOpen(false);
+                  }}
+                />
+                <PaneActionItem
+                  icon={<TerminalSquare size={13} />}
+                  label="terminal here"
+                  onClick={() => {
+                    requestSpawnPane("terminal", { cwd: paneCwd, label: paneCwd ? `terminal · ${paneCwd.split("/").filter(Boolean).pop()}` : "terminal" });
+                    setOpenAsOpen(false);
+                  }}
+                />
+                <PaneActionItem
+                  icon={<Folder size={13} />}
+                  label="files here"
+                  onClick={() => {
+                    requestSpawnPane("files", { path: paneCwd, label: paneCwd ? `files · ${paneCwd.split("/").filter(Boolean).pop()}` : "files" });
+                    setOpenAsOpen(false);
+                  }}
+                />
+                <PaneActionItem
+                  icon={<MessageSquare size={13} />}
+                  label="chat here"
+                  onClick={() => {
+                    requestSpawnPane("chat", { cwd: paneCwd, label: paneCwd ? `chat · ${paneCwd.split("/").filter(Boolean).pop()}` : "chat" });
                     setOpenAsOpen(false);
                   }}
                 />
@@ -3873,6 +4038,8 @@ function PaneCard({
             <TerminalPane kind={pane.kind} paneKey={pane.key} />
           ) : pane.kind.type === "files" ? (
             <FilesPane initialRoot={pane.kind.root} onOpenFile={onOpenFile} />
+          ) : pane.kind.type === "git" ? (
+            <GitPane initialRoot={pane.kind.root} />
           ) : pane.kind.type === "browser" ? (
             <BrowserPane
               label={pane.key}
@@ -3890,10 +4057,10 @@ function PaneCard({
               active={active}
               initialWindowId={pane.kind.windowId}
             />
-          ) : pane.kind.type === "pet" ? (
-            <PetPane />
           ) : pane.kind.type === "notes" ? (
             <NotesPane onSend={onSendToAi} />
+          ) : pane.kind.type === "memory" ? (
+            <MemoryPane onSend={onSendToAi} />
           ) : pane.kind.type === "bridges" ? (
             <BridgesPane />
           ) : pane.kind.type === "plugins" ? (
@@ -3939,6 +4106,7 @@ function PaneCard({
               agentLabel={pane.kind.type === "chat" ? pane.kind.agentLabel : undefined}
               resume={pane.kind.type === "chat" ? pane.kind.resume : undefined}
               reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}
+              workspaceContext={workspaceContext}
               onOpenUrl={onOpenUrl}
             />
           )}
