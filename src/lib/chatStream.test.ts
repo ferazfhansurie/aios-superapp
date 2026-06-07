@@ -289,3 +289,79 @@ test("finalizeStreamingTurns closes live assistant and thinking blocks", () => {
     ],
   });
 });
+
+// Validates the round-2 rAF coalescing assumption: applying a batch of stream
+// deltas in one folded pass (the flushPending path in ChatPane) must produce the
+// EXACT same state as applying them one at a time as they arrive. If the reducer
+// ever became order/timing-sensitive in a way that broke this, batching would
+// silently corrupt the transcript.
+function applyOneByOne(events) {
+  let state = { turns: [], streamingTurnId: null, thinkingTurnId: null };
+  for (const e of events) {
+    const r = reduceChatStreamEvent(state, e, { now: 100, uid });
+    if (r.handled) state = r.state;
+  }
+  return state;
+}
+function applyFolded(events) {
+  // mirrors flushPending: fold all events through the reducer in a single pass
+  return events.reduce(
+    (state, e) => {
+      const r = reduceChatStreamEvent(state, e, { now: 100, uid });
+      return r.handled ? r.state : state;
+    },
+    { turns: [], streamingTurnId: null, thinkingTurnId: null },
+  );
+}
+
+test("batched delta fold equals one-by-one application (rAF coalescing safety)", () => {
+  const mk = (text) => ({
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+  });
+  const mkThink = (thinking) => ({
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking } },
+  });
+  const events = [
+    mkThink("let me "),
+    mkThink("think"),
+    mk("Hel"),
+    mk("lo "),
+    mk("wor"),
+    mk("ld"),
+  ];
+
+  n = 0;
+  const seq = applyOneByOne(events);
+  n = 0;
+  const folded = applyFolded(events);
+
+  assert.deepEqual(folded.turns, seq.turns, "folded turns must match sequential");
+  assert.equal(folded.streamingTurnId, seq.streamingTurnId);
+  assert.equal(folded.thinkingTurnId, seq.thinkingTurnId);
+  // and the actual content is intact
+  const assistant = folded.turns.find((t) => t.kind === "assistant");
+  const thinking = folded.turns.find((t) => t.kind === "thinking");
+  assert.equal(assistant.text, "Hello world");
+  assert.equal(thinking.text, "let me think");
+});
+
+test("batched fold then assistant-final reconciliation keeps authoritative text", () => {
+  const mk = (text) => ({
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+  });
+  // deltas drop a chunk (simulating a coalesced/lost token), final is authoritative
+  const deltas = [mk("Par"), mk("tial")]; // -> "Partial"
+  n = 0;
+  let state = applyFolded(deltas);
+  const final = reduceChatStreamEvent(
+    state,
+    { type: "assistant", message: { content: [{ type: "text", text: "Partial but actually complete" }] } },
+    { now: 200, uid },
+  );
+  const assistant = final.state.turns.find((t) => t.kind === "assistant");
+  assert.equal(assistant.text, "Partial but actually complete", "final must win over batched deltas");
+  assert.equal(assistant.streaming, false);
+});
