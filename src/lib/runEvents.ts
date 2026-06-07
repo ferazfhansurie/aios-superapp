@@ -121,6 +121,13 @@ function tokensFromUsage(usage: Record<string, unknown> | undefined): number | u
   return total > 0 ? total : undefined;
 }
 
+// Bound the live in-memory event log. Serialization already caps at
+// DEFAULT_PERSISTED_EVENT_LIMIT, but the in-memory array grew unbounded across a
+// long session (slow memory leak + an ever-growing slice on every persist). Keep
+// a generous tail (> the persisted limit) so the visible recent timeline is
+// unaffected.
+const MAX_IN_MEMORY_EVENTS = 1000;
+
 function append(state: RunEventState, events: RunEvent[], phase: RunPhase): RunEventState {
   let activeActionId = state.activeActionId;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -130,8 +137,12 @@ function append(state: RunEventState, events: RunEvent[], phase: RunPhase): RunE
       break;
     }
   }
+  const merged = [...state.events, ...events];
   return {
-    events: [...state.events, ...events],
+    events:
+      merged.length > MAX_IN_MEMORY_EVENTS
+        ? merged.slice(-MAX_IN_MEMORY_EVENTS)
+        : merged,
     phase,
     activeActionId,
   };

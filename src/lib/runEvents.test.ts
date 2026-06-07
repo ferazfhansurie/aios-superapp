@@ -202,3 +202,21 @@ test("run event state parser rejects malformed storage", () => {
     },
   );
 });
+
+test("reduceRunEvents bounds the in-memory event log over a long session", () => {
+  let state = emptyRunEventState();
+  // feed far more text deltas than the in-memory cap (1000)
+  for (let i = 0; i < 3000; i++) {
+    state = reduceRunEvents(state, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: `t${i}` } },
+    });
+  }
+  assert.ok(
+    state.events.length <= 1000,
+    `expected in-memory events bounded to <=1000, got ${state.events.length}`,
+  );
+  // the tail (most recent) must be retained
+  const last = state.events[state.events.length - 1];
+  assert.ok(JSON.stringify(last).includes("t2999"), "most recent event should be kept");
+});
