@@ -1974,12 +1974,7 @@ export function ChatPane({
   const resolveApproval = useCallback(
     (requestId: string, toolName: string, decision: ApprovalDecision) => {
       const id = sessionIdRef.current;
-      if (id != null) {
-        // chat.ts owns the exact control_response shape (buildApprovalLine).
-        chatSendRaw(id, buildApprovalLine(requestId, decision, toolName)).catch(
-          () => {},
-        );
-      }
+      // optimistically reflect the decision on the card so it feels responsive
       setTurns((prev) =>
         prev.map((t) =>
           t.kind === "approval" && t.requestId === requestId
@@ -1987,6 +1982,25 @@ export function ChatPane({
             : t,
         ),
       );
+      if (id != null) {
+        // chat.ts owns the exact control_response shape (buildApprovalLine).
+        chatSendRaw(id, buildApprovalLine(requestId, decision, toolName)).catch(
+          (e) => {
+            reportDiag("chat.approval", e, { action: "resolve", toolName });
+            // the control response never reached claude → the turn is stuck
+            // waiting on an approval it'll never get. surface it instead of
+            // leaving firaz staring at a silently-hung run.
+            setTurns((prev) => [
+              ...prev,
+              {
+                kind: "result",
+                id: uid(),
+                text: `approval for ${toolName} failed to send — the run may be stuck; try stop then resend`,
+              },
+            ]);
+          },
+        );
+      }
     },
     [],
   );
