@@ -139,6 +139,7 @@ import {
   finalizeStreamingTurns,
   reduceChatStreamEvent,
   type ChatTurn,
+  type ChatStreamState,
 } from "../lib/chatStream";
 import { memorySearch, type MemoryHit } from "../lib/memory";
 import {
@@ -176,6 +177,19 @@ type RenderBlock =
 
 let _uid = 0;
 const uid = () => `t${++_uid}`;
+
+/** High-frequency streaming token events that are safe to batch on a rAF tick
+ *  (text/thinking deltas). Structural events — assistant finals, tool results,
+ *  result, control_request/response, system — are NOT coalescable and must be
+ *  applied promptly and in order. */
+function isCoalescableDelta(ev: ChatEvent): boolean {
+  return (
+    ev.type === "stream_event" &&
+    ev.event?.type === "content_block_delta" &&
+    (ev.event.delta?.type === "text_delta" ||
+      ev.event.delta?.type === "thinking_delta")
+  );
+}
 
 /** Debounced localStorage persist. `serialize` returns the string to write, or
  *  null to remove the key. Trailing debounce coalesces rapid changes into one
@@ -1009,6 +1023,11 @@ export function ChatPane({
   const streamingTurnId = useRef<string | null>(null);
   // id of the thinking block currently being streamed (own block, precedes text)
   const thinkingTurnId = useRef<string | null>(null);
+  // high-frequency stream deltas are buffered here and flushed on a single rAF
+  // tick (≤~60Hz) instead of one state update per token — caps the render storm,
+  // markdown re-parses, and layout reads regardless of how fast the model emits.
+  const pendingDeltasRef = useRef<ChatEvent[]>([]);
+  const rafRef = useRef<number | null>(null);
   // last user prompt text actually sent to claude (for regenerate)
   const lastSentRef = useRef<string | null>(null);
   const stopChatRef = useRef<() => void>(() => {});
@@ -1352,7 +1371,10 @@ export function ChatPane({
 
   // ── event ingestion ───────────────────────────────────────────────────────
 
-  const handleEvent = useCallback((ev: ChatEvent) => {
+  // applies ONE event synchronously (the full ingestion logic). handleEvent
+  // below wraps this to coalesce high-frequency deltas; everything else flushes
+  // the buffer first (to preserve order) then applies synchronously here.
+  const applyEvent = useCallback((ev: ChatEvent) => {
     setRunEventState((state) => reduceRunEvents(state, ev));
     // ---- control protocol: tool approval requests + acks --------------------
     // claude → us, non-bypass modes: a `control_request` whose request.subtype
@@ -1551,6 +1573,69 @@ export function ChatPane({
         return;
     }
   }, [rememberUsage]);
+
+  // Apply all buffered stream deltas in ONE pass: a single setRunEventState fold
+  // and a single setTurns fold (threading the streaming/thinking ids through),
+  // so N tokens cost one render instead of N. Safe to call anytime; no-op when
+  // the buffer is empty. Cancels any pending rAF.
+  const flushPending = useCallback(() => {
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    const evs = pendingDeltasRef.current;
+    if (evs.length === 0) return;
+    pendingDeltasRef.current = [];
+    setRunEventState((state) => evs.reduce((s, e) => reduceRunEvents(s, e), state));
+    setTurns((prev) => {
+      let st: ChatStreamState = {
+        turns: prev,
+        streamingTurnId: streamingTurnId.current,
+        thinkingTurnId: thinkingTurnId.current,
+      };
+      const now = Date.now();
+      for (const e of evs) {
+        const r = reduceChatStreamEvent(st, e, { now, uid });
+        if (r.handled) st = r.state;
+      }
+      streamingTurnId.current = st.streamingTurnId;
+      thinkingTurnId.current = st.thinkingTurnId;
+      return st.turns;
+    });
+  }, []);
+
+  const handleEvent = useCallback(
+    (ev: ChatEvent) => {
+      // buffer high-frequency text/thinking deltas; everything else (assistant
+      // finals, tool results, result, control, system) must apply promptly and
+      // IN ORDER, so flush the buffer first then handle it synchronously.
+      if (isCoalescableDelta(ev)) {
+        pendingDeltasRef.current.push(ev);
+        if (rafRef.current == null) {
+          rafRef.current = requestAnimationFrame(() => {
+            rafRef.current = null;
+            flushPending();
+          });
+        }
+        return;
+      }
+      flushPending();
+      applyEvent(ev);
+    },
+    [applyEvent, flushPending],
+  );
+
+  // cancel any in-flight rAF on unmount so a buffered flush never fires a
+  // setState into an unmounted component.
+  useEffect(
+    () => () => {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    },
+    [],
+  );
 
   // ── session lifecycle: one channel + one session per mount ─────────────────
   // `restartKey` lets `/clear` tear down + re-spin the session without changing
@@ -2361,6 +2446,9 @@ export function ChatPane({
   const finalizeStreaming = useCallback(
     (note: string, mode: "interrupt" | "kill-and-restart" = "interrupt") => {
       const id = sessionIdRef.current;
+      // apply any buffered deltas before finalizing, else a pending rAF flush
+      // could re-open the bubble we just closed.
+      flushPending();
       setTurns((prev) =>
         finalizeStreamingTurns(
           {
@@ -2398,7 +2486,7 @@ export function ChatPane({
         }
       }
     },
-    [webChatRuntime],
+    [webChatRuntime, flushPending],
   );
 
   // true interrupt of the in-flight turn (process survives)
