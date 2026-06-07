@@ -365,3 +365,50 @@ test("batched fold then assistant-final reconciliation keeps authoritative text"
   assert.equal(assistant.text, "Partial but actually complete", "final must win over batched deltas");
   assert.equal(assistant.streaming, false);
 });
+
+// End-to-end pipeline replay: a realistic full claude turn (thinking -> text ->
+// assistant final -> AskUserQuestion tool_use -> auto-dismiss tool_result),
+// validating that everything rounds 1-4 touched composes correctly — including
+// that the AskUserQuestion payload the QuestionCard renders survives intact.
+test("full-turn replay: thinking, text, assistant final, AskUserQuestion", () => {
+  n = 0;
+  let state = { turns: [], streamingTurnId: null, thinkingTurnId: null };
+  const push = (ev, now = 100) => {
+    const r = reduceChatStreamEvent(state, ev, { now, uid });
+    if (r.handled) state = r.state;
+  };
+  const delta = (kind, text) => ({
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: kind === "think" ? { type: "thinking_delta", thinking: text } : { type: "text_delta", text } },
+  });
+
+  push(delta("think", "deciding"));
+  push(delta("text", "Here are "));
+  push(delta("text", "your options."));
+  // authoritative assistant final (reconciliation must win, settle streaming)
+  push({ type: "assistant", message: { content: [{ type: "text", text: "Here are your options." }] } }, 150);
+  // AskUserQuestion tool call — the headline feature's source data
+  push({
+    type: "assistant",
+    message: { content: [{
+      type: "tool_use", id: "toolu_q1", name: "AskUserQuestion",
+      input: { questions: [{ question: "Tea or coffee?", header: "Drink", multiSelect: false, options: [{ label: "Tea" }, { label: "Coffee" }] }] },
+    }] },
+  }, 160);
+  // headless auto-dismiss result
+  push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_q1", content: "Answer questions?", is_error: true }] } }, 161);
+
+  const assistant = state.turns.find((t) => t.kind === "assistant");
+  const thinking = state.turns.find((t) => t.kind === "thinking");
+  const auq = state.turns.find((t) => t.kind === "tool" && t.name === "AskUserQuestion");
+
+  assert.equal(assistant.text, "Here are your options.");
+  assert.equal(assistant.streaming, false, "final must settle the bubble");
+  assert.equal(thinking.text, "deciding");
+  assert.ok(auq, "AskUserQuestion must be a tool turn (so ChatPane renders a QuestionCard)");
+  assert.equal(auq.input.questions[0].question, "Tea or coffee?");
+  assert.equal(auq.input.questions[0].options.length, 2, "QuestionCard needs the options intact");
+  assert.equal(auq.isError, true, "auto-dismiss result attaches (card hides this, doesn't render the error)");
+  assert.equal(state.streamingTurnId, null);
+  assert.equal(state.thinkingTurnId, null);
+});
