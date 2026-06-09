@@ -6,7 +6,7 @@
  *
  *  Usage: <PaneDropZone onPath={(p) => insert(p)}>…pane content…</PaneDropZone> */
 import { useEffect, useState } from "react";
-import { AIOS_DIR_MIME, AIOS_PATH_MIME, onAiosDrag } from "../lib/paneBus";
+import { AIOS_DIR_MIME, AIOS_PATH_MIME, getDragPayload, onAiosDrag } from "../lib/paneBus";
 
 /** True when the drag carries our directory marker (a folder row from the Files
  *  pane). Lets a pane do the folder-appropriate thing (`cd`, re-root) instead of
@@ -82,6 +82,17 @@ export function PaneDropZone({
           }}
           onDragLeave={(e) => {
             if (e.currentTarget === e.target) setOver(false);
+          }}
+          // pointer-drag path (in-app drags use mouse events, not HTML5 dnd —
+          // see paneBus.beginPathDrag). Releasing over this overlay IS the drop.
+          onMouseEnter={() => setOver(true)}
+          onMouseLeave={() => setOver(false)}
+          onMouseUp={() => {
+            const payload = getDragPayload();
+            if (!payload) return;
+            setOver(false);
+            if (onDir && payload.isDir && onDir(payload.path)) return;
+            onPath(payload.path);
           }}
           onDrop={(e) => {
             e.preventDefault();

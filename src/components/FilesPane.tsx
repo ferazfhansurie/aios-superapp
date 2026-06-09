@@ -42,7 +42,7 @@ import {
   type GitCode,
 } from "../lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "../lib/run";
-import { AIOS_DIR_MIME, AIOS_PATH_MIME, spawnPane } from "../lib/paneBus";
+import { AIOS_DIR_MIME, AIOS_PATH_MIME, beginPathDrag, consumeDragClick, spawnPane } from "../lib/paneBus";
 import { fileIcon } from "../lib/fileIcons";
 import { PaneDropZone } from "./PaneDropZone";
 
@@ -619,7 +619,14 @@ function TreeRow({
         if (isDir) ev.dataTransfer.setData(AIOS_DIR_MIME, entry.path);
         ev.dataTransfer.effectAllowed = "copy";
       }}
+      // pointer-based in-app drag — the path that actually works inside the
+      // Tauri webview (HTML5 drops get swallowed by the native interception).
+      onMouseDown={(ev) => {
+        if (ev.button !== 0) return;
+        beginPathDrag({ path: entry.path, isDir }, ev.clientX, ev.clientY);
+      }}
       onClick={() => {
+        if (consumeDragClick()) return; // the mouseup ending a drag, not a click
         onSelect();
         if (isDir) onToggle();
         else onOpen();

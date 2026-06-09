@@ -213,6 +213,8 @@ export interface ChatModel {
   disabled?: boolean;
   /** Tooltip note (e.g. availability date) shown for disabled entries. */
   note?: string;
+  /** The flashy new flagship — sparkle icon + "new" badge in the picker. */
+  hot?: boolean;
 }
 
 /**
@@ -234,6 +236,7 @@ export const CHAT_MODELS: ChatModel[] = [
   { id: "gpt-5.4", label: "gpt-5.4 · codex", engine: "codex" },
   { id: "gpt-5.4-mini", label: "gpt-5.4 mini · codex", engine: "codex" },
   { id: "gpt-5.2", label: "gpt-5.2 · codex", engine: "codex" },
+  { id: "claude-fable-5", label: "fable 5", engine: "claude", hot: true },
   { id: "claude-opus-4-8", label: "opus 4.8", engine: "claude" },
   { id: "claude-sonnet-4-6", label: "sonnet 4.6", engine: "claude" },
   { id: "claude-haiku-4-5", label: "haiku 4.5", engine: "claude" },

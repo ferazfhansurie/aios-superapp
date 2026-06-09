@@ -1810,6 +1810,11 @@ export function BrowserPane({
               <span className="max-w-md text-[var(--color-danger)]">
                 native browser failed to load: {showError}
               </span>
+            ) : overlayOpen || contextMenu || dragArmed ? (
+              /* the webview is INTENTIONALLY hidden so an HTML overlay (menu /
+                 context menu / drop zone) can paint above the native view —
+                 saying "loading…" here read like the page was lost. */
+              <span>page hidden while a menu is open</span>
             ) : (
               "loading native browser…"
             )}

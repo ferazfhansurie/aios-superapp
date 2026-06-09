@@ -304,6 +304,8 @@ html, body, #root {
 @keyframes aios-fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes aios-cell-in { from { opacity: 0; transform: scale(0.4); } to { opacity: 1; transform: scale(1); } }
 @keyframes aios-orbit { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+/* Composer ultracode pill — purple gradient shimmer (background-position pendulum loops cleanly). */
+@keyframes aios-ultra-sweep { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
 /* Browser pane navigation progress bar — indeterminate sweep. */
 @keyframes browserprog { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
 @keyframes aios-colon { 0%, 45% { opacity: 1; } 55%, 100% { opacity: 0.25; } }

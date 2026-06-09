@@ -1,7 +1,7 @@
 import type { ChatEvent } from "./chat.ts";
 
 export type ChatTurn =
-  | { kind: "user"; id: string; text: string; steered?: boolean }
+  | { kind: "user"; id: string; text: string; steered?: boolean; images?: string[] }
   | { kind: "assistant"; id: string; text: string; streaming: boolean }
   | {
       kind: "thinking";

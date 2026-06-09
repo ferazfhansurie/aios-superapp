@@ -320,6 +320,95 @@ export function onAiosDrag(fn: DragListener): () => void {
   };
 }
 
+// ── pointer-based in-app drag ────────────────────────────────────────────────
+// HTML5 dnd is unreliable inside the Tauri webview on macOS: with
+// `dragDropEnabled` on (required for Finder→pane drops via onDragDropEvent),
+// WKWebView's native interception can swallow in-app HTML5 `drop` events — the
+// FilesPane→ChatPane drag "just doesn't work". So in-app drags use plain mouse
+// events instead: `beginPathDrag` on row mousedown arms the same `onAiosDrag`
+// signal (so PaneDropZone overlays light up and BrowserPane hides its native
+// webview), floats a ghost label under the cursor, and drop targets read the
+// payload via `getDragPayload()` on mouseup. No dataTransfer involved.
+
+export interface AiosDragPayload {
+  path: string;
+  isDir: boolean;
+}
+
+let dragPayload: AiosDragPayload | null = null;
+// set briefly after a real drag ends so the row's click handler can tell a
+// drag-release apart from a plain click (mouseup fires both).
+let dragEndedAt = 0;
+
+/** The in-flight pointer-drag payload, readable by drop targets on mouseup. */
+export function getDragPayload(): AiosDragPayload | null {
+  return dragPayload;
+}
+
+/** True once shortly after a pointer-drag ended — lets the drag-source row
+ *  swallow the click that the ending mouseup also produces. */
+export function consumeDragClick(): boolean {
+  return Date.now() - dragEndedAt < 200;
+}
+
+/** Start tracking a potential pointer-drag from a row mousedown. Becomes a real
+ *  drag (arms overlays + ghost) only after the cursor moves past a threshold,
+ *  so plain clicks are untouched. Esc cancels. */
+export function beginPathDrag(payload: AiosDragPayload, startX: number, startY: number): void {
+  const THRESHOLD = 5;
+  let started = false;
+  let ghost: HTMLDivElement | null = null;
+  const name = payload.path.replace(/\/+$/, "").split("/").pop() || payload.path;
+  const onMove = (e: MouseEvent) => {
+    if (!started) {
+      if (Math.abs(e.clientX - startX) < THRESHOLD && Math.abs(e.clientY - startY) < THRESHOLD) {
+        return;
+      }
+      started = true;
+      dragPayload = payload;
+      setDragActive(true);
+      ghost = document.createElement("div");
+      ghost.textContent = `${payload.isDir ? "📁" : "📄"} ${name}`;
+      ghost.style.cssText =
+        "position:fixed;z-index:9999;pointer-events:none;padding:3px 10px;border-radius:8px;" +
+        "background:var(--color-panel-2);border:1px solid var(--color-border-strong);" +
+        "color:var(--color-text);font:12px sans-serif;box-shadow:0 8px 24px rgba(0,0,0,0.5);";
+      document.body.appendChild(ghost);
+    }
+    if (ghost) {
+      ghost.style.left = `${e.clientX + 12}px`;
+      ghost.style.top = `${e.clientY + 10}px`;
+    }
+  };
+  const cleanup = () => {
+    document.removeEventListener("mousemove", onMove, true);
+    document.removeEventListener("mouseup", onUp, true);
+    document.removeEventListener("keydown", onKey, true);
+    ghost?.remove();
+    ghost = null;
+  };
+  const onUp = () => {
+    cleanup();
+    if (!started) return;
+    dragEndedAt = Date.now();
+    // capture-phase listener: defer clearing one tick so the drop target's own
+    // (target-phase) mouseup can still read the payload via getDragPayload().
+    setTimeout(() => {
+      dragPayload = null;
+      setDragActive(false);
+    }, 0);
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key !== "Escape") return;
+    cleanup();
+    dragPayload = null;
+    if (started) setDragActive(false);
+  };
+  document.addEventListener("mousemove", onMove, true);
+  document.addEventListener("mouseup", onUp, true);
+  document.addEventListener("keydown", onKey, true);
+}
+
 // Wire the window-level listeners once. We arm the overlays on any in-app HTML5
 // drag (Files-pane row → another pane). NOTE: `dragDropEnabled:true` means OS
 // file drops (Finder → pane) bypass HTML5 entirely and are handled by the

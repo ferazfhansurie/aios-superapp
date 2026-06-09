@@ -22,7 +22,8 @@
  *   7. `/` slash menu (clear / plan / model / help)
  *   8. `@` file-mention picker sourced from cwd
  */
-import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, Fragment, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
@@ -63,6 +64,7 @@ import {
   Waypoints,
   Wrench,
   X,
+  Zap,
 } from "lucide-react";
 import {
   buildApprovalLine,
@@ -1830,7 +1832,7 @@ export function ChatPane({
   // auto-memory, and session recording a normally-typed message would. Routing
   // queued sends through the bare `dispatch` was the "claude queue sucks" gap:
   // the follow-up landed without any of that context.
-  const flushSendRef = useRef<(text: string) => void>(() => {});
+  const flushSendRef = useRef<(text: string, images?: string[]) => void>(() => {});
   useEffect(() => {
     if (streaming) return;
     if (!started) return;
@@ -1839,7 +1841,7 @@ export function ChatPane({
     const [next, ...rest] = queuedRef.current;
     setQueued(rest);
     setQueuedIdx((idx) => (rest.length === 0 ? 0 : Math.min(idx, rest.length - 1)));
-    flushSendRef.current(next.text);
+    flushSendRef.current(next.text, next.images);
   }, [streaming, started]);
 
   // autoscroll on new content — but with a STICKY pause. The moment you scroll
@@ -2041,7 +2043,10 @@ export function ChatPane({
         }
       }
       if (!opts?.skipUserBubble) {
-        setTurns((prev) => [...prev, { kind: "user", id: uid(), text: display }]);
+        setTurns((prev) => [
+          ...prev,
+          { kind: "user", id: uid(), text: display, images: opts?.imagePaths },
+        ]);
       }
       setStreaming(true);
       setBackendBusy(true);
@@ -2125,9 +2130,9 @@ export function ChatPane({
 
   // Queue a message instead of sending it (used while a turn is streaming). It
   // fires automatically when the current turn completes (see the flush effect).
-  const enqueue = useCallback((raw: string) => {
+  const enqueue = useCallback((raw: string, images?: string[]) => {
     setQueued((items) => {
-      const next = queueMessage(items, raw);
+      const next = queueMessage(items, raw, images);
       setQueuedIdx(next.selected);
       return next.items;
     });
@@ -2182,6 +2187,9 @@ export function ChatPane({
     (queuedId: string) => {
       const item = queuedRef.current.find((q) => q.id === queuedId);
       if (!item || model.engine !== "codex") return;
+      // steer is a text-only channel — an entry carrying images must wait for
+      // the normal flush (which sends them as real content blocks).
+      if (item.images?.length) return;
       const id = sessionIdRef.current;
       if (id == null) return;
       chatSteer(id, item.text)
@@ -2198,7 +2206,7 @@ export function ChatPane({
   // external "send to AI" submitter which passes the note body directly so it
   // doesn't race the input state).
   const sendText = useCallback(
-    async (raw: string) => {
+    async (raw: string, queuedImages?: string[]) => {
       const text = raw.trim();
       // Always drain in-flight disk saves before collecting paths. The old guard
       // (`some(path==null) && pendingSavesRef.size`) had a race: a save could
@@ -2208,62 +2216,53 @@ export function ChatPane({
       // dropped (the "image never reaches the model" bug). Awaiting
       // unconditionally + reading the synchronously-mirrored imagesRef AFTER the
       // await closes that window entirely.
-      if (pendingSavesRef.current.size) {
+      if (!queuedImages && pendingSavesRef.current.size) {
         await Promise.allSettled([...pendingSavesRef.current.values()]);
       }
       // attached images are sent as REAL image content blocks (the backend reads
       // these temp paths → base64/localImage), so they land on every turn, not
       // just the first. allow a send with images even when the text is empty.
-      const imgPaths = imagesRef.current
-        .filter((im) => im.path)
-        .map((im) => im.path as string);
+      // A queue flush passes its OWN images (queuedImages) and must not touch
+      // the composer's — those belong to whatever the user is drafting next.
+      const fromComposer = !queuedImages;
+      const imgPaths = queuedImages
+        ?? imagesRef.current.filter((im) => im.path).map((im) => im.path as string);
       reportDiag("chat.image", "sendText:collect", {
-        total: imagesRef.current.length,
+        total: queuedImages ? queuedImages.length : imagesRef.current.length,
         withPath: imgPaths.length,
+        queued: !fromComposer,
       });
       if (!text && imgPaths.length === 0) return;
       // Submitting while a turn is still streaming → queue it (ChatGPT-style),
-      // don't silently drop. Text queues + auto-fires when the turn finishes
-      // (the flush effect routes it back through here). Images can't ride a
-      // text-only queue entry, so a still-streaming send WITH an attachment is
-      // surfaced rather than swallowed.
+      // don't silently drop. The queue entry carries the image temp paths, so
+      // attachments fire with THEIR message when the turn finishes — the old
+      // "images stay in the composer, resend them" gap is gone.
       if (streaming) {
-        if (text) {
-          enqueue(text);
-          if (imgPaths.length > 0) {
-            setTurns((prev) => [
-              ...prev,
-              {
-                kind: "result",
-                id: uid(),
-                text: "queued your message — attached image(s) stay in the composer; resend them once the current turn finishes.",
-              },
-            ]);
-          }
+        enqueue(text, imgPaths.length ? imgPaths : undefined);
+        if (fromComposer && imgPaths.length) {
+          setImagesSync((prev) => {
+            prev.forEach((im) => URL.revokeObjectURL(im.url));
+            return [];
+          });
         }
         return;
       }
       if (sessionIdRef.current == null) {
-        if (imgPaths.length === 0) {
-          enqueue(text);
-          setInput("");
-          setOverlay(null);
-          setTurns((prev) => [
-            ...prev,
-            {
-              kind: "result",
-              id: uid(),
-              text: "chat is still starting — queued message will send automatically.",
-            },
-          ]);
-          return;
+        enqueue(text, imgPaths.length ? imgPaths : undefined);
+        if (fromComposer && imgPaths.length) {
+          setImagesSync((prev) => {
+            prev.forEach((im) => URL.revokeObjectURL(im.url));
+            return [];
+          });
         }
+        setInput("");
+        setOverlay(null);
         setTurns((prev) => [
           ...prev,
           {
             kind: "result",
             id: uid(),
-            text: "chat session isn't ready yet. retry this message after startup and attachments will be included.",
+            text: "chat is still starting — queued message will send automatically.",
           },
         ]);
         return;
@@ -2298,10 +2297,12 @@ export function ChatPane({
           chatSetTitle(sessionIdRef.current, stableTitle).catch((e) => reportDiag("chat.title", e, { action: "setTitle" }));
       }
       setInput("");
-      setImagesSync((prev) => {
-        prev.forEach((im) => URL.revokeObjectURL(im.url));
-        return [];
-      });
+      if (fromComposer) {
+        setImagesSync((prev) => {
+          prev.forEach((im) => URL.revokeObjectURL(im.url));
+          return [];
+        });
+      }
       setOverlay(null);
       const attachedMemoryBlock = memoryContextBlock(attachedMemories);
       let autoMemories: MemoryHit[] = [];
@@ -2370,8 +2371,8 @@ export function ChatPane({
   // The queue-flush effect (declared earlier) fires queued messages through the
   // full send path so they get the same context capsule / memory / recording a
   // freshly-typed message gets.
-  flushSendRef.current = (text: string) => {
-    void sendText(text).catch((e) => reportDiag("chat.send", e, { action: "queueFlush" }));
+  flushSendRef.current = (text: string, images?: string[]) => {
+    void sendText(text, images).catch((e) => reportDiag("chat.send", e, { action: "queueFlush" }));
   };
 
   // ── launcher seed: auto-send as the first turn ─────────────────────────────
@@ -3100,8 +3101,6 @@ export function ChatPane({
               >
                 {chip.id === "cwd" ? (
                   <Folder size={12} className="shrink-0 text-[var(--color-accent)]" />
-                ) : chip.id === "engine" ? (
-                  <Terminal size={12} className="shrink-0 text-[var(--color-muted)]" />
                 ) : chip.id === "attachments" ? (
                   <ImageIcon size={12} className="shrink-0 text-[var(--color-accent)]" />
                 ) : chip.id === "queue" ? (
@@ -3191,15 +3190,18 @@ export function ChatPane({
           }`}
           title="estimated tokens added by the next send; exact billing comes from provider usage"
         >
-          <span>{estimatedContextTokens.toLocaleString()} est tok</span>
-          {contextBuckets.map((bucket) => (
-            <span
-              key={bucket.id}
-              className={bucket.level === "warning" ? "text-[var(--color-warning)]" : undefined}
-            >
-              {bucket.label}:{bucket.tokens.toLocaleString()}
-            </span>
-          ))}
+          <span>~{estimatedContextTokens.toLocaleString()} tok next send</span>
+          {/* per-bucket breakdown only when there's an actual breakdown — a
+              single bucket just repeats the total ("agent:650" noise). */}
+          {contextBuckets.length > 1 &&
+            contextBuckets.map((bucket) => (
+              <span
+                key={bucket.id}
+                className={bucket.level === "warning" ? "text-[var(--color-warning)]" : undefined}
+              >
+                · {bucket.label} {bucket.tokens.toLocaleString()}
+              </span>
+            ))}
         </div>
 
         {memoryPanelOpen && (
@@ -3429,7 +3431,14 @@ export function ChatPane({
                     className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
                   />
                 ) : (
-                  <span className="min-w-0 flex-1 truncate">{q.text}</span>
+                  <span className="min-w-0 flex-1 truncate">
+                    {q.text || "(image only)"}
+                  </span>
+                )}
+                {q.images && q.images.length > 0 && (
+                  <span className="flex shrink-0 items-center gap-1 font-mono text-[10px] text-[var(--color-accent)]">
+                    <ImageIcon size={11} /> {q.images.length}
+                  </span>
                 )}
                 <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">queued</span>
                 {editingQueuedId === q.id ? (
@@ -3606,8 +3615,10 @@ export function ChatPane({
             </div>
           )}
           <div className="flex flex-wrap items-center justify-end gap-1.5 px-3 pb-3 pt-1">
-            {/* advanced controls stay available, but the composer stays clean. */}
-            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            {/* advanced controls stay available, but the composer stays clean.
+                min-w-0 + wrap (NOT shrink-0): on a narrow pane the pills wrap to
+                a second row instead of bleeding out the left edge of the card. */}
+            <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
             {!empty && (
               <button
                 type="button"
@@ -3676,21 +3687,6 @@ export function ChatPane({
                 </span>
               </MenuItem>
               <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
-                access
-              </div>
-              {PERMISSION_MODES.map((p) => (
-                <MenuItem
-                  key={p.id}
-                  active={p.id === permission.id}
-                  onClick={() => {
-                    setPermission(p);
-                    setOpenMenu(null);
-                  }}
-                >
-                  {p.label}
-                </MenuItem>
-              ))}
-              <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
                 context
               </div>
               {CONTEXT_BUDGETS.map((b) => (
@@ -3718,65 +3714,195 @@ export function ChatPane({
                   </span>
                 </MenuItem>
               ))}
-              <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
+            </Dropdown>
+            {/* permission mode — promoted out of the wrench menu: what the
+                agent is ALLOWED to do is a safety setting, not an advanced
+                tool. Subtle when restricted, accent-tinted on full access. */}
+            <Dropdown
+              open={openMenu === "perm"}
+              onToggle={() => setOpenMenu(openMenu === "perm" ? null : "perm")}
+              align="right"
+              triggerClassName={
+                permission.id === "bypassPermissions"
+                  ? "flex items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-panel)]/70 px-3 py-1 font-sans text-[12px] font-medium text-[var(--color-text-2)] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-text)]"
+                  : "flex items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 px-3 py-1 font-sans text-[12px] font-medium text-[var(--color-text-2)] transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+              }
+              trigger={
+                <>
+                  <ShieldQuestion
+                    size={13}
+                    className={`shrink-0 ${
+                      permission.id === "bypassPermissions"
+                        ? "text-[var(--color-accent)]"
+                        : "text-[var(--color-muted)]"
+                    }`}
+                  />
+                  <span className="whitespace-nowrap">{permission.label}</span>
+                  <ChevronDown size={12} className="text-[var(--color-faint)]" />
+                </>
+              }
+            >
+              <div className="px-3 pb-1 pt-1.5 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
+                access
+              </div>
+              {PERMISSION_MODES.map((p) => (
+                <MenuItem
+                  key={p.id}
+                  active={p.id === permission.id}
+                  onClick={() => {
+                    setPermission(p);
+                    setOpenMenu(null);
+                  }}
+                >
+                  {p.label}
+                </MenuItem>
+              ))}
+            </Dropdown>
+            {/* mic — one-click voice dictation (the wrench menu still has it,
+                but voice deserves a visible button). Recording swaps the
+                textarea for the waveform; this hides until idle again. */}
+            {voicePhase === "idle" && (
+              <button
+                type="button"
+                onClick={() => void micStart()}
+                className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-accent-soft)] hover:text-[var(--color-accent)]"
+                title="dictate (esc to cancel)"
+              >
+                <Mic size={15} />
+              </button>
+            )}
+            {/* effort selector — promoted out of the wrench menu so the
+                reasoning tier is always one click away. The pill is
+                tier-colored: faint → accent as effort climbs, animated purple
+                gradient at ultracode. */}
+            <Dropdown
+              open={openMenu === "effort"}
+              onToggle={() => setOpenMenu(openMenu === "effort" ? null : "effort")}
+              align="right"
+              triggerClassName={
+                effort.ultra
+                  ? "flex items-center gap-1.5 rounded-full border border-transparent bg-[linear-gradient(110deg,#7c3aed,#a855f7,#ec4899,#a855f7,#7c3aed)] bg-[length:220%_100%] px-3 py-1 font-sans text-[12px] font-semibold text-white shadow-[0_0_16px_-3px_#a855f7] [animation:aios-ultra-sweep_4s_ease_infinite] transition-shadow hover:shadow-[0_0_20px_-2px_#a855f7]"
+                  : effort.id === "xhigh" || effort.id === "max"
+                    ? "flex items-center gap-1.5 rounded-full border border-[var(--color-accent)]/60 bg-[var(--color-accent-soft)] px-3 py-1 font-sans text-[12px] font-semibold text-[var(--color-text)] shadow-[0_0_12px_-4px_var(--color-accent)] transition-colors hover:border-[var(--color-accent)]"
+                    : "flex items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 px-3 py-1 font-sans text-[12px] font-medium text-[var(--color-text-2)] transition-colors hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)]"
+              }
+              trigger={
+                <>
+                  {effort.ultra ? (
+                    <Sparkles size={13} className="shrink-0" />
+                  ) : (
+                    <Zap
+                      size={13}
+                      className={`shrink-0 ${
+                        effort.id === "xhigh" || effort.id === "max"
+                          ? "text-[var(--color-accent)]"
+                          : "text-[var(--color-muted)]"
+                      }`}
+                    />
+                  )}
+                  <span className="whitespace-nowrap">
+                    {effortChipLabel(effort.id, effort.label, model.engine ?? "claude")}
+                  </span>
+                  <ChevronDown size={12} className={effort.ultra ? "text-white/70" : "text-[var(--color-faint)]"} />
+                </>
+              }
+            >
+              <div className="px-3 pb-1 pt-1.5 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
                 effort
               </div>
               {EFFORTS.map((ef) => (
                 <MenuItem
                   key={ef.id}
                   active={ef.id === effort.id}
+                  title={ef.sub}
                   onClick={() => {
                     setEffort(ef);
                     setOpenMenu(null);
                   }}
                 >
-                  <span className="flex items-center gap-2">
-                    {ef.ultra && <Sparkles size={13} className="text-[#a855f7]" />}
-                    {ef.label}
+                  <span className="flex min-w-0 flex-col">
+                    <span className="flex items-center gap-2">
+                      {ef.ultra && <Sparkles size={13} className="text-[#a855f7]" />}
+                      {ef.label}
+                    </span>
+                    {ef.sub && (
+                      <span className="truncate text-[10.5px] text-[var(--color-faint)]">{ef.sub}</span>
+                    )}
                   </span>
                 </MenuItem>
               ))}
             </Dropdown>
-            {/* model selector (right) */}
+            {/* model selector (right) — the headline pill: accent glow, hot
+                models get the sparkle. */}
             <Dropdown
               open={openMenu === "model"}
               onToggle={() => setOpenMenu(openMenu === "model" ? null : "model")}
               align="right"
+              triggerClassName={
+                model.hot
+                  ? "flex items-center gap-1.5 rounded-full border border-[var(--color-accent)]/60 bg-[var(--color-accent-soft)] px-3 py-1 font-sans text-[12px] font-semibold text-[var(--color-text)] shadow-[0_0_16px_-3px_var(--color-accent)] transition-all hover:border-[var(--color-accent)] hover:shadow-[0_0_20px_-2px_var(--color-accent)]"
+                  : "flex items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1 font-sans text-[12px] font-semibold text-[var(--color-text)] shadow-[0_0_12px_-5px_var(--color-accent)] transition-colors hover:border-[var(--color-accent)]"
+              }
               trigger={
                 <>
+                  {model.hot ? (
+                    <Sparkles size={13} className="shrink-0 text-[var(--color-accent)]" />
+                  ) : (
+                    <Brain size={13} className="shrink-0 text-[var(--color-accent)]" />
+                  )}
                   <span className="whitespace-nowrap">{model.label}</span>
                   <ChevronDown size={12} className="text-[var(--color-faint)]" />
                 </>
               }
             >
-              {CHAT_MODELS.map((m) => (
-                <MenuItem
-                  key={m.id}
-                  active={m.id === model.id}
-                  disabled={m.disabled}
-                  title={m.note}
-                  onClick={() => {
-                    if (m.disabled) return;
-                    setModel(m);
-                    // picking a model sets it as the global default (sticks
-                    // across panes + restarts). engine omitted = claude.
-                    saveSettings({
-                      chatModel: m.id,
-                      chatProvider: `${m.engine ?? "claude"}-cli`,
-                    });
-                    setOpenMenu(null);
-                  }}
-                >
-                  <span className="flex items-center gap-2">
-                    {m.label}
-                    {m.disabled && m.note && (
-                      <span className="rounded bg-[var(--color-panel)] px-1.5 py-0.5 text-[10px] text-[var(--color-faint)]">
-                        {m.note}
-                      </span>
+              {CHAT_MODELS.map((m, i) => {
+                const eng = m.engine ?? "claude";
+                const prevEng = i > 0 ? (CHAT_MODELS[i - 1].engine ?? "claude") : null;
+                return (
+                  <Fragment key={m.id}>
+                    {eng !== prevEng && (
+                      <div
+                        className={`px-3 pb-1 pt-1.5 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)] ${
+                          i > 0 ? "mt-1 border-t border-[var(--color-border)] pt-2" : ""
+                        }`}
+                      >
+                        {eng === "codex" ? "codex · chatgpt sub" : eng === "opencode" ? "opencode · free" : "claude"}
+                      </div>
                     )}
-                  </span>
-                </MenuItem>
-              ))}
+                    <MenuItem
+                      active={m.id === model.id}
+                      disabled={m.disabled}
+                      title={m.note}
+                      onClick={() => {
+                        if (m.disabled) return;
+                        setModel(m);
+                        // picking a model sets it as the global default (sticks
+                        // across panes + restarts). engine omitted = claude.
+                        saveSettings({
+                          chatModel: m.id,
+                          chatProvider: `${m.engine ?? "claude"}-cli`,
+                        });
+                        setOpenMenu(null);
+                      }}
+                    >
+                      <span className="flex items-center gap-2">
+                        {m.hot && <Sparkles size={13} className="text-[var(--color-accent)]" />}
+                        {m.label}
+                        {m.hot && (
+                          <span className="rounded-full bg-[var(--color-accent-soft)] px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-[0.08em] text-[var(--color-accent)]">
+                            new
+                          </span>
+                        )}
+                        {m.disabled && m.note && (
+                          <span className="rounded bg-[var(--color-panel)] px-1.5 py-0.5 text-[10px] text-[var(--color-faint)]">
+                            {m.note}
+                          </span>
+                        )}
+                      </span>
+                    </MenuItem>
+                  </Fragment>
+                );
+              })}
             </Dropdown>
 
             {voicePhase === "transcribing" ? (
@@ -3976,7 +4102,7 @@ export function ChatPane({
           )}
           {composer}
           <div className="mt-3 flex items-center justify-center gap-3 font-mono text-[11px] text-[var(--color-faint)]">
-            <span>{started ? "claude · ready" : "starting claude…"}</span>
+            <span>{started ? "ready" : `starting ${model.engine ?? "claude"}…`}</span>
             <span className="text-[var(--color-border-strong)]">·</span>
             <span className="inline-flex items-center gap-1">
               <Slash size={10} /> commands
@@ -4791,9 +4917,23 @@ const UserBubble = memo(function UserBubble({
           <Waypoints size={10} /> steered into the running turn
         </span>
       )}
-      <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-[var(--color-accent-soft)] px-4 py-2.5 font-sans text-[14px] leading-relaxed text-[var(--color-text)]">
-        {turn.text}
-      </div>
+      {turn.images && turn.images.length > 0 && (
+        <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5">
+          {turn.images.map((p) => (
+            <img
+              key={p}
+              src={fileSrc(p)}
+              alt="attached image"
+              className="h-24 max-w-[180px] rounded-xl border border-[var(--color-border-strong)] object-cover"
+            />
+          ))}
+        </div>
+      )}
+      {turn.text && !(turn.images?.length && /^\[\d+ images?\]$/.test(turn.text)) && (
+        <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-[var(--color-accent-soft)] px-4 py-2.5 font-sans text-[14px] leading-relaxed text-[var(--color-text)]">
+          {turn.text}
+        </div>
+      )}
       <div className="flex items-center gap-0.5 pr-0.5 opacity-0 transition-opacity group-hover:opacity-100">
         <CopyButton text={turn.text} title="copy message" />
         <button
@@ -5631,9 +5771,42 @@ function Dropdown({
   /** Override the trigger pill styling (e.g. the ultracode gradient). */
   triggerClassName?: string;
 }) {
+  // The panel renders through a PORTAL to document.body, fixed-positioned above
+  // the trigger. An absolutely-positioned menu inside a pane card got clipped at
+  // the window edge AND hidden under overlapping sibling cards (each card is its
+  // own stacking context) — the portal escapes both. Repositions on window
+  // resize / any scroll while open, and clamps to the viewport with internal
+  // scroll for tall menus.
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const [pos, setPos] = useState<{ left?: number; right?: number; bottom: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!open) {
+      setPos(null);
+      return;
+    }
+    const place = () => {
+      const b = btnRef.current?.getBoundingClientRect();
+      if (!b) return;
+      const pad = 8;
+      const bottom = window.innerHeight - b.top + 6;
+      if (align === "right") {
+        setPos({ right: Math.max(pad, window.innerWidth - b.right), bottom });
+      } else {
+        setPos({ left: Math.max(pad, b.left), bottom });
+      }
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open, align]);
   return (
     <div className="relative">
       <button
+        ref={btnRef}
         type="button"
         onClick={onToggle}
         className={
@@ -5643,15 +5816,24 @@ function Dropdown({
       >
         {trigger}
       </button>
-      {open && (
-        <div
-          className={`absolute bottom-full z-30 mb-1.5 min-w-[140px] overflow-hidden rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50 ${
-            align === "right" ? "right-0" : "left-0"
-          }`}
-        >
-          {children}
-        </div>
-      )}
+      {open &&
+        pos &&
+        createPortal(
+          <div
+            style={{
+              position: "fixed",
+              bottom: pos.bottom,
+              left: pos.left,
+              right: pos.right,
+              zIndex: 70,
+              maxWidth: "min(92vw, 360px)",
+            }}
+            className="max-h-[min(55vh,420px)] min-w-[140px] overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50"
+          >
+            {children}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

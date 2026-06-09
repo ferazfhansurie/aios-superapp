@@ -358,7 +358,7 @@ test("codex usage surfaces pace-risk warnings", () => {
 
   assert.match(chatPane, /usagePaceRisk/);
   assert.match(chatPane, /contextLedger/);
-  assert.match(chatPane, /est tok/);
+  assert.match(chatPane, /tok next send/);
   assert.match(usageGlance, /PaceWarning/);
   assert.match(usageGlance, /usagePaceRisk/);
   assert.match(usagePace, /fast pace/);
@@ -580,9 +580,15 @@ test("native browser and appcast panes resync through fullscreen settle", () => 
   for (const source of [browser, appcast]) {
     assert.match(source, /syncSettled/);
     assert.match(source, /fullscreenchange/);
-    assert.match(source, /\[40, 120, 260, 520, 900\]/);
-    assert.match(source, /setInterval\(sync, 250\)/);
   }
+  // AppCast still uses the staged settle cadence, with a slow 1s safety poll.
+  assert.match(appcast, /\[40, 120, 260, 520, 900\]/);
+  assert.match(appcast, /setInterval\(\(\) => sync\(\), 1000\)/);
+  // BrowserPane was reworked: debounced settle (no timer storm) + RO-driven
+  // bounds with a slow 1s safety poll instead of the 250ms hammer.
+  assert.match(browser, /resizeTimer = setTimeout\(sync, 120\)/);
+  assert.match(browser, /setInterval\(sync, 1000\)/);
+  assert.match(browser, /new ResizeObserver\(sync\)/);
 });
 
 test("files pane exposes ide-grade workspace context actions", () => {

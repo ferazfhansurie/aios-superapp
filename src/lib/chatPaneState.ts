@@ -1,6 +1,10 @@
 export interface QueuedMessage {
   id: string;
   text: string;
+  /** Temp-file paths of images attached when the message was queued — they
+   *  ride the queue entry (not composer state) so a queued image can't be
+   *  dropped or stolen by a later draft. */
+  images?: string[];
 }
 
 export interface QueueState {
@@ -173,11 +177,21 @@ export function usageStack(current: number, initial: number): UsageStack {
   return { baseline, session: total - baseline, total };
 }
 
-/** Append one non-empty pending steer message and highlight the new row. */
-export function queueMessage(items: QueuedMessage[], raw: string): QueueState {
+/** Append one pending steer message and highlight the new row. Empty text is
+ *  allowed when images ride along (image-only queue entry). */
+export function queueMessage(
+  items: QueuedMessage[],
+  raw: string,
+  images?: string[],
+): QueueState {
   const text = raw.trim();
-  if (!text) return { items, selected: Math.max(0, items.length - 1) };
-  const next = [...items, { id: `q${++queueSeq}`, text }];
+  if (!text && !images?.length) {
+    return { items, selected: Math.max(0, items.length - 1) };
+  }
+  const next = [
+    ...items,
+    { id: `q${++queueSeq}`, text, ...(images?.length ? { images } : {}) },
+  ];
   return { items: next, selected: next.length - 1 };
 }
 
@@ -308,14 +322,12 @@ export function stopStrategy(engine: string | null | undefined): ChatStopStrateg
   return engine === "opencode" ? "kill-and-restart" : "interrupt";
 }
 
-/** Compact chips shown above the composer, ordered by operational importance. */
+/** Compact chips shown above the composer, ordered by operational importance.
+ *  Engine/model/effort/permission are NOT chips — they have their own
+ *  interactive pills in the composer row; repeating them here was noise. */
 export function composerContextChips(input: ComposerContextInput): ComposerContextChip[] {
   const chips: ComposerContextChip[] = [];
   if (input.cwd) chips.push({ id: "cwd", label: basename(input.cwd) });
-  chips.push({ id: "engine", label: input.engine });
-  chips.push({ id: "model", label: input.modelLabel });
-  chips.push({ id: "effort", label: input.effortLabel });
-  chips.push({ id: "permission", label: input.permissionLabel });
   chips.push({ id: "budget", label: input.contextBudget });
   if (input.imageCount > 0) {
     chips.push({

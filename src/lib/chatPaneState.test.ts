@@ -246,10 +246,6 @@ test("composerContextChips exposes the control contract at a glance", () => {
     }),
     [
       { id: "cwd", label: "shell" },
-      { id: "engine", label: "codex" },
-      { id: "model", label: "gpt-5.3 codex spark" },
-      { id: "effort", label: "low" },
-      { id: "permission", label: "full access" },
       { id: "budget", label: "lean" },
       { id: "attachments", label: "1 image" },
       { id: "queue", label: "2 queued" },
