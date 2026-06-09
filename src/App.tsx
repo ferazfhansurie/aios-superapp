@@ -202,6 +202,42 @@ const TerminalPane = lazy(() =>
   import("./components/TerminalPane").then((m) => ({ default: m.TerminalPane })),
 );
 
+// Idle prefetch of the heavy lazy chunks. Opening a pane for the first time
+// used to pay its chunk fetch + parse ON CLICK — worst case the editor pulls
+// the ~3.7MB monaco chunk, a visible main-thread stall ("laggy when opening
+// things"). Warm them after first paint instead, staggered so the warmup
+// itself never competes with real interaction. Failures are ignored — this is
+// purely an optimization.
+if (typeof window !== "undefined") {
+  // setTimeout staggers the tiers; requestIdleCallback then waits for an
+  // actually-quiet frame within each window so the parse never lands mid-click.
+  const warmAt = (delayMs: number, load: () => Promise<unknown>) => {
+    window.setTimeout(() => {
+      const go = () => void load().catch(() => {});
+      if ("requestIdleCallback" in window) window.requestIdleCallback(go, { timeout: 3000 });
+      else go();
+    }, delayMs);
+  };
+  // tier 1 (~2s): the panes firaz opens constantly
+  warmAt(2000, () => Promise.all([
+    import("./components/ChatPane"),
+    import("./components/TerminalPane"),
+    import("./components/FilesPane"),
+  ]));
+  // tier 2 (~7s): heavy but common — editor drags in the monaco chunk
+  warmAt(7000, () => Promise.all([
+    import("./components/EditorPane"),
+    import("./components/BrowserPane"),
+  ]));
+  // tier 3 (~14s): the rest of the catalog
+  warmAt(14000, () => Promise.all([
+    import("./components/MemoryPane"),
+    import("./components/GitPane"),
+    import("./components/NotesPane"),
+    import("./components/Settings"),
+  ]));
+}
+
 interface Pane {
   key: string;
   label: string;
@@ -3651,7 +3687,7 @@ function OpenPanesList({
         {!iconsOnly && <span>open</span>}
         {!iconsOnly && <span className="text-[var(--color-faint)]">({panes.length})</span>}
       </div>
-      {panes.map((p) => {
+      {panes.map((p, paneIdx) => {
         const hidden = hiddenKeys.includes(p.key);
         const active = activeKey === p.key && !hidden;
         const maximized = maximizedKey === p.key;
@@ -3689,14 +3725,27 @@ function OpenPanesList({
                 setDraft(p.label);
                 setEditKey(p.key);
               }}
+              // middle-click closes — browser-tab muscle memory
+              onAuxClick={(e) => {
+                if (e.button === 1) {
+                  e.preventDefault();
+                  onClose(p.key);
+                }
+              }}
               className={`flex min-w-0 flex-1 items-center gap-2.5 px-2.5 py-1.5 text-left text-[13px] transition-colors ${
                 hidden ? "text-[var(--color-faint)]" : "text-[var(--color-text-2)] group-hover:text-[var(--color-text)]"
               } ${iconsOnly ? "justify-center gap-0 px-0 text-center" : ""}`}
-              title={hidden ? `restore pane: ${p.label}` : `focus pane: ${p.label} · double-click to rename`}
+              title={hidden ? `restore pane: ${p.label}` : `focus pane: ${p.label} · double-click to rename · middle-click to close`}
             >
               <span className={`status-dot shrink-0 ${hidden ? "status-dot--cold" : DOT[p.kind.type] ?? "status-dot--cold"}`} />
               {!iconsOnly && <span className="truncate">{p.label}</span>}
               {!iconsOnly && maximized && <Maximize2 size={10} className="shrink-0 text-[var(--color-accent)]" />}
+              {/* ⌘N jump hint — teaches the existing shortcut, hover-only */}
+              {!iconsOnly && paneIdx < 9 && (
+                <span className="ml-auto shrink-0 pl-1 font-mono text-[9.5px] text-[var(--color-faint)] opacity-0 transition-opacity group-hover:opacity-100">
+                  ⌘{paneIdx + 1}
+                </span>
+              )}
             </button>
             {!iconsOnly && <div className="flex shrink-0 items-center pr-1 opacity-0 transition-opacity group-hover:opacity-100">
               <button

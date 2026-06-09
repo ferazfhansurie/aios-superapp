@@ -4135,54 +4135,18 @@ export function ChatPane({
               <ResumedNote title={resumedTitle} onClear={() => setResumedTitle(null)} />
             </div>
           )}
-          {blocks.map((b, i) =>
-            b.kind === "activity" ? (
-              <ActivityGroup
-                key={b.id}
-                tools={b.tools}
-                durationMs={b.durationMs}
-                // live only on the final activity group, while a turn is in
-                // flight and it hasn't been closed by a result yet
-                live={streaming && b.durationMs == null && i === lastActivityIdx}
-                // pass the START timestamp (stable per-turn), not a per-second
-                // elapsed value — the leaf owns its own 1Hz tick so this prop
-                // change doesn't re-render the whole list every second.
-                liveStart={liveStart}
-              />
-            ) : b.kind === "user" ? (
-              <UserBubble
-                key={b.id}
-                turn={b.turn}
-                streaming={streaming}
-                onRegenerate={regenerate}
-              />
-            ) : b.kind === "assistant" ? (
-              <AssistantBubble
-                key={b.id}
-                turn={b.turn}
-                onButton={handleAssistantButton}
-                disabled={streaming}
-                onOpenUrl={onOpenUrl}
-              />
-            ) : b.kind === "thinking" ? (
-              <ThinkingBlock key={b.id} turn={b.turn} />
-            ) : b.kind === "approval" ? (
-              <ApprovalCard
-                key={b.id}
-                turn={b.turn}
-                onResolve={resolveApproval}
-              />
-            ) : b.kind === "question" ? (
-              <QuestionCard
-                key={b.id}
-                turn={b.turn}
-                answered={answeredQuestions[b.turn.id]}
-                onAnswer={handleQuestionAnswer}
-              />
-            ) : (
-              <ResultFooter key={b.id} turn={b.turn} />
-            ),
-          )}
+          <TranscriptBlocks
+            blocks={blocks}
+            streaming={streaming}
+            lastActivityIdx={lastActivityIdx}
+            liveStart={liveStart}
+            onRegenerate={regenerate}
+            onAssistantButton={handleAssistantButton}
+            onOpenUrl={onOpenUrl}
+            onResolveApproval={resolveApproval}
+            answeredQuestions={answeredQuestions}
+            onQuestionAnswer={handleQuestionAnswer}
+          />
           {/* turn in flight with neither streamed text nor a live activity group
               yet (the very first beat) → the bare working timer */}
           {streaming &&
@@ -4900,6 +4864,79 @@ function CopyButton({
     </button>
   );
 }
+
+/** The conversation body, extracted + memo'd so composer keystrokes — which
+ *  re-render the whole ChatPane (input is root state) — stop re-building and
+ *  re-diffing the entire transcript element tree on every keypress. That diff
+ *  was the main source of typing lag in long chats. All handler props are
+ *  useCallback-stable, so this only re-renders when blocks/stream state move. */
+const TranscriptBlocks = memo(function TranscriptBlocks({
+  blocks,
+  streaming,
+  lastActivityIdx,
+  liveStart,
+  onRegenerate,
+  onAssistantButton,
+  onOpenUrl,
+  onResolveApproval,
+  answeredQuestions,
+  onQuestionAnswer,
+}: {
+  blocks: RenderBlock[];
+  streaming: boolean;
+  lastActivityIdx: number;
+  liveStart: number | null;
+  onRegenerate: () => void;
+  onAssistantButton: (label: string) => void;
+  onOpenUrl?: (url: string) => void;
+  onResolveApproval: (requestId: string, toolName: string, decision: ApprovalDecision) => void;
+  answeredQuestions: Record<string, string>;
+  onQuestionAnswer: (turnId: string, text: string) => void;
+}) {
+  return (
+    <>
+      {blocks.map((b, i) =>
+        b.kind === "activity" ? (
+          <ActivityGroup
+            key={b.id}
+            tools={b.tools}
+            durationMs={b.durationMs}
+            // live only on the final activity group, while a turn is in
+            // flight and it hasn't been closed by a result yet
+            live={streaming && b.durationMs == null && i === lastActivityIdx}
+            // pass the START timestamp (stable per-turn), not a per-second
+            // elapsed value — the leaf owns its own 1Hz tick so this prop
+            // change doesn't re-render the whole list every second.
+            liveStart={liveStart}
+          />
+        ) : b.kind === "user" ? (
+          <UserBubble key={b.id} turn={b.turn} streaming={streaming} onRegenerate={onRegenerate} />
+        ) : b.kind === "assistant" ? (
+          <AssistantBubble
+            key={b.id}
+            turn={b.turn}
+            onButton={onAssistantButton}
+            disabled={streaming}
+            onOpenUrl={onOpenUrl}
+          />
+        ) : b.kind === "thinking" ? (
+          <ThinkingBlock key={b.id} turn={b.turn} />
+        ) : b.kind === "approval" ? (
+          <ApprovalCard key={b.id} turn={b.turn} onResolve={onResolveApproval} />
+        ) : b.kind === "question" ? (
+          <QuestionCard
+            key={b.id}
+            turn={b.turn}
+            answered={answeredQuestions[b.turn.id]}
+            onAnswer={onQuestionAnswer}
+          />
+        ) : (
+          <ResultFooter key={b.id} turn={b.turn} />
+        ),
+      )}
+    </>
+  );
+});
 
 const UserBubble = memo(function UserBubble({
   turn,
