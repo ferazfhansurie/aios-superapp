@@ -989,9 +989,10 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
         .unwrap_or_default();
 
     // Images — frontend renders via the asset protocol, no inline payload.
+    // KEEP IN SYNC with src/lib/fileKinds.ts IMG_EXT
     if matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico"
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif"
     ) {
         return Ok(json!({
             "kind": "image",
@@ -1042,6 +1043,7 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
 
     // Quick media detection: route common video formats directly into the in-pane
     // player instead of generic binary rendering.
+    // KEEP IN SYNC with src/lib/fileKinds.ts VIDEO_EXT
     if matches!(ext.as_str(), "mp4" | "mov" | "webm" | "m4v" | "avi" | "mkv") {
         return Ok(json!({
             "kind": "video",
@@ -1053,11 +1055,12 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
     }
 
     // Known text/code extensions, OR anything that decodes cleanly as UTF-8.
+    // KEEP IN SYNC with src/lib/fileKinds.ts CODE_EXT ∪ TEXT_EXT
     let texty = matches!(
         ext.as_str(),
-        "txt" | "md" | "markdown" | "json" | "jsonl" | "csv" | "tsv" | "yaml" | "yml"
-            | "toml" | "log" | "ini" | "cfg" | "conf" | "env" | "xml" | "html" | "htm"
-            | "css" | "scss" | "less" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+        "txt" | "md" | "markdown" | "json" | "jsonc" | "jsonl" | "csv" | "tsv" | "yaml" | "yml"
+            | "toml" | "log" | "rst" | "ini" | "cfg" | "conf" | "env" | "xml" | "html" | "htm"
+            | "css" | "scss" | "less" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
             | "rs" | "py" | "rb" | "go" | "java" | "kt" | "kts" | "swift" | "c" | "h"
             | "cpp" | "cc" | "hpp" | "cs" | "php" | "sh" | "bash" | "zsh" | "fish"
             | "sql" | "dart" | "lua" | "pl" | "r" | "scala" | "clj" | "ex" | "exs"
@@ -1092,6 +1095,8 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
 }
 
 /// Office / document formats LibreOffice can render to PDF.
+/// KEEP IN SYNC with src/lib/fileKinds.ts DOC_EXT (subset — iWork
+/// key/numbers/pages route to the viewer but LibreOffice can't convert them).
 fn is_office_ext(ext: &str) -> bool {
     matches!(
         ext,

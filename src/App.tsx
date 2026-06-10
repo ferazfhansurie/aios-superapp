@@ -51,6 +51,7 @@ import {
 
 import { recallUrl, recallPaneUrl, forgetUrl } from "./lib/browser-mem";
 import { browserOpenDevtools, setWindowFullscreen } from "./lib/browser";
+import { VIEWER_EXT } from "./lib/fileKinds";
 import { AccountMenu } from "./components/AccountMenu";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FileFinder } from "./components/FileFinder";
@@ -302,16 +303,6 @@ function buildWorkspaceContext(
   };
 }
 
-// Files that render in the viewer (images / pdf / office / binary); everything
-// else opens in the Monaco editor pane (the editor itself falls back to "open
-// externally" if the file turns out to be binary).
-const VIEWER_EXT = new Set([
-  "png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico",
-  "md", "markdown",
-  "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "key", "numbers", "pages",
-  "zip", "gz", "tar", "dmg", "app", "mp4", "mov", "webm", "m4v", "avi", "mkv", "mp3", "wav", "woff", "woff2", "ttf",
-]);
-
 const INTERACTIVE_SELECTOR = [
   "button",
   "a",
@@ -323,8 +314,8 @@ const INTERACTIVE_SELECTOR = [
   "[data-no-window-drag]",
 ].join(",");
 
-/** Pick the pane kind for opening a file: viewer for media/binaries, else the
- *  code editor. */
+/** Pick the pane kind for opening a file: viewer for media/binaries (the
+ *  canonical VIEWER_EXT set in lib/fileKinds.ts), else the code editor. */
 function paneForFile(path: string, name: string): PaneContent {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return VIEWER_EXT.has(ext)
