@@ -199,12 +199,51 @@ test("sendContract makes streaming send behavior explicit", () => {
       disabled: false,
     },
   );
+  // claude steers mid-turn now (stdin injection, verified vs claude 2.1.170) —
+  // with or without images (the stdin user line carries image content blocks).
   assert.deepEqual(
     sendContract({
       streaming: true,
       hasDraft: true,
       hasImages: false,
       engine: "claude",
+      started: true,
+    }),
+    {
+      mode: "steer",
+      label: "steer",
+      title: "inject into the running claude turn",
+      disabled: false,
+    },
+  );
+  assert.equal(
+    sendContract({
+      streaming: true,
+      hasDraft: false,
+      hasImages: true,
+      engine: "claude",
+      started: true,
+    }).mode,
+    "steer",
+  );
+  // codex turn/steer is text-only — an image-carrying draft queues instead.
+  assert.equal(
+    sendContract({
+      streaming: true,
+      hasDraft: true,
+      hasImages: true,
+      engine: "codex",
+      started: true,
+    }).mode,
+    "queue",
+  );
+  // opencode has no live mid-turn process → queue.
+  assert.equal(
+    sendContract({
+      streaming: true,
+      hasDraft: true,
+      hasImages: false,
+      engine: "opencode",
       started: true,
     }).mode,
     "queue",

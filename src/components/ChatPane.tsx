@@ -72,7 +72,6 @@ import {
   chatDetach,
   chatReattach,
   chatSend,
-  chatSteer,
   chatSendRaw,
   chatSetTitle,
   chatStart,
@@ -157,6 +156,18 @@ import { reportDiag } from "../lib/diag";
 import { pushNotification } from "../lib/notifications";
 
 // ── transcript model ──────────────────────────────────────────────────────
+
+/**
+ * Mid-turn steer, per engine (backed by chat.rs `chat_steer`): claude injects
+ * the user line (with image content blocks) into the persistent process's
+ * stdin — verified against claude 2.1.170, the line is folded into the SAME
+ * running turn; codex fires `turn/steer` (text-only). Rejects (no live turn /
+ * unsupported engine / codex+images) → caller falls back to the queue.
+ * lib/chat.ts's `chatSteer` wrapper is owned by another track and still
+ * text-only, so the command is invoked directly here for the image arg.
+ */
+const steerTurn = (id: number, text: string, imagePaths?: string[]) =>
+  invoke<void>("chat_steer", { sessionId: id, text, imagePaths: imagePaths ?? null });
 
 type Turn = ChatTurn;
 
@@ -2128,9 +2139,57 @@ export function ChatPane({
   // keep the flush effect calling the latest dispatch closure
   dispatchRef.current = dispatch;
 
+  // FIX 3b — pin queued temp images until they're sent. Queue entries reference
+  // paste temp files under /tmp/aios-paste; the OS (or anything else) can reap
+  // those before the queue drains, and the backend's user_line_with_images
+  // SILENTLY skips unreadable paths — the message would flush with its images
+  // gone. So at queue time we slurp the bytes into memory, and just before the
+  // entry fires we re-write them to the SAME content-hashed path (save_image_temp
+  // is deterministic on content), making the flush immune to temp-file lifetime.
+  // OS-dropped files (real user files outside aios-paste) are durable already.
+  const pinnedImagesRef = useRef<Map<string, { b64: string; ext: string }>>(new Map());
+  const pinQueuedImages = useCallback((paths: string[]) => {
+    for (const path of paths) {
+      if (!path.includes("aios-paste") || pinnedImagesRef.current.has(path)) continue;
+      void (async () => {
+        try {
+          const res = await fetch(fileSrc(path));
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          let bin = "";
+          const CHUNK = 0x8000;
+          for (let i = 0; i < bytes.length; i += CHUNK) {
+            bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+          }
+          const ext = path.split(".").pop() ?? "png";
+          pinnedImagesRef.current.set(path, { b64: btoa(bin), ext });
+        } catch (e) {
+          reportDiag("chat.image", e, { action: "pinQueued", path });
+        }
+      })();
+    }
+  }, []);
+  const restorePinnedImages = useCallback(async (paths: string[]) => {
+    await Promise.allSettled(
+      paths.map(async (path) => {
+        const pin = pinnedImagesRef.current.get(path);
+        if (!pin) return;
+        try {
+          // content-hashed filename → rewriting the same bytes recreates the
+          // exact same path; harmless when the file still exists.
+          await saveImageTemp(pin.b64, pin.ext);
+        } catch (e) {
+          reportDiag("chat.image", e, { action: "restorePinned", path });
+        } finally {
+          pinnedImagesRef.current.delete(path);
+        }
+      }),
+    );
+  }, []);
+
   // Queue a message instead of sending it (used while a turn is streaming). It
   // fires automatically when the current turn completes (see the flush effect).
   const enqueue = useCallback((raw: string, images?: string[]) => {
+    if (images?.length) pinQueuedImages(images);
     setQueued((items) => {
       const next = queueMessage(items, raw, images);
       setQueuedIdx(next.selected);
@@ -2138,9 +2197,11 @@ export function ChatPane({
     });
     setInput("");
     setOverlay(null);
-  }, []);
+  }, [pinQueuedImages]);
 
   const removeQueued = useCallback((id: string) => {
+    const gone = queuedRef.current.find((q) => q.id === id);
+    gone?.images?.forEach((path) => pinnedImagesRef.current.delete(path));
     setQueued((items) => {
       const next = removeQueuedMessage({ items, selected: queuedIdx }, id);
       setQueuedIdx(next.selected);
@@ -2181,25 +2242,39 @@ export function ChatPane({
     });
   }, [queuedIdx]);
 
-  // Explicitly inject one highlighted pending message into a live codex turn.
+  // Explicitly inject one highlighted pending message into the live turn.
+  // claude steers over stdin (images ride as real content blocks); codex steers
+  // via turn/steer (text-only — image entries wait for the normal flush).
   // If the backend cannot steer yet, leave it queued so normal auto-send wins.
   const steerQueued = useCallback(
     (queuedId: string) => {
       const item = queuedRef.current.find((q) => q.id === queuedId);
-      if (!item || model.engine !== "codex") return;
-      // steer is a text-only channel — an entry carrying images must wait for
-      // the normal flush (which sends them as real content blocks).
-      if (item.images?.length) return;
+      const engine = model.engine ?? "claude";
+      if (!item || (engine !== "codex" && engine !== "claude")) return;
+      if (engine === "codex" && item.images?.length) return;
       const id = sessionIdRef.current;
       if (id == null) return;
-      chatSteer(id, item.text)
-        .then(() => {
+      void (async () => {
+        try {
+          if (item.images?.length) await restorePinnedImages(item.images);
+          await steerTurn(id, item.text, item.images);
           removeQueued(queuedId);
-          setTurns((prev) => [...prev, { kind: "user", id: uid(), text: item.text, steered: true }]);
-        })
-        .catch((e) => reportDiag("chat.steer", e, { action: "queued" })); // no active turn yet → keep queued for automatic send
+          const bubble =
+            item.text ||
+            (item.images?.length
+              ? `[${item.images.length} image${item.images.length > 1 ? "s" : ""}]`
+              : "");
+          setTurns((prev) => [
+            ...prev,
+            { kind: "user", id: uid(), text: bubble, steered: true, images: item.images },
+          ]);
+        } catch (e) {
+          // no active turn yet → keep queued for automatic send
+          reportDiag("chat.steer", e, { action: "queued" });
+        }
+      })();
     },
-    [model.engine, removeQueued],
+    [model.engine, removeQueued, restorePinnedImages],
   );
 
   // Send an explicit string (used by send() with the composer text, and by the
@@ -2216,45 +2291,87 @@ export function ChatPane({
       // dropped (the "image never reaches the model" bug). Awaiting
       // unconditionally + reading the synchronously-mirrored imagesRef AFTER the
       // await closes that window entirely.
-      if (!queuedImages && pendingSavesRef.current.size) {
+      if (pendingSavesRef.current.size) {
         await Promise.allSettled([...pendingSavesRef.current.values()]);
       }
       // attached images are sent as REAL image content blocks (the backend reads
       // these temp paths → base64/localImage), so they land on every turn, not
       // just the first. allow a send with images even when the text is empty.
-      // A queue flush passes its OWN images (queuedImages) and must not touch
-      // the composer's — those belong to whatever the user is drafting next.
-      const fromComposer = !queuedImages;
+      //
+      // FIX 3a — a queue flush passes the entry's OWN images (queuedImages), and
+      // anything attached to the composer SINCE the entry was queued is MERGED in
+      // (dedup by path) instead of silently thrown away: the old `queuedImages ??
+      // composer` meant "queue a message, then attach the screenshot it needs"
+      // dropped the screenshot when the entry flushed. Composer chips that ride
+      // along are consumed (cleared) like any sent attachment.
+      const composerPaths = imagesRef.current
+        .filter((im) => im.path)
+        .map((im) => im.path as string);
       const imgPaths = queuedImages
-        ?? imagesRef.current.filter((im) => im.path).map((im) => im.path as string);
+        ? [...new Set([...queuedImages, ...composerPaths])]
+        : composerPaths;
+      const consumeComposerImages = () => {
+        if (composerPaths.length === 0) return;
+        setImagesSync((prev) => {
+          prev.forEach((im) => URL.revokeObjectURL(im.url));
+          return [];
+        });
+      };
       reportDiag("chat.image", "sendText:collect", {
-        total: queuedImages ? queuedImages.length : imagesRef.current.length,
+        total: imagesRef.current.length,
         withPath: imgPaths.length,
-        queued: !fromComposer,
+        queued: Boolean(queuedImages),
       });
       if (!text && imgPaths.length === 0) return;
-      // Submitting while a turn is still streaming → queue it (ChatGPT-style),
-      // don't silently drop. The queue entry carries the image temp paths, so
-      // attachments fire with THEIR message when the turn finishes — the old
-      // "images stay in the composer, resend them" gap is gone.
-      if (streaming) {
-        enqueue(text, imgPaths.length ? imgPaths : undefined);
-        if (fromComposer && imgPaths.length) {
-          setImagesSync((prev) => {
-            prev.forEach((im) => URL.revokeObjectURL(im.url));
-            return [];
-          });
+      // FIX 3b — a flushing queue entry's temp files may have been reaped since
+      // it was queued; rewrite any pinned bytes back to their paths first so
+      // the backend never silently skips them.
+      if (queuedImages?.length) {
+        await restorePinnedImages(queuedImages);
+      }
+      // Submitting while a turn is in flight: STEER it into the running turn
+      // when the engine supports it (claude = stdin inject incl. images, codex
+      // = turn/steer text-only), render it as a normal sent bubble; otherwise
+      // queue it ChatGPT-style to fire when the turn finishes.
+      if (activeRunRef.current) {
+        const engine = model.engine ?? "claude";
+        const sid = sessionIdRef.current;
+        const steerable =
+          sid != null &&
+          !webChatRuntime &&
+          (engine === "claude" || (engine === "codex" && imgPaths.length === 0));
+        if (steerable) {
+          try {
+            await steerTurn(sid, text, imgPaths.length ? imgPaths : undefined);
+            const bubble =
+              text || `[${imgPaths.length} image${imgPaths.length > 1 ? "s" : ""}]`;
+            setTurns((prev) => [
+              ...prev,
+              {
+                kind: "user",
+                id: uid(),
+                text: bubble,
+                steered: true,
+                images: imgPaths.length ? imgPaths : undefined,
+              },
+            ]);
+            consumeComposerImages();
+            setInput("");
+            setOverlay(null);
+            return;
+          } catch (e) {
+            // no live turn after all (it just ended / hasn't started) or the
+            // write failed → fall back to the queue; the flush effect wins.
+            reportDiag("chat.steer", e, { action: "sendText" });
+          }
         }
+        enqueue(text, imgPaths.length ? imgPaths : undefined);
+        consumeComposerImages();
         return;
       }
       if (sessionIdRef.current == null) {
         enqueue(text, imgPaths.length ? imgPaths : undefined);
-        if (fromComposer && imgPaths.length) {
-          setImagesSync((prev) => {
-            prev.forEach((im) => URL.revokeObjectURL(im.url));
-            return [];
-          });
-        }
+        consumeComposerImages();
         setInput("");
         setOverlay(null);
         setTurns((prev) => [
@@ -2297,12 +2414,7 @@ export function ChatPane({
           chatSetTitle(sessionIdRef.current, stableTitle).catch((e) => reportDiag("chat.title", e, { action: "setTitle" }));
       }
       setInput("");
-      if (fromComposer) {
-        setImagesSync((prev) => {
-          prev.forEach((im) => URL.revokeObjectURL(im.url));
-          return [];
-        });
-      }
+      consumeComposerImages();
       setOverlay(null);
       const attachedMemoryBlock = memoryContextBlock(attachedMemories);
       let autoMemories: MemoryHit[] = [];
@@ -2346,23 +2458,13 @@ export function ChatPane({
     // `images` intentionally NOT a dep: sendText reads the synchronously-mirrored
     // imagesRef.current (fresh after the pending-save await), so depending on the
     // images STATE would only re-create this closure on every attach for nothing.
-    [streaming, dispatch, cwd, model, attachedMemories, effectiveBudget, workspaceContext, runEventState.phase, setImagesSync],
+    // `streaming` is read through activeRunRef (always-fresh), not as a dep.
+    [dispatch, cwd, model, attachedMemories, effectiveBudget, workspaceContext, runEventState.phase, setImagesSync, enqueue, restorePinnedImages, webChatRuntime],
   );
 
+  // The single submit entry — sendText routes per state: idle → normal send;
+  // turn in flight → steer (claude/codex) or queue; session not up → queue.
   const send = useCallback(() => sendText(input), [sendText, input]);
-
-  const steerDraft = useCallback(() => {
-    const text = input.trim();
-    const id = sessionIdRef.current;
-    if (!text || model.engine !== "codex" || id == null) return;
-    chatSteer(id, text)
-      .then(() => {
-        setTurns((prev) => [...prev, { kind: "user", id: uid(), text, steered: true }]);
-        setInput("");
-        setOverlay(null);
-      })
-      .catch(() => enqueue(text));
-  }, [input, model.engine, enqueue]);
 
   // Keep a fresh ref to sendText so the external submitter (registered once per
   // paneKey) always calls the latest closure without re-registering.
@@ -2931,7 +3033,8 @@ export function ChatPane({
       }
     }
     // Pending steer list behaves like the slash menu: arrows choose a queued
-    // follow-up, then Enter injects the highlighted row into a live codex turn.
+    // follow-up, then Enter injects the highlighted row into the live turn
+    // (claude stdin inject / codex turn/steer — steerQueued routes per engine).
     if (streaming && input.trim() === "" && queued.length > 0) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
@@ -2989,13 +3092,10 @@ export function ChatPane({
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      // mid-turn Enter is explicit now: Codex steers the active turn; engines
-      // without true steering queue the follow-up for the next turn.
-      if (activeRun) {
-        if (model.engine === "codex") steerDraft();
-        else enqueue(input);
-      }
-      else send();
+      // one entry point: sendText routes a mid-turn Enter per engine — claude
+      // injects into the running turn over stdin, codex fires turn/steer
+      // (text-only), opencode/image-on-codex queues for the next turn.
+      send();
     }
   };
 
@@ -3478,7 +3578,9 @@ export function ChatPane({
                 >
                   <ArrowDown size={12} />
                 </button>
-                {model.engine === "codex" && streaming && (
+                {streaming &&
+                  ((model.engine ?? "claude") === "claude" ||
+                    (model.engine === "codex" && !q.images?.length)) && (
                   <button
                     type="button"
                     onClick={() => steerQueued(q.id)}
@@ -3917,10 +4019,7 @@ export function ChatPane({
                 {hasDraft && (
                   <button
                     type="button"
-                    onClick={() => {
-                      if (action.mode === "steer") steerDraft();
-                      else enqueue(input);
-                    }}
+                    onClick={send}
                     disabled={action.disabled}
                     className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
                     title={action.title}
@@ -3994,7 +4093,6 @@ export function ChatPane({
       saveQueuedEdit,
       moveQueued,
       steerQueued,
-      steerDraft,
       planMode,
       goal,
       overlay,

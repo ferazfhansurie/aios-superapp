@@ -270,11 +270,18 @@ export function sendContract(input: ComposerSendContractInput): ComposerSendCont
         disabled: true,
       };
     }
-    if (input.engine === "codex") {
+    // claude steers mid-turn over stdin (images ride as content blocks, so
+    // attachments steer too); codex steers via turn/steer (text-only — an
+    // image-carrying draft queues instead). opencode has no live process to
+    // steer → queue.
+    const steers =
+      input.engine === "claude" ||
+      (input.engine === "codex" && !input.hasImages);
+    if (steers) {
       return {
         mode: "steer",
         label: "steer",
-        title: "inject into the running codex turn",
+        title: `inject into the running ${input.engine} turn`,
         disabled: false,
       };
     }
