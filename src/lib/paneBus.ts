@@ -69,6 +69,16 @@ export const paneImageDrop = new Map<string, (paths: string[]) => void>();
 /** What kind of payload a drop carries, so a pane can opt out (canAccept). */
 export type PayloadKind = "path" | "url" | "image" | "files";
 
+/** Lightweight context a pane exposes about what it's showing — lets
+ *  cross-cutting features (spawn-with-context, drops, future routing) read
+ *  "where is this pane rooted" without kind-specific switches. All fields
+ *  optional; a pane reports whatever applies. */
+export interface PaneContext {
+  cwd?: string;
+  url?: string;
+  file?: string;
+}
+
 export interface PaneHandle {
   key: string;
   type: string;
@@ -76,6 +86,8 @@ export interface PaneHandle {
   getRect: () => DOMRect | null;
   /** Whether this pane wants a payload of the given kind. */
   canAccept: (kind: PayloadKind) => boolean;
+  /** Optional: what the pane is currently showing (cwd / url / file). */
+  getContext?: () => PaneContext;
 }
 
 /** Every mounted PaneCard registers here keyed by pane key. */
@@ -91,15 +103,25 @@ export function registerPane(handle: PaneHandle): () => void {
 /** Resolve the pane key under a CSS-pixel point, topmost-wins. Iterates the
  *  registry's live rects rather than the DOM, so it's robust over native
  *  webviews. Iteration order = insertion; later-mounted panes win ties (matches
- *  z-order well enough for a non-overlapping grid). Returns null if no pane. */
-export function paneKeyAtPoint(x: number, y: number): string | null {
+ *  z-order well enough for a non-overlapping grid). Returns null if no pane.
+ *
+ *  When `payload` is given, panes whose `canAccept(payload)` declines are
+ *  skipped — ALL drop hit-testing routes through here so opting out of a
+ *  payload kind is honored at the registry, not ad-hoc per call site. */
+export function paneKeyAtPoint(x: number, y: number, payload?: PayloadKind): string | null {
   let hit: string | null = null;
   for (const handle of paneRegistry.values()) {
+    if (payload && !handle.canAccept(payload)) continue;
     const r = handle.getRect();
     if (!r) continue;
     if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) hit = handle.key;
   }
   return hit;
+}
+
+/** Read a pane's self-reported context ({} when the pane reports none). */
+export function paneContextFor(key: string): PaneContext {
+  return paneRegistry.get(key)?.getContext?.() ?? {};
 }
 
 // ── per-pane drop sinks (R2b) ────────────────────────────────────────────────
@@ -203,7 +225,7 @@ export function revealFileInPane(path: string, name: string): boolean {
 // a fresh pane of a given kind, carrying just enough context to root/seed it. App
 // translates the (kind, ctx) into a real PaneContent + label and spawns it
 // (reusing the existing `spawn`, so the exit-fullscreen-on-spawn behavior applies).
-export type SpawnPaneKind = "terminal" | "files" | "browser" | "chat" | "memory" | "git";
+export type SpawnPaneKind = "terminal" | "files" | "browser" | "chat" | "memory" | "git" | "chrome";
 
 /** Context a spawn carries. Only the fields relevant to the target kind are read:
  *  - terminal → `cwd` (shell starts there)
@@ -244,6 +266,84 @@ export function spawnPane(kind: SpawnPaneKind, ctx?: SpawnCtx): boolean {
   if (!spawnPaneImpl) return false;
   spawnPaneImpl(kind, ctx);
   return true;
+}
+
+// ── pane-nav: the global keybind contract (FROZEN for wave-2 consumers) ──────
+// Cockpit-wide shortcuts fire as native menu accelerators in src-tauri/lib.rs
+// (so they work even when focus sits inside a child webview) and arrive in the
+// React layer as a Tauri event:
+//
+//   event:   "pane-nav"
+//   payload: { action: PaneNavAction, index?: number }   // index: 1-based, goto only
+//
+// App.tsx owns the single listener and routes BY FOCUSED PANE: it first offers
+// the action to the focused pane's registered handler (below); only if no
+// handler consumes it does the app-level default run (⌘F → fullscreen toggle,
+// ⌘W → close pane, …). Pane components subscribe with `onPaneNav(key, handler)`
+// and return true to consume — e.g. a browser pane consumes "find" to open
+// find-in-page, an editor consumes "save". The window-keydown fallback in
+// App.tsx routes through the SAME dispatcher, so handlers work in web builds.
+
+export type PaneNavAction =
+  | "find"
+  | "save"
+  | "close"
+  | "goto"
+  | "palette"
+  | "sidebar"
+  | "quickopen"
+  | "globalsearch"
+  | "newtab";
+
+export interface PaneNavEvent {
+  action: PaneNavAction;
+  /** 1-based pane ordinal — present only for `goto` (⌘1-9). */
+  index?: number;
+}
+
+/** Return true to consume the action (App's default behavior is skipped). */
+export type PaneNavHandler = (ev: PaneNavEvent) => boolean | void;
+
+const paneNavHandlers = new Map<string, PaneNavHandler>();
+
+/** Register a pane's keybind handler (keyed by pane key). Last-write-wins per
+ *  key; returns an unregister fn — pair with the pane's mount lifecycle. */
+export function onPaneNav(key: string, handler: PaneNavHandler): () => void {
+  paneNavHandlers.set(key, handler);
+  return () => {
+    if (paneNavHandlers.get(key) === handler) paneNavHandlers.delete(key);
+  };
+}
+
+/** Offer a pane-nav action to the pane's registered handler. Returns true when
+ *  the pane consumed it (callers then skip the app-level default). */
+export function dispatchPaneNav(key: string | null | undefined, ev: PaneNavEvent): boolean {
+  if (!key) return false;
+  const handler = paneNavHandlers.get(key);
+  if (!handler) return false;
+  try {
+    return handler(ev) === true;
+  } catch {
+    return false; // a broken handler must not eat the app-level default
+  }
+}
+
+// ── unified focus: the active pane, readable from anywhere ───────────────────
+// App owns focus as React state; the keybind router and future panes need a
+// synchronous read without prop-drilling. App registers a getter once.
+
+let activePaneGetter: (() => string | null) | null = null;
+
+export function registerActivePane(get: () => string | null): () => void {
+  activePaneGetter = get;
+  return () => {
+    if (activePaneGetter === get) activePaneGetter = null;
+  };
+}
+
+/** The pane key that currently holds cockpit focus (null when none/idle). */
+export function getActivePaneKey(): string | null {
+  return activePaneGetter?.() ?? null;
 }
 
 // ── open-url-in-pane channel ─────────────────────────────────────────────────

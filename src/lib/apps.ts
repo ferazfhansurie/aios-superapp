@@ -24,6 +24,10 @@ export type PaneContent =
   | { type: "files"; root?: string }
   | { type: "git"; root?: string }
   | { type: "browser"; url?: string; profile?: string; memKey?: string; transient?: boolean }
+  // CDP "real Chrome as a pane" (CdpChromePane): a supervised Chrome tab
+  // screencast into a canvas. `url` is optional seed context (carried for
+  // spawn-with-context callers; the pane currently opens its own default).
+  | { type: "chrome"; url?: string }
   | { type: "appcast"; windowId?: number }
   | { type: "notes" }
   | { type: "memory" }
@@ -73,6 +77,10 @@ export const SPAWN: AppDef[] = [
   { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools", firstClass: true },
   { id: "git", kind: { type: "git" }, icon: GitBranch, label: "git", group: "tools", firstClass: true },
   { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools", firstClass: true },
+  // Real supervised Chrome over CDP (CdpChromePane). Not first-class: seeds
+  // hidden in the sidebar, reachable via ⌘K / un-hide. The legacy dev palette
+  // entry ("dev: real chrome") still opens it as an overlay.
+  { id: "chrome", kind: { type: "chrome" }, icon: Globe, label: "Chrome", group: "tools" },
   { id: "apps", kind: { type: "apps" }, icon: MonitorUp, label: "apps", group: "tools" },
   // App-cast (ScreenCaptureKit spike): live-mirror a native macOS window in a
   // pane. Hidden by default (not firstClass) — reachable via ⌘K. macOS-only.

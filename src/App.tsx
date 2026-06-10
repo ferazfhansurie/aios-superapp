@@ -105,6 +105,9 @@ import {
   openSettingsTo,
   paneKeyForChatSession,
   registerSpawnPane,
+  dispatchPaneNav,
+  registerActivePane,
+  type PaneNavEvent,
   type SpawnPaneKind,
   type SpawnCtx,
   type PayloadKind,
@@ -138,7 +141,7 @@ import {
 } from "./lib/agentController";
 import type { AgentAuditEntry } from "./lib/agentActions";
 import { buildMirrorSnapshot, type MirrorSnapshot } from "./lib/mirror";
-import { gridTrackStorageKey, movePane } from "./lib/paneLayout";
+import { gridTrackStorageKey, migrateLayoutPanes, movePane, newPaneKey } from "./lib/paneLayout";
 import {
   clearAllNotifications,
   clearNotification,
@@ -184,6 +187,9 @@ const AppAttachPane = lazy(() =>
 const AppCastPane = lazy(() => import("./components/AppCastPane").then((m) => ({ default: m.AppCastPane })));
 const BridgesPane = lazy(() => import("./components/BridgesPane").then((m) => ({ default: m.BridgesPane })));
 const BrowserPane = lazy(() => import("./components/BrowserPane").then((m) => ({ default: m.BrowserPane })));
+const CdpChromePane = lazy(() =>
+  import("./components/CdpChromePane").then((m) => ({ default: m.CdpChromePane })),
+);
 const ChatPane = lazy(() => import("./components/ChatPane").then((m) => ({ default: m.ChatPane })));
 const EditorPane = lazy(() => import("./components/EditorPane").then((m) => ({ default: m.EditorPane })));
 const FilesPane = lazy(() => import("./components/FilesPane").then((m) => ({ default: m.FilesPane })));
@@ -262,6 +268,8 @@ function paneContextDetail(kind: PaneContent): string | undefined {
       return kind.root;
     case "browser":
       return kind.url;
+    case "chrome":
+      return kind.url;
     case "appcast":
       return kind.windowId != null ? `window ${kind.windowId}` : undefined;
     case "chat":
@@ -323,19 +331,12 @@ function paneForFile(path: string, name: string): PaneContent {
     : { type: "editor", path, name };
 }
 
-let seq = 0;
-const nextKey = () => `k${++seq}-${Math.random().toString(36).slice(2, 6)}`;
-
-/** Advance `seq` past a restored pane key's numeric index so a freshly-minted
- *  key (`nextKey`) can never collide with a persisted one (B1). Restored keys
- *  have the shape `k<seq>-<rand>`; parse the <seq> and keep `seq` ahead of it. */
-function reserveKeySeq(key: string) {
-  const m = /^k(\d+)-/.exec(key);
-  if (m) {
-    const n = Number(m[1]);
-    if (Number.isFinite(n) && n > seq) seq = n;
-  }
-}
+// STABLE PANE KEYS (wave 1B): keys are minted ONCE at spawn via
+// paneLayout.newPaneKey (`k-<kind>-<shortid>`), persisted with the layout and
+// REUSED on restore — never re-randomized per launch. Terminal panes derive
+// their tmux session (`aios-term-<key>`) from the key, so key stability across
+// restarts IS session reattach. Legacy `k<seq>-<rand>` keys restore verbatim
+// (different shape → no collision with freshly minted ones).
 
 /** Derives the `aios-term-<name>` session SUFFIX from a pane key — MUST match
  *  `termSessionName` in TerminalRuntime.tsx (kept inline here so the reaper
@@ -385,28 +386,33 @@ function loadLayout(): Pane[] {
   try {
     const raw = localStorage.getItem(LAYOUT_KEY);
     if (!raw) return [];
-    const saved = JSON.parse(raw) as { key?: string; label: string; kind: PaneContent }[];
-    if (!Array.isArray(saved)) return [];
+    // B1 + wave 1B: REUSE persisted keys so a restored terminal pane keeps its
+    // original pane key → `termSessionName` derives the SAME `aios-term-<name>`
+    // and reattaches to the session its claude/codex was running in. Layouts
+    // saved BEFORE keys existed get one minted ONCE here (non-destructive —
+    // migrateLayoutPanes never sheds entries or fields) and written straight
+    // back, so the next launch sees the same keys.
+    const { panes: saved, changed } = migrateLayoutPanes(JSON.parse(raw));
+    if (changed) {
+      try {
+        localStorage.setItem(LAYOUT_KEY, JSON.stringify(saved));
+      } catch {
+        /* quota / unavailable — keys still stable for this session */
+      }
+    }
     return saved.map((p) => {
-      // B1: REUSE the persisted key so a restored terminal pane keeps its
-      // original pane key → `termSessionName` derives the SAME `aios-term-<name>`
-      // and reattaches to the session its claude/codex was running in. Minting a
-      // fresh key here (the old bug) computed a brand-new name → `new-session -A`
-      // created an empty session and orphaned the real one. Reserve `seq` past
-      // the restored index so a future nextKey() can't collide.
-      const key = typeof p.key === "string" && p.key ? p.key : nextKey();
-      reserveKeySeq(key);
+      const key = p.key;
+      const kind = p.kind as PaneContent;
       // Session restore (item 4): a browser pane reopens at the LAST url it was
       // on, not its original landing page. BrowserPane records its live url under
       // its pane key (the same key persisted here, B1) via browser-mem, so we
       // read it back and seed the restored pane's url. Falls back to the
       // persisted url (e.g. a pinned-site deep-link) when there's no memory.
-      if (p.kind.type === "browser") {
-        const last = recallPaneUrl(key) ?? recallPaneUrl(p.kind.memKey);
-        const kind = last ? { ...p.kind, url: last } : p.kind;
-        return { key, label: p.label, kind };
+      if (kind.type === "browser") {
+        const last = recallPaneUrl(key) ?? recallPaneUrl(kind.memKey);
+        return { key, label: p.label, kind: last ? { ...kind, url: last } : kind };
       }
-      return { key, label: p.label, kind: p.kind };
+      return { key, label: p.label, kind };
     });
   } catch {
     return [];
@@ -526,7 +532,7 @@ function App() {
     setPanes((cur) => {
       const index = cur.findIndex((p) => p.key === key);
       const next = movePane(cur, index, delta);
-      setActiveKey(next.items[next.selected]?.key ?? key);
+      setFocusedPane(next.items[next.selected]?.key ?? key);
       return next.items;
     });
   }, []);
@@ -709,7 +715,9 @@ function App() {
   }, [flash]);
 
   const spawn = useCallback((kind: PaneContent, label: string): string => {
-    const key = nextKey();
+    // Stable key, minted once for the pane's whole life (persists via saveLayout,
+    // reused across relaunches — see the STABLE PANE KEYS note above).
+    const key = newPaneKey(kind.type);
     // Light usage event (kind:"usage") — seeds the "what I use" prioritization.
     // Carries only the pane-type enum, never any argument/label content.
     reportUsage("pane.spawn", kind.type);
@@ -888,6 +896,19 @@ function App() {
   // focusedPane.current during render — a later `const` would be in its TDZ
   // and throw "cannot access before initialization" (black screen on mount).
   const focusedPane = useRef<string | null>(null);
+  // UNIFIED FOCUS (wave 1B): `activeKey` state is the single source of truth;
+  // `focusedPane` is its synchronously-updated mirror (a ref so render-time
+  // readers like finderRoot and dependency-free callbacks get the live value
+  // without re-render races). EVERY focus write goes through this setter — no
+  // site may assign focusedPane.current or call setActiveKey for focus on its
+  // own, or the two views drift apart again.
+  const setFocusedPane = useCallback((key: string | null) => {
+    focusedPane.current = key;
+    setActiveKey(key);
+  }, []);
+  // Expose the focused pane to the keybind router + future panes via paneBus
+  // (synchronous read, no prop-drilling).
+  useEffect(() => registerActivePane(() => focusedPane.current), []);
   const setPanesRef = useRef<typeof setPanes>(setPanes);
 
   // OPEN-FILE DEDUP (panes ARE tabs): if a pane already shows this exact file,
@@ -1074,7 +1095,8 @@ function App() {
       return m === key ? null : m;
     });
     if (prevMaxRef.current === key) prevMaxRef.current = null;
-    if (focusedPane.current === key) focusedPane.current = null;
+    // unified focus: ref + state always agree, so one check covers both.
+    if (focusedPane.current === key) setFocusedPane(null);
     // Drop any session-restore memory for this pane key — a pane closed on
     // purpose shouldn't have its last url linger in the browser-mem map (it
     // also won't be in the next layout, so this just keeps the map from
@@ -1082,8 +1104,7 @@ function App() {
     forgetUrl(key);
     setPanes((p) => p.filter((x) => x.key !== key));
     setHiddenKeys((h) => h.filter((k) => k !== key));
-    setActiveKey((a) => (a === key ? null : a));
-  }, []);
+  }, [setFocusedPane]);
   // Closing must be visually instant. If a chat is still running, detach it in
   // the background with the existing completion notification, then remove the
   // pane immediately so the grid can fall back to idle without a modal pause.
@@ -1094,6 +1115,47 @@ function App() {
       closePane(key);
     },
     [closePane],
+  );
+  const routePaneNav = useCallback(
+    (ev: PaneNavEvent) => {
+      const key = focusedPane.current ?? activeKey;
+      if (dispatchPaneNav(key, ev)) return;
+      switch (ev.action) {
+        case "find":
+          handleCmdF();
+          break;
+        case "close":
+          if (key) requestClose(key);
+          break;
+        case "goto": {
+          const idx = (ev.index ?? 0) - 1;
+          const p = idx >= 0 ? panes[idx] : null;
+          if (p) {
+            setHiddenKeys((h) => h.filter((k) => k !== p.key));
+            setFocusedPane(p.key);
+          }
+          break;
+        }
+        case "palette":
+          setPaletteOpen((v) => !v);
+          break;
+        case "sidebar":
+          setSidebarOpen((v) => !v);
+          break;
+        case "quickopen":
+          setFileFinderOpen((v) => !v);
+          break;
+        case "globalsearch":
+          setGlobalSearchOpen((v) => !v);
+          break;
+        case "newtab":
+          newPaneForContext();
+          break;
+        case "save":
+          break;
+      }
+    },
+    [activeKey, handleCmdF, newPaneForContext, panes, requestClose, setFocusedPane],
   );
   const resumeChat = useCallback(
     (s: ChatSessionInfo) =>
@@ -1262,8 +1324,7 @@ function App() {
         spawn({ type: "chat" }, "chat");
 
       setHiddenKeys((h) => h.filter((k) => k !== key));
-      focusedPane.current = key;
-      setActiveKey(key);
+      setFocusedPane(key);
 
       const attached = await attachToChat(key, path);
       flash(
@@ -1298,9 +1359,8 @@ function App() {
   // so dictation / drops target it (and the rail row highlights).
   const focusPane = useCallback((key: string) => {
     setHiddenKeys((h) => h.filter((k) => k !== key));
-    focusedPane.current = key;
-    setActiveKey(key);
-  }, []);
+    setFocusedPane(key);
+  }, [setFocusedPane]);
   // Keep the open-file-dedup refs pointed at the freshest panes + focusPane.
   useEffect(() => {
     panesRef.current = panes;
@@ -1364,8 +1424,7 @@ function App() {
         const s = paneSubmitters.get(key);
         if (!s) return false;
         setHiddenKeys((h) => h.filter((k) => k !== key));
-        focusedPane.current = key;
-        setActiveKey(key);
+        setFocusedPane(key);
         s(body);
         return true;
       };
@@ -1523,6 +1582,27 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [addShell, newPaneForContext, fireAppshot, runF5, handleCmdF, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
+
+  // NATIVE PANE-NAV BRIDGE (wave 1B). Rust emits this frozen shortcut contract
+  // for pane-routed actions so ⌘F/⌘W/⌘K/⌘1-9 still work when a native child
+  // webview owns focus. Pane handlers get first refusal; App supplies defaults.
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<PaneNavEvent>("pane-nav", ({ payload }) => {
+      routePaneNav(payload);
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((e) => reportDiag("app.listen", e, { action: "paneNav" }));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [routePaneNav]);
 
   // NATIVE MENU BRIDGE (R2a FIX 1 — the urgent fix). The `window.keydown` handler
   // above only fires when the REACT webview has focus. When focus is inside a
@@ -1766,8 +1846,7 @@ function App() {
         maximizePane: (key) => {
           setHiddenKeys((cur) => cur.filter((k) => k !== key));
           setMaximizedKey(key);
-          focusedPane.current = key;
-          setActiveKey(key);
+          setFocusedPane(key);
         },
         closePane,
         setSidebarOpen,
@@ -2012,8 +2091,7 @@ function App() {
           if (submit) {
             if (reveal) {
               setHiddenKeys((current) => current.filter((value) => value !== key));
-              focusedPane.current = key;
-              setActiveKey(key);
+              setFocusedPane(key);
             }
             submit(text);
             return;
@@ -2463,8 +2541,7 @@ function App() {
                   onMoveLeft={() => movePaneByKey(pane.key, -1)}
                   onMoveRight={() => movePaneByKey(pane.key, 1)}
                   onFocus={() => {
-                    focusedPane.current = pane.key;
-                    setActiveKey(pane.key);
+                    setFocusedPane(pane.key);
                   }}
                   onAnnotate={routeToChat}
                   onSendToAi={sendToAi}
@@ -4091,6 +4168,8 @@ function PaneCard({
               onProfileChange={onProfileChange}
               onVideoFullscreen={onVideoFullscreen}
             />
+          ) : pane.kind.type === "chrome" ? (
+            <CdpChromePane onClose={onClose} />
           ) : pane.kind.type === "appcast" ? (
             <AppCastPane
               label={pane.key}

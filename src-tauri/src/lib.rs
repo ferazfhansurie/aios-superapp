@@ -103,6 +103,15 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let global_search = MenuItemBuilder::with_id("pane:global-search", "Search in Files…")
         .accelerator("CmdOrCtrl+Shift+F")
         .build(app)?;
+    // ⌘S — save, routed to the FOCUSED pane only (App.tsx → paneBus.onPaneNav).
+    // Via the native menu so it still fires when a child webview holds focus.
+    // NOTE: when an editor inside the React webview has focus, the page consumes
+    // ⌘S itself (monaco keybinding / window keydown, both preventDefault) and
+    // this item stays silent — WKWebView only forwards an UNCONSUMED key
+    // equivalent on to the menu.
+    let save = MenuItemBuilder::with_id("pane:save", "Save")
+        .accelerator("CmdOrCtrl+S")
+        .build(app)?;
     // DevTools for the focused browser pane (R5 item 3). ⌥⌘I = the standard
     // "Web Inspector" accelerator; routed via the native menu so it fires even
     // when focus is inside the browser child webview.
@@ -128,6 +137,7 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .separator()
         .item(&new_term)
         .item(&close_pane)
+        .item(&save)
         .separator()
         .item(&palette)
         .item(&file_finder)
@@ -162,19 +172,47 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Routes a native menu click into the React cockpit. The id encodes the action
-/// (and, for `pane:jump:N`, the arg). The React side has a `listen("menu-action")`
-/// that dispatches into the exact same handlers as the in-React keydown fallback.
+/// Routes a native menu click into the React cockpit. Two events, no overlap
+/// (a menu id emits exactly ONE of them, so double-handling is impossible):
+///
+/// 1. `pane-nav` — the FROZEN global-keybind contract for pane-routed actions.
+///    Payload: `{ action: "find"|"save"|"close"|"goto"|"palette"|"sidebar"|
+///    "quickopen"|"globalsearch"|"newtab", index?: number }` (index = 1-based
+///    pane ordinal, present only for "goto"). App.tsx routes by FOCUSED pane —
+///    wave-2 pane components subscribe via paneBus.onPaneNav(key, handler).
+///
+/// 2. `menu-action` — the legacy channel, kept for the app-level items that are
+///    not part of the pane-nav contract (exit-fullscreen, minimize, overview,
+///    open-devtools).
 fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
-    if let Some(rest) = id.strip_prefix("pane:") {
-        let (action, arg): (&str, Option<u8>) = if let Some(n) = rest.strip_prefix("jump:") {
-            ("jump", n.parse().ok())
-        } else {
-            (rest, None)
-        };
+    let Some(rest) = id.strip_prefix("pane:") else {
+        return;
+    };
+    // pane-nav contract mapping (menu id → frozen action name).
+    let nav: Option<(&str, Option<u8>)> = if let Some(n) = rest.strip_prefix("jump:") {
+        Some(("goto", n.parse().ok()))
+    } else {
+        match rest {
+            "toggle-fullscreen" => Some(("find", None)), // ⌘F: contextual find/maximize
+            "save" => Some(("save", None)),
+            "close" => Some(("close", None)),
+            "palette" => Some(("palette", None)),
+            "sidebar" => Some(("sidebar", None)),
+            "file-finder" => Some(("quickopen", None)),
+            "global-search" => Some(("globalsearch", None)),
+            "new" => Some(("newtab", None)),
+            _ => None,
+        }
+    };
+    if let Some((action, index)) = nav {
+        let _ = app.emit(
+            "pane-nav",
+            serde_json::json!({ "action": action, "index": index }),
+        );
+    } else {
         let _ = app.emit(
             "menu-action",
-            serde_json::json!({ "action": action, "arg": arg }),
+            serde_json::json!({ "action": rest, "arg": Option::<u8>::None }),
         );
     }
 }
