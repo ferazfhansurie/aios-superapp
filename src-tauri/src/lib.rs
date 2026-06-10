@@ -5,6 +5,7 @@ mod appcast;
 mod bridges;
 mod browser;
 mod browser_store;
+mod cdp;
 mod chat;
 mod device;
 mod diag;
@@ -356,6 +357,19 @@ pub fn run() {
             appcast::appcast_hide,
             appcast::appcast_show,
             appcast::appcast_close,
+            // CDP "real Chrome as a pane" spike (cdp.rs).
+            cdp::cdp_detect_chrome,
+            cdp::cdp_open,
+            cdp::cdp_close_pane,
+            cdp::cdp_navigate,
+            cdp::cdp_back,
+            cdp::cdp_forward,
+            cdp::cdp_reload,
+            cdp::cdp_mouse,
+            cdp::cdp_key,
+            cdp::cdp_scroll,
+            cdp::cdp_insert_text,
+            cdp::cdp_set_viewport,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -375,6 +389,7 @@ pub fn run() {
             }
             tauri::RunEvent::Exit => {
                 chat::kill_all_sessions();
+                cdp::kill_supervised_chrome();
             }
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {

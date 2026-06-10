@@ -43,7 +43,14 @@ sqlx = { version = "0.8", default-features = false, features = [
   "bigdecimal",
   "uuid",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+# ── CDP "real Chrome as a pane" spike (cdp.rs) ────────────────────────────────
+# WS client for the Chrome DevTools Protocol (Page.startScreencast frames +
+# Input.* forwarding). Plain ws:// to 127.0.0.1 only — no TLS features needed.
+# The /json/version discovery GET is hand-rolled over tokio::net::TcpStream so
+# we don't pull a whole HTTP client (reqwest) for one localhost request.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 # macOS-only: flip the WKWebView element-fullscreen preference (off by default)
 # so YouTube/video fullscreen works inside browser panes. Pinned to the same

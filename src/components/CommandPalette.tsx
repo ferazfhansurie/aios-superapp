@@ -3,15 +3,23 @@
  *  scoring), keyboard nav, grouped results, match highlighting. No deps beyond
  *  React + lucide-react. App.tsx owns the `open` state + global ⌘K listener and
  *  passes a `commands` array — see the usage snippet in the PR notes. */
-import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, memo, Suspense, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 /** Max rows rendered at once. Scoring still ranks the full set; we just never
  *  paint more than this many buttons (the rest are unreachable noise anyway).
  *  Caps DOM churn so typing stays smooth even with hundreds of commands. */
 const MAX_RESULTS = 50;
 
-import { Brain, CornerDownLeft, MessageSquare, Search } from "lucide-react";
+import { Brain, CornerDownLeft, Globe, MessageSquare, Search } from "lucide-react";
 import { reportUsage } from "../lib/diag";
+
+/** CDP "real Chrome" spike pane (dev-only reachability). The pane can't go
+ *  through App.tsx's kind registry yet (that wiring is a later coordinated
+ *  wave), so the palette hosts it as a fullscreen overlay it fully owns.
+ *  Lazy so the spike never costs the normal palette bundle anything. */
+const CdpChromePane = lazy(() =>
+  import("./CdpChromePane").then((m) => ({ default: m.CdpChromePane })),
+);
 
 /** Run a palette command + emit a light usage event (kind:"usage") keyed by the
  *  command id — seeds the "what I use" prioritization. No argument values. */
@@ -143,8 +151,31 @@ export function CommandPalette({
   // (heavier) re-rank/re-render runs at lower priority — React's built-in debounce.
   const deferredQuery = useDeferredValue(query);
   const [sel, setSel] = useState(0);
+  // CDP real-Chrome spike overlay (dev-only entry below spawns it).
+  const [cdpPaneOpen, setCdpPaneOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+
+  // dev-only spike launcher — the only palette-reachable way to open the CDP
+  // pane until App.tsx wires a real pane kind (later coordinated wave).
+  const devCommands = useMemo<Command[]>(
+    () =>
+      import.meta.env.DEV
+        ? [
+            {
+              id: "dev.cdp-chrome",
+              title: "dev: real chrome (cdp spike)",
+              subtitle: "supervised chrome tab via devtools protocol",
+              group: "dev",
+              icon: <Globe size={14} />,
+              keywords: "cdp chrome devtools screencast netflix spike browser real",
+              actionLabel: "open",
+              run: () => setCdpPaneOpen(true),
+            },
+          ]
+        : [],
+    [],
+  );
 
   // reset query + selection every time it opens; focus the input.
   useEffect(() => {
@@ -188,7 +219,7 @@ export function CommandPalette({
         ]
       : [];
     const scored: Scored[] = [];
-    for (const c of [...intentCommands, ...commands]) {
+    for (const c of [...intentCommands, ...commands, ...devCommands]) {
       const m = scoreCommand(deferredQuery, c);
       if (m) scored.push({ ...c, _idx: m.idx, _score: m.score });
     }
@@ -209,7 +240,7 @@ export function CommandPalette({
     const flat: Scored[] = [];
     for (const g of order) flat.push(...byGroup.get(g)!);
     return flat.slice(0, MAX_RESULTS);
-  }, [commands, onAsk, onDeepSearch, deferredQuery]);
+  }, [commands, devCommands, onAsk, onDeepSearch, deferredQuery]);
 
   // clamp selection when results shrink
   useEffect(() => {
@@ -223,7 +254,23 @@ export function CommandPalette({
     el?.scrollIntoView({ block: "nearest" });
   }, [sel, open]);
 
-  if (!open) return null;
+  // The spike overlay outlives the palette modal (the palette closes the moment
+  // the command runs), so it renders regardless of `open`.
+  const cdpOverlay = cdpPaneOpen ? (
+    <div className="fixed inset-0 z-[60] flex flex-col bg-[var(--color-bg)]">
+      <Suspense
+        fallback={
+          <div className="grid h-full place-items-center text-[11px] text-[var(--color-faint)]">
+            loading cdp spike…
+          </div>
+        }
+      >
+        <CdpChromePane onClose={() => setCdpPaneOpen(false)} />
+      </Suspense>
+    </div>
+  ) : null;
+
+  if (!open) return cdpOverlay;
 
   const move = (delta: number) => {
     if (!results.length) return;
@@ -269,6 +316,8 @@ export function CommandPalette({
   const selAction = selCmd?.actionLabel ?? "select";
 
   return (
+    <>
+    {cdpOverlay}
     <div
       className="fixed inset-0 z-50 flex justify-center bg-black/50 backdrop-blur-sm"
       onMouseDown={(e) => {
@@ -376,5 +425,6 @@ export function CommandPalette({
         </div>
       </div>
     </div>
+    </>
   );
 }
