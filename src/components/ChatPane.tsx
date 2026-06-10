@@ -151,6 +151,16 @@ import {
   type ScrollIntent,
 } from "../lib/chatScroll";
 import { invoke, isTauriRuntime } from "../lib/tauri";
+import {
+  baseName,
+  ellipsizeMid,
+  extFromMime,
+  fmtClock,
+  fmtDuration,
+  fmtElapsed,
+  fmtRelativeTime,
+  uid,
+} from "./chat/chatFormat";
 import { PaneDropZone } from "./PaneDropZone";
 import { reportDiag } from "../lib/diag";
 import { pushNotification } from "../lib/notifications";
@@ -187,9 +197,6 @@ type RenderBlock =
   | { kind: "question"; id: string; turn: ToolTurn }
   | { kind: "result"; id: string; turn: Extract<Turn, { kind: "result" }> }
   | { kind: "activity"; id: string; tools: ToolTurn[]; durationMs?: number };
-
-let _uid = 0;
-const uid = () => `t${++_uid}`;
 
 /** High-frequency streaming token events that are safe to batch on a rAF tick
  *  (text/thinking deltas). Structural events — assistant finals, tool results,
@@ -325,12 +332,6 @@ interface ImageChip {
   path: string | null;
 }
 let _imgSeq = 0;
-/** "0:05" from elapsed seconds (dictation timer). */
-function fmtElapsed(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
 /** Precomputed equalizer bars for the inline dictation waveform (time-keyed). */
 const WAVEFORM_BARS: { h: number; delay: number }[] = Array.from(
   { length: 40 },
@@ -340,16 +341,6 @@ const WAVE_KEYFRAMES = `@keyframes aios-wave {
   0%, 100% { transform: scaleY(0.32); opacity: 0.55; }
   50% { transform: scaleY(1); opacity: 1; }
 }`;
-
-/** File extension for a clipboard/file image mime. */
-function extFromMime(mime: string): string {
-  const m = mime.toLowerCase();
-  if (m.includes("png")) return "png";
-  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
-  if (m.includes("gif")) return "gif";
-  if (m.includes("webp")) return "webp";
-  return "png";
-}
 
 // instruction prefixes for the composer modes
 const PLAN_PREFIX =
@@ -425,22 +416,9 @@ function tokensFromUsage(usage: unknown): number | undefined {
   return total > 0 ? total : undefined;
 }
 
-/** basename for a path, for the @-mention picker labels. */
-function baseName(p: string): string {
-  const i = p.replace(/\/+$/, "").lastIndexOf("/");
-  return i >= 0 ? p.slice(i + 1) : p;
-}
-
 // ── tool presentation (Codex-style activity steps) ───────────────────────────
 
 type ToolTurn = Extract<Turn, { kind: "tool" }>;
-
-/** Truncate the middle of a string so both ends stay visible. */
-function ellipsizeMid(s: string, max = 52): string {
-  if (s.length <= max) return s;
-  const half = Math.floor((max - 1) / 2);
-  return s.slice(0, half) + "…" + s.slice(s.length - half);
-}
 
 /** Pull the most relevant target arg out of a tool's input. Mirrors the verbs
  *  below: a path basename for file tools, the command for Bash, the pattern for
@@ -647,42 +625,6 @@ function artifactFromTool(turn: ToolTurn): Artifact | null {
     "";
   if (!path) return null;
   return { path, name: baseName(path), kind: artifactKind(path) };
-}
-
-/** Format a duration in ms as a compact human label: "2m 38s", "47s", "0.4s". */
-function fmtDuration(ms: number): string {
-  if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`;
-  const totalSec = Math.round(ms / 1000);
-  if (totalSec < 60) return `${totalSec}s`;
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}m ${s}s`;
-}
-
-/** Format an elapsed-while-running timer as m:ss (Codex "Working… 0:42"). */
-function fmtClock(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-/** Compact "time since" label from a unix-SECONDS timestamp ("3h ago", "2d ago",
- *  "just now"). Used for the /resume session picker's faint secondary line. */
-function fmtRelativeTime(unixSeconds: number): string {
-  const diffSec = Math.max(0, Math.floor(Date.now() / 1000 - unixSeconds));
-  if (diffSec < 45) return "just now";
-  const min = Math.floor(diffSec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.floor(hr / 24);
-  if (day < 7) return `${day}d ago`;
-  const wk = Math.floor(day / 7);
-  if (wk < 5) return `${wk}w ago`;
-  const mo = Math.floor(day / 30);
-  if (mo < 12) return `${mo}mo ago`;
-  return `${Math.floor(day / 365)}y ago`;
 }
 
 // ── deterministic in-chat file open ──────────────────────────────────────────
