@@ -897,6 +897,16 @@ fn file_mtime_ms(path: &std::path::Path) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Pure conflict predicate for the editor save guard. `expected` is the mtime
+/// (ms) the editor captured at load; `current` is the on-disk mtime now.
+/// Tolerates sub-millisecond float jitter (a real external write moves the
+/// mtime by far more than 1ms). A zero on either side means "stat unavailable"
+/// — we fail open (no conflict) rather than block saves on filesystems without
+/// mtime support.
+fn mtime_conflicts(expected: f64, current: f64) -> bool {
+    expected > 0.0 && current > 0.0 && (current - expected).abs() > 1.0
+}
+
 /// Returns a file's last-modified time in unix milliseconds (0 if missing /
 /// unavailable). The editor pane captures this on load so it can detect a
 /// conflicting on-disk change before overwriting (AI + human editing the same
@@ -923,14 +933,11 @@ pub fn write_text_file(
     expected_mtime: Option<f64>,
 ) -> Result<f64, String> {
     let p = std::path::Path::new(&path);
-    // Conflict check: tolerate sub-millisecond float jitter. A real external
-    // write moves the mtime by far more than 1ms, so a >1ms delta = conflict.
+    // Conflict check (pure predicate in `mtime_conflicts` — unit-tested).
     if let Some(expected) = expected_mtime {
-        if expected > 0.0 {
-            let current = file_mtime_ms(p);
-            if current > 0.0 && (current - expected).abs() > 1.0 {
-                return Err(format!("conflict:{current}"));
-            }
+        let current = file_mtime_ms(p);
+        if mtime_conflicts(expected, current) {
+            return Err(format!("conflict:{current}"));
         }
     }
     let dir = p.parent().ok_or_else(|| "invalid path".to_string())?;
@@ -1622,4 +1629,70 @@ fn search_with_ignore(
         }
     }
     Ok(hits)
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod save_conflict_tests {
+    use super::{file_mtime_ms, mtime_conflicts, write_text_file};
+
+    #[test]
+    fn exact_match_is_not_a_conflict() {
+        assert!(!mtime_conflicts(1_700_000_000_000.0, 1_700_000_000_000.0));
+    }
+
+    #[test]
+    fn sub_millisecond_jitter_is_tolerated() {
+        assert!(!mtime_conflicts(1_700_000_000_000.0, 1_700_000_000_000.9));
+        assert!(!mtime_conflicts(1_700_000_000_000.9, 1_700_000_000_000.0));
+    }
+
+    #[test]
+    fn real_external_change_conflicts_both_directions() {
+        // newer on disk than expected (the normal clobber case)
+        assert!(mtime_conflicts(1_700_000_000_000.0, 1_700_000_000_500.0));
+        // older on disk (file restored / touched backwards) still counts
+        assert!(mtime_conflicts(1_700_000_000_500.0, 1_700_000_000_000.0));
+    }
+
+    #[test]
+    fn unavailable_stat_fails_open() {
+        // either side 0 = "couldn't stat" — never block the save on that
+        assert!(!mtime_conflicts(0.0, 1_700_000_000_000.0));
+        assert!(!mtime_conflicts(1_700_000_000_000.0, 0.0));
+        assert!(!mtime_conflicts(0.0, 0.0));
+    }
+
+    #[test]
+    fn write_refuses_on_stale_mtime_and_preserves_disk() {
+        let dir = std::env::temp_dir().join(format!("aios-conflict-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("guarded.txt");
+        std::fs::write(&f, "theirs").unwrap();
+        let path = f.to_string_lossy().to_string();
+
+        // an expected mtime far in the past = the file changed since "load"
+        let stale = file_mtime_ms(&f) - 60_000.0;
+        let err = write_text_file(path.clone(), "mine".into(), Some(stale)).unwrap_err();
+        assert!(err.starts_with("conflict:"), "got: {err}");
+        // structured payload = the current on-disk mtime, parseable as f64
+        assert!(err["conflict:".len()..].parse::<f64>().is_ok());
+        // and the on-disk content was NOT clobbered
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "theirs");
+
+        // matching mtime → write succeeds and returns the new mtime
+        let now = file_mtime_ms(&f);
+        let new_mtime = write_text_file(path.clone(), "mine".into(), Some(now)).unwrap();
+        assert!(new_mtime > 0.0);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "mine");
+
+        // no expected_mtime = unguarded force write (keep-mine path)
+        std::fs::write(&f, "theirs again").unwrap();
+        let forced = write_text_file(path, "mine wins".into(), None).unwrap();
+        assert!(forced > 0.0);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "mine wins");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

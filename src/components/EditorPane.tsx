@@ -74,14 +74,23 @@ export function EditorPane({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
-  // Save-conflict prompt state: set when an external change is detected on save.
+  // Save-conflict prompt state: set when an external change is detected on save
+  // (backend mtime guard) or by the idle external-change watcher below.
   const [conflict, setConflict] = useState(false);
+  // "show diff" overlay (disk version vs the live buffer) while in conflict.
+  const [diffOpen, setDiffOpen] = useState(false);
   // Language-server status for THIS file (null = no server involved → no pill).
   const [lsp, setLsp] = useState<LspStatusEvent | null>(null);
 
   // mtime captured at load (and re-based after each successful save). Drives the
   // save-conflict guard so an AI/human edit underneath us can't be clobbered.
   const mtimeRef = useRef<number>(0);
+  // mirrors `dirty` for the idle watcher's interval closure
+  const dirtyRef = useRef(false);
+  // true while a save/reload is in flight — the idle watcher skips its check so
+  // it can't race our own write (rename moves the mtime before we re-base).
+  const busyRef = useRef(false);
+  const diffHostRef = useRef<HTMLDivElement>(null);
   // keep the latest save fn reachable from the monaco keybinding closure
   const saveRef = useRef<() => void>(() => {});
   // in-flight LSP acquire for this path — cleanup chains release behind it
@@ -155,6 +164,7 @@ export function EditorPane({
       const save = async () => {
         const ed = editorRef.current;
         if (!ed) return;
+        busyRef.current = true;
         try {
           const newMtime = await writeTextFile(path, ed.getValue(), mtimeRef.current || undefined);
           if (disposed) return;
@@ -167,11 +177,14 @@ export function EditorPane({
           if (disposed) return;
           if (e instanceof SaveConflictError) {
             // someone changed the file on disk since we loaded it — don't clobber.
-            mtimeRef.current = e.currentMtime || mtimeRef.current;
+            // NOTE: do NOT re-base mtimeRef here — a plain ⌘S retry must keep
+            // failing until the user picks keep-mine / take-disk.
             setConflict(true);
           } else {
             setError(String(e));
           }
+        } finally {
+          busyRef.current = false;
         }
       };
       saveRef.current = save;
@@ -222,10 +235,11 @@ export function EditorPane({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // Reload the file from disk, discarding local edits (conflict → "reload").
+  // Reload the file from disk, discarding local edits (conflict → "take disk").
   const reloadFromDisk = useCallback(async () => {
     const ed = editorRef.current;
     if (!ed) return;
+    busyRef.current = true;
     try {
       const content = await readTextFile(path);
       mtimeRef.current = await fileMtime(path).catch(() => 0);
@@ -235,14 +249,17 @@ export function EditorPane({
       setSavedAt(null);
     } catch (e) {
       setError(String(e));
+    } finally {
+      busyRef.current = false;
     }
   }, [path]);
 
-  // Force-overwrite the on-disk file with the buffer (conflict → "overwrite").
-  // Re-base the mtime first so the guard passes.
+  // Force-overwrite the on-disk file with the buffer (conflict → "keep mine").
+  // No expected_mtime = the backend guard is bypassed on purpose.
   const overwrite = useCallback(async () => {
     const ed = editorRef.current;
     if (!ed) return;
+    busyRef.current = true;
     try {
       const newMtime = await writeTextFile(path, ed.getValue(), undefined);
       mtimeRef.current = newMtime || mtimeRef.current;
@@ -251,8 +268,92 @@ export function EditorPane({
       setConflict(false);
     } catch (e) {
       setError(String(e));
+    } finally {
+      busyRef.current = false;
     }
   }, [path]);
+
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
+
+  // EXTERNAL-CHANGE WATCHER (idle): the backend guard only fires on ⌘S — if the
+  // AI (or any other tool) rewrites the file while it just sits open here, we
+  // want to know NOW, not at the next save. Cheap stat every 4s + on window
+  // focus. Clean buffer → quietly take the disk version (nothing of ours to
+  // lose — VS Code's auto-revert behavior). Dirty buffer → same conflict banner
+  // as a blocked save.
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      if (busyRef.current || !editorRef.current || !mtimeRef.current) return;
+      const onDisk = await fileMtime(path).catch(() => 0);
+      if (cancelled || busyRef.current || !editorRef.current) return;
+      if (!onDisk || !mtimeRef.current || Math.abs(onDisk - mtimeRef.current) <= 1) return;
+      if (dirtyRef.current) setConflict(true);
+      else void reloadFromDisk();
+    };
+    const id = window.setInterval(check, 4000);
+    window.addEventListener("focus", check);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      window.removeEventListener("focus", check);
+    };
+  }, [path, reloadFromDisk]);
+
+  // Close the diff overlay whenever the conflict resolves (keep-mine, take-disk,
+  // or a clean save from elsewhere).
+  useEffect(() => {
+    if (!conflict && diffOpen) setDiffOpen(false);
+  }, [conflict, diffOpen]);
+
+  // "show diff" — a monaco diff editor OVERLAID on the normal editor. Left =
+  // on-disk version (read-only snapshot), right = the LIVE buffer model, so
+  // edits made inside the diff land in the real buffer. The standalone editor
+  // stays mounted underneath (automaticLayout keeps both happy) — no pane
+  // restructuring needed.
+  useEffect(() => {
+    if (!diffOpen) return;
+    let disposed = false;
+    let diff: Monaco.editor.IStandaloneDiffEditor | null = null;
+    let original: Monaco.editor.ITextModel | null = null;
+    (async () => {
+      let disk: string;
+      try {
+        disk = await readTextFile(path);
+      } catch {
+        setDiffOpen(false); // disk version unreadable — nothing to diff against
+        return;
+      }
+      const { initMonaco } = await import("../lib/monaco");
+      if (disposed || !diffHostRef.current) return;
+      const monaco = initMonaco();
+      const modified = editorRef.current?.getModel();
+      if (!modified) return;
+      original = monaco.editor.createModel(disk, languageForPath(path));
+      diff = monaco.editor.createDiffEditor(diffHostRef.current, {
+        theme: "aios-dark",
+        automaticLayout: true,
+        originalEditable: false,
+        readOnly: false,
+        renderSideBySide: true,
+        fontSize: 13,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+      });
+      diff.setModel({ original, modified });
+    })();
+    return () => {
+      disposed = true;
+      // Detach BEFORE dispose so the diff editor can't tear down the SHARED
+      // modified model (other panes may hold it); only our snapshot dies.
+      diff?.setModel(null);
+      diff?.dispose();
+      original?.dispose();
+    };
+  }, [diffOpen, path]);
 
   // Drop a file onto the editor → open it (in the correct pane kind via
   // paneForFile). We don't hot-swap this pane's `path` prop — opening is the
@@ -317,33 +418,44 @@ export function EditorPane({
       </div>
 
       {/* SAVE-CONFLICT banner: the file changed on disk since load (AI or human
-       *  edited it). Don't silently clobber — offer reload (take theirs) or
-       *  overwrite (force ours). */}
+       *  edited it). Don't silently clobber — keep mine (force write), take disk
+       *  (reload), or show diff (disk vs buffer, side by side). */}
       {conflict && (
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-danger)]/10 px-3 py-1.5">
           <AlertTriangle size={12} className="shrink-0 text-[var(--color-danger)]" />
           <span className="flex-1 truncate text-[11px] text-[var(--color-text-2)]">
-            file changed on disk since you opened it
+            file changed on disk — your buffer and the disk version differ
           </span>
-          <button
-            onClick={reloadFromDisk}
-            className="rounded border border-[var(--color-border)] px-2 py-0.5 text-[10.5px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
-            title="discard your edits, load the on-disk version"
-          >
-            reload
-          </button>
           <button
             onClick={overwrite}
             className="rounded border border-[var(--color-danger)]/40 px-2 py-0.5 text-[10.5px] text-[var(--color-danger)] hover:bg-[var(--color-danger)]/15"
             title="force-save your version over the on-disk changes"
           >
-            overwrite
+            keep mine
+          </button>
+          <button
+            onClick={reloadFromDisk}
+            className="rounded border border-[var(--color-border)] px-2 py-0.5 text-[10.5px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
+            title="discard your edits, load the on-disk version"
+          >
+            take disk
+          </button>
+          <button
+            onClick={() => setDiffOpen((v) => !v)}
+            className="rounded border border-[var(--color-border)] px-2 py-0.5 text-[10.5px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
+            title="side-by-side diff: on-disk version (left) vs your buffer (right, editable)"
+          >
+            {diffOpen ? "hide diff" : "show diff"}
           </button>
         </div>
       )}
 
       <div className="relative min-h-0 flex-1">
         <div ref={hostRef} className="h-full w-full" />
+        {/* conflict diff overlay — floats over the editor, editor stays mounted */}
+        {conflict && diffOpen && (
+          <div ref={diffHostRef} className="absolute inset-0 z-10 bg-[var(--color-bg)]" />
+        )}
         {loading && (
           <div className="absolute inset-0 grid place-items-center bg-[var(--color-bg)]">
             <Loader2 size={18} className="animate-spin text-[var(--color-accent)]" />
