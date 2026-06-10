@@ -153,6 +153,319 @@ fn profile_store_id(profile: &str) -> [u8; 16] {
     id
 }
 
+// ─── Push-based nav state + load errors (macOS) ──────────────────────────────
+//
+// Replaces the frontend's 350ms `browser_nav_state`/`browser_current_url` poll
+// with real push events. One `AiosNavObserver` per browser webview does two
+// jobs:
+//
+//   1. KVO-observes the WKWebView's `canGoBack` / `canGoForward` / `URL` /
+//      `estimatedProgress` / `loading` and emits a coalesced
+//      `browser-nav-state` event whenever the composed snapshot changes.
+//   2. Becomes the webview's `navigationDelegate`, RETAINING wry's original
+//      delegate and forwarding every selector it doesn't implement back to it
+//      (`respondsToSelector:` + `forwardingTargetForSelector:` — the standard
+//      ObjC proxy pattern), while adding the two `didFail*` callbacks wry never
+//      implemented → `browser-load-error` events. wry's policy decisions,
+//      page-load hooks and download delegate all keep firing through the proxy.
+//
+// TEARDOWN (read before touching): a WKWebView deallocated while KVO observers
+// are still registered is a use-after-free-shaped crash on older macOS (10.13+
+// auto-unregisters, but we don't lean on that). `browser_close` calls
+// `nav_state::detach` BEFORE navigating away / closing — it removes every
+// observer and restores wry's original delegate, all inside a `with_webview`
+// main-thread closure, which the runtime serializes ahead of the subsequent
+// `close()`. The observer itself is kept alive by the `OBSERVERS` registry
+// (the webview's delegate reference is weak), so dropping the registry entry
+// after detach is the whole lifecycle.
+#[cfg(target_os = "macos")]
+mod nav_state {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, ProtocolObject, Sel};
+    use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
+    use objc2_foundation::{
+        NSError, NSKeyValueObservingOptions, NSObject, NSObjectNSKeyValueObserverRegistration,
+        NSObjectProtocol, NSString,
+    };
+    use objc2_web_kit::{WKNavigation, WKNavigationDelegate, WKWebView};
+    use tauri::{AppHandle, Emitter, Manager};
+
+    /// The observed key paths. Every one of these changing re-emits the full
+    /// composed snapshot (the frontend wants the whole state, not deltas).
+    const KEY_PATHS: &[&str] = &[
+        "canGoBack",
+        "canGoForward",
+        "URL",
+        "estimatedProgress",
+        "loading",
+    ];
+
+    pub struct Ivars {
+        app: AppHandle,
+        label: String,
+        /// wry's original navigation delegate — retained so policy decisions,
+        /// page-load events and downloads keep flowing via forwarding.
+        inner: RefCell<Option<Retained<ProtocolObject<dyn WKNavigationDelegate>>>>,
+        /// Last emitted nav-state JSON; identical snapshots are coalesced away
+        /// (KVO fires in bursts during a navigation — 5 keys × several phases).
+        last_emit: RefCell<String>,
+        /// True while KVO observers are registered — guarantees exactly-once
+        /// `removeObserver` even if detach is somehow entered twice.
+        attached: Cell<bool>,
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = Ivars]
+        pub struct AiosNavObserver;
+
+        unsafe impl NSObjectProtocol for AiosNavObserver {}
+
+        /// KVO sink + delegate-forwarding plumbing.
+        impl AiosNavObserver {
+            #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+            fn observe_value(
+                &self,
+                _key_path: Option<&NSString>,
+                object: Option<&AnyObject>,
+                _change: Option<&AnyObject>,
+                _context: *mut std::ffi::c_void,
+            ) {
+                // We only ever register on a WKWebView; verify anyway before
+                // casting — a wrong-object crash here takes the whole app down.
+                let Some(object) = object else { return };
+                let is_wk: bool =
+                    unsafe { msg_send![object, isKindOfClass: WKWebView::class()] };
+                if !is_wk {
+                    return;
+                }
+                let wk = unsafe { &*(object as *const AnyObject as *const WKWebView) };
+                self.emit_nav_state(wk);
+            }
+
+            #[unsafe(method(respondsToSelector:))]
+            fn responds_to_selector(&self, sel: Sel) -> objc2::runtime::Bool {
+                // Own methods (didFail*, observeValue…, NSObject) first…
+                let own: bool = unsafe { msg_send![super(self), respondsToSelector: sel] };
+                // …then whatever wry's delegate answers, so WebKit keeps
+                // calling decidePolicy…/didCommit…/download hooks through us.
+                let fwd = || {
+                    self.ivars()
+                        .inner
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|inner| inner.respondsToSelector(sel))
+                };
+                objc2::runtime::Bool::new(own || fwd())
+            }
+
+            #[unsafe(method(forwardingTargetForSelector:))]
+            fn forwarding_target_for_selector(&self, sel: Sel) -> *mut AnyObject {
+                if let Some(inner) = self.ivars().inner.borrow().as_ref() {
+                    if inner.respondsToSelector(sel) {
+                        // +0 (unretained) return is the forwardingTarget contract.
+                        return Retained::as_ptr(inner) as *mut AnyObject;
+                    }
+                }
+                std::ptr::null_mut()
+            }
+        }
+
+        // The two navigation-failure callbacks wry's delegate doesn't implement.
+        // Everything else in the protocol forwards to wry (above).
+        unsafe impl WKNavigationDelegate for AiosNavObserver {
+            #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
+            fn did_fail_provisional_navigation(
+                &self,
+                webview: &WKWebView,
+                _navigation: Option<&WKNavigation>,
+                error: &NSError,
+            ) {
+                self.emit_load_error(webview, error, true);
+                self.emit_nav_state(webview);
+            }
+
+            #[unsafe(method(webView:didFailNavigation:withError:))]
+            fn did_fail_navigation(
+                &self,
+                webview: &WKWebView,
+                _navigation: Option<&WKNavigation>,
+                error: &NSError,
+            ) {
+                self.emit_load_error(webview, error, false);
+                self.emit_nav_state(webview);
+            }
+        }
+    );
+
+    impl AiosNavObserver {
+        fn new(mtm: MainThreadMarker, app: AppHandle, label: String) -> Retained<Self> {
+            let this = mtm.alloc::<Self>().set_ivars(Ivars {
+                app,
+                label,
+                inner: RefCell::new(None),
+                last_emit: RefCell::new(String::new()),
+                attached: Cell::new(false),
+            });
+            unsafe { msg_send![super(this), init] }
+        }
+
+        /// Composes the full nav snapshot and emits `browser-nav-state` if it
+        /// differs from the last one sent (burst coalescing).
+        fn emit_nav_state(&self, wk: &WKWebView) {
+            let iv = self.ivars();
+            let url = unsafe { wk.URL() }
+                .and_then(|u| u.absoluteString())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            // 0..1; round to 2dp so progress jitter doesn't defeat coalescing.
+            let progress = (unsafe { wk.estimatedProgress() } * 100.0).round() / 100.0;
+            let payload = serde_json::json!({
+                "label": iv.label,
+                "url": url,
+                "canBack": unsafe { wk.canGoBack() },
+                "canFwd": unsafe { wk.canGoForward() },
+                "loading": unsafe { wk.isLoading() },
+                "progress": progress,
+            });
+            let snapshot = payload.to_string();
+            if *iv.last_emit.borrow() == snapshot {
+                return;
+            }
+            iv.last_emit.replace(snapshot);
+            let _ = iv.app.emit("browser-nav-state", payload);
+        }
+
+        /// Emits `browser-load-error` for a real navigation failure. Filters the
+        /// non-errors: NSURLErrorCancelled (-999, fired by rapid re-navigation /
+        /// JS-initiated stops) and WebKitErrorDomain 102 "frame load interrupted"
+        /// (fired when a navigation turns into a download or a policy redirect).
+        fn emit_load_error(&self, wk: &WKWebView, error: &NSError, provisional: bool) {
+            let code = error.code() as i64;
+            if code == -999 {
+                return;
+            }
+            let domain = error.domain().to_string();
+            if domain == "WebKitErrorDomain" && (code == 102 || code == 204) {
+                return;
+            }
+            let url = failing_url(error)
+                .or_else(|| {
+                    unsafe { wk.URL() }
+                        .and_then(|u| u.absoluteString())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default();
+            let iv = self.ivars();
+            let _ = iv.app.emit(
+                "browser-load-error",
+                serde_json::json!({
+                    "label": iv.label,
+                    "code": code,
+                    "url": url,
+                    "description": error.localizedDescription().to_string(),
+                    "provisional": provisional,
+                }),
+            );
+        }
+    }
+
+    /// The url that actually failed, from the NSError userInfo (the webview's
+    /// `URL()` may already point elsewhere by the time the failure lands).
+    fn failing_url(error: &NSError) -> Option<String> {
+        let info = error.userInfo();
+        let key = NSString::from_str("NSErrorFailingURLStringKey");
+        let val = info.objectForKey(&key)?;
+        val.downcast::<NSString>().ok().map(|s| s.to_string())
+    }
+
+    /// Registry keeping each observer alive (the webview's delegate ref is
+    /// weak). Keyed by webview label; entry removed on detach.
+    struct RegistryCell(Retained<AiosNavObserver>);
+    impl RegistryCell {
+        /// Consumes the WHOLE cell (not just `.0`) — keeps Rust-2021 disjoint
+        /// closure capture from grabbing the non-Send `Retained` field directly,
+        /// which would defeat the `unsafe impl Send` below.
+        fn take(self) -> Retained<AiosNavObserver> {
+            self.0
+        }
+    }
+    // SAFETY: the Retained is only created, dereferenced and (in the normal
+    // path) dropped on the main thread — attach/detach bodies run inside
+    // `with_webview` main-thread closures. Off-main-thread the registry only
+    // moves the pointer; in the worst (webview-already-gone) case the drop is
+    // an off-thread objc release of an object whose dealloc touches only
+    // plain Rust ivars, which is safe.
+    unsafe impl Send for RegistryCell {}
+
+    static OBSERVERS: LazyLock<Mutex<HashMap<String, RegistryCell>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Installs the observer on a freshly-created browser webview. Idempotent
+    /// per label. Emits one initial `browser-nav-state` so the frontend has
+    /// the state without waiting for the first change.
+    pub fn attach(app: &AppHandle, label: &str) {
+        let Some(wv) = app.get_webview(label) else { return };
+        let app = app.clone();
+        let label = label.to_string();
+        let _ = wv.with_webview(move |pw| {
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            let ptr = pw.inner() as *mut WKWebView;
+            let Some(wk) = (unsafe { ptr.as_ref() }) else { return };
+            {
+                let Ok(map) = OBSERVERS.lock() else { return };
+                if map.contains_key(&label) {
+                    return;
+                }
+            }
+            let this = AiosNavObserver::new(mtm, app, label.clone());
+            this.ivars().inner.replace(unsafe { wk.navigationDelegate() });
+            unsafe { wk.setNavigationDelegate(Some(ProtocolObject::from_ref(&*this))) };
+            for kp in KEY_PATHS {
+                unsafe {
+                    wk.addObserver_forKeyPath_options_context(
+                        &this,
+                        &NSString::from_str(kp),
+                        NSKeyValueObservingOptions::New,
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+            this.ivars().attached.set(true);
+            this.emit_nav_state(wk);
+            if let Ok(mut map) = OBSERVERS.lock() {
+                map.insert(label, RegistryCell(this));
+            }
+        });
+    }
+
+    /// Removes KVO observers + restores wry's original delegate. MUST run
+    /// before the webview is closed — see the module header. Safe to call for
+    /// labels that were never attached.
+    pub fn detach(app: &AppHandle, label: &str) {
+        let cell = OBSERVERS.lock().ok().and_then(|mut m| m.remove(label));
+        let Some(cell) = cell else { return };
+        let Some(wv) = app.get_webview(label) else { return };
+        let _ = wv.with_webview(move |pw| {
+            let this = cell.take();
+            let ptr = pw.inner() as *mut WKWebView;
+            let Some(wk) = (unsafe { ptr.as_ref() }) else { return };
+            if this.ivars().attached.replace(false) {
+                for kp in KEY_PATHS {
+                    unsafe { wk.removeObserver_forKeyPath(&this, &NSString::from_str(kp)) };
+                }
+            }
+            let inner = this.ivars().inner.borrow_mut().take();
+            unsafe { wk.setNavigationDelegate(inner.as_deref()) };
+        });
+    }
+}
+
 /// Shows the browser `label` at the given rect, creating it (loading `url`) on
 /// first call or just repositioning an existing one.
 ///
@@ -204,6 +517,7 @@ pub async fn browser_show(
     // limitation — tauri docs note this), then on a successful `Finished` emit
     // `browser-download` with that path so the frontend opens it in a pane.
     let dl_app = app.clone();
+    let dl_label = label.clone();
     let dl_dest: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let dl_dest_req = dl_dest.clone();
@@ -256,7 +570,7 @@ pub async fn browser_show(
                         *slot = Some(destination.clone());
                     }
                 }
-                tauri::webview::DownloadEvent::Finished { path, success, .. } => {
+                tauri::webview::DownloadEvent::Finished { url, path, success, .. } => {
                     if success {
                         // Prefer the event's path; fall back to the captured
                         // destination (macOS path is empty on Finished).
@@ -274,9 +588,14 @@ pub async fn browser_show(
                                 p.to_string_lossy().to_string(),
                                 name.clone(),
                             );
+                            // `label` + `url` ride along so the notification /
+                            // open-in-files flow knows which pane downloaded
+                            // what without another lookup.
                             let _ = dl_app.emit(
                                 "browser-download",
                                 serde_json::json!({
+                                    "label": dl_label,
+                                    "url": url.to_string(),
                                     "path": p.to_string_lossy(),
                                     "name": name,
                                 }),
@@ -339,6 +658,11 @@ pub async fn browser_show(
             }
         });
     }
+    // Push-based nav state + load errors (replaces the frontend poll). Queued
+    // on the main thread AFTER the pref/adblock closure above, so it sees the
+    // fully-configured webview.
+    #[cfg(target_os = "macos")]
+    nav_state::attach(&app, &label);
     Ok(())
 }
 
@@ -508,6 +832,10 @@ pub fn browser_force_reload(app: AppHandle, label: String) -> Result<(), String>
 /// disable when there's no history (they were always-enabled no-op buttons).
 /// macOS reads the real WKWebView state; elsewhere we can't cheaply know, so we
 /// report `[true, true]` (buttons stay enabled, same as before).
+///
+/// SUPERSEDED on macOS by the pushed `browser-nav-state` event (see the
+/// `nav_state` module) — kept for compatibility while the frontend still
+/// polls, and as the only source on non-mac platforms.
 #[tauri::command]
 pub async fn browser_nav_state(app: AppHandle, label: String) -> [bool; 2] {
     #[cfg(target_os = "macos")]
@@ -541,16 +869,18 @@ pub fn browser_open_devtools(app: AppHandle, label: String) -> Result<(), String
 }
 
 /// Native find-in-page (item 4) via WKWebView `findString:withConfiguration:`.
-/// `forward` walks matches in direction; `wraps` so the search cycles. Returns
-/// whether a match was found. NOTE: WKFindResult exposes only `matchFound` — the
-/// WebKit public API has NO match-COUNT, so the frontend shows found/not-found,
-/// not "3 of 12". macOS-only; on Windows this is a no-op returning false.
+/// `forward` walks matches in direction; `wraps` (default true) cycles past the
+/// last match back to the first. Returns whether a match was found. NOTE:
+/// WKFindResult exposes only `matchFound` — the WebKit public API has NO
+/// match-COUNT, so the frontend shows found/not-found, not "3 of 12".
+/// macOS-only; on Windows this is a no-op returning false.
 #[tauri::command]
 pub async fn browser_find(
     app: AppHandle,
     label: String,
     query: String,
     forward: bool,
+    wraps: Option<bool>,
 ) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -576,7 +906,7 @@ pub async fn browser_find(
                 let cfg = unsafe { WKFindConfiguration::new(mtm) };
                 unsafe {
                     cfg.setBackwards(!forward);
-                    cfg.setWraps(true);
+                    cfg.setWraps(wraps.unwrap_or(true));
                     cfg.setCaseSensitive(false);
                 }
                 let q = NSString::from_str(&query);
@@ -601,7 +931,7 @@ pub async fn browser_find(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (&app, &label, &query, &forward);
+        let _ = (&app, &label, &query, &forward, &wraps);
         false
     }
 }
@@ -623,6 +953,12 @@ pub fn browser_hide(app: AppHandle, label: String) -> Result<(), String> {
 /// fullscreen, then blank the document so no background media context survives.
 #[tauri::command]
 pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
+    // FIRST: tear down the KVO observers + restore wry's navigation delegate.
+    // Must precede the about:blank dance + close() below — a WKWebView that
+    // deallocates with observers still registered is a crash, and the detach
+    // closure is serialized on the main thread ahead of the close.
+    #[cfg(target_os = "macos")]
+    nav_state::detach(&app, &label);
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.eval(
             "try{document.querySelectorAll('video,audio').forEach(m=>{try{m.pause();m.removeAttribute('src');m.srcObject=null;m.load();}catch(e){}});if(document.fullscreenElement){try{document.exitFullscreen();}catch(e){}}}catch(e){}",

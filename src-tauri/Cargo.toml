@@ -58,8 +58,11 @@ futures-util = "0.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSDate", "NSSet", "NSArray", "NSError", "NSHTTPCookie"] }
-objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKFindConfiguration", "WKFindResult", "WKWebsiteDataStore", "WKWebsiteDataRecord", "WKHTTPCookieStore", "block2"] }
+# `NSKeyValueObserving` + `WKNavigation`/`WKNavigationDelegate`: the browser
+# nav-state observer (browser.rs `nav_state` module) KVO-watches each child
+# WKWebView and proxies its navigation delegate for didFail* load errors.
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDate", "NSSet", "NSArray", "NSError", "NSHTTPCookie", "NSDictionary", "NSURL", "NSKeyValueObserving"] }
+objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKFindConfiguration", "WKFindResult", "WKWebsiteDataStore", "WKWebsiteDataRecord", "WKHTTPCookieStore", "WKNavigation", "WKNavigationDelegate", "objc2-app-kit", "block2"] }
 
 # ── ScreenCaptureKit "native app as a pane" spike (appcast.rs) ───────────────
 # Live-mirror a single foreign macOS window into an AIOS pane: SCK captures the

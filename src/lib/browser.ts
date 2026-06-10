@@ -1,5 +1,6 @@
 /** Wrappers over the native embedded-browser (child webview) commands. Each
  *  browser pane drives its own webview, addressed by a per-pane `label`. */
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "./tauri";
 
 export interface Rect {
@@ -34,9 +35,11 @@ export const browserNavState = (label: string) =>
 /** Opens the WKWebView Web Inspector (DevTools) for this pane. */
 export const browserOpenDevtools = (label: string) =>
   invoke("browser_open_devtools", { label });
-/** Native find-in-page. Returns whether a match was found (no match-count in the WebKit API). */
-export const browserFind = (label: string, query: string, forward: boolean) =>
-  invoke<boolean>("browser_find", { label, query, forward });
+/** Native find-in-page. Returns whether a match was found (no match-count in
+ *  the WebKit API — found/not-found is the whole contract). `forward` sets the
+ *  walk direction; `wraps` (default true) cycles past the last match. */
+export const browserFind = (label: string, query: string, forward: boolean, wraps?: boolean) =>
+  invoke<boolean>("browser_find", { label, query, forward, wraps: wraps ?? true });
 export const browserHide = (label: string) => invoke("browser_hide", { label });
 export const browserClose = (label: string) => invoke("browser_close", { label });
 export const browserZoom = (label: string, factor: number) =>
@@ -133,3 +136,83 @@ export interface BrowserContextPayload {
   linkUrl: string;
   text: string;
 }
+
+// ─── Backend-pushed browser events (the wave-2D contract) ────────────────────
+// Payload shapes exactly as emitted by src-tauri/src/browser.rs. The listen
+// helpers below are thin: they subscribe and hand the typed payload to `cb`,
+// returning the tauri unlisten fn. Events arrive for EVERY pane — filter on
+// `label` for per-pane consumers.
+
+/** `browser-nav-state` — pushed from the macOS KVO observer (nav_state module)
+ *  whenever canGoBack / canGoForward / URL / estimatedProgress / loading
+ *  change on a pane's WKWebView. Coalesced: identical snapshots are not
+ *  re-emitted. Replaces polling `browserNavState` + `browserCurrentUrl`
+ *  (macOS; other platforms still need the poll). One initial snapshot is
+ *  pushed right after the webview is created. */
+export interface BrowserNavState {
+  /** The pane's webview label. */
+  label: string;
+  url: string;
+  canBack: boolean;
+  canFwd: boolean;
+  loading: boolean;
+  /** WKWebView estimatedProgress, 0–1, rounded to 2dp. */
+  progress: number;
+}
+
+/** `browser-load-error` — a navigation actually failed (didFailNavigation /
+ *  didFailProvisionalNavigation). Cancellation (-999) and "became a download"
+ *  (WebKit 102) are filtered out backend-side. macOS only. */
+export interface BrowserLoadError {
+  label: string;
+  /** NSError code, e.g. -1009 offline, -1003 DNS, -1004 connect refused. */
+  code: number;
+  /** The url that failed (NSError failing-url, falling back to current url). */
+  url: string;
+  /** Human-readable localizedDescription. */
+  description: string;
+  /** True = failed before any content arrived (provisional navigation). */
+  provisional: boolean;
+}
+
+/** `browser-load` — Started/Finished page-load phases from wry's hooks (all
+ *  platforms; pre-dates `browser-nav-state` and stays for the progress bar). */
+export interface BrowserLoadEvent {
+  label: string;
+  phase: "started" | "finished";
+  url: string;
+}
+
+/** `browser-download` — a download finished successfully (already persisted to
+ *  the downloads store backend-side). `label` + `url` identify which pane
+ *  downloaded what, for the notification + open-in-files flow. */
+export interface BrowserDownloadEvent {
+  label: string;
+  /** Source url of the download request. */
+  url: string;
+  /** Absolute filesystem path of the saved file. */
+  path: string;
+  /** Basename of `path`, when resolvable. */
+  name: string | null;
+}
+
+/** `browser-new-pane` — the page asked for a new window (target=_blank /
+ *  window.open / ⌘-click); the backend denies the OS window and the frontend
+ *  spawns a pane. `is_popup` = window.open with explicit size (OAuth shape) →
+ *  treat as a transient child of the opener. */
+export interface BrowserNewPaneEvent {
+  url: string;
+  profile: string | null;
+  is_popup: boolean;
+}
+
+export const onBrowserNavState = (cb: (e: BrowserNavState) => void): Promise<UnlistenFn> =>
+  listen<BrowserNavState>("browser-nav-state", ({ payload }) => cb(payload));
+export const onBrowserLoadError = (cb: (e: BrowserLoadError) => void): Promise<UnlistenFn> =>
+  listen<BrowserLoadError>("browser-load-error", ({ payload }) => cb(payload));
+export const onBrowserLoad = (cb: (e: BrowserLoadEvent) => void): Promise<UnlistenFn> =>
+  listen<BrowserLoadEvent>("browser-load", ({ payload }) => cb(payload));
+export const onBrowserDownload = (cb: (e: BrowserDownloadEvent) => void): Promise<UnlistenFn> =>
+  listen<BrowserDownloadEvent>("browser-download", ({ payload }) => cb(payload));
+export const onBrowserNewPane = (cb: (e: BrowserNewPaneEvent) => void): Promise<UnlistenFn> =>
+  listen<BrowserNewPaneEvent>("browser-new-pane", ({ payload }) => cb(payload));
