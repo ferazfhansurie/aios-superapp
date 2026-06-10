@@ -2095,6 +2095,14 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
         .map(|v| v.get("type").and_then(|x| x.as_str()) == Some("result"))
         .unwrap_or(false);
 
+    // Clear `busy` BEFORE forwarding a `result`: the frontend reacts to the
+    // result line by immediately firing any queued follow-up via `chat_send`,
+    // and chat_send's compare_exchange would bounce it if the flag were still
+    // set. Clearing first makes "see result → send next" race-free.
+    if is_result {
+        sess.busy.store(false, Ordering::SeqCst);
+    }
+
     // Forward the line itself first (buffer + live sink), so the pane sees the
     // turn close before the usage tick that follows it. For an image-bearing
     // user echo, send the REAL line live but buffer only a slimmed placeholder
@@ -2110,7 +2118,6 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
     }
 
     if is_result {
-        sess.busy.store(false, Ordering::SeqCst);
         if sess.detached.load(Ordering::SeqCst) && sess.notify_on_done.swap(false, Ordering::SeqCst)
         {
             let title = sess.title.lock().clone();
@@ -2287,7 +2294,18 @@ pub fn chat_send(
     let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) else {
         return Err(format!("chat session {session_id} not found"));
     };
-    s.busy.store(true, Ordering::SeqCst);
+    // FIX (busy race): claim the turn atomically. A plain `store(true)` let two
+    // racing sends both proceed (double-fired turns, crossed results); the CAS
+    // makes the second caller bounce with a clean error instead. Mid-turn
+    // follow-ups should go through `chat_steer` (claude stdin inject / codex
+    // turn/steer) or the frontend queue — never a second chat_send.
+    if s
+        .busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("session busy — a turn is already in flight (steer or queue instead)".into());
+    }
     let images = image_paths.unwrap_or_default();
     if matches!(s.engine, Engine::Codex) {
         return codex_send_turn(&s, text, &images);
@@ -2324,11 +2342,18 @@ pub fn chat_send(
         }
         return Ok(());
     }
-    if images.is_empty() {
-        write_line(session_id, &user_line(&text))
+    let line = if images.is_empty() {
+        user_line(&text)
     } else {
-        write_line(session_id, &user_line_with_images(&text, &images))
+        user_line_with_images(&text, &images)
+    };
+    let res = write_line(session_id, &line);
+    if res.is_err() {
+        // The turn never reached claude — release the claim or the session
+        // wedges busy=true forever (no `result` will ever clear it).
+        s.busy.store(false, Ordering::SeqCst);
     }
+    res
 }
 
 /// Detaches a session from its pane WITHOUT killing it: clears the sink so
@@ -2497,18 +2522,52 @@ pub fn chat_interrupt(session_id: u32) -> Result<(), String> {
     write_line(session_id, &line)
 }
 
-/// Steers the in-flight turn with a follow-up message WITHOUT interrupting it
-/// (codex `turn/steer` — the model folds it into the running turn). Only codex
-/// supports true mid-turn steering today; other engines return Err so the
-/// frontend queues the message to fire when the current turn completes.
+/// Steers the in-flight turn with a follow-up message WITHOUT interrupting it.
+/// This is the unified mid-turn dispatcher — it picks the right mechanism per
+/// engine, and returns Err when the message must wait in the frontend queue:
+///
+/// - **claude**: writes the user line straight to the persistent process's
+///   stdin. Verified empirically against claude 2.1.170 (stream-json stdin
+///   mode): a user line written mid-turn is picked up between agent steps and
+///   folded into the SAME turn, codex-style — no interrupt, no second turn.
+///   Because stdin injection is a full user line, it carries image content
+///   blocks too (`user_line_with_images`).
+/// - **codex**: `turn/steer` RPC (text-only — the RPC takes text input items;
+///   image-carrying messages return Err so the frontend keeps them queued and
+///   they fire as a normal turn with real content blocks).
+/// - **opencode**: no live process mid-turn — always Err → frontend queue.
 #[tauri::command]
-pub fn chat_steer(session_id: u32, text: String) -> Result<(), String> {
+pub fn chat_steer(
+    session_id: u32,
+    text: String,
+    image_paths: Option<Vec<String>>,
+) -> Result<(), String> {
     let s = with_sessions(|m| m.get(&session_id).cloned())
         .ok_or_else(|| format!("chat session {session_id} not found"))?;
-    if matches!(s.engine, Engine::Codex) {
-        return codex_steer(&s, &text);
+    let images = image_paths.unwrap_or_default();
+    match s.engine {
+        Engine::Codex => {
+            if !images.is_empty() {
+                return Err("codex steer is text-only — image messages stay queued".into());
+            }
+            codex_steer(&s, &text)
+        }
+        Engine::Claude => {
+            // No live turn → nothing to steer into; Err makes the frontend fall
+            // back to a normal send/queue instead of silently starting a turn
+            // the composer doesn't know about.
+            if !s.busy.load(Ordering::SeqCst) {
+                return Err("no active claude turn to steer".into());
+            }
+            let line = if images.is_empty() {
+                user_line(&text)
+            } else {
+                user_line_with_images(&text, &images)
+            };
+            write_line(session_id, &line)
+        }
+        Engine::Opencode => Err("steering not supported for this engine".into()),
     }
-    Err("steering not supported for this engine".into())
 }
 
 /// Writes a raw, already-formed JSON line to a session's stdin (must end in
@@ -3188,6 +3247,51 @@ mod tests {
             answer_streamed: AtomicBool::new(false),
             pending_approvals: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Registers a session under a unique high id (clear of NEXT_ID's range)
+    /// so command-level tests can exercise the global registry without
+    /// interfering with each other.
+    fn register_test_session(id: u32, engine: Engine, busy: bool) {
+        let sess = Arc::new(ChatSession {
+            engine,
+            busy: AtomicBool::new(busy),
+            id,
+            ..match Arc::try_unwrap(test_codex_session()) {
+                Ok(s) => s,
+                Err(_) => unreachable!("fresh test session has one owner"),
+            }
+        });
+        super::with_sessions(|m| {
+            m.insert(id, sess);
+        });
+    }
+
+    #[test]
+    fn chat_steer_routes_and_rejects_per_engine() {
+        // claude with no live turn → Err (frontend falls back to send/queue)…
+        register_test_session(900_001, Engine::Claude, false);
+        let e = super::chat_steer(900_001, "x".into(), None).unwrap_err();
+        assert!(e.contains("no active claude turn"), "got: {e}");
+        // …and with a live turn it attempts the stdin write (no stdin in the
+        // test session → the write path is reached and reports it, instead of
+        // the no-active-turn gate firing).
+        register_test_session(900_002, Engine::Claude, true);
+        let e = super::chat_steer(900_002, "x".into(), None).unwrap_err();
+        assert!(e.contains("stdin"), "got: {e}");
+        // codex steering is text-only: image-carrying messages must stay queued.
+        register_test_session(900_003, Engine::Codex, true);
+        let e = super::chat_steer(900_003, "x".into(), Some(vec!["/tmp/i.png".into()]))
+            .unwrap_err();
+        assert!(e.contains("text-only"), "got: {e}");
+        // opencode has no mid-turn channel at all.
+        register_test_session(900_004, Engine::Opencode, true);
+        assert!(super::chat_steer(900_004, "x".into(), None).is_err());
+        super::with_sessions(|m| {
+            for id in [900_001, 900_002, 900_003, 900_004] {
+                m.remove(&id);
+            }
+        });
     }
 
     #[test]
