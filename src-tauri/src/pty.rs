@@ -51,6 +51,20 @@ impl PtyState {
     }
 }
 
+/// Structured payload for the `pty-exit` event. Mirrored as `PtyExitEvent` in
+/// `src/lib/pty.ts` — wave-2B consumes this to render the inline
+/// "process exited — ⏎ restart / ⌘W close" state.
+///
+/// `exit_code` is `None` when the child couldn't be reaped quickly (or the
+/// reader stopped while the child was still alive, e.g. the frontend dropped
+/// its channel on webview reload).
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyExit {
+    id: u32,
+    exit_code: Option<u32>,
+}
+
 /// Splits a byte buffer at the last valid UTF-8 boundary, returning the decoded
 /// prefix and any trailing incomplete bytes (to be prepended to the next read).
 fn split_valid_utf8(buf: &[u8]) -> (String, Vec<u8>) {
@@ -128,9 +142,36 @@ fn spawn_internal(
         }
         // Child exited / reader EOF: evict the session BEFORE announcing the
         // exit, so any pty_write racing the exit notification can't land on a
-        // dead master. Dropping the Arc<Session> here also frees the PTY master.
-        sessions.lock().remove(&id);
+        // dead master (post-eviction, pty_write returns Err("dead or unknown")
+        // so the frontend gets a real signal instead of a black hole). Dropping
+        // the Arc<Session> here also frees the PTY master.
+        let removed = sessions.lock().remove(&id);
+        // Resolve the exit code WITHOUT blocking indefinitely: after EOF the
+        // child has normally already exited, but if the reader stopped because
+        // the frontend dropped the channel the child may still be alive —
+        // `wait()` would park this thread forever. Bounded try_wait instead.
+        let mut exit_code: Option<u32> = None;
+        if let Some(s) = &removed {
+            let mut child = s.child.lock();
+            for _ in 0..5 {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        exit_code = Some(status.exit_code());
+                        break;
+                    }
+                    Ok(None) => thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+        }
+        // MIGRATION (wave-1C → wave-2B): emit twice on the same event name.
+        // 1) legacy bare-id payload — TerminalRuntime's current listener does
+        //    `e.payload !== mySid` on a number; keep it working until wave-2B
+        //    adopts the structured shape, then delete this emit.
+        // 2) structured `PtyExit` payload — the canonical shape going forward
+        //    (documented as `PtyExitEvent` in src/lib/pty.ts).
         let _ = app.emit("pty-exit", id);
+        let _ = app.emit("pty-exit", PtyExit { id, exit_code });
     });
 
     let session = Arc::new(Session {
@@ -411,14 +452,50 @@ pub fn pty_spawn_tmux(
 }
 
 /// Writes raw input bytes to a session's PTY stdin.
+///
+/// Unknown/dead sessions are a hard `Err` — the reader thread evicts a session
+/// from the registry the moment its PTY closes, so a write landing here after
+/// that is typing into a corpse. Returning Err lets the frontend surface it
+/// (instead of the old silent-Ok black hole).
 #[tauri::command]
 pub fn pty_write(state: State<PtyState>, id: u32, data: String) -> Result<(), String> {
     let session = state.sessions.lock().get(&id).cloned();
-    if let Some(s) = session {
-        let mut w = s.writer.lock();
-        w.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-        w.flush().map_err(|e| e.to_string())?;
-    }
+    let Some(s) = session else {
+        return Err(format!("pty session {id} is dead or unknown"));
+    };
+    let mut w = s.writer.lock();
+    w.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+    w.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Bracketed-paste write: wraps `text` in `ESC[200~ … ESC[201~` so multiline
+/// pastes arrive at the application as ONE atomic paste instead of N typed
+/// lines — replacing the frontend's 40/150/600ms chunked-write timer hacks.
+///
+/// Whether the inner application actually enabled bracketed-paste mode
+/// (DECSET 2004) is NOT trackable from this side of the PTY — the mode toggle
+/// flows out through the data stream to xterm.js, which is wave-2B's side.
+/// In practice this is safe for every pane kind we spawn:
+/// - tmux-backed panes (`aios-term-*`, oracles, all-tmux): tmux itself parses
+///   the 200~/201~ markers as paste delimiters and re-brackets only if the
+///   inner app requested mode 2004 — passthrough is handled for us.
+/// - raw shell panes: zsh (≥5.1), bash/readline (≥4.4) and fish enable
+///   bracketed paste by default.
+#[tauri::command]
+pub fn pty_paste(state: State<PtyState>, id: u32, text: String) -> Result<(), String> {
+    let session = state.sessions.lock().get(&id).cloned();
+    let Some(s) = session else {
+        return Err(format!("pty session {id} is dead or unknown"));
+    };
+    // Paste-breakout guard: an embedded end-marker would terminate the bracket
+    // early and let the remainder of the text execute as typed keystrokes.
+    let sanitized = text.replace("\x1b[201~", "");
+    let mut w = s.writer.lock();
+    w.write_all(b"\x1b[200~").map_err(|e| e.to_string())?;
+    w.write_all(sanitized.as_bytes()).map_err(|e| e.to_string())?;
+    w.write_all(b"\x1b[201~").map_err(|e| e.to_string())?;
+    w.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -515,5 +592,156 @@ pub fn pty_reap_terminals(keep: Vec<String>) -> Result<Vec<String>, String> {
             }
         }
         Ok(reaped)
+    }
+}
+
+/// Pure GC filter for `pty_gc` — factored out so the safety rails are unit
+/// testable without a tmux server. Takes the raw output of
+/// `tmux list-sessions -F '#{session_name}\t#{session_attached}'` plus the
+/// live keys, and returns the session names that are safe to kill.
+///
+/// Safety rails (in order):
+/// 1. PREFIX: only `aios-term-*` sessions are ever candidates. Oracles
+///    (`aios-<identity>`), the bridge, and anything else on the socket are
+///    untouchable.
+/// 2. ATTACHED: a session with ≥1 attached client is never killed — that
+///    client may be a SECOND running app instance or a manual `tmux attach`.
+///    Lines whose attached-count doesn't parse are treated as attached
+///    (conservative: when in doubt, don't kill).
+/// 3. LIVE: sessions belonging to the caller's layout are kept. Keys are
+///    accepted either as bare suffixes (`k3-abcd`, the pane's
+///    `termSessionName`) or full session names (`aios-term-k3-abcd`).
+#[cfg_attr(windows, allow(dead_code))]
+fn gc_kill_candidates(list_output: &str, live_keys: &[String]) -> Vec<String> {
+    use std::collections::HashSet;
+    let keep: HashSet<String> = live_keys
+        .iter()
+        .map(|k| {
+            if k.starts_with("aios-term-") {
+                k.clone()
+            } else {
+                format!("aios-term-{k}")
+            }
+        })
+        .collect();
+    let mut out = Vec::new();
+    for line in list_output.lines() {
+        let Some((name, attached)) = line.trim().split_once('\t') else {
+            continue; // malformed line → never a kill candidate
+        };
+        let name = name.trim();
+        if !name.starts_with("aios-term-") {
+            continue; // rail 1: outside our namespace
+        }
+        match attached.trim().parse::<u32>() {
+            Ok(0) => {}
+            _ => continue, // rail 2: attached (or unparseable → assume attached)
+        }
+        if keep.contains(name) {
+            continue; // rail 3: has a live pane
+        }
+        out.push(name.to_string());
+    }
+    out
+}
+
+/// Orphan GC: kills `aios-term-*` tmux sessions on the adletic socket that are
+/// BOTH absent from `live_keys` AND currently detached. Panes that crash
+/// without cleanup leave their persistent sessions accumulating forever
+/// (`pty_kill` only detaches the attach client) — this is the boot-time sweep.
+///
+/// Differs from `pty_reap_terminals` by the attached-client check: a detach-only
+/// filter would let one app instance kill sessions a SECOND running instance is
+/// actively attached to. Safety rails live in `gc_kill_candidates` (tested).
+/// Kill targets use tmux's `=name` exact-match form so a session vanishing
+/// between list and kill can't prefix-match a different one.
+///
+/// Returns the full session names actually killed. Non-unix / no tmux server →
+/// empty. Boot-time invocation is wave-2 (needs the stable-keys layout).
+#[tauri::command]
+pub fn pty_gc(live_keys: Vec<String>) -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        let _ = live_keys;
+        Ok(Vec::new())
+    }
+    #[cfg(not(windows))]
+    {
+        let tmux = tmux_bin();
+        let output = std::process::Command::new(&tmux)
+            .args([
+                "-L",
+                "adletic",
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{session_attached}",
+            ])
+            .output()
+            .map_err(|e| format!("failed to run tmux: {e}"))?;
+        // No server / no sessions → tmux exits non-zero; nothing to GC.
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut killed = Vec::new();
+        for name in gc_kill_candidates(&stdout, &live_keys) {
+            let result = std::process::Command::new(&tmux)
+                .args(["-L", "adletic", "kill-session", "-t", &format!("={name}")])
+                .output();
+            if matches!(result, Ok(o) if o.status.success()) {
+                killed.push(name);
+            }
+        }
+        Ok(killed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gc_kill_candidates;
+
+    fn keys(ks: &[&str]) -> Vec<String> {
+        ks.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn kills_detached_orphans_only() {
+        let out = "aios-term-orphan\t0\naios-term-live\t0\n";
+        assert_eq!(
+            gc_kill_candidates(out, &keys(&["live"])),
+            vec!["aios-term-orphan"]
+        );
+    }
+
+    #[test]
+    fn never_touches_non_prefix_sessions() {
+        // oracles / bridge / unrelated sessions on the same socket, all detached
+        // and none in live_keys — still untouchable.
+        let out = "aios-firaz\t0\nbridge\t0\naios-cron\t0\naios-termless\t0\n";
+        assert!(gc_kill_candidates(out, &[]).is_empty());
+    }
+
+    #[test]
+    fn never_kills_attached_sessions() {
+        // attached orphan = likely a second app instance or manual attach.
+        let out = "aios-term-other-instance\t1\naios-term-multi\t2\naios-term-dead\t0\n";
+        assert_eq!(gc_kill_candidates(out, &[]), vec!["aios-term-dead"]);
+    }
+
+    #[test]
+    fn accepts_suffix_and_full_name_live_keys() {
+        let out = "aios-term-a\t0\naios-term-b\t0\naios-term-c\t0\n";
+        assert_eq!(
+            gc_kill_candidates(out, &keys(&["a", "aios-term-b"])),
+            vec!["aios-term-c"]
+        );
+    }
+
+    #[test]
+    fn malformed_lines_are_never_candidates() {
+        // missing tab field, non-numeric attached count, empty line → skip all
+        // (conservative: when in doubt, don't kill).
+        let out = "aios-term-no-tab\naios-term-weird\tx\n\naios-term-ok\t0\n";
+        assert_eq!(gc_kill_candidates(out, &[]), vec!["aios-term-ok"]);
     }
 }
