@@ -73,6 +73,8 @@ import {
   browserDownloadForget,
   browserDownloadClear,
   browserRevealInFinder,
+  onBrowserLoadError,
+  onBrowserNavState,
   readClipboard,
   type BrowserAnnotation,
   type BrowserContextPayload,
@@ -359,9 +361,70 @@ export function BrowserPane({
     };
   }, [active, dragArmed, loadError, contextMenu, overlayOpen, current, label, profile, rect]);
 
-  // Poll the webview's REAL url (catches in-page navigation the address bar never
-  // sees). On a real change: remember it (pinned sites resume here) and sync the
-  // address bar — unless the user is mid-edit in it.
+  // Push-driven nav state from the native WKWebView KVO/delegate observer. This
+  // is the hot path for back/fwd enablement, address-bar sync, loading state and
+  // real load errors; the old polls below stay only as slow safety fallbacks.
+  useEffect(() => {
+    if (!active) return;
+    let disposed = false;
+    let unNav: (() => void) | undefined;
+    let unErr: (() => void) | undefined;
+    const applyUrl = (u: string) => {
+      if (!u || u === "about:blank") return;
+      const changed = u !== lastUrlRef.current;
+      if (changed) {
+        lastUrlRef.current = u;
+        rememberUrl(mem, u);
+        browserHistoryRecord(u).catch((e) =>
+          reportError("browser.history", e, { action: "record" }),
+        );
+      }
+      if (!inputFocusedRef.current) {
+        setCurrent(u);
+        setInput(u);
+      }
+    };
+    void onBrowserNavState((payload) => {
+      if (payload.label !== label) return;
+      setCanGoBack(payload.canBack);
+      setCanGoForward(payload.canFwd);
+      setLoading(payload.loading);
+      applyUrl(payload.url);
+      if (payload.loading) setLoadError(null);
+      else if (loadTimer.current) {
+        clearTimeout(loadTimer.current);
+        loadTimer.current = null;
+      }
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unNav = stop;
+      })
+      .catch((e) => reportDiag("browser.listen", e, { action: "navStatePush" }));
+    void onBrowserLoadError((payload) => {
+      if (payload.label !== label) return;
+      if (loadTimer.current) {
+        clearTimeout(loadTimer.current);
+        loadTimer.current = null;
+      }
+      const u = payload.url || lastUrlRef.current;
+      setLoading(false);
+      setLoadError(u || payload.description || "navigation failed");
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unErr = stop;
+      })
+      .catch((e) => reportDiag("browser.listen", e, { action: "loadErrorPush" }));
+    return () => {
+      disposed = true;
+      unNav?.();
+      unErr?.();
+    };
+  }, [active, label, mem]);
+
+  // Slow safety poll for the webview's REAL url (non-mac fallback / missed event
+  // guard). Push events above do the normal address-bar work instantly.
   useEffect(() => {
     if (!active) return;
     const tick = () => {
@@ -381,7 +444,7 @@ export function BrowserPane({
         })
         .catch((e) => reportDiag("browser.url", e, { action: "currentUrl" }));
     };
-    const poll = setInterval(tick, 1500);
+    const poll = setInterval(tick, 5000);
     return () => clearInterval(poll);
   }, [active, label, mem]);
 
@@ -524,8 +587,8 @@ export function BrowserPane({
     };
   }, [active, label, mem]);
 
-  // Poll the live WKWebView back/forward history so the toolbar buttons disable
-  // when there's nowhere to go (they were always-enabled no-ops before).
+  // Slow safety poll for back/forward enablement. Native KVO push above is the
+  // primary path; this catches non-mac fallback / missed observer events.
   useEffect(() => {
     if (!active) return;
     const tick = () => {
@@ -538,7 +601,7 @@ export function BrowserPane({
         .catch((e) => reportDiag("browser.nav", e, { action: "navState" }));
     };
     tick();
-    const poll = setInterval(tick, 700);
+    const poll = setInterval(tick, 5000);
     return () => clearInterval(poll);
   }, [active, label]);
 

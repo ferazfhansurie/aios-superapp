@@ -205,10 +205,11 @@ fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
         }
     };
     if let Some((action, index)) = nav {
-        let _ = app.emit(
-            "pane-nav",
-            serde_json::json!({ "action": action, "index": index }),
-        );
+        let payload = match index {
+            Some(index) => serde_json::json!({ "action": action, "index": index }),
+            None => serde_json::json!({ "action": action }),
+        };
+        let _ = app.emit("pane-nav", payload);
     } else {
         let _ = app.emit(
             "menu-action",

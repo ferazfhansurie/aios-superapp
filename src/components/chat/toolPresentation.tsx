@@ -3,7 +3,7 @@
  *  sets: the private IMG_EXT/DOC_EXT/CODE_EXT copies were replaced with the
  *  canonical groups from lib/fileKinds.ts (the one planned non-move change). */
 import { FileText, Globe, Pencil, Search, Terminal, Wrench } from "lucide-react";
-import { CODE_EXT, DOC_EXT, IMG_EXT } from "../../lib/fileKinds";
+import { CODE_EXT, DOC_EXT, IMG_EXT, TEXT_EXT } from "../../lib/fileKinds";
 import type { ChatTurn } from "../../lib/chatStream";
 import { baseName, ellipsizeMid } from "./chatFormat";
 
@@ -215,7 +215,7 @@ export function artifactKind(path: string): Artifact["kind"] {
   if (ext === "pdf") return "pdf";
   if (IMG_EXT.has(ext)) return "img";
   if (CODE_EXT.has(ext)) return "code";
-  if (DOC_EXT.has(ext)) return "doc";
+  if (DOC_EXT.has(ext) || TEXT_EXT.has(ext)) return "doc";
   return "file";
 }
 

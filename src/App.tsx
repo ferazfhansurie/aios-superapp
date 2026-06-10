@@ -1003,6 +1003,9 @@ function App() {
         case "browser":
           spawn({ type: "browser", url: ctx?.url }, ctx?.label ?? "browser");
           break;
+        case "chrome":
+          spawn({ type: "chrome", url: ctx?.url }, ctx?.label ?? "chrome");
+          break;
         case "chat":
           spawn({ type: "chat", cwd: ctx?.cwd, seed: ctx?.seed }, ctx?.label ?? "chat");
           break;
@@ -1504,24 +1507,24 @@ function App() {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
-        setPaletteOpen((v) => !v);
+        routePaneNav({ action: "palette" });
       } else if (mod && e.shiftKey && e.key.toLowerCase() === "f") {
         // ⌘⇧F — global content search (must come BEFORE the bare ⌘F fullscreen
         // branch below, which also keys on "f").
         e.preventDefault();
-        setGlobalSearchOpen((v) => !v);
+        routePaneNav({ action: "globalsearch" });
       } else if (mod && !e.shiftKey && e.key.toLowerCase() === "p") {
         // ⌘P — fuzzy file finder ("go to file"). firaz's #1 pain.
         e.preventDefault();
-        setFileFinderOpen((v) => !v);
+        routePaneNav({ action: "quickopen" });
       } else if (mod && e.key.toLowerCase() === "b") {
         e.preventDefault();
-        setSidebarOpen((v) => !v);
+        routePaneNav({ action: "sidebar" });
       } else if (mod && (e.key.toLowerCase() === "t" || e.key.toLowerCase() === "n")) {
         // ⌘T / ⌘N — new pane (context-aware: browser pane focused → new browser
         // pane; otherwise a new terminal).
         e.preventDefault();
-        newPaneForContext();
+        routePaneNav({ action: "newtab" });
       } else if (mod && e.key.toLowerCase() === "r") {
         // ⌘R — reload the cockpit fresh (re-init theme, re-poll all live data).
         e.preventDefault();
@@ -1530,8 +1533,7 @@ function App() {
         // ⌘W — close the focused pane (mac muscle memory). Falls back to the
         // active pane; no-op when nothing's focused.
         e.preventDefault();
-        const k = focusedPane.current ?? activeKey;
-        if (k) requestClose(k);
+        routePaneNav({ action: "close" });
       } else if ((mod && e.key === "`") || (e.ctrlKey && e.key === "ArrowUp")) {
         // ⌘` / Ctrl+↑ — toggle the mission-control pane overview (switch panes).
         // Ctrl+↑ mirrors macOS Mission Control; ⌘` mirrors window-cycle.
@@ -1540,7 +1542,8 @@ function App() {
       } else if (mod && e.key.toLowerCase() === "f") {
         // ⌘F — context-aware: browser pane focused → find-in-page; else fullscreen
         // the selected pane. Only preventDefault when we actually handled it.
-        if (handleCmdF()) e.preventDefault();
+        e.preventDefault();
+        routePaneNav({ action: "find" });
       } else if (mod && e.key.toLowerCase() === "m") {
         // ⌘M — minimize (hide) the selected pane to the OPEN rail. ⇧ restores all.
         e.preventDefault();
@@ -1554,9 +1557,7 @@ function App() {
       } else if (mod && /^[1-9]$/.test(e.key)) {
         // ⌘1..9 — jump to the Nth open pane (restore + select it).
         e.preventDefault();
-        const idx = Number(e.key) - 1;
-        const p = panes[idx];
-        if (p) focusPane(p.key);
+        routePaneNav({ action: "goto", index: Number(e.key) });
       } else if (mod && e.key === ",") {
         e.preventDefault();
         setSettingsOpen(true);
@@ -1581,7 +1582,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addShell, newPaneForContext, fireAppshot, runF5, handleCmdF, requestClose, toggleHide, focusPane, activeKey, maximizedKey, panes]);
+  }, [addShell, fireAppshot, runF5, routePaneNav, toggleHide, activeKey, maximizedKey, panes]);
 
   // NATIVE PANE-NAV BRIDGE (wave 1B). Rust emits this frozen shortcut contract
   // for pane-routed actions so ⌘F/⌘W/⌘K/⌘1-9 still work when a native child
