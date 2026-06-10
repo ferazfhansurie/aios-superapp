@@ -11,6 +11,7 @@ mod device;
 mod diag;
 mod files;
 mod global_monitor;
+mod lsp;
 mod mac_apps;
 mod memory;
 mod monitor;
@@ -310,6 +311,13 @@ pub fn run() {
             monitor::monitor_start,
             monitor::monitor_stop,
             monitor::list_monitors,
+            // LSP supervisor (lsp.rs) — process spawn + framed pipe; protocol
+            // intelligence lives in src/lib/lsp/ on the TS side.
+            lsp::lsp_start,
+            lsp::lsp_send,
+            lsp::lsp_stop,
+            lsp::lsp_status,
+            lsp::lsp_find_root,
             chat::chat_start,
             chat::chat_send,
             chat::chat_steer,
@@ -386,9 +394,11 @@ pub fn run() {
             // belt-and-braces catch for exit paths that skip ExitRequested.
             tauri::RunEvent::ExitRequested { .. } => {
                 chat::kill_all_sessions();
+                lsp::kill_all_servers();
             }
             tauri::RunEvent::Exit => {
                 chat::kill_all_sessions();
+                lsp::kill_all_servers();
                 cdp::kill_supervised_chrome();
             }
             #[cfg(target_os = "macos")]
