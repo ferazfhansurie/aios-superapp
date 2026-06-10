@@ -52,14 +52,19 @@ export interface MoneyAgentChatSession {
   updatedAt: number;
 }
 
-const home = "/Users/firazfhansurie";
-const aiosOutputs = `${home}/Repo/firaz/adletic/aios-firaz/outputs`;
+// Home dir resolves at runtime via the Tauri path API (async). `home` starts as a
+// "~" placeholder so module init stays sync; async entry points await `homeReady`
+// first, and the builtin catalog is rebuilt in place once the real path lands.
+let home = "~";
+
 const customAgentsKey = "aios.chatAgents.custom";
 const lastScheduledRunKey = (id: string) => `aios.chatAgents.lastScheduledRun:${id}`;
 
 export const AGENT_CHAT_MODEL = "gpt-5.3-codex-spark";
 
-export const MONEY_AGENTS: MoneyAgentConfig[] = [
+function builtinMoneyAgents(): MoneyAgentConfig[] {
+  const aiosOutputs = `${home}/Repo/firaz/adletic/aios-firaz/outputs`;
+  return [
   {
     id: "firaz",
     label: "firaz",
@@ -99,7 +104,20 @@ export const MONEY_AGENTS: MoneyAgentConfig[] = [
     mission: "research, qualify, demo, and draft agency leads",
     schedule: "daily work blocks",
   },
-];
+  ];
+}
+
+export const MONEY_AGENTS: MoneyAgentConfig[] = builtinMoneyAgents();
+
+const homeReady: Promise<void> = (async () => {
+  try {
+    const { homeDir } = await import("@tauri-apps/api/path");
+    home = (await homeDir()).replace(/[\\/]+$/, "");
+    MONEY_AGENTS.splice(0, MONEY_AGENTS.length, ...builtinMoneyAgents());
+  } catch {
+    /* outside the tauri runtime (node tests) — keep the placeholder */
+  }
+})();
 
 function normalizeAgentId(value: string): string {
   return value
@@ -386,6 +404,7 @@ async function readJson(path: string): Promise<any | null> {
 }
 
 export async function loadMoneyAgentSummaries(): Promise<MoneyAgentSummary[]> {
+  await homeReady;
   const rows = await Promise.all(
     loadConfiguredMoneyAgents().map(async (agent) => {
       const [status, queue] = await Promise.all([
@@ -408,6 +427,7 @@ async function tailText(path: string, maxLines = 28): Promise<string[]> {
 }
 
 export async function loadMoneyAgentDetails(): Promise<MoneyAgentDetail[]> {
+  await homeReady;
   return Promise.all(
     loadConfiguredMoneyAgents().map(async (agent) => {
       const [status, queue, stdout, stderr] = await Promise.all([
