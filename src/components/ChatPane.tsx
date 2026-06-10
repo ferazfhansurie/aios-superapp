@@ -22,7 +22,7 @@
  *   7. `/` slash menu (clear / plan / model / help)
  *   8. `@` file-mention picker sourced from cwd
  */
-import { createContext, Fragment, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
@@ -161,6 +161,13 @@ import {
   fmtRelativeTime,
   uid,
 } from "./chat/chatFormat";
+import {
+  ChatCwdContext,
+  ChatFileOpenContext,
+  useChatCwd,
+  useChatFileOpener,
+  type ChatFileOpener,
+} from "./chat/chatContext";
 import { PaneDropZone } from "./PaneDropZone";
 import { reportDiag } from "../lib/diag";
 import { pushNotification } from "../lib/notifications";
@@ -625,44 +632,6 @@ function artifactFromTool(turn: ToolTurn): Artifact | null {
     "";
   if (!path) return null;
   return { path, name: baseName(path), kind: artifactKind(path) };
-}
-
-// ── deterministic in-chat file open ──────────────────────────────────────────
-//
-// Opening a file the model mentioned must NOT rely on the model or on a
-// name-search-and-hope. Two reliable sources:
-//   1. ABSOLUTE paths harvested from tool_use inputs (Read/Edit/Write/… file_path,
-//      codex apply_patch path) — already model-verified, opened directly.
-//   2. text/code-fence mentions → resolved against the session cwd by the backend
-//      (`resolve_in_cwd`), which returns a real absolute path ONLY if the file
-//      exists. A bounded fuzzy `find_files` is the LAST resort (exact-join first).
-// Everything routes through `openFileInPane` (paneBus) → identical to FilesPane.
-//
-// `cwd` is provided once at the ChatPane root via this context so the deep
-// markdown/inline/tool renderers don't each need it threaded through.
-
-type ChatFileOpener = (ref: string) => void;
-const ChatFileOpenContext = createContext<ChatFileOpener | null>(null);
-
-/** Session cwd, provided once at the ChatPane root so deep renderers (code-fence
- *  "run in terminal" affordance) can spawn a terminal rooted in the same dir
- *  without threading cwd through every layer. */
-const ChatCwdContext = createContext<string | null>(null);
-
-function useChatCwd(): string | null {
-  return useContext(ChatCwdContext);
-}
-
-function useChatFileOpener(): ChatFileOpener {
-  const ctx = useContext(ChatFileOpenContext);
-  return (
-    ctx ??
-    // fallback (no provider, e.g. web/test): open as-is, best-effort.
-    ((ref: string) => {
-      const path = resolvePaneFileTarget(ref);
-      openFileInPane(path, targetLabel(path));
-    })
-  );
 }
 
 /** Resolve a file reference against `cwd` (backend existence check) and open it
