@@ -59,6 +59,14 @@ import { GlobalSearch } from "./components/GlobalSearch";
 import { IdleDashboard } from "./components/IdleDashboard";
 import { MirrorViewer } from "./components/MirrorViewer";
 import { MoneyAgentsSection, type MoneyAgentChatState } from "./components/MoneyAgentsSection";
+import { AgentsSection, type AgentLiveState } from "./components/AgentsSection";
+import {
+  type AgentConfig,
+  agentPaneKey,
+  getAgent,
+  markAgentRun,
+  listAgents as listPersistentAgents,
+} from "./lib/agents";
 import { OracleRoster } from "./components/OracleRoster";
 import { PaneErrorBoundary } from "./components/PaneErrorBoundary";
 import { ResizableGrid } from "./components/ResizableGrid";
@@ -69,7 +77,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { appshotCapture, listOracles, reapTerminals, type OracleInfo } from "./lib/pty";
-import { listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } from "./lib/chat";
+import { chatStop, listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } from "./lib/chat";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import {
@@ -104,6 +112,7 @@ import {
   spawnPane as requestSpawnPane,
   openSettingsTo,
   paneKeyForChatSession,
+  chatSessions,
   registerSpawnPane,
   dispatchPaneNav,
   registerActivePane,
@@ -714,10 +723,13 @@ function App() {
     };
   }, [flash]);
 
-  const spawn = useCallback((kind: PaneContent, label: string): string => {
+  const spawn = useCallback((kind: PaneContent, label: string, explicitKey?: string): string => {
     // Stable key, minted once for the pane's whole life (persists via saveLayout,
     // reused across relaunches — see the STABLE PANE KEYS note above).
-    const key = newPaneKey(kind.type);
+    // `explicitKey` lets callers force a deterministic key (e.g. the persistent
+    // agents runtime keys an agent's pane `agent:<id>` so reopen reattaches the
+    // SAME pane instead of spawning a duplicate); minted otherwise.
+    const key = explicitKey ?? newPaneKey(kind.type);
     // Light usage event (kind:"usage") — seeds the "what I use" prioritization.
     // Carries only the pane-type enum, never any argument/label content.
     reportUsage("pane.spawn", kind.type);
@@ -2175,6 +2187,167 @@ function App() {
     }
     return out;
   }, [liveChats, moneyAgentSessionVersion, panes]);
+
+  // ── persistent agents runtime (src/lib/agents.ts) ──────────────────────────
+  // The generic "named agent → chatpane with a chosen model" runtime. Separate
+  // from the money-agents path above; nothing here touches it. Pane key per
+  // agent is `agent:<id>` so reopen reattaches rather than duplicates.
+  const [agentVersion, setAgentVersion] = useState(0);
+  const bumpAgents = useCallback(() => setAgentVersion((v) => v + 1), []);
+
+  // Submit text into a pane once its submitter is registered (CLI boot grace).
+  const submitWhenAgentReady = useCallback((key: string, text: string) => {
+    let tries = 0;
+    const tick = () => {
+      const submit = paneSubmitters.get(key);
+      if (submit) {
+        submit(text);
+        return;
+      }
+      if (tries++ < 60) setTimeout(tick, 150);
+    };
+    tick();
+  }, []);
+
+  // Open (or reattach) an agent's chatpane. Reuses the `agent:<id>` pane if it's
+  // already mounted; otherwise spawns a fresh chat with the agent's model/cwd
+  // and seeds the prompt (claude auto-sends the seed once ready).
+  const openAgentPane = useCallback(
+    (agent: AgentConfig, opts: { run?: boolean } = {}): string => {
+      const paneKey = agentPaneKey(agent.id);
+      const existing = panes.find((p) => p.key === paneKey);
+      if (existing) {
+        focusPane(paneKey);
+        if (opts.run) submitWhenAgentReady(paneKey, agent.prompt);
+        return paneKey;
+      }
+      // Fresh spawn. `seed` runs once on boot; for a Run-now on a never-opened
+      // agent the seed IS the prompt, so opts.run + first-open coincide.
+      const key = spawn(
+        {
+          type: "chat",
+          seed: agent.prompt,
+          cwd: agent.cwd || undefined,
+          modelId: agent.model,
+          agentId: agent.id,
+          agentLabel: agent.label,
+        },
+        agent.label,
+        paneKey,
+      );
+      markAgentRun(agent.id);
+      bumpAgents();
+      return key;
+    },
+    [panes, focusPane, spawn, submitWhenAgentReady, bumpAgents],
+  );
+
+  // Run-now: if a session is already open, re-send the prompt; else open+run.
+  const runAgentNow = useCallback(
+    (agent: AgentConfig) => {
+      const paneKey = agentPaneKey(agent.id);
+      const open = panes.some((p) => p.key === paneKey);
+      if (open) {
+        submitWhenAgentReady(paneKey, agent.prompt);
+        markAgentRun(agent.id);
+        bumpAgents();
+        return;
+      }
+      openAgentPane(agent, { run: true });
+    },
+    [panes, submitWhenAgentReady, openAgentPane, bumpAgents],
+  );
+
+  // Stop the agent's live chat session (chat_stop). Resolves the backend session
+  // id via the pane-key→session registry (chatSessions in paneBus).
+  const stopAgent = useCallback(
+    (agent: AgentConfig) => {
+      const sid = chatSessions.get(agentPaneKey(agent.id));
+      if (sid != null) void chatStop(sid).catch(() => {});
+      bumpAgents();
+    },
+    [bumpAgents],
+  );
+
+  // id → live/idle, cross-referencing the open `agent:<id>` panes + live chats.
+  const agentLiveStates = useMemo(() => {
+    const out: Record<string, AgentLiveState> = {};
+    for (const agent of listPersistentAgents()) {
+      const paneKey = agentPaneKey(agent.id);
+      const open = panes.some((p) => p.key === paneKey);
+      const sid = chatSessions.get(paneKey);
+      const live = open || (sid != null && liveChats.some((c) => c.id === sid));
+      out[agent.id] = live ? "live" : "idle";
+    }
+    return out;
+  }, [panes, liveChats, agentVersion]);
+
+  // Control hook (control.rs → `control-command` event): a 127.0.0.1 POST fires
+  // an agent / opens a pane WITHOUT a webview (the cron seam). Rust never
+  // touches panes — it relays here, where panes + chat sessions live.
+  useEffect(() => {
+    if (!nativeRuntime) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<Record<string, unknown>>("control-command", (event) => {
+      const payload = event.payload || {};
+      const cmd = String(payload.cmd ?? "");
+      if (cmd === "run-agent") {
+        const agentId = String(payload.agentId ?? "");
+        const persisted = agentId ? getAgent(agentId) : undefined;
+        if (persisted) {
+          runAgentNow(persisted);
+          return;
+        }
+        // One-off poke: no persisted agent — spawn a transient chat with the
+        // inline model/prompt/cwd.
+        const prompt = String(payload.prompt ?? "").trim();
+        if (!prompt) return;
+        spawn(
+          {
+            type: "chat",
+            seed: prompt,
+            cwd: payload.cwd ? String(payload.cwd) : undefined,
+            modelId: payload.model ? String(payload.model) : undefined,
+          },
+          agentId || "agent",
+        );
+      } else if (cmd === "open-pane") {
+        const paneType = String(payload.paneType ?? "");
+        switch (paneType) {
+          case "chat":
+            spawn({ type: "chat" }, "chat");
+            break;
+          case "terminal":
+          case "shell":
+            spawn({ type: "shell" }, "terminal");
+            break;
+          case "browser":
+            spawn({ type: "browser" }, "browser");
+            break;
+          case "memory":
+            spawn({ type: "memory" }, "memory");
+            break;
+          case "money-agents":
+          case "agents":
+            spawn({ type: "money-agents" }, "agents");
+            break;
+          default:
+            break;
+        }
+      }
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((e) => reportDiag("app.listen", e, { action: "controlCommand" }));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [nativeRuntime, runAgentNow, spawn]);
+
   const moneyAgentBootstrapRef = useRef(false);
   useEffect(() => {
     if (moneyAgentBootstrapRef.current || !nativeRuntime) return;
@@ -2464,6 +2637,16 @@ function App() {
                   />
                 }
               />
+              {!iconsOnly && (
+                <AgentsSection
+                  version={agentVersion}
+                  liveStates={agentLiveStates}
+                  onOpen={(agent) => openAgentPane(agent)}
+                  onRunNow={runAgentNow}
+                  onStop={stopAgent}
+                  onCreated={(agent) => openAgentPane(agent, { run: true })}
+                />
+              )}
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
               <div className={`flex pb-1 ${iconsOnly ? "justify-center" : "justify-center px-1.5"}`}>

@@ -271,6 +271,14 @@ pub fn run() {
             }
             global_monitor::start(app.handle().clone());
 
+            // Local control hook (control.rs): 127.0.0.1-only HTTP listener that
+            // re-emits `run-agent` / `open-pane` commands into the frontend as a
+            // `control-command` event. The inbound seam for the persistent-agents
+            // runtime (a future cron/CLI poke fires agents through this). Bearer
+            // token from ~/.aios/state/node-secret. Soft-fails on its own thread —
+            // never blocks startup. Cross-platform (std::net + HOME paths).
+            control::start(app.handle().clone());
+
             // Box GUI node: when spawned by the box launcher/autostart (which sets
             // AIOS_FULLSCREEN=1), come up fullscreen on the TV. Laptop launches
             // never set this env, so the windowed default there is unchanged.
@@ -384,6 +392,11 @@ pub fn run() {
             chat::list_chat_sessions,
             chat::record_chat_session,
             chat::read_chat_transcript,
+            // Persistent-agents runtime: fs-mirrored agent config CRUD (the Rust
+            // half of src/lib/agents.ts). Lets a headless caller enumerate agents.
+            control::agent_save,
+            control::agent_list,
+            control::agent_delete,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,
