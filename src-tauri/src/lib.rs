@@ -17,6 +17,7 @@ mod mac_apps;
 mod memory;
 mod monitor;
 mod oracles;
+mod pane_history;
 mod plugins;
 mod pm2;
 mod pty;
@@ -392,6 +393,8 @@ pub fn run() {
             chat::list_chat_sessions,
             chat::record_chat_session,
             chat::read_chat_transcript,
+            pane_history::load_pane_history,
+            pane_history::save_pane_history,
             // Persistent-agents runtime: fs-mirrored agent config CRUD (the Rust
             // half of src/lib/agents.ts). Lets a headless caller enumerate agents.
             control::agent_save,

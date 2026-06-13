@@ -15,8 +15,10 @@ const hasRuntimeImport = (source: string, specifier: string) => {
 test("app shell does not statically import heavy pane implementations", () => {
   const app = read("src/App.tsx");
   const forbidden = [
+    "./components/BrowserPane",
     "./components/ChatPane",
     "./components/EditorPane",
+    "./components/FilesPane",
     "./components/TerminalRuntime",
   ];
 
@@ -29,7 +31,14 @@ test("app shell does not statically import heavy pane implementations", () => {
   }
 
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/ChatPane"\)/);
-  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/EditorPane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/BrowserPane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/FilesPane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/TerminalPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/EditorPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/FileViewerPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/GitPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/MoneyAgentsPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/MemoryPane"\)/);
 });
 
 test("editor pane keeps monaco behind an async runtime import", () => {
@@ -195,6 +204,43 @@ test("hosted web shell is mobile and ipad first", () => {
   assert.match(app, /function MobileBottomNav/);
 });
 
+test("superapp runtime is core-only: browser, chat, terminal, files, and history", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const commands = read("src/lib/appCommands.ts");
+  const sidebar = read("src/lib/sidebar.ts");
+  const paneBus = read("src/lib/paneBus.ts");
+  const palette = read("src/components/CommandPalette.tsx");
+  const settings = read("src/components/Settings.tsx");
+
+  for (const id of ["chat", "terminal", "files", "browser", "history"]) {
+    assert.match(apps, new RegExp(`id: "${id}"`));
+  }
+  for (const cut of ["notes", "memory", "git", "chrome", "appcast", "apps", "money-agents"]) {
+    assert.doesNotMatch(apps, new RegExp(`id: "${cut}"`));
+  }
+
+  assert.doesNotMatch(app, /AttachAppsPane|AppAttachPane|AppCastPane|BridgesPane|CdpChromePane|EditorPane|FileViewerPane|GitPane|MoneyAgentsPane|MemoryPane|NotesPane|PluginsPane|PulsePane/);
+  assert.doesNotMatch(app, /moneyAgentBootstrapRef|loadConfiguredMoneyAgents|buildMoneyAgentRunCommand|MoneyAgentsSection|OracleRoster/);
+  assert.doesNotMatch(commands, /oracle\.attach|project\.run\.(?!focused)|project\.rescan|oracle\.appshot|app\.settings\.open/);
+  assert.doesNotMatch(palette, /CdpChromePane|dev\.cdp-chrome|cdp spike/);
+  assert.doesNotMatch(settings, /BridgesPane|PluginsPane|channels|plugins/);
+  assert.match(sidebar, /SCHEMA_VERSION = 6/);
+  assert.match(paneBus, /export type SpawnPaneKind = "terminal" \| "files" \| "browser" \| "chat"/);
+});
+
+test("idle dashboard renders instantly without mount-time data loaders", () => {
+  const idle = read("src/components/IdleDashboard.tsx");
+  const controlCenter = read("src/components/IdleControlCenter.tsx");
+
+  assert.doesNotMatch(idle, /usageExtras|idleRate|memoryFocus|gitPulse|loadMoneyAgentSummaries|pm2List|setInterval|windowVisible|useUsageRates|ProviderBlock/);
+  assert.doesNotMatch(controlCenter, /useUsageRates|ProviderBlock|claudeRate|codexRate/);
+  assert.doesNotMatch(controlCenter, /MemoryFocus|RepoPulse|MoneyAgentSummary|AiosNotification|Pm2Monitor|StatusFooter|AmbientLine|Flame|Target|GitBranch/);
+  assert.match(controlCenter, /const CORE_LAUNCHERS/);
+  assert.match(controlCenter, /new browser/);
+  assert.match(controlCenter, /new files/);
+});
+
 test("sidebar exposes an icon-only rail mode", () => {
   const app = read("src/App.tsx");
   const settings = read("src/lib/settings.ts");
@@ -206,68 +252,42 @@ test("sidebar exposes an icon-only rail mode", () => {
   assert.match(app, /iconsOnly/);
 });
 
-test("shell exposes a shared notification center and controls", () => {
+test("sidebar keeps usage visible outside the idle dashboard", () => {
+  const app = read("src/App.tsx");
+  const sidebarUsage = read("src/components/SidebarUsage.tsx");
+  const controlCenter = read("src/components/IdleControlCenter.tsx");
+
+  assert.match(sidebarUsage, /UsageGlance as SidebarUsage/);
+  assert.match(app, /<SidebarUsage \/>/);
+  assert.doesNotMatch(controlCenter, /SidebarUsage|UsageGlance|useUsageRates/);
+});
+
+test("notification center pane is cut from the core shell runtime", () => {
   const app = read("src/App.tsx");
   const settings = read("src/lib/settings.ts");
   const settingsPane = read("src/components/Settings.tsx");
+  const commands = read("src/lib/appCommands.ts");
+  const apps = read("src/lib/apps.ts");
 
-  assert.match(app, /NotificationCenter/);
-  assert.match(app, /subscribeNotifications/);
-  assert.match(app, /openNotificationTarget/);
-  assert.match(app, /reattach: t\.sessionId/);
-  assert.match(app, /focusPane\(pane\.key\)/);
+  assert.doesNotMatch(app, /NotificationCenter|subscribeNotifications|openNotificationTarget|openNotificationsPane/);
+  assert.doesNotMatch(apps, /id: "notifications"/);
+  assert.doesNotMatch(commands, /notifications|notification center/i);
   assert.match(settings, /notificationNativeMode: NotificationNativeMode/);
   assert.match(settingsPane, /native alerts/);
 });
 
-test("money agents open as chatpane-backed agents", () => {
+test("money agents are cut from the core shell runtime", () => {
   const app = read("src/App.tsx");
-  const pane = read("src/components/MoneyAgentsPane.tsx");
-  const section = read("src/components/MoneyAgentsSection.tsx");
   const idle = read("src/components/IdleDashboard.tsx");
+  const controlCenter = read("src/components/IdleControlCenter.tsx");
   const apps = read("src/lib/apps.ts");
-  const agents = read("src/lib/moneyAgents.ts");
+  const chatPane = read("src/components/ChatPane.tsx");
 
-  assert.match(apps, /\| \{ type: "money-agents" \}/);
-  assert.match(apps, /agentId\?: string/);
-  assert.match(apps, /modelId\?: string/);
-  assert.match(app, /import\("\.\/components\/MoneyAgentsPane"\)/);
-  assert.match(app, /pane\.kind\.type === "money-agents"/);
-  assert.match(app, /<MoneyAgentsPane onOpenAgentChat=\{onOpenMoneyAgentChat\} \/>/);
-  assert.match(app, /moneyAgentsSlot=/);
-  assert.match(app, /chatpaneAgentsOnly/);
-  assert.match(app, /embedded/);
-  assert.match(app, /moneyAgentChatStates/);
-  assert.match(app, /AGENT_CHAT_MODEL/);
-  assert.match(app, /modelId=\{pane\.kind\.type === "chat" \? pane\.kind\.modelId : undefined\}/);
-  assert.match(app, /focusPane\(existingPane\.key\)/);
-  assert.match(app, /reattach: live\.id/);
-  assert.match(app, /moneyAgentBootstrapRef/);
-  assert.match(app, /setHiddenKeys\(\(current\)/);
-  assert.match(app, /if \(command\) submitWhenReady\(existingPane\.key, command\);\s*else focusPane\(existingPane\.key\)/);
-  assert.match(app, /if \(command\) \{\s*setHiddenKeys\(\(current\) => \(current\.includes\(key\) \? current : \[\.\.\.current, key\]\)\);/);
-  assert.match(app, /buildMoneyAgentChatSeed/);
-  assert.match(app, /loadMoneyAgentChatSession/);
-  assert.match(app, /resume: \{ id: saved\.sessionId, title: saved\.title \}/);
-  assert.match(section, /embedded/);
-  assert.match(section, /createMoneyAgent/);
-  assert.match(section, /new chatpane agent/);
-  assert.match(section, /chatStateLabel/);
-  assert.match(section, /onOpenAgentChat/);
-  assert.doesNotMatch(section, /Terminal/);
-  assert.match(pane, /aios sales agents/);
-  assert.match(pane, /open chatpane/);
-  assert.match(pane, /run sales pulse/);
-  assert.match(pane, /control update for all agents/);
-  assert.match(pane, /state and evidence/);
-  assert.match(idle, /onOpenMoneyAgentChat/);
-  assert.match(agents, /buildMoneyAgentChatSeed/);
-  assert.match(agents, /buildMoneyAgentRunCommand/);
-  assert.match(agents, /shell control plane/);
-  assert.match(agents, /saveMoneyAgentChatSession/);
-  assert.match(agents, /AGENT_CHAT_MODEL = "gpt-5\.3-codex-spark"/);
-  assert.match(agents, /loadConfiguredMoneyAgents/);
-  assert.match(agents, /createMoneyAgent/);
+  assert.doesNotMatch(apps, /id: "money-agents"|agentId\?:/);
+  assert.doesNotMatch(app, /MoneyAgentsPane|MoneyAgentsSection|moneyAgent|loadConfiguredMoneyAgents|buildMoneyAgentRunCommand/);
+  assert.doesNotMatch(idle, /onOpenMoneyAgentChat|MoneyAgent/);
+  assert.doesNotMatch(controlCenter, /MoneyAgent/);
+  assert.doesNotMatch(chatPane, /moneyAgents|saveMoneyAgentChatSession/);
 });
 
 test("idle dashboard is a minimal home: clock + command line + usage glance, not lanes", () => {
@@ -277,34 +297,92 @@ test("idle dashboard is a minimal home: clock + command line + usage glance, not
   const usageGlance = read("src/components/dashboard/UsageGlance.tsx");
   const sidebarUsage = read("src/components/SidebarUsage.tsx");
 
-  // IdleDashboard is a thin loader that hands data to IdleControlCenter.
+  // IdleDashboard is a pure wrapper: no mount-time loaders before the dashboard
+  // appears. The instant control center owns only local clock state.
   assert.match(idle, /<IdleControlCenter/);
-  assert.match(idle, /notifications=\{notifications\}/);
+  assert.doesNotMatch(idle, /useEffect|setInterval|load[A-Z]|pm2List|gitPulse|notifications=\{notifications\}/);
 
-  // The home is the Option-B layout: hero clock, the seed-a-chat command line,
-  // claude+codex usage via the shared ProviderBlock, recent/quick launch row.
+  // The home is core-only: hero clock, command line, and direct launchers for
+  // chat/terminal/browser/files. Usage polling belongs outside the idle route.
   assert.match(controlCenter, /HeroClock/);
   assert.match(controlCenter, /CommandLine/);
-  assert.match(controlCenter, /ProviderBlock/);
-  assert.match(controlCenter, /useUsageRates/);
-  assert.match(controlCenter, /recent/);
+  assert.doesNotMatch(controlCenter, /ProviderBlock|useUsageRates/);
+  assert.match(controlCenter, /CORE_LAUNCHERS/);
+  assert.match(controlCenter, /new chat/);
+  assert.match(controlCenter, /new terminal/);
+  assert.match(controlCenter, /new browser/);
+  assert.match(controlCenter, /new files/);
   assert.match(controlCenter, /QuickActions/);
   assert.doesNotMatch(controlCenter, /PetDashboardCompanion/);
 
   // The overloaded control-center lanes are gone (deleted, not just hidden).
-  assert.doesNotMatch(controlCenter, /JarvisBriefingLane/);
-  assert.doesNotMatch(controlCenter, /NotificationCommandLane/);
-  assert.doesNotMatch(controlCenter, /AgentOperationsLane/);
-  assert.doesNotMatch(controlCenter, /ControlCenterCharts/);
-  assert.doesNotMatch(controlCenter, /PulseIdentityBand/);
+  assert.doesNotMatch(controlCenter, /JarvisBriefingLane|NotificationCommandLane|AgentOperationsLane|ControlCenterCharts|PulseIdentityBand/);
+  assert.doesNotMatch(controlCenter, /RecentProjects|StatusFooter|Pm2Monitor|AmbientLine|MoneyAgent|RepoPulse|MemoryFocus/);
 
   // usage rendering is shared: SidebarUsage aliases the dashboard UsageGlance,
   // so the sidebar + home draw the bars from one source.
   assert.match(usageGlance, /export function ProviderBlock/);
   assert.match(usageGlance, /export function useUsageRates/);
   assert.match(sidebarUsage, /UsageGlance as SidebarUsage/);
+  assert.doesNotMatch(app, /notifications=\{notifications\}/);
+});
 
-  assert.match(app, /notifications=\{notifications\}/);
+test("sidebar leaves session resume to history and in-chat resume", () => {
+  const app = read("src/App.tsx");
+  const commands = read("src/lib/appCommands.ts");
+
+  assert.doesNotMatch(app, /latestSessions|LatestSessionsSection|onResumeChat|resumeChat|setChats|listChatSessions|ChatSessionInfo/);
+  assert.doesNotMatch(commands, /ChatSessionInfo|deps\.chats|resumeChat|chat\.resume/);
+  assert.match(app, /HistoryPane/);
+  assert.match(app, /recordPaneHistory/);
+});
+
+test("chat panes opened from sidebar history hydrate the resumed transcript", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+
+  assert.match(chatPane, /useEffect\(\(\) => \{[\s\S]*if \(!resume\?\.id\) return;[\s\S]*readChatTranscript\(resume\.id\)[\s\S]*setTurns\(transcriptToTurns\(rows\)\)/);
+});
+
+test("pane history is a lightweight core pane with reopen and cleanup controls", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const layout = read("src/lib/paneLayout.ts");
+  const tauriLib = read("src-tauri/src/lib.rs");
+
+  assert.equal(exists("src/lib/paneHistory.ts"), true);
+  assert.equal(exists("src/components/HistoryPane.tsx"), true);
+  assert.equal(exists("src-tauri/src/pane_history.rs"), true);
+  const history = read("src/lib/paneHistory.ts");
+  const pane = read("src/components/HistoryPane.tsx");
+  const rustHistory = read("src-tauri/src/pane_history.rs");
+
+  assert.match(apps, /id: "history"/);
+  assert.match(apps, /type: "history"/);
+  assert.match(layout, /"history"/);
+  assert.match(app, /HistoryPane/);
+  assert.match(app, /recordPaneHistory/);
+  assert.match(app, /onOpenHistoryItem/);
+  assert.match(history, /describePaneHistoryItem/);
+  assert.match(history, /paneHistoryKindLabel/);
+  assert.match(history, /removePaneHistory/);
+  assert.match(history, /clearPaneHistory/);
+  assert.match(history, /hydratePaneHistoryStore/);
+  assert.match(history, /load_pane_history/);
+  assert.match(history, /save_pane_history/);
+  assert.match(pane, /reopen/);
+  assert.match(pane, /delete/);
+  assert.match(pane, /clear all/);
+  assert.match(pane, /hydratePaneHistoryStore/);
+  assert.match(rustHistory, /\.aios\/state\/pane-history\.json/);
+  assert.match(rustHistory, /pub fn load_pane_history/);
+  assert.match(rustHistory, /pub fn save_pane_history/);
+  assert.match(rustHistory, /with_extension\("json\.tmp"\)/);
+  assert.match(rustHistory, /std::fs::rename\(&tmp, &path\)/);
+  assert.match(tauriLib, /mod pane_history/);
+  assert.match(tauriLib, /pane_history::load_pane_history/);
+  assert.match(tauriLib, /pane_history::save_pane_history/);
+  assert.doesNotMatch(pane, /kind\.resume\.title[\s\S]*item\.detail/);
+  assert.doesNotMatch(pane, /useUsageRates|claudeRate|codexRate|listChatSessions/);
 });
 
 test("pane overview is button driven, not a global scroll gesture", () => {
@@ -440,44 +518,20 @@ test("chatpane memory search is explicit slash command only", () => {
   assert.doesNotMatch(chatPane, /q\.length < 4/);
 });
 
-test("memory is a first-class pane backed by the vault commands", () => {
+test("memory pane is cut; chat memory stays inline", () => {
   const app = read("src/App.tsx");
   const apps = read("src/lib/apps.ts");
-  const pane = read("src/components/MemoryPane.tsx");
-  const bridge = read("src/lib/memory.ts");
+  const chatPane = read("src/components/ChatPane.tsx");
   const rust = read("src-tauri/src/memory.rs");
   const lib = read("src-tauri/src/lib.rs");
 
-  assert.match(apps, /id: "memory"/);
-  assert.match(app, /MemoryPane/);
-  assert.match(pane, /memoryGraph\(\)/);
-  assert.match(pane, /memorySearch\(/);
-  assert.match(pane, /memorySaveRaw/);
-  assert.match(pane, /MemoryGraphView/);
-  assert.match(pane, /viewMode/);
-  assert.match(pane, /onSelect\(node\.path\)/);
-  assert.match(pane, /MemoryInspector/);
-  assert.match(pane, /graphFilter/);
-  assert.match(pane, /suggested_links/);
-  assert.match(pane, /backlinks/);
-  assert.match(pane, /orphaned/);
-  assert.match(pane, /neural/);
-  assert.match(pane, /memory-graph-cluster/);
-  assert.match(pane, /memory-graph-node/);
-  assert.match(pane, /memory-graph-html-node/);
-  assert.match(pane, /memory-graph-html-edge/);
-  assert.match(pane, /memory-graph-pan-surface/);
-  assert.match(pane, /memory-graph-camera/);
-  assert.match(pane, /visibleNodes/);
-  assert.match(pane, /graphOnly/);
-  assert.match(pane, /onPointerDown/);
-  assert.match(pane, /onWheel/);
-  assert.match(bridge, /memory_delete_path/);
+  assert.doesNotMatch(apps, /id: "memory"/);
+  assert.doesNotMatch(app, /MemoryPane|type: "memory"/);
+  assert.match(chatPane, /memoryPanelOpen/);
+  assert.match(chatPane, /setMemoryPanelOpen\(true\)/);
+  assert.match(chatPane, /memorySearch\(/);
+  assert.doesNotMatch(chatPane, /spawnPane\("memory"/);
   assert.match(rust, /fn vault_dirs\(\)/);
-  assert.match(rust, /build_memory_graph/);
-  assert.match(rust, /suggested_links/);
-  assert.match(rust, /backlinks/);
-  assert.match(rust, /normalize_link_key/);
   assert.match(rust, /pub fn memory_save_raw/);
   assert.match(lib, /memory::memory_save_raw/);
 });
@@ -512,30 +566,14 @@ test("shell still surfaces source build state via the source-status backend", ()
   assert.match(read("src-tauri/src/lib.rs"), /files::shell_source_status/);
 });
 
-test("shell exposes running mac apps as attachable pane targets", () => {
+test("mac app attach panes are cut from the core shell runtime", () => {
   const app = read("src/App.tsx");
   const apps = read("src/lib/apps.ts");
-  const pane = read("src/components/AttachAppsPane.tsx");
-  const attachedPane = read("src/components/AppAttachPane.tsx");
-  const bridge = read("src/lib/macApps.ts");
   const rust = read("src-tauri/src/mac_apps.rs");
   const lib = read("src-tauri/src/lib.rs");
 
-  assert.match(app, /AttachAppsPane/);
-  assert.match(app, /AppAttachPane/);
-  assert.match(app, /onAttachApp/);
-  assert.match(apps, /type: "apps"/);
-  assert.match(apps, /type: "app"/);
-  assert.match(pane, /attach as pane/);
-  assert.match(pane, /focusMacApp/);
-  assert.match(attachedPane, /attached external app/);
-  assert.match(attachedPane, /capture preview/);
-  assert.match(attachedPane, /captureMacApp/);
-  assert.match(attachedPane, /fileSrc\(capturePath\)/);
-  assert.match(attachedPane, /direct native window embedding is not reliable on macos/);
-  assert.match(bridge, /mac_list_apps/);
-  assert.match(bridge, /mac_focus_app/);
-  assert.match(bridge, /mac_capture_app/);
+  assert.doesNotMatch(app, /AttachAppsPane|AppAttachPane|onAttachApp/);
+  assert.doesNotMatch(apps, /id: "apps"/);
   assert.match(rust, /MacAppInfo/);
   assert.match(rust, /screencapture/);
   assert.match(lib, /mac_apps::mac_list_apps/);
@@ -591,7 +629,16 @@ test("native browser and appcast panes resync through fullscreen settle", () => 
   assert.match(browser, /new ResizeObserver\(sync\)/);
 });
 
-test("files pane exposes ide-grade workspace context actions", () => {
+test("background utility panes are not mounted by the core shell runtime", () => {
+  const app = read("src/App.tsx");
+
+  assert.doesNotMatch(app, /windowVisible|visibilitychange|listChatSessions/);
+  assert.doesNotMatch(app, /<NotesPane|<BridgesPane|<PulsePane|<AppAttachPane|<EditorPane/);
+  assert.doesNotMatch(app, /import\("\.\/components\/NotesPane"\)|import\("\.\/components\/BridgesPane"\)|import\("\.\/components\/PulsePane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/AppAttachPane"\)|import\("\.\/components\/EditorPane"\)/);
+});
+
+test("files pane exposes fast core workspace context actions", () => {
   const files = read("src/components/FilesPane.tsx");
 
   assert.match(files, /detectProject/);
@@ -602,46 +649,26 @@ test("files pane exposes ide-grade workspace context actions", () => {
   assert.match(files, /openContextTerminal/);
   assert.match(files, /openContextBrowser/);
   assert.match(files, /openContextChat/);
-  assert.match(files, /openContextGit/);
-  assert.match(files, /openGitPane/);
-  assert.match(files, /spawnPane\("git"/);
   assert.match(files, /open containing files pane/);
+  assert.doesNotMatch(files, /openContextGit|openGitPane|spawnPane\("git"|gitStatus|gitDecorations/);
 });
 
-test("git pane exposes branch switching, changed files, and chat handoff", () => {
+test("git pane is cut from the core shell runtime", () => {
   const app = read("src/App.tsx");
   const apps = read("src/lib/apps.ts");
   const paneBus = read("src/lib/paneBus.ts");
-  const fs = read("src/lib/fs.ts");
   const tauriFiles = read("src-tauri/src/files.rs");
   const tauriLib = read("src-tauri/src/lib.rs");
+  const filesPane = read("src/components/FilesPane.tsx");
 
-  assert.equal(exists("src/components/GitPane.tsx"), true);
-  const gitPane = read("src/components/GitPane.tsx");
-
-  assert.match(apps, /id: "git"/);
-  assert.match(apps, /type: "git"/);
-  assert.match(app, /GitPane/);
-  assert.match(app, /pane\.kind\.type === "git"/);
-  assert.match(paneBus, /"git"/);
-  assert.match(paneBus, /seed\?: string/);
-  assert.match(app, /type: "chat", cwd: ctx\?\.cwd, seed: ctx\?\.seed/);
-
-  assert.match(fs, /export interface GitSnapshot/);
-  assert.match(fs, /gitSnapshot/);
-  assert.match(fs, /gitCheckout/);
+  assert.doesNotMatch(apps, /id: "git"/);
+  assert.doesNotMatch(app, /GitPane|pane\.kind\.type === "git"|type: "git"/);
+  assert.doesNotMatch(paneBus, /"git"/);
+  assert.doesNotMatch(filesPane, /spawnPane\("git"|openContextGit|gitStatus/);
   assert.match(tauriFiles, /pub fn git_snapshot/);
   assert.match(tauriFiles, /pub fn git_checkout/);
   assert.match(tauriLib, /files::git_snapshot/);
   assert.match(tauriLib, /files::git_checkout/);
-
-  assert.match(gitPane, /gitSnapshot/);
-  assert.match(gitPane, /gitCheckout/);
-  assert.match(gitPane, /branches/);
-  assert.match(gitPane, /switchBranch/);
-  assert.match(gitPane, /openEditorFileInPane/);
-  assert.match(gitPane, /spawnPane\("chat"/);
-  assert.match(gitPane, /buildGitChatSeed/);
 });
 
 test("global appshot attaches to chat instead of only the focused webview", () => {
@@ -661,7 +688,7 @@ test("global appshot attaches to chat instead of only the focused webview", () =
   assert.match(app, /listen<\{ source: string \}>\("global-appshot"/);
   assert.match(app, /paneImageDrop\.get\(key\)/);
   assert.match(app, /appshot attached to chat/);
-  assert.match(commands, /appshot - attach to chat/);
+  assert.doesNotMatch(commands, /appshot - attach to chat|oracle\.appshot/);
   assert.doesNotMatch(commands, /screenshot to oracle/);
 });
 

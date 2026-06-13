@@ -20,6 +20,7 @@ import {
 import { openFileInPane, registerPaneDropSink } from "../lib/paneBus";
 import { PaneDropZone } from "./PaneDropZone";
 import { reportDiag } from "../lib/diag";
+import { useVisible } from "../lib/useVisible";
 
 // ── ref-counted URI models (STRETCH) ────────────────────────────────────────
 // Anonymous `value`-based models can't see each other, so a single-file TS
@@ -55,12 +56,14 @@ function releaseModel(monaco: typeof Monaco, path: string) {
 }
 
 export function EditorPane({
+  active = true,
   path,
   name,
   paneKey,
   line,
   col,
 }: {
+  active?: boolean;
   path: string;
   name: string;
   paneKey?: string;
@@ -68,6 +71,7 @@ export function EditorPane({
   line?: number;
   col?: number;
 }) {
+  const { ref: rootRef, visible: paneVisible } = useVisible<HTMLDivElement>();
   const hostRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -284,6 +288,7 @@ export function EditorPane({
   // lose — VS Code's auto-revert behavior). Dirty buffer → same conflict banner
   // as a blocked save.
   useEffect(() => {
+    if (!active || !paneVisible) return;
     let cancelled = false;
     const check = async () => {
       if (busyRef.current || !editorRef.current || !mtimeRef.current) return;
@@ -300,7 +305,7 @@ export function EditorPane({
       window.clearInterval(id);
       window.removeEventListener("focus", check);
     };
-  }, [path, reloadFromDisk]);
+  }, [active, paneVisible, path, reloadFromDisk]);
 
   // Close the diff overlay whenever the conflict resolves (keep-mine, take-disk,
   // or a clean save from elsewhere).
@@ -375,7 +380,7 @@ export function EditorPane({
 
   return (
     <PaneDropZone onPath={onDropFile} label="drop file to open">
-    <div className="flex h-full min-h-0 flex-col bg-[var(--color-bg)]">
+    <div ref={rootRef} className="flex h-full min-h-0 flex-col bg-[var(--color-bg)]">
       <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3">
         {dirty ? (
           <Circle size={8} className="shrink-0 fill-[var(--color-accent)] text-[var(--color-accent)]" />

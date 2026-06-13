@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { gridTrackStorageKey, migrateLayoutPanes, movePane, newPaneKey } from "./paneLayout.ts";
+import { CORE_PANE_TYPES, gridTrackStorageKey, isCorePaneKind, migrateLayoutPanes, movePane, newPaneKey } from "./paneLayout.ts";
 
 test("movePane reorders panes and returns selected destination", () => {
   const state = movePane(["a", "b", "c"], 1, -1);
@@ -18,6 +18,16 @@ test("movePane clamps at edges", () => {
 
 test("gridTrackStorageKey scopes persisted sizes by grid shape", () => {
   assert.equal(gridTrackStorageKey("aios.grid", 2, 3), "aios.grid:2x3");
+});
+
+test("core pane policy keeps only browser, chat, terminal, files, and history surfaces", () => {
+  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "history", "oracle", "shell", "tmux"]);
+  for (const type of ["browser", "chat", "files", "oracle", "shell", "tmux"]) {
+    assert.equal(isCorePaneKind(type), true, `${type} should be core`);
+  }
+  for (const type of ["app", "appcast", "apps", "bridges", "chrome", "editor", "file", "git", "memory", "money-agents", "notes", "notifications", "plugins", "pulse"]) {
+    assert.equal(isCorePaneKind(type), false, `${type} should be cut from the runtime shell`);
+  }
 });
 
 test("newPaneKey mints k-<kind>-<shortid> and respects the taken set", () => {
@@ -59,19 +69,34 @@ test("migrateLayoutPanes passes through existing keys untouched (changed=false)"
   );
 });
 
-test("migrateLayoutPanes is non-destructive: unknown kinds + extra fields survive", () => {
+test("migrateLayoutPanes drops non-core panes and persists the cleanup", () => {
   const { panes, changed } = migrateLayoutPanes([
     {
-      key: "k-future-aaaa",
-      label: "future",
-      kind: { type: "hologram", knob: 7 },
-      futureTopLevel: true,
+      key: "k-git-aaaa",
+      label: "git",
+      kind: { type: "git", root: "/repo" },
     },
+    {
+      key: "k-editor-bbbb",
+      label: "editor",
+      kind: { type: "editor", path: "/repo/a.ts", name: "a.ts" },
+    },
+    {
+      key: "k-chat-good",
+      label: "chat",
+      kind: { type: "chat", cwd: "/repo", modelId: "x" },
+    },
+    { key: "k-history-good", label: "history", kind: { type: "history" } },
+    { key: "k-browser-good", label: "browser", kind: { type: "browser", url: "https://x.com" } },
+    { key: "k-memory-cccc", label: "memory", kind: { type: "memory" } },
   ]);
-  assert.equal(changed, false);
-  assert.equal(panes[0].kind.type, "hologram");
-  assert.equal(panes[0].kind.knob, 7);
-  assert.equal(panes[0].futureTopLevel, true);
+  assert.equal(changed, true);
+  assert.deepEqual(
+    panes.map((p) => p.kind.type),
+    ["chat", "history", "browser"],
+  );
+  assert.equal(panes[0].key, "k-chat-good");
+  assert.equal(panes[0].kind.cwd, "/repo");
 });
 
 test("migrateLayoutPanes tolerates junk without nuking valid entries", () => {

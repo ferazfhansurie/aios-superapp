@@ -7,7 +7,7 @@
 import { SPAWN } from "./apps.ts";
 
 const STORAGE_KEY = "aios.sidebar";
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 /** A space = a named, collapsible section of the rail. The three built-ins
  *  (sessions / tools / pinned) are `system` — they can be renamed + collapsed +
@@ -74,9 +74,6 @@ export function seedDefault(): SidebarState {
       iconName: a.id, // resolved back to the lucide icon via SPAWN_BY_ID at render
       kind: { type: "app", appId: a.id } as SidebarItemKind,
       group: a.group as SidebarGroup,
-      // non-first-class apps seed hidden — still reachable via ⌘K, just off the
-      // default rail. The user can un-hide any of them from the row menu.
-      hidden: !a.firstClass,
     })),
   };
 }
@@ -150,21 +147,6 @@ export function loadSidebar(): SidebarState {
     let fixed = remapped.map((it) =>
       knownSpaces.has(it.group) ? it : { ...it, group: "pinned" },
     );
-    // v4→v5: default rail focuses on FIRST-CLASS apps. Stored states written
-    // before v5 predate the firstClass seeding, so their non-first-class app
-    // rows (claude-code, apps, appcast, chrome…) sit visible with `hidden`
-    // unset. Hide those ONCE — but only where `hidden` is undefined, so a user
-    // who explicitly un-hid an app (hidden:false via toggleHidden) keeps it.
-    // Items are never dropped; this only flips a visibility flag.
-    const storedVersion = typeof stored.version === "number" ? stored.version : 0;
-    if (storedVersion < 5) {
-      const firstClassIds = new Set(SPAWN.filter((a) => a.firstClass).map((a) => a.id));
-      fixed = fixed.map((it) =>
-        it.kind?.type === "app" && !firstClassIds.has(it.kind.appId) && it.hidden === undefined
-          ? { ...it, hidden: true }
-          : it,
-      );
-    }
     cache = { version: SCHEMA_VERSION, spaces, items: fixed };
   } catch {
     cache = seeded;

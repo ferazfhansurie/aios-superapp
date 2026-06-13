@@ -2,8 +2,6 @@
  *  AIOS cockpit. Left nav rail + scrollable right panel. Esc / backdrop close.
  *  Every control persists through src/lib/settings.ts. lowercase, terse. */
 import {
-  lazy,
-  Suspense,
   type ComponentType,
   type ReactNode,
   useEffect,
@@ -14,7 +12,6 @@ import {
 import {
   Activity,
   Bell,
-  Blocks,
   Brain,
   Check,
   Cpu,
@@ -31,7 +28,6 @@ import {
   Palette,
   Pencil,
   Plus,
-  Radio,
   RotateCcw,
   Trash2,
   Settings as SettingsIcon,
@@ -97,9 +93,6 @@ import {
   type DiagEvent,
   type DiagInfo,
 } from "../lib/diag";
-
-const BridgesPane = lazy(() => import("./BridgesPane").then((m) => ({ default: m.BridgesPane })));
-const PluginsPane = lazy(() => import("./PluginsPane").then((m) => ({ default: m.PluginsPane })));
 
 /* ── control primitives ─────────────────────────────────────────────── */
 
@@ -633,8 +626,6 @@ type SectionId =
   | "notifications"
   | "projects"
   | "oracles"
-  | "channels"
-  | "plugins"
   | "memory"
   | "diagnostics"
   | "shortcuts"
@@ -647,8 +638,6 @@ const NAV: { id: SectionId; label: string; icon: ComponentType<{ size?: number }
   { id: "notifications", label: "notifications", icon: Bell },
   { id: "projects", label: "projects", icon: FolderGit2 },
   { id: "oracles", label: "oracles", icon: Cpu },
-  { id: "channels", label: "channels", icon: Radio },
-  { id: "plugins", label: "plugins", icon: Blocks },
   { id: "memory", label: "memory", icon: Brain },
   { id: "diagnostics", label: "diagnostics", icon: Activity },
   { id: "shortcuts", label: "shortcuts", icon: Keyboard },
@@ -1130,15 +1119,6 @@ export function Settings({
             <X size={15} />
           </button>
 
-          {section === "channels" || section === "plugins" ? (
-            // Channels + plugins are full panes (own header + scroll) — render
-            // them full-bleed instead of inside the padded settings rows.
-            <div className="min-h-0 flex-1">
-              <Suspense fallback={<div className="grid h-full place-items-center font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--color-faint)]">loading pane</div>}>
-                {section === "channels" ? <BridgesPane /> : <PluginsPane />}
-              </Suspense>
-            </div>
-          ) : (
           <div className="flex-1 overflow-y-auto px-6 py-5">
             <h2 className="mb-3 text-[15px] font-medium lowercase text-[var(--color-text)]">
               {section}
@@ -1563,7 +1543,6 @@ export function Settings({
               )}
             </div>
           </div>
-          )}
         </div>
       </div>
     </div>

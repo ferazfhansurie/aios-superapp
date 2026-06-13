@@ -13,13 +13,16 @@ import { usageExtras, type UsageExtras } from "../lib/stats";
 import { idleRate, memoryFocus, type IdleRate, type MemoryFocus } from "../lib/dashboard";
 import { Ring, heatColor, fmtNum, shortModel, shortDate } from "./IdleDashboard";
 import { reportDiag } from "../lib/diag";
+import { useVisible } from "../lib/useVisible";
 
-export function PulsePane() {
+export function PulsePane({ active = true }: { active?: boolean }) {
+  const { ref: rootRef, visible: paneVisible } = useVisible<HTMLDivElement>();
   const [extras, setExtras] = useState<UsageExtras | null>(null);
   const [rate, setRate] = useState<IdleRate | null>(null);
   const [focus, setFocus] = useState<MemoryFocus | null>(null);
 
   useEffect(() => {
+    if (!active || !paneVisible) return;
     let alive = true;
     const load = () => {
       usageExtras().then((v) => alive && setExtras(v)).catch((e) => reportDiag("pulse.load", e, { action: "usageExtras" }));
@@ -32,7 +35,7 @@ export function PulsePane() {
       alive = false;
       clearInterval(t);
     };
-  }, []);
+  }, [active, paneVisible]);
 
   // last ~18 weeks of activity, columned into weeks (same logic the tile uses).
   const days = (extras?.heatmap ?? []).slice(-126);
@@ -41,7 +44,7 @@ export function PulsePane() {
   for (let i = 0; i < days.length; i += 7) weeks.push(days.slice(i, i + 7));
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
+    <div ref={rootRef} className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       {/* header — same shape as the other tool panes */}
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3">
         <Zap size={14} className="text-[var(--color-highlight)]" />

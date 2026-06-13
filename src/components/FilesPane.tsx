@@ -1,7 +1,6 @@
 /** Files pane — a VS Code-style explorer tree. Nested expandable folders,
- *  file-type icons, git status decorations (M/A/D/U + folder change-dots),
- *  indent guides. Single-click a file opens it (editor pane for code, viewer
- *  for media). Rows (files AND folders) stay draggable → drop onto a terminal
+ *  file-type icons, and indent guides. Single-click a file opens it through the
+ *  core browser path. Rows (files AND folders) stay draggable → drop onto a terminal
  *  to `cd`, onto a files pane to re-root, etc. Files open in the Monaco editor,
  *  so there's no inline preview.
  *
@@ -22,7 +21,6 @@ import {
   FolderClosed,
   FolderGit2,
   FolderOpen,
-  GitBranch,
   Globe,
   Home,
   ListCollapse,
@@ -35,24 +33,14 @@ import {
 
 import {
   fileSrc,
-  gitStatus,
   homeDir,
   readDirTree,
   type DirEntry,
-  type GitCode,
 } from "../lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "../lib/run";
 import { AIOS_DIR_MIME, AIOS_PATH_MIME, beginPathDrag, consumeDragClick, spawnPane } from "../lib/paneBus";
 import { fileIcon } from "../lib/fileIcons";
 import { PaneDropZone } from "./PaneDropZone";
-
-const GIT_COLOR: Record<GitCode, string> = {
-  M: "#e2b341", // modified — amber
-  A: "#73c991", // added (staged) — green
-  U: "#73c991", // untracked — green
-  D: "#e05252", // deleted — red
-  R: "#6cb6ff", // renamed — blue
-};
 
 // Persisted toggles (VS Code-style defaults: both hidden).
 const HIDDEN_KEY = "aios.files.showHidden";
@@ -91,9 +79,6 @@ export function FilesPane({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [children, setChildren] = useState<Map<string, DirEntry[]>>(new Map());
   const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set());
-  const [git, setGit] = useState<Map<string, GitCode>>(new Map());
-  const [gitFolders, setGitFolders] = useState<Set<string>>(new Set());
-  const [gitRoot, setGitRoot] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -127,33 +112,6 @@ export function FilesPane({
     }
   }, []);
 
-  const refreshGit = useCallback(async (path: string) => {
-    try {
-      const st = await gitStatus(path);
-      setGitRoot(st.root);
-      const m = new Map<string, GitCode>();
-      const folders = new Set<string>();
-      const stop = st.root ?? "";
-      for (const e of st.entries) {
-        m.set(e.path, e.status);
-        let dir = e.path.slice(0, e.path.lastIndexOf("/"));
-        while (dir && dir.length >= stop.length) {
-          folders.add(dir);
-          if (dir === stop) break;
-          const next = dir.slice(0, dir.lastIndexOf("/"));
-          if (next === dir) break;
-          dir = next;
-        }
-      }
-      setGit(m);
-      setGitFolders(folders);
-    } catch {
-      setGit(new Map());
-      setGitFolders(new Set());
-      setGitRoot(null);
-    }
-  }, []);
-
   const setRootTo = useCallback(
     (path: string) => {
       setRoot(path);
@@ -161,9 +119,8 @@ export function FilesPane({
       setExpanded(new Set([path]));
       setSelected(null);
       loadDir(path);
-      refreshGit(path);
     },
-    [loadDir, refreshGit],
+    [loadDir],
   );
 
   // initial: open the requested directory, falling back to the user's home
@@ -205,8 +162,7 @@ export function FilesPane({
   const refreshAll = useCallback(() => {
     for (const p of expanded) loadDir(p);
     if (!children.has(root)) loadDir(root);
-    refreshGit(root);
-  }, [expanded, children, root, loadDir, refreshGit]);
+  }, [expanded, children, root, loadDir]);
 
   const collapseAll = () => setExpanded(new Set([root]));
   const goUp = () => {
@@ -306,13 +262,6 @@ export function FilesPane({
     closeContextMenu();
   }, [closeContextMenu, contextMenu]);
 
-  const openContextGit = useCallback(() => {
-    const entry = contextMenu?.entry;
-    if (!entry) return;
-    spawnPane("git", { path: entryDir(entry), label: `git · ${entry.name}` });
-    closeContextMenu();
-  }, [closeContextMenu, contextMenu]);
-
   const openContainingFilesPane = useCallback(() => {
     const entry = contextMenu?.entry;
     if (!entry) return;
@@ -338,9 +287,6 @@ export function FilesPane({
   }, [closeContextMenu, contextMenu]);
 
   const rootName = root.split("/").filter(Boolean).pop() ?? root;
-  const openGitPane = useCallback(() => {
-    spawnPane("git", { path: gitRoot ?? root, label: `git · ${rootName}` });
-  }, [gitRoot, root, rootName]);
   const f = filter.trim().toLowerCase();
 
   // Whether the current selection is a file (enables "open in browser").
@@ -383,15 +329,7 @@ export function FilesPane({
         >
           {rootName}
         </button>
-        {gitRoot && (
-          <span className="shrink-0 font-mono text-[9.5px] text-[var(--color-faint)]" title={`git repo · ${gitRoot}`}>
-            git
-          </span>
-        )}
         <span className="flex-1" />
-        <button onClick={openGitPane} className="rounded p-1 hover:text-[var(--color-text)]" title={`Open source control\n${gitRoot ?? root}`}>
-          <GitBranch size={13} />
-        </button>
         <button onClick={openTerminalHere} className="rounded p-1 hover:text-[var(--color-text)]" title={`Open terminal here\n${focusDir}`}>
           <TerminalSquare size={13} />
         </button>
@@ -499,8 +437,6 @@ export function FilesPane({
             open={expanded.has(entry.path)}
             loading={loadingDirs.has(entry.path)}
             selected={selected === entry.path}
-            gitCode={git.get(entry.path)}
-            folderDirty={entry.is_dir && gitFolders.has(entry.path)}
             onToggle={() => toggle(entry.path)}
             onOpen={() => openFile(entry)}
             onSelect={() => setSelected(entry.path)}
@@ -545,7 +481,6 @@ export function FilesPane({
             )}
             <ContextAction icon={<FolderOpen size={13} />} label="open containing files pane" onClick={openContainingFilesPane} />
             <ContextAction icon={<MessageSquare size={13} />} label="open chat here" onClick={openContextChat} />
-            <ContextAction icon={<GitBranch size={13} />} label="open source control" onClick={openContextGit} />
             <ContextAction icon={<Copy size={13} />} label="copy path" onClick={copyPath} />
           </div>
         </>
@@ -581,8 +516,6 @@ function TreeRow({
   open,
   loading,
   selected,
-  gitCode,
-  folderDirty,
   onToggle,
   onOpen,
   onSelect,
@@ -593,8 +526,6 @@ function TreeRow({
   open: boolean;
   loading: boolean;
   selected: boolean;
-  gitCode?: GitCode;
-  folderDirty: boolean;
   onToggle: () => void;
   onOpen: () => void;
   onSelect: () => void;
@@ -602,11 +533,7 @@ function TreeRow({
 }) {
   const isDir = entry.is_dir;
   const { Icon, color } = fileIcon(entry.name);
-  const nameColor = gitCode
-    ? GIT_COLOR[gitCode]
-    : isDir
-      ? "var(--color-text-2)"
-      : "var(--color-text-2)";
+  const nameColor = isDir ? "var(--color-text-2)" : "var(--color-text-2)";
 
   return (
     <div
@@ -668,19 +595,10 @@ function TreeRow({
       {/* name */}
       <span
         className="min-w-0 flex-1 truncate"
-        style={{ color: nameColor, fontWeight: gitCode || folderDirty ? 500 : 400 }}
+        style={{ color: nameColor }}
       >
         {entry.name}
       </span>
-
-      {/* git decoration: a letter for files, a dot for changed folders */}
-      {gitCode ? (
-        <span className="shrink-0 font-mono text-[10px]" style={{ color: GIT_COLOR[gitCode] }}>
-          {gitCode}
-        </span>
-      ) : folderDirty ? (
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-accent)]" />
-      ) : null}
 
       {loading && <span className="shrink-0 font-mono text-[9px] text-[var(--color-faint)]">…</span>}
     </div>

@@ -11,21 +11,16 @@ import {
 } from "react";
 
 import {
-  Bell,
   Bot,
   Camera,
-  CheckCheck,
   ChevronDown,
   ChevronRight,
-  Clock,
-  Database,
   EllipsisVertical,
-  FileText,
   Folder,
   FolderPlus,
-  GitBranch,
   Globe,
   GripVertical,
+  History as HistoryIcon,
   Layers,
   Maximize2,
   Minimize2,
@@ -33,7 +28,6 @@ import {
   MessageCircle,
   MonitorUp,
   MoveRight,
-  NotebookPen,
   PanelLeft,
   Pencil,
   Pin,
@@ -51,49 +45,30 @@ import {
 
 import { recallUrl, recallPaneUrl, forgetUrl } from "./lib/browser-mem";
 import { browserOpenDevtools, setWindowFullscreen } from "./lib/browser";
-import { VIEWER_EXT } from "./lib/fileKinds";
 import { AccountMenu } from "./components/AccountMenu";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FileFinder } from "./components/FileFinder";
 import { GlobalSearch } from "./components/GlobalSearch";
+import { HistoryPane } from "./components/HistoryPane";
 import { IdleDashboard } from "./components/IdleDashboard";
 import { MirrorViewer } from "./components/MirrorViewer";
-import { MoneyAgentsSection, type MoneyAgentChatState } from "./components/MoneyAgentsSection";
-import { AgentsSection, type AgentLiveState } from "./components/AgentsSection";
-import {
-  type AgentConfig,
-  agentPaneKey,
-  getAgent,
-  markAgentRun,
-  listAgents as listPersistentAgents,
-} from "./lib/agents";
-import { OracleRoster } from "./components/OracleRoster";
 import { PaneErrorBoundary } from "./components/PaneErrorBoundary";
 import { ResizableGrid } from "./components/ResizableGrid";
+import { SidebarUsage } from "./components/SidebarUsage";
 import { VoiceButton } from "./components/VoiceButton";
 import type { PaneKind } from "./components/TerminalPane";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import { appshotCapture, listOracles, reapTerminals, type OracleInfo } from "./lib/pty";
-import { chatStop, listChatLive, listChatSessions, type ChatSessionInfo, type LiveChat } from "./lib/chat";
+import { appshotCapture, reapTerminals } from "./lib/pty";
+import { listChatLive } from "./lib/chat";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
-import {
-  AGENT_CHAT_MODEL,
-  MONEY_AGENTS,
-  buildMoneyAgentChatSeed,
-  buildMoneyAgentRunCommand,
-  loadConfiguredMoneyAgents,
-  loadMoneyAgentChatSession,
-  moneyAgentById,
-} from "./lib/moneyAgents";
 import {
   chatHandles,
   detachBusyChats,
   paneWriters,
-  paneSubmitters,
   paneImageDrop,
   paneDropSink,
   registerPane,
@@ -103,16 +78,9 @@ import {
   registerOpenEditorFile,
   registerOpenViewerFile,
   registerRevealFile,
-  openEditorFileInPane,
-  openViewerFileInPane,
-  revealFileInPane,
-  openUrlInPane,
   registerOpenUrl,
   registerOpenSettings,
   spawnPane as requestSpawnPane,
-  openSettingsTo,
-  paneKeyForChatSession,
-  chatSessions,
   registerSpawnPane,
   dispatchPaneNav,
   registerActivePane,
@@ -123,9 +91,9 @@ import {
 } from "./lib/paneBus";
 import { containingDir, paneFileTarget } from "./lib/paneOpenActions";
 import { loadSettings, saveSettings, applyFlashLevel, subscribe as subscribeSettings } from "./lib/settings";
-import { homeDir, startupOpenPane } from "./lib/fs";
-import { detectProject, listProjects, type ProjectInfo } from "./lib/run";
-import { loadProjectsStore, mergeProjects, subscribeProjects } from "./lib/projects";
+import { fileSrc, homeDir, startupOpenPane } from "./lib/fs";
+import { recordPaneHistory } from "./lib/paneHistory";
+import { detectProject, type ProjectInfo } from "./lib/run";
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
 import { buildAppCommands } from "./lib/appCommands";
 import type { AgentAction } from "./lib/agentActions";
@@ -150,20 +118,10 @@ import {
 } from "./lib/agentController";
 import type { AgentAuditEntry } from "./lib/agentActions";
 import { buildMirrorSnapshot, type MirrorSnapshot } from "./lib/mirror";
-import { gridTrackStorageKey, migrateLayoutPanes, movePane, newPaneKey } from "./lib/paneLayout";
-import {
-  clearAllNotifications,
-  clearNotification,
-  listNotifications,
-  markAllNotificationsRead,
-  markNotificationRead,
-  pushNotification,
-  subscribeNotifications,
-  type AiosNotification,
-  type NotificationTarget,
-} from "./lib/notifications";
+import { gridTrackStorageKey, isCorePaneKind, migrateLayoutPanes, movePane, newPaneKey } from "./lib/paneLayout";
+import { pushNotification } from "./lib/notifications";
 
-import { SPAWN, SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
+import { SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
 import {
   loadSidebar,
   reorder,
@@ -187,32 +145,9 @@ import {
 // `import { AppDef } from "../App"` path working without churn.
 export type { AppDef, PaneContent };
 
-const AttachAppsPane = lazy(() =>
-  import("./components/AttachAppsPane").then((m) => ({ default: m.AttachAppsPane })),
-);
-const AppAttachPane = lazy(() =>
-  import("./components/AppAttachPane").then((m) => ({ default: m.AppAttachPane })),
-);
-const AppCastPane = lazy(() => import("./components/AppCastPane").then((m) => ({ default: m.AppCastPane })));
-const BridgesPane = lazy(() => import("./components/BridgesPane").then((m) => ({ default: m.BridgesPane })));
 const BrowserPane = lazy(() => import("./components/BrowserPane").then((m) => ({ default: m.BrowserPane })));
-const CdpChromePane = lazy(() =>
-  import("./components/CdpChromePane").then((m) => ({ default: m.CdpChromePane })),
-);
 const ChatPane = lazy(() => import("./components/ChatPane").then((m) => ({ default: m.ChatPane })));
-const EditorPane = lazy(() => import("./components/EditorPane").then((m) => ({ default: m.EditorPane })));
 const FilesPane = lazy(() => import("./components/FilesPane").then((m) => ({ default: m.FilesPane })));
-const GitPane = lazy(() => import("./components/GitPane").then((m) => ({ default: m.GitPane })));
-const FileViewerPane = lazy(() =>
-  import("./components/FileViewerPane").then((m) => ({ default: m.FileViewerPane })),
-);
-const MoneyAgentsPane = lazy(() =>
-  import("./components/MoneyAgentsPane").then((m) => ({ default: m.MoneyAgentsPane })),
-);
-const MemoryPane = lazy(() => import("./components/MemoryPane").then((m) => ({ default: m.MemoryPane })));
-const NotesPane = lazy(() => import("./components/NotesPane").then((m) => ({ default: m.NotesPane })));
-const PluginsPane = lazy(() => import("./components/PluginsPane").then((m) => ({ default: m.PluginsPane })));
-const PulsePane = lazy(() => import("./components/PulsePane").then((m) => ({ default: m.PulsePane })));
 const Settings = lazy(() => import("./components/Settings").then((m) => ({ default: m.Settings })));
 const TerminalPane = lazy(() =>
   import("./components/TerminalPane").then((m) => ({ default: m.TerminalPane })),
@@ -234,23 +169,13 @@ if (typeof window !== "undefined") {
       else go();
     }, delayMs);
   };
-  // tier 1 (~2s): the panes firaz opens constantly
+  // core panes only. parse them after first paint so first use is fast without
+  // restoring old feature chunks or monaco on machines that do not need them.
   warmAt(2000, () => Promise.all([
     import("./components/ChatPane"),
     import("./components/TerminalPane"),
     import("./components/FilesPane"),
-  ]));
-  // tier 2 (~7s): heavy but common — editor drags in the monaco chunk
-  warmAt(7000, () => Promise.all([
-    import("./components/EditorPane"),
     import("./components/BrowserPane"),
-  ]));
-  // tier 3 (~14s): the rest of the catalog
-  warmAt(14000, () => Promise.all([
-    import("./components/MemoryPane"),
-    import("./components/GitPane"),
-    import("./components/NotesPane"),
-    import("./components/Settings"),
   ]));
 }
 
@@ -273,21 +198,12 @@ function paneContextDetail(kind: PaneContent): string | undefined {
       return `${kind.socket}/${kind.session}`;
     case "files":
       return kind.root;
-    case "git":
-      return kind.root;
     case "browser":
       return kind.url;
-    case "chrome":
-      return kind.url;
-    case "appcast":
-      return kind.windowId != null ? `window ${kind.windowId}` : undefined;
     case "chat":
       return kind.cwd ?? kind.resume?.title ?? kind.agentLabel;
-    case "file":
-    case "editor":
-      return kind.path;
-    case "app":
-      return kind.bundleId ?? kind.name;
+    case "history":
+      return "opened panes";
     default:
       return undefined;
   }
@@ -331,13 +247,10 @@ const INTERACTIVE_SELECTOR = [
   "[data-no-window-drag]",
 ].join(",");
 
-/** Pick the pane kind for opening a file: viewer for media/binaries (the
- *  canonical VIEWER_EXT set in lib/fileKinds.ts), else the code editor. */
-function paneForFile(path: string, name: string): PaneContent {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  return VIEWER_EXT.has(ext)
-    ? { type: "file", path, name }
-    : { type: "editor", path, name };
+/** Open files through the core browser pane. This keeps files useful without
+ *  loading the editor/monaco surface on older machines. */
+function paneForFile(path: string, _name: string): PaneContent {
+  return { type: "browser", url: fileSrc(path), transient: true, memKey: `file:${path}` };
 }
 
 // STABLE PANE KEYS (wave 1B): keys are minted ONCE at spawn via
@@ -386,6 +299,7 @@ function recordAgentAudit(entry: AgentAuditEntry) {
 
 /** Strip a pane kind down to its restorable shape (drop one-shot fields). */
 function persistableKind(kind: PaneContent): PaneContent | null {
+  if (!isCorePaneKind(kind.type)) return null;
   if (kind.type === "chat") return { type: "chat", cwd: kind.cwd }; // fresh chat, no seed/resume/reattach
   // file/editor restore by path; everything else is self-describing.
   return kind;
@@ -496,7 +410,6 @@ function App() {
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   // Recent-files MRU (⌘P empty-query list); kept in state so opens repaint it.
   const [mru, setMru] = useState<string[]>(loadMru);
-  const [notifications, setNotifications] = useState<AiosNotification[]>(listNotifications);
   const [remoteMirrorSnapshot, setRemoteMirrorSnapshot] = useState<MirrorSnapshot | null>(null);
   const [mirrorStatus, setMirrorStatus] = useState<MirrorConnectionStatus>("off");
   const [mirrorPresence, setMirrorPresence] = useState<MirrorPresence | null>(null);
@@ -611,7 +524,6 @@ function App() {
   // personalizable sidebar — items + order live in lib/sidebar (localStorage).
   const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
   useEffect(() => subscribeSidebar(setSidebar), []);
-  useEffect(() => subscribeNotifications(setNotifications), []);
   const [sidebarMode, setSidebarMode] = useState(() => loadSettings().sidebarMode);
   const [topBarMode, setTopBarMode] = useState(() => loadSettings().topBarMode);
   useEffect(() =>
@@ -724,6 +636,10 @@ function App() {
   }, [flash]);
 
   const spawn = useCallback((kind: PaneContent, label: string, explicitKey?: string): string => {
+    if (!isCorePaneKind(kind.type)) {
+      reportUsage("pane.spawn.blocked", kind.type);
+      return "";
+    }
     // Stable key, minted once for the pane's whole life (persists via saveLayout,
     // reused across relaunches — see the STABLE PANE KEYS note above).
     // `explicitKey` lets callers force a deterministic key (e.g. the persistent
@@ -733,6 +649,7 @@ function App() {
     // Light usage event (kind:"usage") — seeds the "what I use" prioritization.
     // Carries only the pane-type enum, never any argument/label content.
     reportUsage("pane.spawn", kind.type);
+    recordPaneHistory(kind, label);
     // EXIT FULLSCREEN ON ANY NEW-PANE SPAWN (R2a FIX 3): if a pane currently owns
     // OS fullscreen / maximize, a freshly-spawned pane would be invisible behind
     // it (the maximized pane fills the window + every other pane deactivates). Drop
@@ -767,6 +684,13 @@ function App() {
   const openUrl = useCallback(
     (url: string, label = "browser") => {
       spawn({ type: "browser", url }, label);
+    },
+    [spawn],
+  );
+
+  const openHistoryItem = useCallback(
+    (kind: PaneContent, label: string) => {
+      spawn(kind, label);
     },
     [spawn],
   );
@@ -896,13 +820,8 @@ function App() {
     [spawn],
   );
 
-  // remember the last file opened in the editor so F5 knows which project to run
+  // remember the last file opened so F5 knows which project to run
   const lastOpenPath = useRef<string | null>(null);
-  // Live mirrors of state/callbacks the open path needs for DEDUP, but which are
-  // declared later (focusPane) — refs keep these callbacks dependency-free while
-  // always reading the freshest values (assigned in an effect below).
-  const panesRef = useRef<Pane[]>([]);
-  const focusPaneRef = useRef<(key: string) => void>(() => {});
   // voice dictation → the focused terminal pane, else clipboard. Declared up
   // here (not next to focusPane) because the finderRoot useMemo reads
   // focusedPane.current during render — a later `const` would be in its TDZ
@@ -921,32 +840,6 @@ function App() {
   // Expose the focused pane to the keybind router + future panes via paneBus
   // (synchronous read, no prop-drilling).
   useEffect(() => registerActivePane(() => focusedPane.current), []);
-  const setPanesRef = useRef<typeof setPanes>(setPanes);
-
-  // OPEN-FILE DEDUP (panes ARE tabs): if a pane already shows this exact file,
-  // focus it instead of spawning a duplicate. For the editor we also reveal the
-  // requested line by patching the pane's kind (EditorPane re-runs on line change).
-  // Returns the focused pane's key, or null when nothing matched (caller spawns).
-  const focusExistingFilePane = useCallback(
-    (kind: "editor" | "file", path: string, at?: { line?: number; col?: number }): string | null => {
-      const existing = panesRef.current.find(
-        (p) => p.kind.type === kind && p.kind.path === path,
-      );
-      if (!existing) return null;
-      if (kind === "editor" && at?.line) {
-        setPanesRef.current((ps) =>
-          ps.map((p) =>
-            p.key === existing.key && p.kind.type === "editor"
-              ? { ...p, kind: { ...p.kind, line: at.line, col: at.col } }
-              : p,
-          ),
-        );
-      }
-      focusPaneRef.current(existing.key);
-      return existing.key;
-    },
-    [],
-  );
 
   const recordMru = useCallback((path: string) => {
     lastOpenPath.current = path;
@@ -957,27 +850,23 @@ function App() {
     (path: string, name: string) => {
       recordMru(path);
       const kind = paneForFile(path, name);
-      const fileKind = kind.type === "editor" ? "editor" : "file";
-      if (focusExistingFilePane(fileKind, path)) return;
       spawn(kind, name);
     },
-    [spawn, focusExistingFilePane, recordMru],
+    [spawn, recordMru],
   );
   const openEditorFile = useCallback(
-    (path: string, name: string, at?: { line?: number; col?: number }) => {
+    (path: string, name: string, _at?: { line?: number; col?: number }) => {
       recordMru(path);
-      if (focusExistingFilePane("editor", path, at)) return;
-      spawn({ type: "editor", path, name, line: at?.line, col: at?.col }, name);
+      spawn(paneForFile(path, name), name);
     },
-    [spawn, focusExistingFilePane, recordMru],
+    [spawn, recordMru],
   );
   const openViewerFile = useCallback(
     (path: string, name: string) => {
       recordMru(path);
-      if (focusExistingFilePane("file", path)) return;
-      spawn({ type: "file", path, name }, name);
+      spawn(paneForFile(path, name), name);
     },
-    [spawn, focusExistingFilePane, recordMru],
+    [spawn, recordMru],
   );
   const revealFile = useCallback(
     (path: string, name: string) => {
@@ -1006,23 +895,11 @@ function App() {
           spawn({ type: "files", root }, ctx?.label ?? `files · ${name}`);
           break;
         }
-        case "git": {
-          const root = ctx?.path ?? ctx?.cwd;
-          const name = root ? root.split("/").filter(Boolean).pop() ?? root : "git";
-          spawn({ type: "git", root }, ctx?.label ?? `git · ${name}`);
-          break;
-        }
         case "browser":
           spawn({ type: "browser", url: ctx?.url }, ctx?.label ?? "browser");
           break;
-        case "chrome":
-          spawn({ type: "chrome", url: ctx?.url }, ctx?.label ?? "chrome");
-          break;
         case "chat":
           spawn({ type: "chat", cwd: ctx?.cwd, seed: ctx?.seed }, ctx?.label ?? "chat");
-          break;
-        case "memory":
-          spawn({ type: "memory" }, ctx?.label ?? "memory");
           break;
       }
     },
@@ -1093,14 +970,6 @@ function App() {
       addShell();
     }
   }, [activeKey, panes, addShell, spawn]);
-  const addOracle = useCallback(
-    (identity: string) => spawn({ type: "oracle", identity }, identity),
-    [spawn],
-  );
-  const addTmux = useCallback(
-    (socket: string, session: string) => spawn({ type: "tmux", socket, session }, session),
-    [spawn],
-  );
   const closePane = useCallback((key: string) => {
     // If the pane being closed owns the OS fullscreen (e.g. a maximized browser
     // pane with a video in fullscreen), drop fullscreen first — otherwise the
@@ -1172,127 +1041,26 @@ function App() {
     },
     [activeKey, handleCmdF, newPaneForContext, panes, requestClose, setFocusedPane],
   );
-  const resumeChat = useCallback(
-    (s: ChatSessionInfo) =>
-      spawn(
-        // carry engine+model so a resumed codex thread boots on codex, not claude
-        { type: "chat", resume: { id: s.id, title: s.title, engine: s.engine, model: s.model } },
-        s.title || "chat",
-      ),
-    [spawn],
-  );
-
-  // Shared live data for the idle homescreen + the ⌘K palette: the fleet and the
-  // recent chats to resume. One source, polled gently; every getter is defensive
-  // so a missing backend just yields an empty list.
-  const [oracles, setOracles] = useState<OracleInfo[]>([]);
-  const [chats, setChats] = useState<ChatSessionInfo[]>([]);
-  const [liveChats, setLiveChats] = useState<LiveChat[]>([]);
-  const [moneyAgentSessionVersion, setMoneyAgentSessionVersion] = useState(0);
-  // every runnable project under ~/Repo (auto-scanned), merged with the user's
-  // project store (custom adds / hides / name+cmd overrides — CRUD from Settings).
-  const [scanned, setScanned] = useState<ProjectInfo[]>([]);
-  const [projStore, setProjStore] = useState(loadProjectsStore);
-  useEffect(() => subscribeProjects(() => setProjStore(loadProjectsStore())), []);
-  const projects = useMemo(() => mergeProjects(scanned, projStore), [scanned, projStore]);
+  // Workspace project context stays local and cheap. Full chat-session resume is
+  // owned by the chat pane's `/resume` picker and the pane history surface.
+  const projects = useMemo<ProjectInfo[]>(() => [], []);
   const [home, setHome] = useState<string>("");
-  useEffect(() => {
-    let alive = true;
-    const loadOracles = () =>
-      listOracles().then((v) => alive && setOracles(v)).catch((e) => reportDiag("app.load", e, { action: "oracles" }));
-    const loadSessions = () =>
-      listChatSessions(12).then((v) => alive && setChats(v)).catch((e) => reportDiag("app.load", e, { action: "chatSessions" }));
-    const loadLive = () =>
-      listChatLive().then((v) => alive && setLiveChats(v)).catch((e) => reportDiag("app.load", e, { action: "chatLive" }));
-    const bumpAgents = () => {
-      if (alive) setMoneyAgentSessionVersion(Date.now());
-    };
 
-    // First paint: fetch everything once so the idle homescreen + palette aren't
-    // empty. After that, STAGGER the pollers across separate intervals + phase
-    // offsets so the ~4 IPC/subprocess calls never fire in the same frame —
-    // bunching them every 30s caused a periodic hitch. Spread out, each cycle is
-    // a single cheap call instead of a synchronized burst.
-    loadOracles();
-    loadSessions();
-    loadLive();
-    bumpAgents();
-
-    const timers: number[] = [];
-    // (delayMs, periodMs, fn) — phase offsets keep them from realigning.
-    const schedule = (delay: number, period: number, fn: () => void) => {
-      const kick = window.setTimeout(() => {
-        if (!alive) return;
-        fn();
-        timers.push(window.setInterval(fn, period));
-      }, delay);
-      timers.push(kick);
-    };
-    schedule(30_000, 30_000, loadOracles);   // fleet roster — moderate churn
-    schedule(7_000, 45_000, loadSessions);   // resume list — slow churn, offset
-    schedule(15_000, 20_000, loadLive);      // live/reattach — most dynamic
-    schedule(22_000, 60_000, bumpAgents);    // cheap version bump — offset
-
-    return () => {
-      alive = false;
-      // ids hold both timeouts (the initial phase-offset kicks) and intervals;
-      // clear both ways (the DOM timer id namespace is shared, but be explicit).
-      timers.forEach((t) => {
-        window.clearTimeout(t);
-        window.clearInterval(t);
-      });
-    };
-  }, []);
-
-  // Discover every runnable project under ~/Repo once on mount so each one gets
-  // its own ⌘K "run <name>" entry. Cheap (bounded scan), so no polling — a stale
-  // list just misses a brand-new repo until next launch.
-  const loadProjects = useCallback((announce = false) => {
-    listProjects()
-      .then((next) => {
-        setScanned(next);
-        if (announce) flash(`rescanned ${next.length} project${next.length === 1 ? "" : "s"}`);
-      })
-      .catch((e) => {
-        if (announce) flash(`project rescan failed: ${e}`);
-      });
-  }, [flash]);
   useEffect(() => {
     homeDir().then(setHome).catch((e) => reportDiag("app.load", e, { action: "homeDir" }));
-    loadProjects();
-  }, [loadProjects]);
+  }, []);
 
   // Root for ⌘P file-finder + ⌘⇧F global search. Priority: the active/focused
-  // files/git pane root → the dir of the last-opened file → $HOME. So the finder
-  // searches the project you're actually working in, like VS Code's workspace.
+  // files pane root → the dir of the last-opened file → $HOME.
   const finderRoot = useMemo(() => {
     const k = activeKey ?? focusedPane.current;
     const active = k ? panes.find((p) => p.key === k) : null;
     if (active?.kind.type === "files" && active.kind.root) return active.kind.root;
-    if (active?.kind.type === "git" && active.kind.root) return active.kind.root;
     const filesPane = panes.find((p) => p.kind.type === "files" && p.kind.root);
     if (filesPane && filesPane.kind.type === "files" && filesPane.kind.root) return filesPane.kind.root;
-    const gitPane = panes.find((p) => p.kind.type === "git" && p.kind.root);
-    if (gitPane && gitPane.kind.type === "git" && gitPane.kind.root) return gitPane.kind.root;
     if (lastOpenPath.current) return containingDir(lastOpenPath.current);
     return home;
   }, [panes, activeKey, home]);
-
-  // spawn a run terminal for a discovered project, exactly like F5 (logs stream
-  // + flutter `r` hot-reload work in-pane). Uses the project's primary command.
-  const runProject = useCallback(
-    (p: ProjectInfo) => {
-      const c = p.commands[0];
-      if (!c) {
-        spawn({ type: "shell", cwd: p.root }, `terminal · ${p.name}`);
-        flash(`opened ${p.name}`);
-        return;
-      }
-      spawn({ type: "shell", cmd: c.cmd, cwd: p.root }, `▶ ${p.name}`);
-      flash(`▶ ${c.cmd}`);
-    },
-    [spawn, flash],
-  );
 
   const fireAppshot = useCallback(async () => {
     const attachToChat = (key: string, path: string) =>
@@ -1376,13 +1144,6 @@ function App() {
     setHiddenKeys((h) => h.filter((k) => k !== key));
     setFocusedPane(key);
   }, [setFocusedPane]);
-  // Keep the open-file-dedup refs pointed at the freshest panes + focusPane.
-  useEffect(() => {
-    panesRef.current = panes;
-  }, [panes]);
-  useEffect(() => {
-    focusPaneRef.current = focusPane;
-  }, [focusPane]);
   // Rename a pane (double-click its OPEN-rail row) — persists via the layout save.
   const renamePane = useCallback((key: string, label: string) => {
     const v = label.trim();
@@ -1416,97 +1177,6 @@ function App() {
         navigator.clipboard?.writeText(text).catch((e) => reportDiag("app.clipboard", e, { action: "toChat" }));
         spawn({ type: "chat" }, "chat");
         flash("opened chat · annotation copied (⌘V)");
-      }
-    },
-    [panes, flash, spawn],
-  );
-
-  // "Send to AI" (notes pane → the configured default AI). Routes by the
-  // `defaultAi` setting: codex/claude terminal, a plain terminal, or the
-  // in-app chat. Reuses each pane's SUBMITTER (paneSubmitters)
-  // so the text is pasted AND actually sent (terminal: text + Enter; chat: real
-  // submit). Restores a minimized target, or spawns a fresh pane and fires once
-  // it's live (claude's TUI needs a beat to boot, so a freshly-spawned terminal
-  // gets a delayed submit).
-  const sendToAi = useCallback(
-    (text: string) => {
-      const body = text.trim();
-      if (!body) return;
-      const ai = loadSettings().defaultAi;
-
-      // submit into an EXISTING pane (restore it from minimized first).
-      const fireExisting = (key: string): boolean => {
-        const s = paneSubmitters.get(key);
-        if (!s) return false;
-        setHiddenKeys((h) => h.filter((k) => k !== key));
-        setFocusedPane(key);
-        s(body);
-        return true;
-      };
-
-      // spawn a fresh pane, then poll for its submitter and fire (after a boot
-      // grace for CLI TUIs like claude that aren't ready the instant they mount).
-      const spawnAndFire = (kind: PaneContent, label: string, bootMs: number) => {
-        const key = spawn(kind, label);
-        let tries = 0;
-        const tick = () => {
-          const s = paneSubmitters.get(key);
-          if (s) {
-            setTimeout(() => s(body), bootMs);
-            return;
-          }
-          if (tries++ < 50) setTimeout(tick, 150);
-        };
-        tick();
-      };
-
-      if (ai === "chat") {
-        const cp = panes.find((p) => p.kind.type === "chat");
-        if (cp && fireExisting(cp.key)) {
-          flash("sent → chat");
-          return;
-        }
-        // a fresh chat auto-sends its `seed` once claude is ready — cleanest path.
-        spawn({ type: "chat", seed: body }, "chat");
-        flash("sent → new chat");
-        return;
-      }
-
-      // codex-code / claude-code: a shell pane whose command launches that
-      // agent runtime. terminal: any plain shell pane (no agent command).
-      const wantCodex = ai === "codex-code";
-      const wantClaude = ai === "claude-code";
-      const match = panes.find(
-        (p) =>
-          p.kind.type === "shell" &&
-          (wantCodex
-            ? (p.kind.cmd ?? "").includes("codex")
-            : wantClaude
-              ? (p.kind.cmd ?? "").includes("claude")
-              : !(p.kind.cmd ?? "").includes("claude") && !(p.kind.cmd ?? "").includes("codex")),
-      );
-      if (match && fireExisting(match.key)) {
-        flash(wantCodex ? "sent → codex" : wantClaude ? "sent → claude code" : "sent → terminal");
-        return;
-      }
-      // none open → spawn the right one and fire when it's live.
-      if (wantCodex) {
-        spawnAndFire(
-          { type: "shell", cmd: "codex --model gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" },
-          "codex",
-          3200,
-        );
-        flash("opening codex → sending…");
-      } else if (wantClaude) {
-        spawnAndFire(
-          { type: "shell", cmd: "claude --dangerously-skip-permissions" },
-          "claude code",
-          3200,
-        );
-        flash("opening claude code → sending…");
-      } else {
-        spawnAndFire({ type: "shell" }, "terminal", 600);
-        flash("opening terminal → sending…");
       }
     },
     [panes, flash, spawn],
@@ -1817,28 +1487,18 @@ function App() {
     return buildAppCommands({
       activeKey,
       panesCount: panes.length,
-      home,
-      chats,
-      oracles,
-      projects,
       spawn,
-      resumeChat,
-      addOracle,
-      runProject,
       runF5,
-      reloadProjects: () => loadProjects(true),
-      fireAppshot,
       setSidebarOpen,
       setTopBarMode: (mode) => {
         setTopBarMode(mode);
         saveSettings({ topBarMode: mode });
       },
       setOverviewOpen,
-      setSettingsOpen,
       setHiddenKeys,
       setMaximizedKey,
     });
-  }, [spawn, fireAppshot, chats, oracles, resumeChat, addOracle, runF5, loadProjects, projects, home, runProject, panes.length, activeKey]);
+  }, [spawn, runF5, panes.length, activeKey]);
 
   const agentController = useMemo(
     () =>
@@ -2042,249 +1702,14 @@ function App() {
     );
   }, []);
 
-  const unreadNotifications = notifications.filter((n) => !n.read).length;
-  const notificationsPane = panes.find((pane) => pane.kind.type === "notifications");
-  const notificationsActive = notificationsPane?.key === activeKey;
-  const openNotificationsPane = useCallback(() => {
-    const existing = panes.find((pane) => pane.kind.type === "notifications");
-    if (existing) {
-      focusPane(existing.key);
-      return;
-    }
-    spawn({ type: "notifications" }, "notifications");
-  }, [panes, focusPane, spawn]);
-  const openNotificationTarget = useCallback((item: AiosNotification) => {
-    markNotificationRead(item.id);
-    const t = item.target;
-    if (!t) return;
-    switch (t.type) {
-      case "pane":
-      case "terminal": {
-        const pane = panes.find((p) => p.key === t.key);
-        if (pane) focusPane(pane.key);
-        break;
-      }
-      case "chat": {
-        // The killer case. If a chat pane is still open + bound to this backend
-        // session id, focus it. Else reattach the detached session — the backend
-        // replays its buffer and goes live, so firaz lands back in the exact chat.
-        const boundKey = paneKeyForChatSession(t.sessionId);
-        const open = boundKey ? panes.find((p) => p.key === boundKey) : undefined;
-        if (open) focusPane(open.key);
-        else spawn({ type: "chat", reattach: t.sessionId }, t.title ?? "chat");
-        break;
-      }
-      case "diagnostics":
-        openSettingsTo("diagnostics");
-        break;
-      case "file":
-        if (t.mode === "reveal") revealFileInPane(t.path, t.name ?? t.path);
-        else if (t.mode === "viewer") openViewerFileInPane(t.path, t.name ?? t.path);
-        else openEditorFileInPane(t.path, t.name ?? t.path, t.at);
-        break;
-      case "url":
-        openUrlInPane(t.url, t.label);
-        break;
-    }
-  }, [panes, focusPane, spawn]);
   const askFromPalette = useCallback((query: string) => {
     spawn({ type: "chat", seed: query }, "ask");
   }, [spawn]);
   const talkToJarvis = useCallback((seed: string) => {
     spawn({ type: "chat", seed }, "jarvis");
   }, [spawn]);
-  const openMoneyAgentChat = useCallback(
-    (id: string, label: string, command?: string) => {
-      const agent = moneyAgentById(id);
-      if (!agent) return;
-      const submitWhenReady = (key: string, text: string, reveal = false) => {
-        let tries = 0;
-        const tick = () => {
-          const submit = paneSubmitters.get(key);
-          if (submit) {
-            if (reveal) {
-              setHiddenKeys((current) => current.filter((value) => value !== key));
-              setFocusedPane(key);
-            }
-            submit(text);
-            return;
-          }
-          if (tries++ < 60) setTimeout(tick, 150);
-        };
-        tick();
-      };
-      const existingPane = panes.find(
-        (pane) => pane.kind.type === "chat" && pane.kind.agentId === agent.id,
-      );
-      if (existingPane) {
-        if (command) submitWhenReady(existingPane.key, command);
-        else focusPane(existingPane.key);
-        return;
-      }
-      const live = liveChats.find(
-        (chat) => chat.title === agent.label || chat.title === agent.shortLabel,
-      );
-      if (live) {
-        const key = spawn(
-          {
-            type: "chat",
-            reattach: live.id,
-            modelId: AGENT_CHAT_MODEL,
-            agentId: agent.id,
-            agentLabel: agent.label,
-          },
-          label,
-        );
-        if (command) {
-          setHiddenKeys((current) => (current.includes(key) ? current : [...current, key]));
-          submitWhenReady(key, command);
-        }
-        return;
-      }
-      const saved = loadMoneyAgentChatSession(agent.id);
-      if (saved) {
-        const key = spawn(
-          {
-            type: "chat",
-            resume: { id: saved.sessionId, title: saved.title },
-            modelId: AGENT_CHAT_MODEL,
-            agentId: agent.id,
-            agentLabel: agent.label,
-          },
-          label,
-        );
-        if (command) {
-          setHiddenKeys((current) => (current.includes(key) ? current : [...current, key]));
-          submitWhenReady(key, command);
-        }
-        return;
-      }
-      const key = spawn(
-        {
-          type: "chat",
-          seed: command ? `${buildMoneyAgentChatSeed(agent)}\n\noperator command:\n${command}` : buildMoneyAgentChatSeed(agent),
-          modelId: AGENT_CHAT_MODEL,
-          agentId: agent.id,
-          agentLabel: agent.label,
-        },
-        label,
-      );
-      if (command) {
-        setHiddenKeys((current) => (current.includes(key) ? current : [...current, key]));
-      }
-    },
-    [focusPane, liveChats, panes, spawn],
-  );
-  const moneyAgentChatStates = useMemo(() => {
-    const out: Partial<Record<(typeof MONEY_AGENTS)[number]["id"], MoneyAgentChatState>> = {};
-    for (const agent of loadConfiguredMoneyAgents()) {
-      const open = panes.some((pane) => pane.kind.type === "chat" && pane.kind.agentId === agent.id);
-      const live = liveChats.some(
-        (chat) => chat.title === agent.label || chat.title === agent.shortLabel,
-      );
-      const saved = loadMoneyAgentChatSession(agent.id);
-      out[agent.id] = open ? "open" : live ? "running" : saved ? "saved" : "none";
-    }
-    return out;
-  }, [liveChats, moneyAgentSessionVersion, panes]);
-
-  // ── persistent agents runtime (src/lib/agents.ts) ──────────────────────────
-  // The generic "named agent → chatpane with a chosen model" runtime. Separate
-  // from the money-agents path above; nothing here touches it. Pane key per
-  // agent is `agent:<id>` so reopen reattaches rather than duplicates.
-  const [agentVersion, setAgentVersion] = useState(0);
-  const bumpAgents = useCallback(() => setAgentVersion((v) => v + 1), []);
-
-  // Submit text into a pane once its submitter is registered (CLI boot grace).
-  const submitWhenAgentReady = useCallback((key: string, text: string) => {
-    let tries = 0;
-    const tick = () => {
-      const submit = paneSubmitters.get(key);
-      if (submit) {
-        submit(text);
-        return;
-      }
-      if (tries++ < 60) setTimeout(tick, 150);
-    };
-    tick();
-  }, []);
-
-  // Open (or reattach) an agent's chatpane. Reuses the `agent:<id>` pane if it's
-  // already mounted; otherwise spawns a fresh chat with the agent's model/cwd
-  // and seeds the prompt (claude auto-sends the seed once ready).
-  const openAgentPane = useCallback(
-    (agent: AgentConfig, opts: { run?: boolean } = {}): string => {
-      const paneKey = agentPaneKey(agent.id);
-      const existing = panes.find((p) => p.key === paneKey);
-      if (existing) {
-        focusPane(paneKey);
-        if (opts.run) submitWhenAgentReady(paneKey, agent.prompt);
-        return paneKey;
-      }
-      // Fresh spawn. `seed` runs once on boot; for a Run-now on a never-opened
-      // agent the seed IS the prompt, so opts.run + first-open coincide.
-      const key = spawn(
-        {
-          type: "chat",
-          seed: agent.prompt,
-          cwd: agent.cwd || undefined,
-          modelId: agent.model,
-          agentId: agent.id,
-          agentLabel: agent.label,
-        },
-        agent.label,
-        paneKey,
-      );
-      markAgentRun(agent.id);
-      bumpAgents();
-      return key;
-    },
-    [panes, focusPane, spawn, submitWhenAgentReady, bumpAgents],
-  );
-
-  // Run-now: if a session is already open, re-send the prompt; else open+run.
-  const runAgentNow = useCallback(
-    (agent: AgentConfig) => {
-      const paneKey = agentPaneKey(agent.id);
-      const open = panes.some((p) => p.key === paneKey);
-      if (open) {
-        submitWhenAgentReady(paneKey, agent.prompt);
-        markAgentRun(agent.id);
-        bumpAgents();
-        return;
-      }
-      openAgentPane(agent, { run: true });
-    },
-    [panes, submitWhenAgentReady, openAgentPane, bumpAgents],
-  );
-
-  // Stop the agent's live chat session (chat_stop). Resolves the backend session
-  // id via the pane-key→session registry (chatSessions in paneBus).
-  const stopAgent = useCallback(
-    (agent: AgentConfig) => {
-      const sid = chatSessions.get(agentPaneKey(agent.id));
-      if (sid != null) void chatStop(sid).catch(() => {});
-      bumpAgents();
-    },
-    [bumpAgents],
-  );
-
-  // id → live/idle, cross-referencing the open `agent:<id>` panes + live chats.
-  const agentLiveStates = useMemo(() => {
-    const out: Record<string, AgentLiveState> = {};
-    for (const agent of listPersistentAgents()) {
-      const paneKey = agentPaneKey(agent.id);
-      const open = panes.some((p) => p.key === paneKey);
-      const sid = chatSessions.get(paneKey);
-      const live = open || (sid != null && liveChats.some((c) => c.id === sid));
-      out[agent.id] = live ? "live" : "idle";
-    }
-    return out;
-  }, [panes, liveChats, agentVersion]);
-
-  // Control hook (control.rs → `control-command` event): a 127.0.0.1 POST fires
-  // an agent / opens a pane WITHOUT a webview (the cron seam). Rust never
-  // touches panes — it relays here, where panes + chat sessions live.
+  // Control hook (control.rs → `control-command` event): allow external callers
+  // to open core panes only.
   useEffect(() => {
     if (!nativeRuntime) return;
     let disposed = false;
@@ -2292,27 +1717,7 @@ function App() {
     void listen<Record<string, unknown>>("control-command", (event) => {
       const payload = event.payload || {};
       const cmd = String(payload.cmd ?? "");
-      if (cmd === "run-agent") {
-        const agentId = String(payload.agentId ?? "");
-        const persisted = agentId ? getAgent(agentId) : undefined;
-        if (persisted) {
-          runAgentNow(persisted);
-          return;
-        }
-        // One-off poke: no persisted agent — spawn a transient chat with the
-        // inline model/prompt/cwd.
-        const prompt = String(payload.prompt ?? "").trim();
-        if (!prompt) return;
-        spawn(
-          {
-            type: "chat",
-            seed: prompt,
-            cwd: payload.cwd ? String(payload.cwd) : undefined,
-            modelId: payload.model ? String(payload.model) : undefined,
-          },
-          agentId || "agent",
-        );
-      } else if (cmd === "open-pane") {
+      if (cmd === "open-pane") {
         const paneType = String(payload.paneType ?? "");
         switch (paneType) {
           case "chat":
@@ -2325,12 +1730,8 @@ function App() {
           case "browser":
             spawn({ type: "browser" }, "browser");
             break;
-          case "memory":
-            spawn({ type: "memory" }, "memory");
-            break;
-          case "money-agents":
-          case "agents":
-            spawn({ type: "money-agents" }, "agents");
+          case "files":
+            spawn({ type: "files" }, "files");
             break;
           default:
             break;
@@ -2346,117 +1747,7 @@ function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [nativeRuntime, runAgentNow, spawn]);
-
-  const moneyAgentBootstrapRef = useRef(false);
-  useEffect(() => {
-    if (moneyAgentBootstrapRef.current || !nativeRuntime) return;
-    moneyAgentBootstrapRef.current = true;
-    for (const agent of loadConfiguredMoneyAgents()) {
-      if (panes.some((pane) => pane.kind.type === "chat" && pane.kind.agentId === agent.id)) continue;
-      const saved = loadMoneyAgentChatSession(agent.id);
-      const key = spawn(
-        saved
-          ? {
-              type: "chat",
-              resume: { id: saved.sessionId, title: saved.title },
-              modelId: AGENT_CHAT_MODEL,
-              agentId: agent.id,
-              agentLabel: agent.label,
-            }
-          : {
-              type: "chat",
-              seed: buildMoneyAgentChatSeed(agent),
-              modelId: AGENT_CHAT_MODEL,
-              agentId: agent.id,
-              agentLabel: agent.label,
-            },
-        agent.label,
-      );
-      setHiddenKeys((current) => (current.includes(key) ? current : [...current, key]));
-    }
-  }, [nativeRuntime, panes, spawn]);
-  useEffect(() => {
-    if (!nativeRuntime) return;
-    const cadenceMs = (schedule?: string): number | null => {
-      const value = (schedule || "manual").toLowerCase();
-      if (value.includes("manual")) return null;
-      if (value.includes("hour")) return 60 * 60 * 1000;
-      if (value.includes("always")) return 6 * 60 * 60 * 1000;
-      if (value.includes("daily") || value.includes("work block")) return 24 * 60 * 60 * 1000;
-      return null;
-    };
-    const lastRunKey = (id: string) => `aios.chatAgents.lastScheduledRun:${id}`;
-    const submitHidden = (key: string, text: string) => {
-      let tries = 0;
-      const tick = () => {
-        const submit = paneSubmitters.get(key);
-        if (submit) {
-          submit(text);
-          return;
-        }
-        if (tries++ < 60) setTimeout(tick, 150);
-      };
-      tick();
-    };
-    const tick = () => {
-      const now = Date.now();
-      for (const agent of loadConfiguredMoneyAgents()) {
-        const cadence = cadenceMs(agent.schedule);
-        if (!cadence) continue;
-        const key = lastRunKey(agent.id);
-        const lastRun = Number(localStorage.getItem(key) || "0");
-        if (lastRun && now - lastRun < cadence) continue;
-        localStorage.setItem(key, String(now));
-        const command = buildMoneyAgentRunCommand(agent, "scheduled");
-        const existingPane = panes.find(
-          (pane) => pane.kind.type === "chat" && pane.kind.agentId === agent.id,
-        );
-        if (existingPane) {
-          submitHidden(existingPane.key, command);
-          continue;
-        }
-        const live = liveChats.find(
-          (chat) => chat.title === agent.label || chat.title === agent.shortLabel,
-        );
-        const saved = loadMoneyAgentChatSession(agent.id);
-        const paneKey = spawn(
-          live
-            ? {
-                type: "chat",
-                reattach: live.id,
-                modelId: AGENT_CHAT_MODEL,
-                agentId: agent.id,
-                agentLabel: agent.label,
-              }
-            : saved
-              ? {
-                  type: "chat",
-                  resume: { id: saved.sessionId, title: saved.title },
-                  modelId: AGENT_CHAT_MODEL,
-                  agentId: agent.id,
-                  agentLabel: agent.label,
-                }
-              : {
-                  type: "chat",
-                  seed: `${buildMoneyAgentChatSeed(agent)}\n\noperator command:\n${command}`,
-                  modelId: AGENT_CHAT_MODEL,
-                  agentId: agent.id,
-                  agentLabel: agent.label,
-                },
-          agent.label,
-        );
-        setHiddenKeys((current) => (current.includes(paneKey) ? current : [...current, paneKey]));
-        if (live || saved) submitHidden(paneKey, command);
-      }
-    };
-    const start = setTimeout(tick, 5_000);
-    const interval = setInterval(tick, 60_000);
-    return () => {
-      clearTimeout(start);
-      clearInterval(interval);
-    };
-  }, [liveChats, nativeRuntime, panes, spawn]);
+  }, [nativeRuntime, spawn]);
   const deepSearchFromPalette = useCallback((query: string) => {
     spawn({
       type: "chat",
@@ -2501,25 +1792,6 @@ function App() {
       <IconBtn title="Appshot — attach to chat (⌘⌘)" onClick={fireAppshot}>
         <Camera size={15} />
       </IconBtn>
-      <div className="relative" data-no-window-drag>
-        <button
-          type="button"
-          onClick={openNotificationsPane}
-          title="notifications"
-          className={`relative rounded-md p-1.5 transition-colors ${
-            notificationsActive
-              ? "bg-[var(--color-panel-2)] text-[var(--color-accent)]"
-              : "text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-          }`}
-        >
-          <Bell size={15} />
-          {unreadNotifications > 0 && (
-            <span className="absolute -right-0.5 -top-0.5 grid h-3.5 min-w-3.5 place-items-center rounded-full bg-[var(--color-danger)] px-1 text-[8px] font-bold leading-none text-white">
-              {unreadNotifications > 9 ? "9+" : unreadNotifications}
-            </span>
-          )}
-        </button>
-      </div>
     </div>
   );
   // Compact action row that lives in the SIDEBAR (the persistent chrome) now that
@@ -2544,25 +1816,6 @@ function App() {
       <IconBtn title="Appshot — attach to chat (⌘⌘)" onClick={fireAppshot}>
         <Camera size={15} />
       </IconBtn>
-      <div className="relative" data-no-window-drag>
-        <button
-          type="button"
-          onClick={openNotificationsPane}
-          title="notifications"
-          className={`relative rounded-md p-1.5 transition-colors ${
-            notificationsActive
-              ? "bg-[var(--color-panel-2)] text-[var(--color-accent)]"
-              : "text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-          }`}
-        >
-          <Bell size={15} />
-          {unreadNotifications > 0 && (
-            <span className="absolute -right-0.5 -top-0.5 grid h-3.5 min-w-3.5 place-items-center rounded-full bg-[var(--color-danger)] px-1 text-[8px] font-bold leading-none text-white">
-              {unreadNotifications > 9 ? "9+" : unreadNotifications}
-            </span>
-          )}
-        </button>
-      </div>
     </div>
   );
 
@@ -2622,31 +1875,6 @@ function App() {
                 onSpawn={spawnSidebarItem}
                 onPinSite={(spaceId) => setPinSiteSpace(spaceId)}
               />
-              <OracleRoster
-                iconsOnly={iconsOnly}
-                onAttachOracle={addOracle}
-                onAttachTmux={addTmux}
-                chatpaneAgentsOnly
-                moneyAgentsSlot={
-                  <MoneyAgentsSection
-                    iconsOnly={iconsOnly}
-                    embedded={!iconsOnly}
-                    agentChatStates={moneyAgentChatStates}
-                    onOpenOverview={() => spawn({ type: "money-agents" }, "agents")}
-                    onOpenAgentChat={openMoneyAgentChat}
-                  />
-                }
-              />
-              {!iconsOnly && (
-                <AgentsSection
-                  version={agentVersion}
-                  liveStates={agentLiveStates}
-                  onOpen={(agent) => openAgentPane(agent)}
-                  onRunNow={runAgentNow}
-                  onStop={stopAgent}
-                  onCreated={(agent) => openAgentPane(agent, { run: true })}
-                />
-              )}
             </div>
             <div className="flex flex-col gap-0.5 border-t border-[var(--color-border)] p-2">
               <div className={`flex pb-1 ${iconsOnly ? "justify-center" : "justify-center px-1.5"}`}>
@@ -2671,22 +1899,12 @@ function App() {
             }
             const idleDash = (
               <IdleDashboard
-                apps={SPAWN}
-                oracles={oracles}
-                projects={projects}
                 sidebar={sidebar}
                 onSpawn={spawn}
-                onAttachOracle={addOracle}
-                onOpenProject={(p) => spawn({ type: "shell", cwd: p.root }, p.name)}
                 onOpenSidebarItem={spawnSidebarItem}
                 onRevealSidebar={() => setSidebarOpen(true)}
-                onOpenMoneyAgents={() => spawn({ type: "money-agents" }, "agents")}
-                onOpenMoneyAgentChat={openMoneyAgentChat}
                 onOpenPalette={() => setPaletteOpen(true)}
-                notifications={notifications}
                 onTalkToJarvis={talkToJarvis}
-                onOpenNotificationTarget={openNotificationTarget}
-                onClearNotification={clearNotification}
               />
             );
             // No panes at all → idle. If panes exist but ALL are hidden, keep them
@@ -2728,27 +1946,14 @@ function App() {
                     setFocusedPane(pane.key);
                   }}
                   onAnnotate={routeToChat}
-                  onSendToAi={sendToAi}
                   workspaceContext={buildWorkspaceContext(pane, panes, projects, activeKey, hiddenKeys)}
                   onOpenFile={openFile}
                   onOpenEditorFile={openEditorFile}
                   onOpenViewerFile={openViewerFile}
                   onRevealFile={revealFile}
                   onDuplicate={() => spawn(pane.kind, pane.label)}
+                  onOpenHistoryItem={openHistoryItem}
                   onOpenUrl={openUrl}
-                  notifications={notifications}
-                  onMarkNotificationRead={markNotificationRead}
-                  onOpenNotificationTarget={openNotificationTarget}
-                  onMarkAllNotificationsRead={markAllNotificationsRead}
-                  onClearNotification={clearNotification}
-                  onClearAllNotifications={clearAllNotifications}
-                  onOpenMoneyAgentChat={openMoneyAgentChat}
-                  onAttachApp={(app) =>
-                    spawn(
-                      { type: "app", name: app.name, bundleId: app.bundle_id },
-                      app.name,
-                    )
-                  }
                   onProfileChange={(profile) =>
                     setPanes((ps) =>
                       ps.map((p) =>
@@ -2935,141 +2140,6 @@ function MobileBottomNav({
   );
 }
 
-/** The explicit action verb a notification row shows / its click does, derived
- *  from the deep-link target (replaces the generic "open pane"). */
-function notificationActionVerb(target: NotificationTarget): string {
-  switch (target.type) {
-    case "chat":
-      return "reopen chat";
-    case "diagnostics":
-      return "open diagnostics";
-    case "terminal":
-      return "go to terminal";
-    case "url":
-      return "open link";
-    case "file":
-      return target.mode === "reveal"
-        ? "reveal file"
-        : target.mode === "viewer"
-          ? "open file"
-          : "open in editor";
-    case "pane":
-    default:
-      return "open pane";
-  }
-}
-
-function NotificationCenter({
-  notifications,
-  onMarkRead,
-  onOpenTarget,
-  onMarkAllRead,
-  onClear,
-  onClearAll,
-}: {
-  notifications: AiosNotification[];
-  onMarkRead: (id: string) => void;
-  onOpenTarget: (item: AiosNotification) => void;
-  onMarkAllRead: () => void;
-  onClear: (id: string) => void;
-  onClearAll: () => void;
-}) {
-  const unread = notifications.filter((n) => !n.read).length;
-  return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--color-bg)] text-[12px] text-[var(--color-text)]">
-      <div className="flex items-center justify-between border-b border-[var(--color-border)] px-3 py-2">
-        <div>
-          <div className="text-[12px] font-medium">notifications</div>
-          <div className="text-[10px] text-[var(--color-muted)]">
-            {unread > 0 ? `${unread} unread` : "all caught up"}
-          </div>
-        </div>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={onMarkAllRead}
-            className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-            title="mark all read"
-          >
-            <CheckCheck size={14} />
-          </button>
-          <button
-            type="button"
-            onClick={onClearAll}
-            className="grid h-7 w-7 place-items-center rounded-md text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-danger)]"
-            title="clear all"
-          >
-            <Trash2 size={13} />
-          </button>
-        </div>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-2">
-        {notifications.length === 0 ? (
-          <div className="grid h-28 place-items-center rounded-md border border-dashed border-[var(--color-border)] text-[11px] text-[var(--color-faint)]">
-            no notifications yet
-          </div>
-        ) : (
-          notifications.map((item) => (
-            <div
-              key={item.id}
-              className={`group flex gap-2 rounded-md px-2 py-2 transition-colors hover:bg-[var(--color-panel-2)] ${
-                item.read ? "opacity-65" : ""
-              }`}
-            >
-              <span
-                className={`mt-1 h-2 w-2 shrink-0 rounded-full ${
-                  item.level === "error"
-                    ? "bg-[var(--color-danger)]"
-                    : item.level === "warning"
-                      ? "bg-[var(--color-warning)]"
-                      : item.level === "success"
-                        ? "bg-[var(--color-success)]"
-                        : "bg-[var(--color-accent)]"
-                }`}
-              />
-              <button
-                type="button"
-                onClick={() => (item.target ? onOpenTarget(item) : onMarkRead(item.id))}
-                className="min-w-0 flex-1 text-left"
-                title={item.target ? notificationActionVerb(item.target) : item.read ? "read" : "mark read"}
-              >
-                <div className="flex items-center gap-1.5">
-                  <span className="truncate text-[12px] font-medium text-[var(--color-text)]">{item.title}</span>
-                  {!item.read && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-accent)]" />}
-                </div>
-                {item.body && (
-                  <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-[var(--color-muted)]">
-                    {item.body}
-                  </div>
-                )}
-                <div className="mt-1 flex items-center gap-1.5 text-[9px] uppercase tracking-wide text-[var(--color-faint)]">
-                  <span>{item.sourceLabel ?? item.kind}</span>
-                  {item.target && (
-                    <>
-                      <span>·</span>
-                      <span>{notificationActionVerb(item.target)}</span>
-                    </>
-                  )}
-                  <span>·</span>
-                  <span>{new Date(item.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-                </div>
-              </button>
-              <button
-                type="button"
-                onClick={() => onClear(item.id)}
-                className="grid h-6 w-6 shrink-0 place-items-center rounded text-[var(--color-muted)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-danger)] group-hover:opacity-100"
-                title="clear"
-              >
-                <X size={12} />
-              </button>
-            </div>
-          ))
-        )}
-      </div>
-    </div>
-  );
-}
-
 /* ── personalizable sidebar rail ─────────────────────────────────────────── */
 
 /** A collapsible space header: click the title to fold/unfold; hover reveals a
@@ -3238,6 +2308,7 @@ function SidebarRail({
 
   return (
     <>
+      {!iconsOnly && <SidebarUsage />}
       {spaces.map((space, si) => {
         const rows = items.filter((it) => it.group === space.id && !it.hidden);
         const isPinned = space.id === "pinned";
@@ -3313,15 +2384,10 @@ const SIDEBAR_ICON_CHOICES: { name: string; label: string; icon: typeof Folder }
   { name: "chat", label: "chat", icon: MessageSquare },
   { name: "terminal", label: "terminal", icon: TerminalSquare },
   { name: "bot", label: "agent", icon: Bot },
-  { name: "notes", label: "notes", icon: NotebookPen },
   { name: "files", label: "files", icon: Folder },
   { name: "browser", label: "web", icon: Globe },
-  { name: "database", label: "data", icon: Database },
-  { name: "automations", label: "time", icon: Clock },
   { name: "contacts", label: "people", icon: MessageCircle },
   { name: "studio", label: "studio", icon: Wand2 },
-  { name: "notifications", label: "alerts", icon: Bell },
-  { name: "doc", label: "doc", icon: FileText },
   { name: "pin", label: "pin", icon: Pin },
   { name: "settings", label: "settings", icon: SettingsIcon },
   { name: "layers", label: "layers", icon: Layers },
@@ -3691,16 +2757,9 @@ const PANE_GLYPH: Record<string, typeof Folder> = {
   oracle: Bot,
   tmux: TerminalSquare,
   files: Folder,
-  git: GitBranch,
+  history: HistoryIcon,
   browser: Globe,
-  notes: NotebookPen,
-  bridges: Radio,
-  plugins: Layers,
-  pulse: Radio,
-  apps: MonitorUp,
   chat: MessageSquare,
-  file: FileText,
-  editor: FileText,
 };
 
 /** Mission-control-style pane overview: a full-screen scrim that fans out every
@@ -3852,6 +2911,7 @@ const DOT: Record<string, string> = {
   tmux: "status-dot--dormant",
   shell: "status-dot--idle",
   files: "status-dot--cold",
+  history: "status-dot--dormant",
   git: "status-dot--active",
   browser: "status-dot--cold",
   notes: "status-dot--cold",
@@ -4048,22 +3108,14 @@ function PaneCard({
   onMoveRight,
   onFocus,
   onAnnotate,
-  onSendToAi,
   workspaceContext,
   onOpenFile,
   onOpenEditorFile,
   onOpenViewerFile,
   onRevealFile,
   onDuplicate,
+  onOpenHistoryItem,
   onOpenUrl,
-  notifications,
-  onMarkNotificationRead,
-  onOpenNotificationTarget,
-  onMarkAllNotificationsRead,
-  onClearNotification,
-  onClearAllNotifications,
-  onOpenMoneyAgentChat,
-  onAttachApp,
   onProfileChange,
   onVideoFullscreen,
 }: {
@@ -4081,22 +3133,14 @@ function PaneCard({
   onMoveRight?: () => void;
   onFocus: () => void;
   onAnnotate: (text: string) => void;
-  onSendToAi: (text: string) => void;
   workspaceContext: ChatWorkspaceContext;
   onOpenFile: (path: string, name: string) => void;
   onOpenEditorFile: (path: string, name: string) => void;
   onOpenViewerFile: (path: string, name: string) => void;
   onRevealFile: (path: string, name: string) => void;
   onDuplicate: () => void;
+  onOpenHistoryItem: (kind: PaneContent, label: string) => void;
   onOpenUrl?: (url: string) => void;
-  notifications: AiosNotification[];
-  onMarkNotificationRead: (id: string) => void;
-  onOpenNotificationTarget: (item: AiosNotification) => void;
-  onMarkAllNotificationsRead: () => void;
-  onClearNotification: (id: string) => void;
-  onClearAllNotifications: () => void;
-  onOpenMoneyAgentChat: (id: string, label: string) => void;
-  onAttachApp: (app: { name: string; bundle_id: string | null }) => void;
   onProfileChange: (profile: string) => void;
   onVideoFullscreen?: (on: boolean) => void;
 }) {
@@ -4137,8 +3181,6 @@ function PaneCard({
         ? (pane.kind.cwd ?? defaultCwd)
         : pane.kind.type === "files"
           ? (pane.kind.root ?? defaultCwd)
-          : pane.kind.type === "git"
-            ? (pane.kind.root ?? defaultCwd)
           : fileTarget
             ? containingDir(fileTarget.path)
             : defaultCwd;
@@ -4339,8 +3381,8 @@ function PaneCard({
             <TerminalPane kind={pane.kind} paneKey={pane.key} />
           ) : pane.kind.type === "files" ? (
             <FilesPane initialRoot={pane.kind.root} onOpenFile={onOpenFile} />
-          ) : pane.kind.type === "git" ? (
-            <GitPane initialRoot={pane.kind.root} />
+          ) : pane.kind.type === "history" ? (
+            <HistoryPane onOpenHistoryItem={onOpenHistoryItem} />
           ) : pane.kind.type === "browser" ? (
             <BrowserPane
               label={pane.key}
@@ -4352,49 +3394,6 @@ function PaneCard({
               onProfileChange={onProfileChange}
               onVideoFullscreen={onVideoFullscreen}
             />
-          ) : pane.kind.type === "chrome" ? (
-            <CdpChromePane onClose={onClose} />
-          ) : pane.kind.type === "appcast" ? (
-            <AppCastPane
-              label={pane.key}
-              active={active}
-              initialWindowId={pane.kind.windowId}
-            />
-          ) : pane.kind.type === "notes" ? (
-            <NotesPane onSend={onSendToAi} />
-          ) : pane.kind.type === "memory" ? (
-            <MemoryPane onSend={onSendToAi} />
-          ) : pane.kind.type === "bridges" ? (
-            <BridgesPane />
-          ) : pane.kind.type === "plugins" ? (
-            <PluginsPane />
-          ) : pane.kind.type === "pulse" ? (
-            <PulsePane />
-          ) : pane.kind.type === "notifications" ? (
-            <NotificationCenter
-              notifications={notifications}
-              onMarkRead={onMarkNotificationRead}
-              onOpenTarget={onOpenNotificationTarget}
-              onMarkAllRead={onMarkAllNotificationsRead}
-              onClear={onClearNotification}
-              onClearAll={onClearAllNotifications}
-            />
-          ) : pane.kind.type === "money-agents" ? (
-            <MoneyAgentsPane onOpenAgentChat={onOpenMoneyAgentChat} />
-          ) : pane.kind.type === "apps" ? (
-            <AttachAppsPane onAttachApp={onAttachApp} />
-          ) : pane.kind.type === "app" ? (
-            <AppAttachPane name={pane.kind.name} bundleId={pane.kind.bundleId} />
-          ) : pane.kind.type === "file" ? (
-            <FileViewerPane path={pane.kind.path} paneKey={pane.key} />
-          ) : pane.kind.type === "editor" ? (
-            <EditorPane
-              path={pane.kind.path}
-              name={pane.kind.name}
-              paneKey={pane.key}
-              line={pane.kind.line}
-              col={pane.kind.col}
-            />
           ) : !chatCwd ? (
             <PaneLoading />
           ) : (
@@ -4405,7 +3404,6 @@ function PaneCard({
               cwd={chatCwd}
               seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
               modelId={pane.kind.type === "chat" ? pane.kind.modelId : undefined}
-              agentId={pane.kind.type === "chat" ? pane.kind.agentId : undefined}
               agentLabel={pane.kind.type === "chat" ? pane.kind.agentLabel : undefined}
               resume={pane.kind.type === "chat" ? pane.kind.resume : undefined}
               reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}

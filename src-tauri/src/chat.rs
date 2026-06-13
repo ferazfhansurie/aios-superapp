@@ -50,17 +50,17 @@ use tauri::{AppHandle, Emitter};
 
 // Engine-agnostic wire format + the `Engine` tag now live in `aios-chat-core`
 // so the headless `aios-noded` daemon shares them verbatim (cross-machine sync).
-use aios_chat_core::wire::{
-    assistant_text_line, assistant_thinking_line, assistant_tool_use_line, json_escape,
-    slim_user_image_line, text_delta_line, thinking_delta_line, user_line, user_line_with_images,
-    user_tool_result_line,
-};
 use aios_chat_core::adapt::{
     adapt_codex_line, adapt_opencode_line, codex_delta_is_answer, codex_effort, codex_input_items,
     codex_is_action_item, codex_item_id, codex_item_is_error, codex_tool_input, codex_tool_name,
     codex_tool_result_text, codex_usage_event, codex_usage_to_claude,
 };
 use aios_chat_core::session::{buffer_push, fan_out, fan_out_split, ChatSession};
+use aios_chat_core::wire::{
+    assistant_text_line, assistant_thinking_line, assistant_tool_use_line, json_escape,
+    slim_user_image_line, text_delta_line, thinking_delta_line, user_line, user_line_with_images,
+    user_tool_result_line,
+};
 use aios_chat_core::{Engine, OutputSink};
 
 /// The Tauri-shell implementation of [`OutputSink`]: forwards each adapted line
@@ -82,7 +82,6 @@ fn detach_child_process(cmd: &mut Command) {
         cmd.process_group(0);
     }
 }
-
 
 /// Module-level registry of every live chat session, keyed by an incrementing
 /// id. Mirrors `PtyState` but as a `static` (the prompt asked for a module-level
@@ -127,25 +126,25 @@ fn claude_bin() -> String {
     }
     #[cfg(not(windows))]
     {
-    let candidates = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"];
-    for c in candidates {
-        if std::path::Path::new(c).exists() {
-            return c.to_string();
+        let candidates = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
         }
-    }
-    // Try the user's HOME-based installs (native installer / nvm current).
-    if let Ok(home) = std::env::var("HOME") {
-        let native = format!("{home}/.local/bin/claude");
-        if std::path::Path::new(&native).exists() {
-            return native;
+        // Try the user's HOME-based installs (native installer / nvm current).
+        if let Ok(home) = std::env::var("HOME") {
+            let native = format!("{home}/.local/bin/claude");
+            if std::path::Path::new(&native).exists() {
+                return native;
+            }
+            let claude_local = format!("{home}/.claude/local/claude");
+            if std::path::Path::new(&claude_local).exists() {
+                return claude_local;
+            }
         }
-        let claude_local = format!("{home}/.claude/local/claude");
-        if std::path::Path::new(&claude_local).exists() {
-            return claude_local;
-        }
-    }
-    // Default: let the OS resolve it from PATH.
-    "claude".to_string()
+        // Default: let the OS resolve it from PATH.
+        "claude".to_string()
     }
 }
 
@@ -895,6 +894,14 @@ fn codex_next_rpc(sess: &Arc<ChatSession>) -> u64 {
     sess.rpc_id.fetch_add(1, Ordering::SeqCst)
 }
 
+fn codex_error_result_line(sess: &Arc<ChatSession>, text: &str) -> String {
+    let tid = sess.thread_id.lock().clone().unwrap_or_default();
+    format!(
+        "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"text\":\"{}\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
+        json_escape(text),
+        json_escape(&tid)
+    )
+}
 
 /// Sends `turn/start` for an (already-known) thread, with the session model +
 /// reasoning effort. Effort is sent every turn (codex has no spawn-time flag like
@@ -908,12 +915,7 @@ fn codex_fire_turn(sess: &Arc<ChatSession>, thread_id: &str, text: &str, image_p
     if let Some(m) = sess.model.lock().clone().filter(|s| !s.is_empty()) {
         params["model"] = json!(m);
     }
-    if let Some(ef) = sess
-        .effort
-        .lock()
-        .as_deref()
-        .and_then(codex_effort)
-    {
+    if let Some(ef) = sess.effort.lock().as_deref().and_then(codex_effort) {
         params["effort"] = json!(ef);
     }
     codex_rpc_write(
@@ -924,7 +926,11 @@ fn codex_fire_turn(sess: &Arc<ChatSession>, thread_id: &str, text: &str, image_p
 
 /// Public turn entry for codex: fire `turn/start` if the thread is ready, else
 /// queue the text until `thread/start` resolves (the first turn races handshake).
-fn codex_send_turn(sess: &Arc<ChatSession>, text: String, image_paths: &[String]) -> Result<(), String> {
+fn codex_send_turn(
+    sess: &Arc<ChatSession>,
+    text: String,
+    image_paths: &[String],
+) -> Result<(), String> {
     let tid = sess.thread_id.lock().clone();
     match tid {
         Some(t) if !t.is_empty() => codex_fire_turn(sess, &t, &text, image_paths),
@@ -959,10 +965,23 @@ fn codex_steer(sess: &Arc<ChatSession>, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn codex_finish_stopped_turn(sess: &Arc<ChatSession>) {
+    *sess.active_turn.lock() = None;
+    *sess.answer_item.lock() = None;
+    sess.answer_streamed.store(false, Ordering::SeqCst);
+    sess.pending_approvals.lock().clear();
+    if sess.busy.swap(false, Ordering::SeqCst) {
+        fan_out(sess, &codex_error_result_line(sess, "stopped by user"));
+    }
+}
+
 /// Interrupts the in-flight codex turn via `turn/interrupt` (keeps process+thread).
 fn codex_interrupt(sess: &Arc<ChatSession>) -> Result<(), String> {
+    *sess.pending_turn.lock() = None;
     let tid = sess.thread_id.lock().clone().unwrap_or_default();
+    let active_turn = sess.active_turn.lock().clone().unwrap_or_default();
     if tid.is_empty() {
+        codex_finish_stopped_turn(sess);
         return Ok(());
     }
     let id = codex_next_rpc(sess);
@@ -973,6 +992,9 @@ fn codex_interrupt(sess: &Arc<ChatSession>) -> Result<(), String> {
             "params": { "threadId": tid }
         }),
     );
+    if active_turn.is_empty() {
+        codex_finish_stopped_turn(sess);
+    }
     Ok(())
 }
 
@@ -1237,6 +1259,19 @@ fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<Strin
 
     // response to one of our requests — only thread/start|resume carries thread.id.
     if has_id {
+        if let Some(error) = v.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("codex request failed");
+            *sess.pending_turn.lock() = None;
+            *sess.active_turn.lock() = None;
+            *sess.answer_item.lock() = None;
+            sess.answer_streamed.store(false, Ordering::SeqCst);
+            sess.pending_approvals.lock().clear();
+            out.push(codex_error_result_line(sess, message));
+            return out;
+        }
         if let Some(tid) = v
             .get("result")
             .and_then(|r| r.get("thread"))
@@ -1471,7 +1506,6 @@ fn adapt_line(sess: &Arc<ChatSession>, engine: Engine, line: &str) -> Vec<String
     }
 }
 
-
 /// Handles one complete output line: append to the replay buffer, update session
 /// state (claude id, busy, done-notification), and forward to the live sink.
 fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
@@ -1488,7 +1522,8 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
     // base64 (`"type":"image"`). Detect it cheaply so we can slim the BUFFERED
     // copy (FIX 1) instead of pinning the megabytes for the whole session. Hot
     // delta/text lines never contain this needle, so the parse stays gated.
-    let want_user_image = line.contains("\"type\":\"image\"") || line.contains("\"type\": \"image\"");
+    let want_user_image =
+        line.contains("\"type\":\"image\"") || line.contains("\"type\": \"image\"");
     let parsed: Option<Value> = if want_session_id || want_result || want_user_image {
         serde_json::from_str::<Value>(line).ok()
     } else {
@@ -1594,7 +1629,6 @@ fn claude_usage_event(app: &AppHandle) -> Option<String> {
     )
 }
 
-
 /// Payload for the in-app `aios-notify` event. The front-end turns this into a
 /// clickable `AiosNotification` whose target reattaches the chat by session id.
 #[derive(serde::Serialize, Clone)]
@@ -1644,8 +1678,7 @@ pub fn chat_send(
     // makes the second caller bounce with a clean error instead. Mid-turn
     // follow-ups should go through `chat_steer` (claude stdin inject / codex
     // turn/steer) or the frontend queue — never a second chat_send.
-    if s
-        .busy
+    if s.busy
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
@@ -1666,7 +1699,11 @@ pub fn chat_send(
                 .map(|p| format!("\"{p}\""))
                 .collect::<Vec<_>>()
                 .join(" ");
-            if text.is_empty() { paths } else { format!("{paths} {text}") }
+            if text.is_empty() {
+                paths
+            } else {
+                format!("{paths} {text}")
+            }
         };
         // FIX 3: `busy` was set true above. If the per-turn spawn fails BEFORE the
         // reader thread starts, no EOF-fallback `result` ever fires (there's no
@@ -1734,7 +1771,10 @@ pub struct ChatReattachInfo {
 /// the channel, replays the buffered lines so the pane reconstructs the whole
 /// run and catches up to live, and clears the detached/notify flags.
 #[tauri::command]
-pub fn chat_reattach(session_id: u32, on_event: Channel<String>) -> Result<ChatReattachInfo, String> {
+pub fn chat_reattach(
+    session_id: u32,
+    on_event: Channel<String>,
+) -> Result<ChatReattachInfo, String> {
     let s = with_sessions(|m| m.get(&session_id).cloned())
         .ok_or_else(|| format!("chat session {session_id} not found"))?;
     // Replay buffer first, then go live — order matters so the pane sees history
@@ -1788,9 +1828,7 @@ pub struct LiveChat {
 pub fn list_chat_live() -> Vec<LiveChat> {
     with_sessions(|m| {
         m.iter()
-            .filter(|(_, s)| {
-                s.detached.load(Ordering::SeqCst) || s.busy.load(Ordering::SeqCst)
-            })
+            .filter(|(_, s)| s.detached.load(Ordering::SeqCst) || s.busy.load(Ordering::SeqCst))
             .map(|(id, s)| LiveChat {
                 id: *id,
                 claude_id: s.claude_id.lock().clone(),
@@ -2562,8 +2600,8 @@ mod tests {
         slim_user_image_line, ChatSession, Engine,
     };
     use aios_chat_core::session::REPLAY_BYTE_CAP;
-    use serde_json::json;
     use parking_lot::Mutex;
+    use serde_json::json;
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2627,8 +2665,8 @@ mod tests {
         assert!(e.contains("stdin"), "got: {e}");
         // codex steering is text-only: image-carrying messages must stay queued.
         register_test_session(900_003, Engine::Codex, true);
-        let e = super::chat_steer(900_003, "x".into(), Some(vec!["/tmp/i.png".into()]))
-            .unwrap_err();
+        let e =
+            super::chat_steer(900_003, "x".into(), Some(vec!["/tmp/i.png".into()])).unwrap_err();
         assert!(e.contains("text-only"), "got: {e}");
         // opencode has no mid-turn channel at all.
         register_test_session(900_004, Engine::Opencode, true);
@@ -2685,6 +2723,48 @@ mod tests {
         );
 
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn codex_appserver_error_response_closes_busy_turn() {
+        let sess = test_codex_session();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        sess.busy.store(true, Ordering::SeqCst);
+
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"turn already active"}}"#,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains(r#""type":"result""#), "{out:?}");
+        assert!(
+            out[0].contains(r#""subtype":"error_during_execution""#),
+            "{out:?}"
+        );
+        assert!(out[0].contains(r#""is_error":true"#), "{out:?}");
+        assert!(out[0].contains("turn already active"), "{out:?}");
+    }
+
+    #[test]
+    fn codex_interrupt_before_thread_ready_drops_queued_turn_and_frees_busy() {
+        let sess = test_codex_session();
+        *sess.pending_turn.lock() = Some(("do it".into(), Vec::new()));
+        sess.busy.store(true, Ordering::SeqCst);
+
+        let res = super::codex_interrupt(&sess);
+
+        assert!(res.is_ok());
+        assert!(sess.pending_turn.lock().is_none());
+        assert!(!sess.busy.load(Ordering::SeqCst));
+        assert!(
+            sess.buffer
+                .lock()
+                .iter()
+                .any(|line| line.contains("stopped by user") && line.contains(r#""type":"result""#)),
+            "buffer: {:?}",
+            sess.buffer.lock()
+        );
     }
 
     #[test]
@@ -2782,8 +2862,14 @@ js_repl = false
         assert_eq!(sessions[0].id, id);
         assert_eq!(sessions[0].engine, "codex");
         assert_eq!(sessions[0].model, "gpt-5-codex");
-        assert_eq!(sessions[0].title, "make resume and buttons commercial ready");
-        assert_eq!(sessions[0].cwd, "/Users/firazfhansurie/Repo/firaz/aios/shell");
+        assert_eq!(
+            sessions[0].title,
+            "make resume and buttons commercial ready"
+        );
+        assert_eq!(
+            sessions[0].cwd,
+            "/Users/firazfhansurie/Repo/firaz/aios/shell"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2797,7 +2883,10 @@ js_repl = false
             ]}
         });
         let slim = slim_user_image_line(&line).expect("image line should slim");
-        assert!(!slim.contains("AAAA_huge_base64_AAAA"), "base64 must be dropped: {slim}");
+        assert!(
+            !slim.contains("AAAA_huge_base64_AAAA"),
+            "base64 must be dropped: {slim}"
+        );
         assert!(!slim.contains("base64"), "no image source retained: {slim}");
         assert!(slim.contains("[image]"), "placeholder kept: {slim}");
         assert!(slim.contains("what is this"), "user text kept: {slim}");

@@ -4,15 +4,10 @@
  *  fine to import here. */
 
 import {
-  Bot,
-  Brain,
   Folder,
-  GitBranch,
   Globe,
+  History,
   MessageSquare,
-  MonitorPlay,
-  MonitorUp,
-  NotebookPen,
   TerminalSquare,
 } from "lucide-react";
 
@@ -22,11 +17,9 @@ import type { PaneKind } from "../components/TerminalPane";
 export type PaneContent =
   | PaneKind
   | { type: "files"; root?: string }
+  | { type: "history" }
   | { type: "git"; root?: string }
   | { type: "browser"; url?: string; profile?: string; memKey?: string; transient?: boolean }
-  // CDP "real Chrome as a pane" (CdpChromePane): a supervised Chrome tab
-  // screencast into a canvas. `url` is optional seed context (carried for
-  // spawn-with-context callers; the pane currently opens its own default).
   | { type: "chrome"; url?: string }
   | { type: "appcast"; windowId?: number }
   | { type: "notes" }
@@ -45,7 +38,6 @@ export type PaneContent =
       resume?: { id: string; title: string; engine?: string; model?: string };
       reattach?: number;
       modelId?: string;
-      agentId?: string;
       agentLabel?: string;
     }
   | { type: "file"; path: string; name: string }
@@ -58,33 +50,16 @@ export type AppDef = {
   kind: PaneContent;
   icon: typeof Folder;
   label: string;
-  /** which default sidebar group this app seeds into. */
-  group: "sessions" | "tools";
-  /** first-class apps show in the default sidebar; everything else seeds hidden
-   *  (still reachable via ⌘K). Lets us ship the full catalog while keeping the
-   *  default rail focused. */
-  firstClass?: boolean;
+  group: "tools";
 };
 
 /** Default app catalog — order here == the seeded default sidebar order. */
 export const SPAWN: AppDef[] = [
-  { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "tools", firstClass: true },
-  { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "tools", firstClass: true },
-  { id: "codex-code", kind: { type: "shell", cmd: "codex --model gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" }, icon: Bot, label: "codex", group: "tools", firstClass: true },
-  { id: "claude-code", kind: { type: "shell", cmd: "claude --dangerously-skip-permissions" }, icon: Bot, label: "claude code", group: "tools" },
-  { id: "notes", kind: { type: "notes" }, icon: NotebookPen, label: "notes", group: "tools", firstClass: true },
-  { id: "memory", kind: { type: "memory" }, icon: Brain, label: "memory", group: "tools", firstClass: true },
-  { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools", firstClass: true },
-  { id: "git", kind: { type: "git" }, icon: GitBranch, label: "git", group: "tools", firstClass: true },
-  { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools", firstClass: true },
-  // Real supervised Chrome over CDP (CdpChromePane). Not first-class: seeds
-  // hidden in the sidebar, reachable via ⌘K / un-hide. The legacy dev palette
-  // entry ("dev: real chrome") still opens it as an overlay.
-  { id: "chrome", kind: { type: "chrome" }, icon: Globe, label: "Chrome", group: "tools" },
-  { id: "apps", kind: { type: "apps" }, icon: MonitorUp, label: "apps", group: "tools" },
-  // App-cast (ScreenCaptureKit spike): live-mirror a native macOS window in a
-  // pane. Hidden by default (not firstClass) — reachable via ⌘K. macOS-only.
-  { id: "appcast", kind: { type: "appcast" }, icon: MonitorPlay, label: "app cast", group: "tools" },
+  { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "tools" },
+  { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "tools" },
+  { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools" },
+  { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools" },
+  { id: "history", kind: { type: "history" }, icon: History, label: "history", group: "tools" },
 ];
 
 /** Stable id → AppDef, for sidebar render-time lookup. */

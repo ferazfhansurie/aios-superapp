@@ -86,7 +86,6 @@ import {
   type ChatTurnInfo,
   type WebChatTurn,
 } from "../lib/chat";
-import { saveMoneyAgentChatSession } from "../lib/moneyAgents";
 import { fileSrc, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
 import { idleRate, codexRate, resetIn } from "../lib/dashboard";
@@ -121,7 +120,6 @@ import {
   openFileInPane,
   openViewerFileInPane,
   revealFileInPane,
-  spawnPane,
 } from "../lib/paneBus";
 import { resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import {
@@ -450,7 +448,6 @@ export function ChatPane({
   resume,
   reattach,
   modelId,
-  agentId,
   agentLabel,
   workspaceContext,
   onOpenUrl,
@@ -466,7 +463,6 @@ export function ChatPane({
   hidden?: boolean;
   seed?: string;
   modelId?: string;
-  agentId?: string;
   agentLabel?: string;
   workspaceContext?: ChatWorkspaceContext;
   /** Resume a prior chat session on mount (from the idle "continue" rail).
@@ -611,8 +607,8 @@ export function ChatPane({
       .filter((hit): hit is MemoryHit => Boolean(hit)),
     [attachedMemoryPaths, memoryHits],
   );
-  const openMemoryPane = useCallback(() => {
-    spawnPane("memory", { label: "memory" });
+  const openMemoryPanel = useCallback(() => {
+    setMemoryPanelOpen(true);
   }, []);
 
   useEffect(() => {
@@ -2079,13 +2075,6 @@ export function ChatPane({
           if (firstRecord) recordedRef.current = false;
           if (promoteCodex) codexTitleLockedRef.current = false;
         });
-        if (agentId) {
-          saveMoneyAgentChatSession(agentId, {
-            sessionId: sid,
-            title: stableTitle,
-            updatedAt: Date.now(),
-          });
-        }
         // Label the backend session for the background tray + done-notification.
         if (sessionIdRef.current != null)
           chatSetTitle(sessionIdRef.current, stableTitle).catch((e) => reportDiag("chat.title", e, { action: "setTitle" }));
@@ -2360,6 +2349,33 @@ export function ChatPane({
         : { kind: "assistant", id: uid(), text: r.text, streaming: false },
     );
   }, []);
+
+  useEffect(() => {
+    if (!resume?.id) return;
+    let cancelled = false;
+    claudeSessionIdRef.current = resume.id;
+    setOpenSessionId(resume.id);
+    setRunEventsKey(runEventsStorageKey(resume.id));
+    recordedRef.current = true;
+    codexTitleLockedRef.current = true;
+    setResumeId(resume.id);
+    setResumedTitle(resume.title);
+    const resumeModel =
+      CHAT_MODELS.find((m) => resume.model && m.id === resume.model) ??
+      CHAT_MODELS.find((m) => (m.engine ?? "claude") === (resume.engine || "claude"));
+    if (resumeModel && resumeModel.id !== activeModelRef.current.id) setModel(resumeModel);
+    setRunEventState(emptyRunEventState());
+    readChatTranscript(resume.id)
+      .then((rows) => {
+        if (!cancelled && rows.length) setTurns(transcriptToTurns(rows));
+      })
+      .catch(() => {
+        /* transcript unavailable; the pane is still resumable */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [resume?.id, resume?.title, resume?.engine, resume?.model, transcriptToTurns]);
 
   const resumeSession = useCallback(
     (session: ChatSessionInfo) => {
@@ -2920,7 +2936,7 @@ export function ChatPane({
             )}
             <button
               type="button"
-              onClick={openMemoryPane}
+              onClick={openMemoryPanel}
               className={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] transition-colors ${
                 memoryContextStatus === "error"
                   ? "border-[color-mix(in_srgb,var(--color-danger)_45%,transparent)] bg-[color-mix(in_srgb,var(--color-danger)_10%,transparent)] text-[var(--color-danger)]"
@@ -2933,7 +2949,7 @@ export function ChatPane({
                   ? "searching memory for this send"
                   : lastAutoMemories.length > 0
                     ? `auto memory used: ${lastAutoMemories.map((m) => m.title).join("; ")}`
-                    : "auto memory is on. click to open memory pane"
+                    : "auto memory is on. click to inspect inline"
               }
             >
               <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
@@ -2950,9 +2966,9 @@ export function ChatPane({
             {attachedMemories.length > 0 && (
               <button
                 type="button"
-                onClick={openMemoryPane}
+                onClick={openMemoryPanel}
                 className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text)]"
-                title="open memory pane"
+                title="show inline memory"
               >
                 <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
                 <span className="truncate">{attachedMemories.length} memories attached</span>
@@ -3756,7 +3772,7 @@ export function ChatPane({
       memoryContextStatus,
       attachedMemoryPaths,
       attachedMemories,
-      openMemoryPane,
+      openMemoryPanel,
       handoffPanelOpen,
       hasDraft,
       send,

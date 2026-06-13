@@ -3,6 +3,14 @@ export interface PaneOrderState<T> {
   selected: number;
 }
 
+export const CORE_PANE_TYPES = ["browser", "chat", "files", "history", "oracle", "shell", "tmux"] as const;
+
+const CORE_PANE_TYPE_SET = new Set<string>(CORE_PANE_TYPES);
+
+export function isCorePaneKind(type: string): type is (typeof CORE_PANE_TYPES)[number] {
+  return CORE_PANE_TYPE_SET.has(type);
+}
+
 // ── stable pane keys ─────────────────────────────────────────────────────────
 // A pane's key is minted ONCE at spawn and persisted with the layout
 // (`aios.layout`), then REUSED on restore. Terminal panes derive their tmux
@@ -46,13 +54,14 @@ export interface SavedPaneRecord {
   [extra: string]: unknown;
 }
 
-/** NON-DESTRUCTIVE key migration for a parsed `aios.layout` value.
+/** Core-shell key migration for a parsed `aios.layout` value.
  *
  *  - entries that already carry a string key are passed through UNTOUCHED
  *  - entries without a key (pre-stable-keys layouts) get one minted ONCE
  *    (`changed: true` tells the caller to persist the migrated array so the
  *    next launch sees the same keys — that's what makes tmux reattach work)
- *  - unknown kind types and extra fields are preserved verbatim
+ *  - non-core pane kinds are dropped and persisted away so old layouts cannot
+ *    quietly revive slow feature panes at startup
  *  - only entries that aren't even pane-shaped (no kind.type string) are
  *    skipped; a skip alone never sets `changed`, so a parse oddity can't
  *    trigger a rewrite of stored data.
@@ -72,6 +81,10 @@ export function migrateLayoutPanes(parsed: unknown): { panes: SavedPaneRecord[];
     const rec = entry as Record<string, unknown>;
     const kind = rec.kind;
     if (!kind || typeof kind !== "object" || typeof (kind as { type?: unknown }).type !== "string") {
+      continue;
+    }
+    if (!isCorePaneKind((kind as { type: string }).type)) {
+      changed = true;
       continue;
     }
     let key = typeof rec.key === "string" && rec.key ? rec.key : null;

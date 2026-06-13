@@ -41,6 +41,7 @@ import {
 } from "../lib/bridges";
 import { type NotificationLevel } from "../lib/notifications";
 import { reportDiag } from "../lib/diag";
+import { useVisible } from "../lib/useVisible";
 
 /** Brand-ish icon per channel id (falls back to a generic plug). lucide only. */
 function channelIcon(id: string, size = 13, className = "") {
@@ -125,7 +126,8 @@ function healthSentence(c: Channel): string {
   return parts.join(" · ");
 }
 
-export function BridgesPane() {
+export function BridgesPane({ active = true }: { active?: boolean }) {
+  const { ref: rootRef, visible: paneVisible } = useVisible<HTMLDivElement>();
   const [data, setData] = useState<Bridges | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -156,11 +158,12 @@ export function BridgesPane() {
   }, []);
 
   useEffect(() => {
+    if (!active || !paneVisible) return;
     refresh();
     // channels should feel live — poll fast.
     const t = setInterval(refresh, 10_000);
     return () => clearInterval(t);
-  }, [refresh]);
+  }, [active, paneVisible, refresh]);
 
   // personal-WhatsApp pairing (the wwebjs session the "personal" send-channel uses)
   const [pairing, setPairing] = useState(false);
@@ -185,7 +188,7 @@ export function BridgesPane() {
   const connectedCount = channels.filter((c) => c.status === "connected").length;
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
+    <div ref={rootRef} className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--color-border)] px-3">
         <div className="flex items-center gap-2">
           <Radio size={14} className="text-[var(--color-accent)]" />
@@ -262,7 +265,7 @@ export function BridgesPane() {
 
         <div className="flex flex-col gap-2.5">
           {channels.map((c) => (
-            <ChannelCard key={c.id} channel={c} onConnect={showToast} />
+            <ChannelCard key={c.id} active={active && paneVisible} channel={c} onConnect={showToast} />
           ))}
         </div>
       </div>
@@ -280,9 +283,11 @@ export function BridgesPane() {
  *  show the stats row + an expandable activity feed; the rest show a clear
  *  status + a "connect" affordance. */
 function ChannelCard({
+  active,
   channel: c,
   onConnect,
 }: {
+  active: boolean;
   channel: Channel;
   onConnect: (msg: string) => void;
 }) {
@@ -362,7 +367,7 @@ function ChannelCard({
             <span>recent messages</span>
           </button>
 
-          {open && <ActivityFeed channelId={c.id} />}
+          {open && <ActivityFeed active={active} channelId={c.id} />}
 
           {/* sysadmin details — hidden by default; only the curious open it */}
           {(c.pid != null || c.launchd || c.logPath || c.lastActivity) && (
@@ -429,7 +434,7 @@ function NotConnectedRow({
 
 /** A scrollable, chat-style feed of the messages flowing through a channel.
  *  Newest at top. Polls every 10s while mounted (i.e. while expanded). */
-function ActivityFeed({ channelId }: { channelId: string }) {
+function ActivityFeed({ active, channelId }: { active: boolean; channelId: string }) {
   const [messages, setMessages] = useState<BridgeMessage[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -444,10 +449,11 @@ function ActivityFeed({ channelId }: { channelId: string }) {
   }, [channelId]);
 
   useEffect(() => {
+    if (!active) return;
     load();
     const t = setInterval(load, 10_000);
     return () => clearInterval(t);
-  }, [load]);
+  }, [active, load]);
 
   if (error) {
     return <p className="text-[11px] text-[var(--color-danger)]">{error}</p>;

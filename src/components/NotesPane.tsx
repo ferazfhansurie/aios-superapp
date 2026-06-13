@@ -10,6 +10,7 @@ import {
   type Note,
 } from "../lib/notes";
 import { reportDiag } from "../lib/diag";
+import { useVisible } from "../lib/useVisible";
 
 /** Relative "edited" stamp — apple-notes-ish (Today / Yesterday / date). */
 function relTime(unixSec: number): string {
@@ -33,7 +34,14 @@ function relTime(unixSec: number): string {
  *  ideas here and hand the whole note to AIOS in one shot via "send to oracle".
  *  Full CRUD: new / edit (autosave) / delete; live search; cross-process sync
  *  (a gentle poll surfaces notes the oracle adds or edits). */
-export function NotesPane({ onSend }: { onSend?: (text: string) => void }) {
+export function NotesPane({
+  active = true,
+  onSend,
+}: {
+  active?: boolean;
+  onSend?: (text: string) => void;
+}) {
+  const { ref: rootRef, visible: paneVisible } = useVisible<HTMLDivElement>();
   const [notes, setNotes] = useState<Note[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -86,6 +94,7 @@ export function NotesPane({ onSend }: { onSend?: (text: string) => void }) {
   }, []);
 
   useEffect(() => {
+    if (!active || !paneVisible) return;
     reload();
     const t = setInterval(reload, 5_000);
     return () => {
@@ -95,7 +104,7 @@ export function NotesPane({ onSend }: { onSend?: (text: string) => void }) {
         saveNote(selectedRef.current, draftRef.current).catch((e) => reportDiag("notes.save", e, { action: "unmountSave" }));
       }
     };
-  }, [reload]);
+  }, [active, paneVisible, reload]);
 
   // Switch the open note (flushing the previous one first).
   const select = useCallback(
@@ -176,7 +185,7 @@ export function NotesPane({ onSend }: { onSend?: (text: string) => void }) {
   const wordCount = draft.trim() ? draft.trim().split(/\s+/).length : 0;
 
   return (
-    <div className="flex h-full min-h-0 bg-[var(--color-pane)] text-[var(--color-text)]">
+    <div ref={rootRef} className="flex h-full min-h-0 bg-[var(--color-pane)] text-[var(--color-text)]">
       {/* list column */}
       <div className="flex w-56 shrink-0 flex-col border-r border-[var(--color-border)]">
         <div className="flex items-center gap-1.5 border-b border-[var(--color-border)] p-2">

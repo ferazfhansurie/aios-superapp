@@ -1,178 +1,32 @@
-/**
- * IdleDashboard — the entry point for the AIOS home screen (shown when no panes
- * are open). This module is a thin DATA LOADER: it self-loads the cheap,
- * defensive idle data (usage extras / claude rate / memory focus / money-agent
- * summaries / git pulse for recent repos) on a 30s poll and hands it to
- * `IdleControlCenter`, which owns the actual (Option-B) layout.
- *
- * Live lists (oracles / projects / sidebar / notifications) come down as props
- * from App so the home screen and the ⌘K palette share one polled source.
- *
- * It also exports the small ring/heatmap/number formatting primitives reused by
- * PulsePane (the click-to-detail view) so the rich pane matches this surface
- * exactly — those are the only render helpers that survive here.
- */
-import { useEffect, useState } from "react";
-
+/** IdleDashboard — pure entry point for the instant home screen. */
 import type { AppDef } from "../App";
-import type { OracleInfo } from "../lib/pty";
-import type { ProjectInfo } from "../lib/run";
 import type { SidebarState, SidebarItem } from "../lib/sidebar";
-import { gitPulse, type RepoPulse } from "../lib/fs";
-import { usageExtras, type UsageExtras } from "../lib/stats";
-import { loadMoneyAgentSummaries, type MoneyAgentSummary } from "../lib/moneyAgents";
-import { pm2List, type Pm2Process } from "../lib/pm2";
-import {
-  idleRate,
-  memoryFocus,
-  resetIn,
-  type IdleRate,
-  type MemoryFocus,
-} from "../lib/dashboard";
-import type { AiosNotification } from "../lib/notifications";
+import { resetIn } from "../lib/dashboard";
 import { IdleControlCenter } from "./IdleControlCenter";
-import { BoxCockpit } from "./BoxCockpit";
-import { reportDiag } from "../lib/diag";
 
 interface IdleDashboardProps {
-  apps: AppDef[];
-  oracles: OracleInfo[];
-  projects: ProjectInfo[];
   sidebar: SidebarState;
   onSpawn: (kind: AppDef["kind"], label: string) => void;
-  onAttachOracle: (identity: string) => void;
-  onOpenProject: (p: ProjectInfo) => void;
   onOpenSidebarItem: (item: SidebarItem) => void;
   onRevealSidebar: () => void;
-  onOpenMoneyAgents: () => void;
-  onOpenMoneyAgentChat: (id: string, label: string, command?: string) => void;
   onOpenPalette: () => void;
-  notifications: AiosNotification[];
   onTalkToJarvis: (seed: string) => void;
-  onOpenNotificationTarget: (item: AiosNotification) => void;
-  onClearNotification: (id: string) => void;
 }
 
 export function IdleDashboard({
-  projects,
   sidebar,
   onSpawn,
-  onOpenProject,
   onOpenSidebarItem,
   onRevealSidebar,
-  onOpenMoneyAgents,
   onOpenPalette,
-  notifications,
   onTalkToJarvis,
 }: IdleDashboardProps) {
-  const [extras, setExtras] = useState<UsageExtras | null>(null);
-  const [rate, setRate] = useState<IdleRate | null>(null);
-  const [focus, setFocus] = useState<MemoryFocus | null>(null);
-  const [pulse, setPulse] = useState<RepoPulse[]>([]);
-  const [moneyAgents, setMoneyAgents] = useState<MoneyAgentSummary[]>([]);
-  const [pm2Processes, setPm2Processes] = useState<Pm2Process[]>([]);
-  // Wall-clock of the last successful pm2 fetch — drives the cockpit's
-  // "updated Ns ago" indicator. Only meaningful on the box (where pm2 exists).
-  const [pm2FetchedAt, setPm2FetchedAt] = useState<number | null>(null);
-  const [now, setNow] = useState(() => Date.now());
-
-  // Whole-window visibility gate. IdleDashboard only mounts as the full-viewport
-  // home screen, so "on screen" == "app window visible" — no IntersectionObserver
-  // needed. When AIOS is minimized / occluded these 30s polls (which read sqlite
-  // usage, claude rate, memory, money-agent files + `git` per recent repo) would
-  // otherwise keep firing into a window nobody's looking at.
-  const [windowVisible, setWindowVisible] = useState(
-    typeof document === "undefined" ? true : document.visibilityState !== "hidden",
-  );
-  useEffect(() => {
-    if (typeof document === "undefined") return;
-    const onVis = () => setWindowVisible(document.visibilityState !== "hidden");
-    document.addEventListener("visibilitychange", onVis);
-    return () => document.removeEventListener("visibilitychange", onVis);
-  }, []);
-
-  // top recent projects by dir mtime — also the set the git-pulse reports on.
-  // Declared before the effects that read it (TDZ-safe ordering).
-  const recent = [...projects].sort((a, b) => b.mtime - a.mtime).slice(0, 6);
-
-  useEffect(() => {
-    let alive = true;
-    const load = () => {
-      usageExtras().then((v) => alive && setExtras(v)).catch((e) => reportDiag("dashboard.load", e, { action: "usageExtras" }));
-      idleRate().then((v) => alive && setRate(v)).catch((e) => reportDiag("dashboard.load", e, { action: "idleRate" }));
-      memoryFocus().then((v) => alive && setFocus(v)).catch((e) => reportDiag("dashboard.load", e, { action: "memoryFocus" }));
-      loadMoneyAgentSummaries().then((v) => alive && setMoneyAgents(v)).catch((e) => reportDiag("dashboard.load", e, { action: "moneyAgents" }));
-      pm2List().then((v) => { if (alive) { setPm2Processes(v); setPm2FetchedAt(Date.now()); } }).catch((e) => reportDiag("dashboard.load", e, { action: "pm2List" }));
-    };
-    // Always load once on mount (so a freshly-shown home isn't blank), then only
-    // poll while the window is visible.
-    load();
-    if (!windowVisible) return () => { alive = false; };
-    const t = setInterval(load, 30_000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, [windowVisible]);
-
-  // git summary for the recent projects (refreshes on the set + 30s, visible only).
-  useEffect(() => {
-    let alive = true;
-    const roots = recent.map((p) => p.root);
-    if (!roots.length) {
-      setPulse([]);
-      return;
-    }
-    const load = () => gitPulse(roots).then((v) => alive && setPulse(v)).catch((e) => reportDiag("dashboard.load", e, { action: "gitPulse" }));
-    load();
-    if (!windowVisible) return () => { alive = false; };
-    const t = setInterval(load, 30_000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recent.map((p) => p.root).join("|"), windowVisible]);
-
-  // Box-only: tick a 1s clock so the cockpit's "updated Ns ago" counts up
-  // between the 30s pm2 polls. Off the box (no pm2) this never arms.
-  const onBox = pm2Processes.length > 0;
-  useEffect(() => {
-    if (!onBox || !windowVisible) return;
-    const t = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(t);
-  }, [onBox, windowVisible]);
-
-  // Gate: the box is the machine where pm2 has processes. There, swap the
-  // laptop's IdleControlCenter for the server cockpit. The laptop (pm2 absent →
-  // empty list) always falls through to IdleControlCenter as before.
-  if (onBox) {
-    return (
-      <BoxCockpit
-        pm2Processes={pm2Processes}
-        secondsSinceUpdate={
-          pm2FetchedAt == null ? null : Math.max(0, Math.round((now - pm2FetchedAt) / 1000))
-        }
-      />
-    );
-  }
-
   return (
     <IdleControlCenter
-      projects={projects}
       sidebar={sidebar}
-      extras={extras}
-      rate={rate}
-      focus={focus}
-      pulse={pulse}
-      moneyAgents={moneyAgents}
-      pm2Processes={pm2Processes}
-      notifications={notifications}
       onSpawn={onSpawn}
-      onOpenProject={onOpenProject}
       onOpenSidebarItem={onOpenSidebarItem}
       onRevealSidebar={onRevealSidebar}
-      onOpenMoneyAgents={onOpenMoneyAgents}
       onOpenPalette={onOpenPalette}
       onTalkToJarvis={onTalkToJarvis}
     />
