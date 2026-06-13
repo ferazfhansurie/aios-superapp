@@ -1391,6 +1391,8 @@ export function ChatPane({
             headroom:
               (model.engine ?? "claude") === "claude" &&
               loadSettings().headroomCompression,
+            // box-backed model → run the session on the node instead of locally.
+            node: model.node ?? null,
           }).then((id) => ({
             id,
             busy: false,

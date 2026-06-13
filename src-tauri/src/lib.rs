@@ -319,6 +319,7 @@ pub fn run() {
             oracles::delete_oracle,
             oracles::kill_tmux_session,
             oracles::launch_box_app,
+            remote::node_registry,
             oracles::appshot,
             oracles::appshot_capture,
             files::read_dir,

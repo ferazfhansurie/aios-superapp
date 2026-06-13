@@ -222,6 +222,9 @@ export interface ChatModel {
   note?: string;
   /** The flashy new flagship — sparkle icon + "new" badge in the picker. */
   hot?: boolean;
+  /** Run this session on a remote node (the bisnesgpt box via aios-noded over
+   *  the tailnet) instead of locally. Omitted = local. claude only in v1. */
+  node?: "bisnesgpt";
 }
 
 /**
@@ -254,6 +257,15 @@ export const CHAT_MODELS: ChatModel[] = [
     id: "opencode/nemotron-3-super-free",
     label: "nemotron · free",
     engine: "opencode",
+  },
+  // Box-backed: this opus session RUNS on the bisnesgpt box (aios-noded) over
+  // the tailnet and streams into the pane. Picking it = a remote node; the
+  // backend opens a WS to the box instead of spawning locally. claude only v1.
+  {
+    id: "claude-opus-4-8",
+    label: "opus 4.8 · @bisnesgpt",
+    engine: "claude",
+    node: "bisnesgpt",
   },
 ];
 

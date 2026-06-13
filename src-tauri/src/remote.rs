@@ -105,6 +105,43 @@ async fn http_post_json(
     Ok(parsed)
 }
 
+/// Minimal authed `GET <path>` over a raw TcpStream (read to EOF). Mirrors
+/// `http_post_json` for the daemon's read endpoints (`/registry`, `/health`).
+async fn http_get_json(addr: &str, path: &str, secret: &str) -> Result<Value, String> {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let host = addr.split(':').next().unwrap_or(addr);
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {secret}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or("malformed HTTP response from node")?;
+    if !head.lines().next().map(|l| l.contains(" 200 ")).unwrap_or(false) {
+        return Err("node returned non-200".to_string());
+    }
+    serde_json::from_str(body.trim()).map_err(|e| format!("bad node JSON: {e}"))
+}
+
+/// Tauri command: fetch the box node's live session registry for the Mac roster.
+/// Returns `{ "sessions": [...] }` (or an error string the UI can show as offline).
+#[tauri::command]
+pub fn node_registry() -> Result<Value, String> {
+    let (addr, secret) = node_target()?;
+    tauri::async_runtime::block_on(http_get_json(&addr, "/registry", &secret))
+}
+
 /// Starts a session on the box and attaches it to `on_event` under `local_id`.
 /// Returns immediately after the start RPC; the WS attach + line pump run on the
 /// Tauri async runtime. `local_id` is allocated by chat.rs so it shares the local
