@@ -1710,6 +1710,11 @@ function App() {
   }, [spawn]);
   // Control hook (control.rs → `control-command` event): allow external callers
   // to open core panes only.
+  // De-dupe guard: a single control command can reach the handler twice (effect
+  // re-registration during the async listen() window, or a double emit), which
+  // spawned two identical panes. Ignore an identical command seen within a short
+  // window so one POST = one pane.
+  const lastControlCmdRef = useRef<{ key: string; at: number }>({ key: "", at: 0 });
   useEffect(() => {
     if (!nativeRuntime) return;
     let disposed = false;
@@ -1717,15 +1722,30 @@ function App() {
     void listen<Record<string, unknown>>("control-command", (event) => {
       const payload = event.payload || {};
       const cmd = String(payload.cmd ?? "");
+      const dedupeKey = `${cmd}:${String(payload.paneType ?? "")}:${String(payload.seed ?? "")}`;
+      const nowTs = Date.now();
+      if (
+        dedupeKey === lastControlCmdRef.current.key &&
+        nowTs - lastControlCmdRef.current.at < 2500
+      ) {
+        return; // duplicate within the window — drop it
+      }
+      lastControlCmdRef.current = { key: dedupeKey, at: nowTs };
       if (cmd === "open-pane") {
         const paneType = String(payload.paneType ?? "");
+        // Optional seed/cwd let an external caller (control plane / CLI / another
+        // oracle) open a chat pane that auto-runs a prompt — the zero-paste
+        // handoff path. seed flows into the same seeded-spawn used by the palette.
+        const seed = payload.seed != null ? String(payload.seed) : undefined;
+        const cwd = payload.cwd != null ? String(payload.cwd) : undefined;
+        const label = payload.label != null ? String(payload.label) : undefined;
         switch (paneType) {
           case "chat":
-            spawn({ type: "chat" }, "chat");
+            spawn({ type: "chat", seed: seed || undefined, cwd }, label ?? "chat");
             break;
           case "terminal":
           case "shell":
-            spawn({ type: "shell" }, "terminal");
+            spawn({ type: "shell", cwd, cmd: seed || undefined }, label ?? "terminal");
             break;
           case "browser":
             spawn({ type: "browser" }, "browser");

@@ -509,6 +509,49 @@ pub fn appshot(identity: Option<String>) -> Result<String, String> {
     Ok(path)
 }
 
+/// Launches the installed superapp (`aios-shell`) on a remote GUI node over
+/// SSH/tailscale — "open the cockpit on the box from my Mac". The box runs the
+/// same Tauri build packaged as a `.deb` (`/usr/bin/aios-shell`); we just need
+/// it to appear on the box's physical display (`:0`, gnome) detached from this
+/// ssh call so the connection returns immediately.
+///
+/// Node target is env-overridable so this isn't hardwired to one box:
+///   - `AIOS_BOX_SSH`     — ssh destination (default `firaz@100.113.3.98`, tailnet)
+///   - `AIOS_BOX_DISPLAY` — X display the GUI lands on (default `:0`)
+///
+/// `BatchMode=yes` keeps it from hanging on a password prompt inside the GUI
+/// (key auth only); `ConnectTimeout` bounds a dead/asleep box. Reversible: it
+/// only spawns a process on the box, touches no shared state here.
+#[tauri::command]
+pub fn launch_box_app(node: Option<String>) -> Result<String, String> {
+    // `node` is reserved for the Part F registry (per-node ssh targets); for now
+    // any value resolves to the single bisnesgpt box via env.
+    let _ = node;
+    let dest = env_or("AIOS_BOX_SSH", "firaz@100.113.3.98");
+    let display = env_or("AIOS_BOX_DISPLAY", ":0");
+    // Detach aios-shell from the ssh session so ssh returns the instant it's
+    // spawned (setsid + full redirect), otherwise ssh blocks on the GUI process.
+    let remote = format!(
+        "DISPLAY={display} setsid aios-shell </dev/null >/dev/null 2>&1 & echo launched"
+    );
+    let out = std::process::Command::new("/usr/bin/ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            dest.as_str(),
+            remote.as_str(),
+        ])
+        .output()
+        .map_err(|e| format!("ssh spawn failed: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("ssh to {dest} failed: {}", err.trim()));
+    }
+    Ok(format!("aios-shell launched on {dest} (display {display})"))
+}
+
 /// Deletes (kills) an oracle session. The master oracle cannot be deleted.
 ///
 /// firaz's primary oracle (`aios-firaz`) is load-bearing — his WhatsApp routes

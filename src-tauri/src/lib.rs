@@ -317,6 +317,7 @@ pub fn run() {
             oracles::rename_oracle,
             oracles::delete_oracle,
             oracles::kill_tmux_session,
+            oracles::launch_box_app,
             oracles::appshot,
             oracles::appshot_capture,
             files::read_dir,

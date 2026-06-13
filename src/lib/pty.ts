@@ -70,6 +70,15 @@ export async function killTmuxSession(socket: string, session: string): Promise<
   return invoke("kill_tmux_session", { socket, session });
 }
 
+/**
+ * Launches the installed superapp (`aios-shell`) on a remote GUI node (the
+ * bisnesgpt box) over ssh/tailscale — "open the cockpit on the box from here".
+ * `node` is reserved for the Part F node registry; today it resolves to the box.
+ */
+export async function launchBoxApp(node?: string): Promise<string> {
+  return invoke<string>("launch_box_app", { node: node ?? null });
+}
+
 /** Legacy appshot: screenshot → routed into an oracle (defaults to master). */
 export async function appshot(identity?: string): Promise<string> {
   return invoke<string>("appshot", { identity: identity ?? null });

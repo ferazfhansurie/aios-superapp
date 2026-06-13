@@ -2,6 +2,28 @@
 
 _2026-06-13 · branch `feat/cross-machine-sync` · the next session needs ONLY this doc + the plan doc + `git log`._
 
+---
+
+## ⏩ SESSION 2026-06-14 (overnight) — firaz directive: "get ALL working" (full product A→F), compact + handoff at 1M ctx
+
+**Approved plan:** `~/.claude/plans/wild-moseying-allen.md` (full A→F, "go" given). This handoff was written because session context hit ~1.5M tokens — resume in a FRESH session.
+
+**Live state on the box (`firaz@100.113.3.98`, tailnet):**
+- **A. Install .deb — IN FLIGHT.** Detached build running on the box: `/tmp/aios-build-install.sh` → log `/tmp/aios-install.log`. It does: `pnpm run build` (frontend ✅ already produced `dist/`) → `pnpm tauri build --bundles deb` (capped `CARGO_BUILD_JOBS=3` + `nice/ionice` — UNCAPPED `-j` REBOOTED the box once, do not remove the cap) → `sudo dpkg -i` the .deb → `/usr/bin/aios-shell` + gnome `.desktop`. **Check on resume:** `ssh firaz@100.113.3.98 'tail -20 /tmp/aios-install.log; which aios-shell'`. If it died/rebooted, relaunch: `ssh firaz@100.113.3.98 'setsid bash /tmp/aios-build-install.sh </dev/null >/dev/null 2>&1 &'`.
+- Box display facts: physical monitor (what firaz sees) = `DISPLAY=:0` (gnome). chrome-remote-desktop = `:20` (xfce) — DIFFERENT screen, don't confuse them (wasted an hour on this). Screenshot a display: `ssh ... 'DISPLAY=:0 xfce4-screenshooter -f -s /tmp/s.png'` then scp. node20 on box: `~/.nvm/versions/node/v20.20.2/bin`. pnpm via corepack. cargo at `~/.cargo/bin`. webkit2gtk-4.1-dev IS installed now (old blocker gone). passwordless sudo works.
+- **ssh gotcha:** `pkill -f "<pat>"` / `pgrep -f "<pat>"` where `<pat>` appears in your own ssh command string SELF-MATCHES and kills your shell (exit 255). Use bracket trick `[v]ite` or match by exact name `pkrill -x`.
+
+**Remaining work (from approved plan, in order):**
+- **B. "launch superapp on box from Mac"** — composer command/button → `ssh firaz@100.113.3.98 'DISPLAY=:0 setsid aios-shell </dev/null >/dev/null 2>&1 &'`. Small. Do after A installs.
+- **C. BUG: :8787 port collision** — control plane (`src-tauri/src/control.rs:34`, scans 8787+) and headroom proxy default (`src-tauri/src/chat.rs:485`, `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`) collide; whoever binds first wins → headroom-on claude turns can hit the doorbell not Anthropic. Fix: give headroom proxy a distinct base (e.g. 8799) OR read `~/.aios/state/control-port` and avoid it. Quick standalone patch.
+- **D. Finish crate surgery (Phase 1.2b-ii + 2c)** — see PENDING below. Sequential, ONE file, NOT fanned out. Gate EVERY step on `cargo check --tests` + `cargo test -p aios-shell --lib chat` (12 tests). `cargo` = `$HOME/.cargo/bin/cargo`.
+- **E. Build `aios-noded`** — the core ask ("box session live in a Mac pane"). New bin crate, path-deps `aios-chat-core`, axum + `tokio-tungstenite` (in-tree via cdp.rs). `GET /registry`, `POST /chat/start`, `WS /chat/:id/attach` (ring-buffer replay → live), `POST /chat/:id/stop`. On box: session `OutputSink` = WS sender (vs `ChannelSink` on Mac). **Bind to tailscale IP `100.113.3.98` ONLY, never 0.0.0.0** (RCE by design). Upgrade `~/.aios/state/node-secret` → CSPRNG + 0600 + constant-time compare (this is where the auth-hardening bug fix lands). pm2/systemd, box no-sleep. Mac side: `chatStart({node:'bisnesgpt'})` opens WS instead of spawning local claude → pumps lines into the local `Channel<String>`; `chat_send`/`chat_steer` reverse the pipe. Make `ChatSession.sink` a `Vec<Box<dyn OutputSink>>` for "open in both" fan-out. Frontend ChatPane UNCHANGED (same stream-json wire).
+- **F. Registry + composer `@bisnesgpt` picker** — `/registry` merged into roster (`oracles.rs`/`OracleRoster`) tagged by node; composer node picker + canned server-monitor agent prompt.
+
+**Bug list (review-confirmed):** (1) :8787 collision [C above]; (2) weak control-plane auth — non-crypto token, world-readable `node-secret`, non-constant-time compare — fine for loopback, fix when E binds to tailscale.
+
+---
+
 ## North star
 Make firaz's laptop superapp and the **bisnesgpt box** (a co-located Ubuntu 24.04 PC on his TV, NOT a remote headless server) feel like **one app with two windows**. A pane/agent running on either machine is visible + attachable from the other. End-goal demo: from the laptop chatpane, spin up a chat session ON the box that monitors the server, and open that pane on both machines. Works **off-wifi** (tailscale is the transport, mandatory not optional).
 

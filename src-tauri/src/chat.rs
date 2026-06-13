@@ -479,10 +479,15 @@ pub fn chat_start(
     // proxy only rewrites the body, not the auth headers. Reversible: turn the
     // toggle off and turns spawn against api.anthropic.com directly again.
     if headroom.unwrap_or(false) {
+        // Headroom proxy listens on 8899 — deliberately OUTSIDE the control
+        // plane's port-scan window ([8787, 8787+16]) so the two can never race
+        // for the same socket. If they shared 8787, whichever bound first won
+        // and a headroom-on claude turn could silently POST to the control
+        // listener instead of Anthropic. Keep the proxy plist's --port in sync.
         let url = std::env::var("HEADROOM_PROXY_URL")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+            .unwrap_or_else(|| "http://127.0.0.1:8899".to_string());
         cmd.env("ANTHROPIC_BASE_URL", url);
     }
 

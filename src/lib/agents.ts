@@ -191,6 +191,12 @@ export interface OpenPaneCommand {
   cmd: "open-pane";
   paneType?: string;
   key?: string;
+  /** chat: initial prompt to auto-run (zero-paste handoff). shell: command to run. */
+  seed?: string;
+  /** working dir for the spawned pane. */
+  cwd?: string;
+  /** override the pane label. */
+  label?: string;
 }
 
 export type ControlCommand = RunAgentCommand | OpenPaneCommand;

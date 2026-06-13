@@ -532,7 +532,9 @@ export function ChatPane({
   const [backendBusy, setBackendBusy] = useState(false);
   const [started, setStarted] = useState(false);
   // claude's init event arrived (session_id known) — gates the seed auto-send
-  const [claudeReady, setClaudeReady] = useState(false);
+  // claudeReady is still tracked (init-event signal) but no longer gates the
+  // seed auto-send — the retry loop polls sessionIdRef directly. Value unused.
+  const [, setClaudeReady] = useState(false);
 
   // composer settings — boot from the saved default (settings.chatModel).
   // The model the user last picked in the composer IS their default; persisted
@@ -2156,40 +2158,45 @@ export function ChatPane({
   // text explicitly (not racy `input` state), and only mark it sent once the
   // dispatch had a live session. If the session never comes live, surface a
   // visible note instead of swallowing the prompt.
+  // Retry until the session is live, then send the seed as the first turn.
+  // Earlier this was a one-shot gate on (started && claudeReady) plus a 12s
+  // give-up that prefilled the composer — under load (slow init, session
+  // re-spawn after an app restart) the gate lost the race and the seed sat in
+  // the composer unsent. A poll removes every timing assumption: the instant a
+  // live backend session id exists and we're not mid-stream, fire it. Only
+  // surface a note after a long window (sessions normally come live in seconds).
   useEffect(() => {
     if (!seed || seedSentRef.current) return;
-    if (!started || !claudeReady) return;
-    // require a live backend session id — not just the started/ready flags,
-    // which can be true for a beat while sessionIdRef is being (re)assigned.
-    if (sessionIdRef.current == null) return;
-    seedSentRef.current = true;
-    void sendTextRef.current(seed).catch((e) => reportDiag("chat.send", e, { action: "seed" }));
-    // started flips true in the same startup .then() that assigns sessionIdRef,
-    // so by the time this re-runs the id is live.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seed, started, claudeReady]);
-
-  // Safety net: if a seed never got delivered (the session kept restarting so a
-  // live id never settled within a grace window), tell the user instead of
-  // silently dropping the prompt they typed on the idle page.
-  useEffect(() => {
-    if (!seed || seedSentRef.current) return;
-    const t = window.setTimeout(() => {
-      if (seedSentRef.current) return;
-      if (sessionIdRef.current != null) return; // a later tick will send it
-      seedSentRef.current = true;
-      setTurns((prev) => [
-        ...prev,
-        {
-          kind: "result",
-          id: uid(),
-          text: "couldn't auto-send your opening message — the session didn't come live. retype + send.",
-        },
-      ]);
-      // keep the prompt in the composer so it isn't lost.
-      setInput((cur) => (cur ? cur : seed));
-    }, 12000);
-    return () => window.clearTimeout(t);
+    let cancelled = false;
+    let tries = 0;
+    const tick = () => {
+      if (cancelled || seedSentRef.current) return;
+      if (sessionIdRef.current != null && !streamingRef.current) {
+        seedSentRef.current = true;
+        void sendTextRef.current(seed).catch((e) => reportDiag("chat.send", e, { action: "seed" }));
+        return;
+      }
+      if (++tries > 120) {
+        // ~60s and still no live session — keep the prompt, surface a note.
+        seedSentRef.current = true;
+        setTurns((prev) => [
+          ...prev,
+          {
+            kind: "result",
+            id: uid(),
+            text: "couldn't auto-send your opening message — the session didn't come live. press send.",
+          },
+        ]);
+        setInput((cur) => (cur ? cur : seed));
+        return;
+      }
+      window.setTimeout(tick, 500);
+    };
+    const t = window.setTimeout(tick, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seed]);
 
