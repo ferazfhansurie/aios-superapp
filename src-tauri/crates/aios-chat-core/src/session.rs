@@ -112,6 +112,50 @@ pub struct ChatSession {
     pub pending_approvals: Mutex<HashMap<String, Value>>,
 }
 
+impl ChatSession {
+    /// Builds a freshly-spawned session from the parts a host must supply (id,
+    /// engine, the child + its stdin, the output sink, and the lifecycle events
+    /// impl); every other field gets its idle/empty default. Lets the `aios-noded`
+    /// daemon construct a session without re-stating the 20-field literal that
+    /// `chat.rs` carries — same defaults, one place. `child`/`stdin` are `Option`
+    /// so a spawn-per-turn engine (codex/opencode) can pass `None` until a turn.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawned(
+        id: u32,
+        engine: Engine,
+        child: Option<Child>,
+        stdin: Option<ChildStdin>,
+        sink: Box<dyn OutputSink>,
+        events: Box<dyn SessionEvents>,
+    ) -> Self {
+        ChatSession {
+            id,
+            engine,
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            thread_id: Mutex::new(None),
+            cwd: Mutex::new(None),
+            model: Mutex::new(None),
+            effort: Mutex::new(None),
+            sink: Mutex::new(Some(sink)),
+            buffer: Mutex::new(VecDeque::with_capacity(256)),
+            buffer_bytes: AtomicUsize::new(0),
+            claude_id: Mutex::new(None),
+            title: Mutex::new(String::new()),
+            busy: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
+            notify_on_done: AtomicBool::new(false),
+            rpc_id: AtomicU64::new(1),
+            pending_turn: Mutex::new(None),
+            active_turn: Mutex::new(None),
+            answer_item: Mutex::new(None),
+            answer_streamed: AtomicBool::new(false),
+            pending_approvals: Mutex::new(HashMap::new()),
+            events,
+        }
+    }
+}
+
 /// Appends one line to the replay ring buffer, evicting oldest lines while over
 /// EITHER the line-count or byte budget. Always keeps at least the incoming line
 /// even if it alone exceeds the byte budget (so the turn isn't lost entirely).
