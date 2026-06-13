@@ -4,6 +4,25 @@ _2026-06-13 · branch `feat/cross-machine-sync` · the next session needs ONLY t
 
 ---
 
+## ✅ SESSION 2026-06-14 (part 2) — A,B,C,D DONE. E in progress.
+
+Branch `feat/cross-machine-sync`. Commits this session: `445a1b2` (B+C), `ab610a7` (1.2b-ii), `3c771a0` (1.2c).
+
+- **A ✅** `.deb` installed on box — `/usr/bin/aios-shell` (23MB, Jun 14 01:41) + gnome `.desktop`. Verified via ssh.
+- **A0 ✅** seed-able open-pane shipped (prior session) — this pane proves it.
+- **B ✅** `launch_box_app` Tauri cmd (`oracles.rs`) + `launchBoxApp` TS wrapper (`pty.ts`). ssh's `DISPLAY=:0 setsid aios-shell` on box, env-overridable `AIOS_BOX_SSH`/`AIOS_BOX_DISPLAY`. UI picker deferred to F.
+- **C ✅** headroom proxy moved 8787→**8899** (chat.rs default + launchd plist `com.firaz.aios-headroom-proxy.plist`, reloaded — py pid confirmed on 8899). Clear of control plane's `[8787,8787+16]` scan window. Source change lands in binary on next `pnpm tauri build`.
+- **D ✅ Phase 1 crate surgery COMPLETE.** `aios-chat-core` is now fully tauri-free.
+  - 1.2b-ii: `NEXT_REQ` + `codex_rpc_write`/`codex_next_rpc`/`codex_error_result_line`/`codex_fire_turn` + `adapt_codex_appserver_frame` (~300 lines) → new `crates/aios-chat-core/src/codex_rpc.rs`. chat.rs re-imports.
+  - 1.2c: `ChatSession.events: Box<dyn SessionEvents>` field (parallel to sink). 3 emit sites (2× chat-exit reader threads + notify_done aios-notify) route through it. `TauriEvents` impl in chat.rs is the only Tauri-emit binding; `NoopEvents` in crate for tests. `start_per_turn` gained `app` param.
+  - Gate held every step: `cargo check --tests` 0 warnings + 14 chat tests green (was 12; grew).
+- **E ⏳ IN PROGRESS** — `aios-noded` daemon. See plan §E + PENDING below.
+- **F ⏳ pending** — registry merge + composer `@bisnesgpt` picker (hosts B's launch action in UI).
+
+**Next-session quick verify:** `cd ~/Repo/firaz/aios/shell/src-tauri && $HOME/.cargo/bin/cargo test -p aios-shell --lib chat` (expect 14 green).
+
+---
+
 ## ⏩ SESSION 2026-06-14 (overnight) — firaz directive: "get ALL working" (full product A→F), compact + handoff at 1M ctx
 
 **Approved plan:** `~/.claude/plans/wild-moseying-allen.md` (full A→F, "go" given). This handoff was written because session context hit ~1.5M tokens — resume in a FRESH session.
