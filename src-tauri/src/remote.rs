@@ -47,17 +47,25 @@ fn node_target() -> Result<(String, String), String> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "100.113.3.98:8765".to_string());
+    // Secret precedence: AIOS_NODE_SECRET env → dedicated `box-node-secret`
+    // (the BOX's token, paired once — distinct from this Mac's own control-plane
+    // `node-secret`, a different trust domain) → fall back to `node-secret` for
+    // the single-machine case. The dedicated file is what makes Mac↔box auth work
+    // without overloading the local control-plane token.
+    let home = std::env::var("HOME").ok();
+    let read = |name: &str| -> Option<String> {
+        let h = home.as_ref()?;
+        std::fs::read_to_string(format!("{h}/.aios/state/{name}"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     let secret = std::env::var("AIOS_NODE_SECRET")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let home = std::env::var("HOME").ok()?;
-            std::fs::read_to_string(format!("{home}/.aios/state/node-secret"))
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .ok_or("no node-secret (set AIOS_NODE_SECRET or ~/.aios/state/node-secret)")?;
+        .or_else(|| read("box-node-secret"))
+        .or_else(|| read("node-secret"))
+        .ok_or("no node-secret (set AIOS_NODE_SECRET or ~/.aios/state/box-node-secret)")?;
     Ok((addr, secret))
 }
 

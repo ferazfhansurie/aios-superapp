@@ -4,7 +4,29 @@ _2026-06-13 · branch `feat/cross-machine-sync` · the next session needs ONLY t
 
 ---
 
-## ✅ SESSION 2026-06-14 (part 2) — A,B,C,D DONE. E in progress.
+## 🎉 SESSION 2026-06-14 (part 2) — A→F ALL DONE + cross-machine VERIFIED.
+
+Branch `feat/cross-machine-sync`, pushed. Commits: `445a1b2` B+C · `ab610a7` 1.2b-ii · `3c771a0` 1.2c · `c92a5b9` E1 daemon · `cca852d` E2 mac-client · `e20fadd` F.
+
+**THE HEADLINE WORKS:** from the Mac, over tailscale, a claude session running ON THE BOX streams into a Mac pane (proven: `BOXPONG` round-trip through real claude stream-json; registry/start/attach/turn all Mac→`100.113.3.98:8765`). Daemon live on box via **pm2** (`aios-noded`, boot-persisted via `pm2 save`, binds tailnet IP only). Gates all green: `cargo check --tests` 0 warnings, 14 chat tests, `tsc --noEmit` 0 errors.
+
+### ✅ node-secret pairing DONE (automatic)
+`remote::node_target` secret precedence: `AIOS_NODE_SECRET` env → `~/.aios/state/box-node-secret` (the BOX's token, a distinct trust domain from the Mac's own control-plane `node-secret`) → `node-secret`. The box token has been copied to the Mac's `~/.aios/state/box-node-secret` (0600). So after the next Mac `pnpm tauri build`, picking the box model just works — no manual env. (If the box regenerates its secret, re-run: `ssh firaz@100.113.3.98 cat ~/.aios/state/node-secret > ~/.aios/state/box-node-secret && chmod 600 ~/.aios/state/box-node-secret`.)
+
+### How to use: rebuild the Mac app, pick the **"opus 4.8 · @bisnesgpt"** model in any chat pane → that session runs on the box, streams live, bidirectional. (Box daemon already running via pm2.)
+
+### Remaining polish (NOT blocking the demo):
+- **Remote reattach**: `chat_detach` on a remote session is a no-op (box keeps running + buffering server-side) but `chat_reattach` doesn't reconnect the WS yet — reopening a closed box pane won't replay. Wire `remote::reattach(local_id, on_event)` (re-subscribe + replay).
+- **Codex on box**: daemon is claude-only in v1 (`/chat/start` 400s other engines). Add codex app-server spawn in `manager.rs` (the crate already has `adapt_codex_appserver_frame`).
+- **Orphan reaper**: if a Mac pane dies, the box session keeps running (visible in `/registry`). Add a TTL/`/registry`-driven reaper in the daemon.
+- **Replay/live handoff**: daemon's `handle_socket` snapshots buffer THEN subscribes → microsecond gap possible on a concurrent line (favored over dup). Seqno handoff = future.
+- **systemd over pm2**: pm2 works; a `--user` systemd unit with no-sleep is tidier.
+- **Composer `@`-picker UI**: F shipped the node as a *model* entry (lowest App.tsx risk). A true composer `@bisnesgpt` chip + canned "server monitor" agent prompt is the nicer UX (plan §F) — additive.
+- **C rebuild**: headroom 8787→8899 source change is committed but only takes effect in the Mac binary on the next `pnpm tauri build` (runtime already moved).
+
+---
+
+## ✅ SESSION 2026-06-14 (part 2 earlier) — A,B,C,D DONE. E in progress.
 
 Branch `feat/cross-machine-sync`. Commits this session: `445a1b2` (B+C), `ab610a7` (1.2b-ii), `3c771a0` (1.2c).
 
