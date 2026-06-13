@@ -22,6 +22,7 @@ name = "aios-chat-core"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "parking_lot",
  "serde",
  "serde_json",
 ]

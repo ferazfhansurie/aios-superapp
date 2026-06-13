@@ -38,7 +38,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -55,18 +55,21 @@ use aios_chat_core::wire::{
     slim_user_image_line, text_delta_line, thinking_delta_line, user_line, user_line_with_images,
     user_tool_result_line,
 };
-use aios_chat_core::Engine;
+use aios_chat_core::session::{buffer_push, fan_out, fan_out_split, ChatSession};
+use aios_chat_core::{Engine, OutputSink};
 
-/// How many raw output lines a detached session keeps for replay on reattach.
-/// Generous enough to reconstruct a long agentic run; oldest lines drop first.
-const REPLAY_CAP: usize = 6000;
+/// The Tauri-shell implementation of [`OutputSink`]: forwards each adapted line
+/// over a per-session `tauri::ipc::Channel<String>`. This is the ONE place the
+/// core's sink seam binds to Tauri on the laptop; `aios-noded` will provide a
+/// WebSocket-backed sink instead. Sends are lossy on a dropped receiver (a closed
+/// pane), exactly as before — the reader thread never wedges on a dead channel.
+struct ChannelSink(Channel<String>);
 
-/// Approximate BYTE budget for the replay buffer, evicted alongside `REPLAY_CAP`.
-/// A line-count cap alone can't bound memory: one huge line (a big tool output,
-/// or a base64 image if the slimming path is ever bypassed) counts as 1 line yet
-/// holds many MB. We sum line lengths and evict oldest until under BOTH caps.
-/// 12 MB is generous for a long agentic transcript while still capping a runaway.
-const REPLAY_BYTE_CAP: usize = 12 * 1024 * 1024;
+impl OutputSink for ChannelSink {
+    fn send(&self, line: &str) {
+        let _ = self.0.send(line.to_string());
+    }
+}
 
 fn detach_child_process(cmd: &mut Command) {
     #[cfg(unix)]
@@ -75,80 +78,6 @@ fn detach_child_process(cmd: &mut Command) {
     }
 }
 
-/// One live chat session. For `claude` this is a persistent child + its stdin
-/// (turns are pushed as stream-json lines). For `codex`/`opencode` there is no
-/// persistent process: `child` holds the CURRENT turn's subprocess (so an
-/// interrupt can kill it) and `thread_id` is the resume handle for the next turn.
-/// The reader thread forwards through the swappable `sink` and always appends to
-/// `buffer`, so the session keeps running (and buffering) after a pane closes.
-struct ChatSession {
-    /// This session's own numeric id (the key in the sessions map), copied in so
-    /// `ingest_line` can name the session when emitting the `aios-notify` event.
-    id: u32,
-    /// Which CLI backend this session drives.
-    engine: Engine,
-    /// claude → the persistent process; codex/opencode → the in-flight turn's
-    /// child (None when idle). Kept so an interrupt can kill the current turn.
-    child: Mutex<Option<Child>>,
-    /// claude's persistent stdin. `None` for spawn-per-turn engines.
-    stdin: Mutex<Option<ChildStdin>>,
-    /// Resume handle for spawn-per-turn engines (codex thread_id / opencode ses_).
-    thread_id: Mutex<Option<String>>,
-    /// Working dir, captured for per-turn re-spawns.
-    cwd: Mutex<Option<String>>,
-    /// Model id, captured for per-turn re-spawns (e.g. `gpt-5.5`, `opencode/...`).
-    model: Mutex<Option<String>>,
-    /// Reasoning effort the composer picked (`low|medium|high|xhigh|max|ultracode`),
-    /// kept so codex `turn/start` can carry it every turn. Claude passes effort as
-    /// a CLI flag at spawn; codex needs it re-sent per turn. `None` = engine default.
-    effort: Mutex<Option<String>>,
-    /// Current frontend channel; `None` while detached (output only buffers).
-    sink: Mutex<Option<Channel<String>>>,
-    /// Ring buffer of recent raw lines, replayed verbatim on reattach.
-    buffer: Mutex<VecDeque<String>>,
-    /// Approximate total bytes currently held in `buffer` (sum of line lengths).
-    /// Tracked so a BYTE budget (REPLAY_BYTE_CAP) can evict oldest lines even when
-    /// the line COUNT is far under REPLAY_CAP — one huge line must not pin MBs.
-    buffer_bytes: AtomicUsize,
-    /// claude's own session uuid (from the init event) — used to match a
-    /// reopened pane back to this live process.
-    claude_id: Mutex<Option<String>>,
-    /// Human label for the tray + notification.
-    title: Mutex<String>,
-    /// True while a turn is in flight (set on send, cleared on `result`).
-    busy: AtomicBool,
-    /// True once the pane closed but we kept the process alive.
-    detached: AtomicBool,
-    /// Fire an OS notification when the current/next turn completes.
-    notify_on_done: AtomicBool,
-    /// codex app-server: monotonic JSON-RPC request id for this session.
-    rpc_id: AtomicU64,
-    /// codex app-server: a turn's text queued until `thread/start` resolves the
-    /// threadId (the first turn races the handshake). Fired once the id lands.
-    pending_turn: Mutex<Option<(String, Vec<String>)>>,
-    /// codex app-server: the in-flight turn's id (from `turn/started`), needed as
-    /// `expectedTurnId` to steer it. `None` between turns. Cleared on turn end.
-    active_turn: Mutex<Option<String>>,
-    /// codex app-server: the item id of the turn's REAL answer (the agentMessage
-    /// whose `phase` is `final_answer`). Codex also emits preamble/status agent
-    /// messages mid-turn; we route THOSE to the thinking block so only the final
-    /// answer renders as the reply (not an identical-looking text bubble).
-    answer_item: Mutex<Option<String>>,
-    /// codex app-server: true once the current answer item has streamed at least
-    /// one `text_delta`. When true, `item/completed` MUST suppress its full
-    /// `assistant_text_line` (the stream already rendered it — emitting it too
-    /// would double-render the answer). False (a short answer that never
-    /// streamed deltas) → emit the full line so the answer isn't dropped. Reset
-    /// per turn (`turn/started`) and when the answer item id changes.
-    answer_streamed: AtomicBool,
-    /// codex app-server: maps a synthetic approval `request_id` (the string we
-    /// put in the frontend's `can_use_tool` control_request) → the codex
-    /// JSON-RPC request id we must answer. In `on-request` approval mode codex
-    /// sends a server→client request (`exec_command_approval` /
-    /// `apply_patch_approval`); we surface it as the SAME ApprovalCard claude
-    /// uses and, on the user's decision, reply over JSON-RPC with the mapped id.
-    pending_approvals: Mutex<HashMap<String, Value>>,
-}
 
 /// Module-level registry of every live chat session, keyed by an incrementing
 /// id. Mirrors `PtyState` but as a `static` (the prompt asked for a module-level
@@ -576,7 +505,7 @@ pub fn chat_start(
         cwd: Mutex::new(None),
         model: Mutex::new(None),
         effort: Mutex::new(None), // claude passes effort as a CLI flag, not per turn
-        sink: Mutex::new(Some(on_event)),
+        sink: Mutex::new(Some(Box::new(ChannelSink(on_event)))),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
         buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
@@ -707,7 +636,7 @@ fn start_per_turn(
         cwd: Mutex::new(cwd.filter(|s| !s.is_empty())),
         model: Mutex::new(model.filter(|s| !s.is_empty())),
         effort: Mutex::new(None), // opencode effort handled per-turn at send
-        sink: Mutex::new(Some(on_event)),
+        sink: Mutex::new(Some(Box::new(ChannelSink(on_event)))),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
         buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
@@ -733,7 +662,7 @@ fn start_per_turn(
 fn ingest_line_arc(sess: &Arc<ChatSession>, line: &str) {
     buffer_push(sess, line);
     if let Some(ch) = sess.sink.lock().as_ref() {
-        let _ = ch.send(line.to_string());
+        ch.send(line);
     }
 }
 
@@ -1113,7 +1042,7 @@ fn start_codex_appserver(
         cwd: Mutex::new(dir),
         model: Mutex::new(model.filter(|s| !s.is_empty())),
         effort: Mutex::new(effort.filter(|s| !s.is_empty())),
-        sink: Mutex::new(Some(on_event)),
+        sink: Mutex::new(Some(Box::new(ChannelSink(on_event)))),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
         buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
@@ -1809,49 +1738,6 @@ fn adapt_opencode_line(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
     out
 }
 
-/// Pushes one line into the replay ring buffer, evicting oldest lines until the
-/// buffer is under BOTH the line-count cap (REPLAY_CAP) and the byte budget
-/// (REPLAY_BYTE_CAP). `buffer_bytes` is kept in sync with the popped/pushed line
-/// lengths so the byte check is O(1). Shared by every buffer-push path.
-fn buffer_push(sess: &Arc<ChatSession>, line: &str) {
-    let mut b = sess.buffer.lock();
-    let incoming = line.len();
-    // Evict oldest while over EITHER cap. Always keep at least the incoming line
-    // even if it alone exceeds the byte budget (so the turn isn't lost entirely).
-    while !b.is_empty()
-        && (b.len() >= REPLAY_CAP
-            || sess.buffer_bytes.load(Ordering::Relaxed) + incoming > REPLAY_BYTE_CAP)
-    {
-        if let Some(old) = b.pop_front() {
-            sess.buffer_bytes.fetch_sub(old.len(), Ordering::Relaxed);
-        }
-    }
-    b.push_back(line.to_string());
-    sess.buffer_bytes.fetch_add(incoming, Ordering::Relaxed);
-}
-
-/// Appends one line to the replay buffer AND forwards it to the live sink (if a
-/// pane is attached). The low-level fan-out shared by `ingest_line` and by
-/// synthetic lines we inject (e.g. the live `usage` tick after a turn).
-fn fan_out(sess: &Arc<ChatSession>, line: &str) {
-    buffer_push(sess, line);
-    if let Some(ch) = sess.sink.lock().as_ref() {
-        let _ = ch.send(line.to_string());
-    }
-}
-
-/// Like `fan_out` but stores a DIFFERENT (slimmed) copy in the replay buffer than
-/// the one sent live. Used for image-bearing user lines: the LIVE sink gets the
-/// real line (claude needs the base64 this turn) while the buffer keeps only a
-/// lightweight placeholder, so a pasted screenshot isn't retained in RAM for the
-/// whole session and re-sent on every reattach/replay.
-fn fan_out_split(sess: &Arc<ChatSession>, live: &str, buffered: &str) {
-    buffer_push(sess, buffered);
-    if let Some(ch) = sess.sink.lock().as_ref() {
-        let _ = ch.send(live.to_string());
-    }
-}
-
 /// Handles one complete output line: append to the replay buffer, update session
 /// state (claude id, busy, done-notification), and forward to the live sink.
 fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
@@ -2194,7 +2080,7 @@ pub fn chat_reattach(session_id: u32, on_event: Channel<String>) -> Result<ChatR
     for line in s.buffer.lock().iter() {
         let _ = on_event.send(line.clone());
     }
-    *s.sink.lock() = Some(on_event);
+    *s.sink.lock() = Some(Box::new(ChannelSink(on_event)));
     s.detached.store(false, Ordering::SeqCst);
     s.notify_on_done.store(false, Ordering::SeqCst);
     let busy = s.busy.load(Ordering::SeqCst);
@@ -3011,8 +2897,9 @@ mod tests {
     use super::{
         adapt_codex_appserver_frame, buffer_push, codex_config_without_mcp_servers,
         discover_codex_sessions, find_codex_rollout_in_home, infer_session_engine,
-        slim_user_image_line, ChatSession, Engine, REPLAY_BYTE_CAP,
+        slim_user_image_line, ChatSession, Engine,
     };
+    use aios_chat_core::session::REPLAY_BYTE_CAP;
     use serde_json::json;
     use parking_lot::Mutex;
     use std::collections::{HashMap, VecDeque};

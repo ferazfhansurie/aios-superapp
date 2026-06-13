@@ -15,8 +15,10 @@
 //! lands first; the session struct, engine adapters, and lifecycle follow, each
 //! moved behind the traits while keeping the shell compiling at every step.
 
+pub mod session;
 pub mod wire;
 
+pub use session::{buffer_push, fan_out, fan_out_split, ChatSession, REPLAY_BYTE_CAP, REPLAY_CAP};
 pub use wire::Engine;
 
 /// Where a session's output lines go. The reader thread calls [`OutputSink::send`]
