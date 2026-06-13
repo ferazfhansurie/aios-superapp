@@ -7,6 +7,7 @@ mod browser;
 mod browser_store;
 mod cdp;
 mod chat;
+mod control;
 mod device;
 mod diag;
 mod files;

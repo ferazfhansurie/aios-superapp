@@ -31,6 +31,7 @@ import {
 } from "../lib/dashboard";
 import type { AiosNotification } from "../lib/notifications";
 import { IdleControlCenter } from "./IdleControlCenter";
+import { BoxCockpit } from "./BoxCockpit";
 import { reportDiag } from "../lib/diag";
 
 interface IdleDashboardProps {
@@ -70,6 +71,10 @@ export function IdleDashboard({
   const [pulse, setPulse] = useState<RepoPulse[]>([]);
   const [moneyAgents, setMoneyAgents] = useState<MoneyAgentSummary[]>([]);
   const [pm2Processes, setPm2Processes] = useState<Pm2Process[]>([]);
+  // Wall-clock of the last successful pm2 fetch — drives the cockpit's
+  // "updated Ns ago" indicator. Only meaningful on the box (where pm2 exists).
+  const [pm2FetchedAt, setPm2FetchedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
 
   // Whole-window visibility gate. IdleDashboard only mounts as the full-viewport
   // home screen, so "on screen" == "app window visible" — no IntersectionObserver
@@ -97,7 +102,7 @@ export function IdleDashboard({
       idleRate().then((v) => alive && setRate(v)).catch((e) => reportDiag("dashboard.load", e, { action: "idleRate" }));
       memoryFocus().then((v) => alive && setFocus(v)).catch((e) => reportDiag("dashboard.load", e, { action: "memoryFocus" }));
       loadMoneyAgentSummaries().then((v) => alive && setMoneyAgents(v)).catch((e) => reportDiag("dashboard.load", e, { action: "moneyAgents" }));
-      pm2List().then((v) => alive && setPm2Processes(v)).catch((e) => reportDiag("dashboard.load", e, { action: "pm2List" }));
+      pm2List().then((v) => { if (alive) { setPm2Processes(v); setPm2FetchedAt(Date.now()); } }).catch((e) => reportDiag("dashboard.load", e, { action: "pm2List" }));
     };
     // Always load once on mount (so a freshly-shown home isn't blank), then only
     // poll while the window is visible.
@@ -128,6 +133,29 @@ export function IdleDashboard({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recent.map((p) => p.root).join("|"), windowVisible]);
+
+  // Box-only: tick a 1s clock so the cockpit's "updated Ns ago" counts up
+  // between the 30s pm2 polls. Off the box (no pm2) this never arms.
+  const onBox = pm2Processes.length > 0;
+  useEffect(() => {
+    if (!onBox || !windowVisible) return;
+    const t = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(t);
+  }, [onBox, windowVisible]);
+
+  // Gate: the box is the machine where pm2 has processes. There, swap the
+  // laptop's IdleControlCenter for the server cockpit. The laptop (pm2 absent →
+  // empty list) always falls through to IdleControlCenter as before.
+  if (onBox) {
+    return (
+      <BoxCockpit
+        pm2Processes={pm2Processes}
+        secondsSinceUpdate={
+          pm2FetchedAt == null ? null : Math.max(0, Math.round((now - pm2FetchedAt) / 1000))
+        }
+      />
+    );
+  }
 
   return (
     <IdleControlCenter
