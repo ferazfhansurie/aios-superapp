@@ -15,6 +15,7 @@
 //! lands first; the session struct, engine adapters, and lifecycle follow, each
 //! moved behind the traits while keeping the shell compiling at every step.
 
+pub mod adapt;
 pub mod session;
 pub mod wire;
 

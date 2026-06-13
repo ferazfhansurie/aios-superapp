@@ -466,6 +466,86 @@ mod nav_state {
     }
 }
 
+// Linux (webkit2gtk via wry) nav-state. There's NO KVO on webkit2gtk, so we
+// can't observe `canGoBack`/`canGoForward` the way the macOS observer does, and
+// `wv.eval` is fire-and-forget (no value round-trips back from the page).
+// Instead we track a per-label, Rust-side navigation counter fed by wry's
+// `on_navigation` callback (which DOES fire on Linux) and emit the same
+// `browser-nav-state` event the frontend already consumes — so no frontend
+// change is needed. We can know `canGoBack` (counter > 1) reliably; `canGoFwd`
+// is not observable without a JS round-trip webkit2gtk doesn't cheaply give us,
+// so it's reported best-effort as the page's own `history.forward()` is still a
+// no-op-safe call. TODO(linux nav-state push): a true forward-availability
+// signal would need a JS-side counter shuttled back over the IPC bridge.
+#[cfg(not(target_os = "macos"))]
+mod nav_state {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use tauri::{AppHandle, Emitter};
+
+    /// Per-label navigation count. `attach` resets it to 0 for the label; each
+    /// top-level navigation bumps it. `count >= 2` means there's somewhere to go
+    /// back to (the first nav is the initial page, no back target yet).
+    static NAV_COUNT: LazyLock<Mutex<HashMap<String, u32>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Initialises the per-label counter so a freshly-created pane starts with
+    /// `canGoBack = false`.
+    pub fn attach(_app: &AppHandle, label: &str) {
+        if let Ok(mut m) = NAV_COUNT.lock() {
+            m.insert(label.to_string(), 0);
+        }
+    }
+
+    /// Drops the per-label counter when the pane closes.
+    pub fn detach(label: &str) {
+        if let Ok(mut m) = NAV_COUNT.lock() {
+            m.remove(label);
+        }
+    }
+
+    /// Records a top-level navigation for `label` and emits a `browser-nav-state`
+    /// snapshot matching the macOS payload shape (label/url/canBack/canFwd/
+    /// loading/progress). Called from the `on_navigation` callback.
+    pub fn record_nav(app: &AppHandle, label: &str, url: &str) {
+        let count = {
+            let mut m = match NAV_COUNT.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let c = m.entry(label.to_string()).or_insert(0);
+            *c = c.saturating_add(1);
+            *c
+        };
+        let _ = app.emit(
+            "browser-nav-state",
+            serde_json::json!({
+                "label": label,
+                "url": url,
+                "canBack": count >= 2,
+                // Not observable on webkit2gtk without a JS round-trip; the
+                // forward button stays enabled (history.forward() is a safe
+                // no-op when there's nothing ahead). See module TODO.
+                "canFwd": true,
+                "loading": false,
+                "progress": 1.0,
+            }),
+        );
+    }
+
+    /// Best-effort `[canGoBack, canGoForward]` for the pull command, read from
+    /// the Rust-side counter (no live webkit2gtk introspection available).
+    pub fn nav_pair(label: &str) -> [bool; 2] {
+        let count = NAV_COUNT
+            .lock()
+            .ok()
+            .and_then(|m| m.get(label).copied())
+            .unwrap_or(0);
+        [count >= 2, true]
+    }
+}
+
 /// Shows the browser `label` at the given rect, creating it (loading `url`) on
 /// first call or just repositioning an existing one.
 ///
@@ -546,6 +626,11 @@ pub async fn browser_show(
                     "url": url.to_string(),
                 }),
             );
+            // Linux has no KVO observer; feed the Rust-side nav counter here so
+            // the toolbar Back button can disable on the first page, and push a
+            // `browser-nav-state` snapshot matching the macOS payload shape.
+            #[cfg(not(target_os = "macos"))]
+            nav_state::record_nav(&nav_app, &nav_label, &url.to_string());
             true // never block navigation
         })
         .on_page_load(move |_webview, payload| {
@@ -662,6 +747,9 @@ pub async fn browser_show(
     // on the main thread AFTER the pref/adblock closure above, so it sees the
     // fully-configured webview.
     #[cfg(target_os = "macos")]
+    nav_state::attach(&app, &label);
+    // Linux: initialise the Rust-side nav counter (no KVO; fed by on_navigation).
+    #[cfg(not(target_os = "macos"))]
     nav_state::attach(&app, &label);
     Ok(())
 }
@@ -854,8 +942,18 @@ pub async fn browser_nav_state(app: AppHandle, label: String) -> [bool; 2] {
             .recv_timeout(std::time::Duration::from_millis(300))
             .unwrap_or([true, true]);
     }
-    let _ = (&app, &label);
-    [true, true]
+    // Linux: best-effort from the Rust-side nav counter (no live webkit2gtk
+    // introspection). canGoBack is reliable; canGoForward stays enabled.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &app;
+        return nav_state::nav_pair(&label);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (&app, &label);
+        [true, true]
+    }
 }
 
 /// Opens the WKWebView's Web Inspector (DevTools) for this pane (item 3).
@@ -929,11 +1027,48 @@ pub async fn browser_find(
         }
         false
     }
+    // Linux (webkit2gtk): no WKWebView find API, but the page-level
+    // `window.find(query, caseSensitive, backwards, wraps, wholeWord, searchInFrames)`
+    // is supported. `eval` is fire-and-forget (no return value), so we fire the
+    // call and report `true` optimistically — the frontend only needs the call
+    // to land; if there's no match webkit just leaves the selection unchanged.
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (&app, &label, &query, &forward, &wraps);
+        if query.is_empty() {
+            return false;
+        }
+        if let Some(wv) = app.get_webview(&label) {
+            let q = js_escape(&query);
+            let backwards = if forward { "false" } else { "true" };
+            let wrap = if wraps.unwrap_or(true) { "true" } else { "false" };
+            let js = format!(
+                "try{{window.find(\"{q}\",false,{backwards},{wrap},false,false);}}catch(e){{}}"
+            );
+            let _ = wv.eval(&js);
+            return true;
+        }
         false
     }
+}
+
+/// Escapes a string for safe embedding inside a JS double-quoted string literal
+/// (backslash, double-quote, and the line/paragraph separators that break JS
+/// source). Used by the Linux find-in-page path.
+#[cfg(not(target_os = "macos"))]
+fn js_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Hides without destroying (shrinks to 0×0, preserves the page).
@@ -959,6 +1094,9 @@ pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
     // closure is serialized on the main thread ahead of the close.
     #[cfg(target_os = "macos")]
     nav_state::detach(&app, &label);
+    // Linux: drop the per-label nav counter so a re-created pane starts clean.
+    #[cfg(not(target_os = "macos"))]
+    nav_state::detach(&label);
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.eval(
             "try{document.querySelectorAll('video,audio').forEach(m=>{try{m.pause();m.removeAttribute('src');m.srcObject=null;m.load();}catch(e){}});if(document.fullscreenElement){try{document.exitFullscreen();}catch(e){}}}catch(e){}",
