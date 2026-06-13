@@ -17,7 +17,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use crate::{Engine, OutputSink};
+use crate::{Engine, OutputSink, SessionEvents};
 
 /// How many raw output lines a detached session keeps for replay on reattach.
 /// Generous enough to reconstruct a long agentic run; oldest lines drop first.
@@ -61,6 +61,11 @@ pub struct ChatSession {
     /// behind [`OutputSink`] so the same session runtime can forward to a Tauri
     /// `Channel` (laptop) or a WebSocket (`aios-noded` on the box) unchanged.
     pub sink: Mutex<Option<Box<dyn OutputSink>>>,
+    /// Side-channel lifecycle events (process exit, turn-done notify). On the
+    /// Tauri shell this wraps `AppHandle::emit` (+ a native toast); on
+    /// `aios-noded` it updates the registry / pushes over the tailnet. Set once
+    /// at construction — the last Tauri coupling the session runtime carried.
+    pub events: Box<dyn SessionEvents>,
     /// Ring buffer of recent raw lines, replayed verbatim on reattach.
     pub buffer: Mutex<VecDeque<String>>,
     /// Approximate total bytes currently held in `buffer` (sum of line lengths).

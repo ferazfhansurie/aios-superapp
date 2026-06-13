@@ -430,7 +430,7 @@ pub fn chat_start(
     // opencode (openrouter/everything) is spawn-per-turn — register the session
     // here, spawn nothing; chat_send runs each turn.
     if eng.per_turn() {
-        return start_per_turn(eng, on_event, cwd, model, resume);
+        return start_per_turn(eng, app, on_event, cwd, model, resume);
     }
 
     let mut cmd = Command::new(claude_bin());
@@ -530,6 +530,7 @@ pub fn chat_start(
         busy: AtomicBool::new(false),
         detached: AtomicBool::new(false),
         notify_on_done: AtomicBool::new(false),
+        events: Box::new(TauriEvents { app: app.clone() }),
         rpc_id: AtomicU64::new(1),
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
@@ -590,7 +591,7 @@ pub fn chat_start(
             );
             ingest_line(&sess, &app_rdr, &result);
         }
-        let _ = app_rdr.emit("chat-exit", id);
+        sess.events.on_exit(id);
     });
 
     // stderr reader: surface as synthetic error events through the same sink.
@@ -638,6 +639,7 @@ pub fn chat_start(
 /// a reopened chat keeps its history.
 fn start_per_turn(
     engine: Engine,
+    app: AppHandle,
     on_event: Channel<String>,
     cwd: Option<String>,
     model: Option<String>,
@@ -661,6 +663,7 @@ fn start_per_turn(
         busy: AtomicBool::new(false),
         detached: AtomicBool::new(false),
         notify_on_done: AtomicBool::new(false),
+        events: Box::new(TauriEvents { app: app.clone() }),
         rpc_id: AtomicU64::new(1),
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
@@ -1017,6 +1020,7 @@ fn start_codex_appserver(
         busy: AtomicBool::new(false),
         detached: AtomicBool::new(false),
         notify_on_done: AtomicBool::new(false),
+        events: Box::new(TauriEvents { app: app.clone() }),
         rpc_id: AtomicU64::new(1),
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
@@ -1117,7 +1121,7 @@ fn start_codex_appserver(
             );
             ingest_line(&sess, &app_rdr, &result);
         }
-        let _ = app_rdr.emit("chat-exit", id);
+        sess.events.on_exit(id);
     });
 
     // stderr reader: codex app-server logs skill-parse warnings etc. — drain + drop
@@ -1218,7 +1222,7 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
             } else {
                 title
             };
-            notify_done(app, sess.id, &label);
+            sess.events.on_notify(sess.id, &label);
         }
         // Live usage tick: right after each claude turn, read the same unified
         // Claude usage source as the sidebar (OAuth first, statusline fallback)
@@ -1278,25 +1282,42 @@ struct AiosNotifyPayload {
     title: String,
 }
 
-/// Fires a native OS notification AND an in-app `aios-notify` event that a
-/// backgrounded chat finished. The in-app event is what makes the bell + toast
-/// fire and carries the session id so the click can reattach the exact chat.
-fn notify_done(app: &AppHandle, session_id: u32, title: &str) {
-    use tauri_plugin_notification::NotificationExt;
-    let _ = app
-        .notification()
-        .builder()
-        .title("✓ chat finished")
-        .body(format!("{title} — done. click to reopen."))
-        .show();
-    let _ = app.emit(
-        "aios-notify",
-        AiosNotifyPayload {
-            kind: "chat.done".to_string(),
-            session_id,
-            title: title.to_string(),
-        },
-    );
+/// The Tauri-shell implementation of the crate's [`aios_chat_core::SessionEvents`]
+/// seam: a session's lifecycle callbacks become `AppHandle::emit` (plus a native
+/// completion toast). On the box, `aios-noded` supplies its own impl, so the
+/// session runtime in `aios-chat-core` never names Tauri. This struct is the ONLY
+/// thing that turns those callbacks back into Tauri events.
+struct TauriEvents {
+    app: AppHandle,
+}
+
+impl aios_chat_core::SessionEvents for TauriEvents {
+    /// Backing process exited → tell the frontend so the pane can flip state.
+    fn on_exit(&self, session_id: u32) {
+        let _ = self.app.emit("chat-exit", session_id);
+    }
+
+    /// A backgrounded chat finished → native OS notification AND the in-app
+    /// `aios-notify` event (bell + toast, carrying the session id so the click
+    /// reattaches the exact chat).
+    fn on_notify(&self, session_id: u32, title: &str) {
+        use tauri_plugin_notification::NotificationExt;
+        let _ = self
+            .app
+            .notification()
+            .builder()
+            .title("✓ chat finished")
+            .body(format!("{title} — done. click to reopen."))
+            .show();
+        let _ = self.app.emit(
+            "aios-notify",
+            AiosNotifyPayload {
+                kind: "chat.done".to_string(),
+                session_id,
+                title: title.to_string(),
+            },
+        );
+    }
 }
 
 /// Sends one user turn. For claude: writes a stream-json user line to the live
@@ -2264,6 +2285,7 @@ mod tests {
             busy: AtomicBool::new(false),
             detached: AtomicBool::new(false),
             notify_on_done: AtomicBool::new(false),
+            events: Box::new(aios_chat_core::NoopEvents),
             rpc_id: AtomicU64::new(1),
             pending_turn: Mutex::new(None),
             active_turn: Mutex::new(None),

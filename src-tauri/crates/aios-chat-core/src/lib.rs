@@ -47,3 +47,8 @@ pub trait SessionEvents: Send + Sync {
     /// (today: shell emits `aios-notify`).
     fn on_notify(&self, _session_id: u32, _title: &str) {}
 }
+
+/// A no-op [`SessionEvents`] for hosts that need none — tests, and any headless
+/// path that reports presence/exit by other means.
+pub struct NoopEvents;
+impl SessionEvents for NoopEvents {}
