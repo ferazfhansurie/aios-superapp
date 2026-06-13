@@ -21,6 +21,7 @@ import type { SidebarState, SidebarItem } from "../lib/sidebar";
 import { gitPulse, type RepoPulse } from "../lib/fs";
 import { usageExtras, type UsageExtras } from "../lib/stats";
 import { loadMoneyAgentSummaries, type MoneyAgentSummary } from "../lib/moneyAgents";
+import { pm2List, type Pm2Process } from "../lib/pm2";
 import {
   idleRate,
   memoryFocus,
@@ -68,6 +69,7 @@ export function IdleDashboard({
   const [focus, setFocus] = useState<MemoryFocus | null>(null);
   const [pulse, setPulse] = useState<RepoPulse[]>([]);
   const [moneyAgents, setMoneyAgents] = useState<MoneyAgentSummary[]>([]);
+  const [pm2Processes, setPm2Processes] = useState<Pm2Process[]>([]);
 
   // Whole-window visibility gate. IdleDashboard only mounts as the full-viewport
   // home screen, so "on screen" == "app window visible" — no IntersectionObserver
@@ -95,6 +97,7 @@ export function IdleDashboard({
       idleRate().then((v) => alive && setRate(v)).catch((e) => reportDiag("dashboard.load", e, { action: "idleRate" }));
       memoryFocus().then((v) => alive && setFocus(v)).catch((e) => reportDiag("dashboard.load", e, { action: "memoryFocus" }));
       loadMoneyAgentSummaries().then((v) => alive && setMoneyAgents(v)).catch((e) => reportDiag("dashboard.load", e, { action: "moneyAgents" }));
+      pm2List().then((v) => alive && setPm2Processes(v)).catch((e) => reportDiag("dashboard.load", e, { action: "pm2List" }));
     };
     // Always load once on mount (so a freshly-shown home isn't blank), then only
     // poll while the window is visible.
@@ -135,6 +138,7 @@ export function IdleDashboard({
       focus={focus}
       pulse={pulse}
       moneyAgents={moneyAgents}
+      pm2Processes={pm2Processes}
       notifications={notifications}
       onSpawn={onSpawn}
       onOpenProject={onOpenProject}

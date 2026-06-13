@@ -17,6 +17,7 @@ mod memory;
 mod monitor;
 mod oracles;
 mod plugins;
+mod pm2;
 mod pty;
 mod stats;
 mod telemetry;
@@ -361,6 +362,7 @@ pub fn run() {
             monitor::monitor_start,
             monitor::monitor_stop,
             monitor::list_monitors,
+            pm2::pm2_list,
             // LSP supervisor (lsp.rs) — process spawn + framed pipe; protocol
             // intelligence lives in src/lib/lsp/ on the TS side.
             lsp::lsp_start,

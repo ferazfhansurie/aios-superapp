@@ -58,6 +58,8 @@ import type { ProjectInfo } from "../lib/run";
 import type { SidebarItem, SidebarState } from "../lib/sidebar";
 import type { UsageExtras } from "../lib/stats";
 import { ProviderBlock, useUsageRates } from "./dashboard/UsageGlance";
+import { Pm2Monitor } from "./dashboard/Pm2Monitor";
+import type { Pm2Process } from "../lib/pm2";
 
 export function IdleControlCenter({
   projects,
@@ -67,6 +69,7 @@ export function IdleControlCenter({
   focus,
   pulse,
   moneyAgents,
+  pm2Processes,
   notifications,
   onSpawn,
   onOpenProject,
@@ -84,6 +87,7 @@ export function IdleControlCenter({
   focus: MemoryFocus | null;
   pulse: RepoPulse[];
   moneyAgents: MoneyAgentSummary[];
+  pm2Processes: Pm2Process[];
   notifications: AiosNotification[];
   onSpawn: (kind: AppDef["kind"], label: string) => void;
   onOpenProject: (p: ProjectInfo) => void;
@@ -171,6 +175,9 @@ export function IdleControlCenter({
               onRevealSidebar={onRevealSidebar}
             />
           </div>
+
+          {/* pm2 fleet — only on the box (empty + invisible on the laptop) */}
+          {pm2Processes.length > 0 && <Pm2Monitor processes={pm2Processes} />}
 
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-[var(--color-border)] pt-3">
             {pinned.length > 0 && (
