@@ -412,7 +412,18 @@ pub fn chat_start(
     fast: Option<bool>,
     resume: Option<String>,
     headroom: Option<bool>,
+    node: Option<String>,
 ) -> Result<u32, String> {
+    // Remote node (the bisnesgpt box): the session runs on `aios-noded` over the
+    // tailnet, not locally. We allocate a local id (shared id space so the
+    // frontend treats it like any session), then attach over WS. The command
+    // handlers below consult the remote table first. Box is claude-only in v1.
+    if node.as_deref().is_some_and(|n| !n.is_empty() && n != "local") {
+        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        crate::remote::start(id, on_event, cwd, model, resume)?;
+        return Ok(id);
+    }
+
     let eng = Engine::parse(engine.as_deref());
     // codex (ChatGPT sub) → persistent codex app-server process (JSON-RPC).
     if matches!(eng, Engine::Codex) {
@@ -1331,6 +1342,11 @@ pub fn chat_send(
     text: String,
     image_paths: Option<Vec<String>>,
 ) -> Result<(), String> {
+    // Box-backed session → reverse-pipe the turn over the WS (images are not
+    // forwarded to the remote in v1).
+    if crate::remote::is_remote(session_id) {
+        return crate::remote::send(session_id, &text);
+    }
     let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) else {
         return Err(format!("chat session {session_id} not found"));
     };
@@ -1405,6 +1421,12 @@ pub fn chat_send(
 /// finish. Called when the user closes a still-working chat.
 #[tauri::command]
 pub fn chat_detach(session_id: u32, notify: bool) -> Result<(), String> {
+    // Remote sessions keep running on the box and buffer there; detaching the
+    // pane just leaves the WS pumping in the background (v1 — no local sink to
+    // null out). Reattach for remote is a future step.
+    if crate::remote::is_remote(session_id) {
+        return Ok(());
+    }
     let s = with_sessions(|m| m.get(&session_id).cloned())
         .ok_or_else(|| format!("chat session {session_id} not found"))?;
     s.detached.store(true, Ordering::SeqCst);
@@ -1538,6 +1560,9 @@ pub fn kill_all_sessions() {
 /// stops consuming deltas and re-enables the composer when it sees the result.
 #[tauri::command]
 pub fn chat_interrupt(session_id: u32) -> Result<(), String> {
+    if crate::remote::is_remote(session_id) {
+        return crate::remote::interrupt(session_id);
+    }
     if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
         // codex app-server: a real `turn/interrupt` (stop the turn, keep the
         // process + thread alive) — not a kill. The server ends the turn; our
@@ -1586,6 +1611,9 @@ pub fn chat_steer(
     text: String,
     image_paths: Option<Vec<String>>,
 ) -> Result<(), String> {
+    if crate::remote::is_remote(session_id) {
+        return crate::remote::steer(session_id, &text);
+    }
     let s = with_sessions(|m| m.get(&session_id).cloned())
         .ok_or_else(|| format!("chat session {session_id} not found"))?;
     let images = image_paths.unwrap_or_default();
@@ -1680,6 +1708,9 @@ pub fn chat_send_raw(session_id: u32, line: String) -> Result<(), String> {
 /// the pipe, which lets the child exit cleanly if `kill` raced.
 #[tauri::command]
 pub fn chat_stop(session_id: u32) -> Result<(), String> {
+    if crate::remote::is_remote(session_id) {
+        return crate::remote::stop(session_id);
+    }
     let removed = with_sessions(|m| m.remove(&session_id));
     if let Some(s) = removed {
         s.busy.store(false, Ordering::SeqCst);

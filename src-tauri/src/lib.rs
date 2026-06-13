@@ -19,6 +19,7 @@ mod monitor;
 mod oracles;
 mod pane_history;
 mod plugins;
+mod remote;
 mod pm2;
 mod pty;
 mod stats;

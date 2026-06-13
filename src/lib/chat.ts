@@ -52,6 +52,10 @@ export interface ChatStartOpts {
   /** route this claude turn through the local Headroom compression proxy
    *  (sets ANTHROPIC_BASE_URL on the spawned claude). claude engine only. */
   headroom?: boolean | null;
+  /** run this session on a remote node instead of locally. `undefined`/`"local"`
+   *  → spawn locally; `"bisnesgpt"` → run on the box via aios-noded over the
+   *  tailnet and stream it into this pane (claude only in v1). */
+  node?: string | null;
 }
 
 /** A past chat session for the /resume picker. */
@@ -284,6 +288,7 @@ export async function chatStart(
     fast: opts.fast ?? null,
     resume: opts.resume ?? null,
     headroom: opts.headroom ?? null,
+    node: opts.node ?? null,
   });
 }
 
