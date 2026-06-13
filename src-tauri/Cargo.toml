@@ -18,6 +18,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Engine-agnostic chat-session core shared with the headless `aios-noded` daemon
+# (cross-machine sync). Holds the wire format + engine adapters so the box and
+# the laptop run one runtime, not two copies. See crates/aios-chat-core.
+aios-chat-core = { path = "crates/aios-chat-core" }
 # `devtools`: keep the WKWebView Web Inspector available in RELEASE builds too
 # (not just debug) — firaz uses this app as his dev browser, so `open_devtools`
 # must compile in the shipped binary, hence the explicit feature (the API is

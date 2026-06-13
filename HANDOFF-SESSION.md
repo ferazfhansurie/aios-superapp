@@ -1,53 +1,43 @@
-# AIOS shell — session handoff
-2026-05-31 · focus: multi-engine chat + making ChatPane the best daily driver
+# HANDOFF — cross-machine superapp sync · Phase 1 in progress
 
-> **Next session: read THIS, then `git -C ~/Repo/firaz/aios/shell log --oneline -16`.**
-> Repo `~/Repo/firaz/aios/shell`, branch `master`, head `287f261`, ~40 commits
-> ahead of origin, **NOT pushed** (don't push unprompted).
+_2026-06-13 · branch `feat/cross-machine-sync` · the next session needs ONLY this doc + the plan doc + `git log`._
 
-## WORKING RULES (firaz, load-bearing)
-- **Build loop (NO `cd` — triggers prompts):** `pnpm --dir ~/Repo/firaz/aios/shell tauri build` → `pkill -9 -f "AIOS.app/Contents/MacOS"; rm -rf /Applications/AIOS.app; cp -R <repo>/src-tauri/target/release/bundle/macos/AIOS.app /Applications/AIOS.app; open /Applications/AIOS.app`. ALWAYS `npx tsc --noEmit` == 0 first.
-- The DMG bundle step sometimes fails (leftover mount) — **the `.app` is built before it, so ignore the dmg error**; install the `.app`.
-- **Edit freely → only build/install when at a checkpoint or handoff.** Commit per logical win.
-- **TerminalComposer.tsx is DONE — do NOT touch it.** firaz: "it's amazing already." It's the reference; port FROM it, never edit it.
-- **ChatPane history (↑ recall) — leave as is**, firaz loves it.
-- No WhatsApp sends. Keep replies in-pane.
-- **Multiple oracle sessions edit this same repo concurrently** (aios-shell-3152 etc.). Re-check `git status` / file state before big edits; converge, don't clobber.
+## North star
+Make firaz's laptop superapp and the **bisnesgpt box** (a co-located Ubuntu 24.04 PC on his TV, NOT a remote headless server) feel like **one app with two windows**. A pane/agent running on either machine is visible + attachable from the other. End-goal demo: from the laptop chatpane, spin up a chat session ON the box that monitors the server, and open that pane on both machines. Works **off-wifi** (tailscale is the transport, mandatory not optional).
 
-## SHIPPED this session (all build-verified, tsc-green, on master)
-Multi-engine chat:
-- `06d23d6` **multi-engine chat pane** — `chat.rs` now engine-agnostic. claude = persistent stream-json process (unchanged); codex (ChatGPT sub) + opencode = spawn-per-turn (`codex exec --json`+resume / `opencode run --format json -s`), output normalized into claude's event shape via `adapt_codex_line`/`adapt_opencode_line`. `ChatStartOpts.engine`, `ChatModel.engine`.
-- `5e7c0b3` **one free model** — `opencode/nemotron-3-super-free` (NVIDIA, US, not Chinese) as the sole free fallback. Dropped model sprawl.
-- `43c202b` **render whole-message text blocks** (codex/opencode emit whole msgs, not deltas — the assistant handler now renders a text block when no streaming bubble exists) + codex `-c mcp_servers={}` for speed.
+**Full plan doc (read this first):** `~/Repo/firaz/adletic/aios-firaz/outputs/2026-06-13-cross-machine-superapp-sync.md` — has the architecture, all phases, and the exact NEXT steps with file:line anchors.
 
-Composer daily-driver work (ChatPane.tsx):
-- `c29b353`,`681b0c4` ↑-recall last msg + running context chip; live mode/model/ctx pills in TerminalComposer (parsed from claude-code's PTY in TerminalPane — see `claudeStatus` parser ~line 297).
-- `cbbeda4` scroll-aware autoscroll + jump-to-latest pill; draft persistence per pane (`localStorage[aios-chat-draft:${paneKey}]`).
-- `981f9b8` **image paste/attach** (⌘V screenshot, attach button, drag) → temp file → quoted path prepended to message; **wrap-aware composer** (flex-wrap + ml-auto action cluster, reflows like TUI).
-- `14b7d57` **voice dictation** (ported from TerminalComposer — mic → waveform → transcript, Esc cancels); flash treatment on the box; **/handoff** in slash menu; model pill nowrap; **context readout moved OUT of composer** to a line above it, model-aware window (**opus 4.8 = 1M**, sonnet/haiku 200K, codex 272K, opencode 256K).
-- `cd7cbd3` **sleek composer** — plan/goal pills removed from the bar → `/plan` `/goal` slash commands. Row is now: `+ full access · medium · model · attach · mic · send`.
-- `9683f76` **fix:** removed `overflow-hidden` from composer box (flash had added it; it clipped the permission/effort/model dropdown menus — "overlay broken").
-- `287f261` **slash menu = compact left-anchored dropdown** (OverlayPanel `compact` prop) instead of full-width overlay; @-mention picker keeps full-width.
+## Working rules
+- This is firaz's **daily-driver app**. Refactor must keep `cargo check` GREEN at every step. Never leave it broken.
+- `cargo` is NOT on PATH in GUI-launched shells → use `$HOME/.cargo/bin/cargo`.
+- Voice: lowercase, sharp, co-founder. No exclaim, no "happy to help".
 
-## DECISIONS locked (firaz)
-- ChatPane is the daily driver to perfect; TerminalComposer is untouchable/done.
-- ChatGPT sub via **Codex native** (not opencode's ChatGPT auth); opencode = the "everything else / free fallback" engine. ONE free model only, no Chinese models.
-- Docker→Colima idea: **PARKED** ("nvm the docker"). Don't action.
-- Codex/opencode replies land whole (no token streaming) — accepted; the "Working… m:ss" timer covers it.
-- Free-model latency is backend-bound (3–25s, variable) — NOT our wrapper; can't fix locally. codex ~9s floor (17.5K base prompt).
+## DONE this session
+- **Phase 0 (network) ✅ DONE + verified.** Tailscale live on both machines, off-LAN ssh proven.
+  - laptop `100.69.172.34`; box `firaz` (ubuntu 24.04) `100.113.3.98`, MagicDNS host `firaz`, ssh user `firaz` (sudo needs password). `ssh firaz@100.113.3.98` works over tailnet. Box has a broken ngrok apt repo — install pkgs via `apt-get install` (cached lists) not `apt update`. Recorded in memory `reference-tailnet-bisnesgpt`.
+- **Phase 1 step 1 ✅ DONE + build-verified green (0 warnings).**
+  - `src-tauri/crates/aios-chat-core/` created (Cargo.toml + src/lib.rs + src/wire.rs), compiles standalone AND as a dep of the shell.
+  - **Trait seam defined** in `crates/aios-chat-core/src/lib.rs`: `OutputSink` (`fn send(&self, line: &str)` — Channel on laptop / WebSocket on box) + `SessionEvents` (`on_exit`, `on_notify` — the only `AppHandle.emit` couplings). **These two traits are the whole cross-machine split.**
+  - **First extraction:** `Engine` enum + 11 pure wire-format fns moved into `wire.rs` (`json_escape`, `user_line`, `image_media_type`, `user_line_with_images`, `slim_user_image_line`, `text_delta_line`, `thinking_delta_line`, `assistant_text_line`, `assistant_thinking_line`, `assistant_tool_use_line`, `user_tool_result_line`). chat.rs re-imports via `use aios_chat_core::wire::{...}` + `use aios_chat_core::Engine;` (top of file, ~line 51). `src-tauri/Cargo.toml` has the path dep `aios-chat-core = { path = "crates/aios-chat-core" }`.
 
-## PENDING (next session)
-1. **VERIFY drag files→chat works.** Mechanism is wired (FilesPane rows draggable w/ `AIOS_PATH_MIME`; `PaneDropZone` wraps ChatPane, auto-arms via window dragover in `lib/paneBus.ts`; `extractPath`→`insertPath`). firaz reported it not working but that may have been the now-fixed clipped-overlay. If still broken: chase z-index / event-capture between FilesPane and ChatPane (PaneDropZone overlay is `z-30 absolute inset-0`). FilesPane onDragStart at `FilesPane.tsx:266`.
-2. **Confirm slash-dropdown direction.** firaz said "reuse down instead of overlay" — I made it a compact left-anchored dropdown (still opens upward since composer is bottom-docked). Confirm that's what he meant; he may want it to open downward (only fits in the empty hero state where the composer is centered).
-3. **Backlog (PLAN-chatpane-daily-driver.md)** still open: edit-a-prior-message→resend, cumulative cost HUD, retry-with-different-model without nuking the thread (route via `resumeId` — model change is a session-restart effect dep, the sharp edge), ⌘F transcript find, codex-style approval scope-tiers, recursive @ mentions, markdown tables/blockquotes/syntax-highlight.
+## DECISIONS locked
+- Box is a **GUI-capable PC** (has the TV as display), not headless. So it can run the superapp itself via a Tauri **Linux** build (Phase 0.5) — it's a true second GUI node, not just a backend. But the sync architecture is identical either way.
+- Architecture = **GUI node(s) + shared runtime via `aios-noded` daemon on the box**, over tailscale. Reuse chat.rs's existing detach/reattach + ring buffer as the remote-attach model. "Open in both" = multi-sink fan-out (`sink: Channel` → `Vec`/`Box<dyn OutputSink>`).
+- firaz chose **go full product** (~2–2.5 wks), not the 1-day ssh+tmux MVP.
+- Phase 1 is sequential surgery (one file) → driven directly, NOT fanned out. Phases 2–4 fan out to parallel agents.
 
-## Key files / anchors
-- `src/components/ChatPane.tsx` (~3200 lines) — the daily driver. composer is a `useMemo` (~line 1640+); slashCommands ~1354; handleEvent ~574; session-restart effect deps include model/permission/effort/cwd (changing any restarts the engine — route mid-convo switches via `resumeId`).
-- `src-tauri/src/chat.rs` — engines: `start_per_turn`, `run_per_turn`, `adapt_codex_line`, `adapt_opencode_line`.
-- `src/components/TerminalPane.tsx` — `claudeStatus` PTY parser (~297) feeding the terminal composer pills. DON'T edit TerminalComposer.
-- `src/lib/paneBus.ts` — `AIOS_PATH_MIME`, `onAiosDrag` (drop-overlay arm signal).
-- `PLAN-chatpane-daily-driver.md` + `PLAN-chat-engines.md` — the design/backlog (untracked; both deep-dive reports synthesized here).
+## PENDING — exact next steps
+1. **Phase 1 step 2 (the heavy middle, ~1500 lines):** move `ChatSession` (struct at chat.rs ~line 106 after the Engine removal) + the engine adapters (`adapt_codex_line`, `adapt_opencode_line`, `adapt_codex_appserver_frame`, the `codex_*` helpers) + ring buffer (`buffer_push`, `fan_out`, `fan_out_split`) into `aios-chat-core`. The adapters read `ChatSession` state → move the struct FIRST. Then swap `sink: Mutex<Option<Channel<String>>>` → `Box<dyn OutputSink>` and the 3 `AppHandle.emit` sites (`chat-exit` ~line 783/1360, `notify_done` ~2265, usage events) → `Box<dyn SessionEvents>`. `cargo check` green each step.
+2. **Phase 1 step 3:** build `aios-noded` binary (new crate, also path-deps `aios-chat-core`) = axum HTTP/WS server exposing `/registry`, `POST /chat/start`, `WS /chat/:id/attach`, `POST /chat/:id/stop`. Token auth from `~/.aios/state/node-secret`. Deploy on box under pm2/systemd. TAILNET-ONLY (it's RCE by design — never on the public domain).
+3. **Phase 2:** node registry/presence — `/registry` + GUI unified roster (merge into existing `OracleRoster` / `oracles.rs`, tag each entry by node).
+4. **Phase 3:** `chatStart({node})` proxy in the Tauri backend → box `/attach` WS bridged to the local `Channel`; multi-sink fan-out for "open in both".
+5. **Phase 4:** composer `@bisnesgpt` node picker + canned server-monitor agent prompt + state-sync allowlist (from the 2026-05-19 failover plan).
+6. **Phase 0.5 (parallel):** Tauri Linux build target so the box renders its own panes on the TV.
 
-## Live context
-- Verified on this machine: codex-cli 0.135.0 (logged in via ChatGPT Plus), opencode 1.15.12 (`~/.opencode/bin`). `timeout` is NOT installed on this mac (use bg + file).
-- Untracked PLAN docs in repo root (leave): PLAN-control-plane, PLAN-customizable-sidebar, PLAN-model-agnostic, PLAN-chat-engines, PLAN-chatpane-daily-driver.
+## Live context / gotchas
+- Branch `feat/cross-machine-sync` is off the `windows-port` line (cross-platform work already in flight there — relevant to Phase 0.5).
+- chat.rs is 3,484 lines pre-extraction; ~95% pure logic, only `Channel` + `AppHandle.emit` (3 sites) are tauri-coupled.
+- No background agents running. No external deps pending.
+
+## Resume
+Open a fresh session in `~/Repo/firaz/aios/shell`, read this doc + the plan doc, `git checkout feat/cross-machine-sync`, and start **Phase 1 step 2** (move `ChatSession` into the crate, struct first).
