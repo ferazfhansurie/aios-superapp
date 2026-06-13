@@ -418,6 +418,7 @@ pub fn chat_start(
     effort: Option<String>,
     fast: Option<bool>,
     resume: Option<String>,
+    headroom: Option<bool>,
 ) -> Result<u32, String> {
     let eng = Engine::parse(engine.as_deref());
     // codex (ChatGPT sub) → persistent codex app-server process (JSON-RPC).
@@ -471,6 +472,19 @@ pub fn chat_start(
                 cmd.current_dir(home);
             }
         }
+    }
+
+    // Headroom compression: route this claude turn through the local proxy so
+    // tool outputs / RAG get compressed before hitting the LLM. Gated on the
+    // cockpit toggle (claude engine only). Subscription auth is preserved — the
+    // proxy only rewrites the body, not the auth headers. Reversible: turn the
+    // toggle off and turns spawn against api.anthropic.com directly again.
+    if headroom.unwrap_or(false) {
+        let url = std::env::var("HEADROOM_PROXY_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+        cmd.env("ANTHROPIC_BASE_URL", url);
     }
 
     cmd.stdin(Stdio::piped())

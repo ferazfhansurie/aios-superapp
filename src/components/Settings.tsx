@@ -1187,6 +1187,15 @@ export function Settings({
                       ]}
                     />
                   </Row>
+                  <Row
+                    label="headroom compression"
+                    sub="route claude chat through the local headroom proxy — compresses tool outputs before the LLM (fewer tokens, easier on usage caps). never touches your prompt."
+                  >
+                    <Toggle
+                      checked={s.headroomCompression}
+                      onChange={(v) => patch({ headroomCompression: v })}
+                    />
+                  </Row>
                   {mirrorUrl && (
                     <Row
                       label="desktop mirror link"

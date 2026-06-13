@@ -268,6 +268,15 @@ pub fn run() {
                 eprintln!("[aios menu] failed to install app menu: {e}");
             }
             global_monitor::start(app.handle().clone());
+
+            // Box GUI node: when spawned by the box launcher/autostart (which sets
+            // AIOS_FULLSCREEN=1), come up fullscreen on the TV. Laptop launches
+            // never set this env, so the windowed default there is unchanged.
+            if std::env::var("AIOS_FULLSCREEN").as_deref() == Ok("1") {
+                if let Some(win) = app.get_window("main") {
+                    let _ = win.set_fullscreen(true);
+                }
+            }
             Ok(())
         })
         .on_menu_event(|app, event| handle_menu_event(app, event.id().0.as_str()))

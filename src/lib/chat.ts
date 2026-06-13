@@ -49,6 +49,9 @@ export interface ChatStartOpts {
   fast?: boolean | null;
   /** resume a prior claude session id (continues that conversation). */
   resume?: string | null;
+  /** route this claude turn through the local Headroom compression proxy
+   *  (sets ANTHROPIC_BASE_URL on the spawned claude). claude engine only. */
+  headroom?: boolean | null;
 }
 
 /** A past chat session for the /resume picker. */
@@ -280,6 +283,7 @@ export async function chatStart(
     effort: opts.effort ?? null,
     fast: opts.fast ?? null,
     resume: opts.resume ?? null,
+    headroom: opts.headroom ?? null,
   });
 }
 

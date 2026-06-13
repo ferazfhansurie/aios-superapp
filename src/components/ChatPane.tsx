@@ -1387,6 +1387,12 @@ export function ChatPane({
             effort: effectiveBudget === "ultracode" ? "xhigh" : effort.id,
             fast: effectiveBudget === "lean",
             resume: resumeId,
+            // route claude turns through the Headroom compression proxy when
+            // the cockpit toggle is on (claude engine only; rust ignores it
+            // for codex/opencode).
+            headroom:
+              (model.engine ?? "claude") === "claude" &&
+              loadSettings().headroomCompression,
           }).then((id) => ({
             id,
             busy: false,

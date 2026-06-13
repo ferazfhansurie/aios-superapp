@@ -51,6 +51,12 @@ export interface AppSettings {
   chatProvider: string;
   chatModel: string | null;
 
+  // route claude chat turns through the local Headroom compression proxy
+  // (ANTHROPIC_BASE_URL → http://127.0.0.1:8787). Compresses tool outputs / RAG
+  // before they hit the LLM (60-95% fewer tokens); never touches your prompt.
+  // Requires the headroom proxy running (com.firaz.headroom-proxy launchd).
+  headroomCompression: boolean;
+
   // where "send to AI" actions route (notes pane "send", future quick-sends):
   //   "codex-code"  → a terminal pane running `codex`
   //   "claude-code" → a terminal pane running `claude`
@@ -96,6 +102,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   chatProvider: "codex-cli",
   chatModel: null,
+
+  headroomCompression: false,
 
   defaultAi: "codex-code",
 };
