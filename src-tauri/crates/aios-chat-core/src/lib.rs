@@ -16,6 +16,7 @@
 //! moved behind the traits while keeping the shell compiling at every step.
 
 pub mod adapt;
+pub mod codex_rpc;
 pub mod session;
 pub mod wire;
 
