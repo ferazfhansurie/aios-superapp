@@ -89,6 +89,7 @@ import {
 import { fileSrc, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
 import { idleRate, codexRate, resetIn } from "../lib/dashboard";
+import { getMission, listAgents, wrmsSeedTasks } from "../lib/agents";
 import {
   buildChatContextCapsule,
   composerContextChips,
@@ -451,6 +452,7 @@ export function ChatPane({
   agentLabel,
   workspaceContext,
   onOpenUrl,
+  onChatSession,
 }: {
   cwd?: string;
   paneKey?: string;
@@ -475,6 +477,11 @@ export function ChatPane({
   reattach?: number;
   /** Open an http(s) link from rendered markdown in an in-app browser pane. */
   onOpenUrl?: (url: string) => void;
+  /** Reports the LIVE chat session id (+ title/engine/model) up to the owning
+   *  pane so it can be recorded into pane history WITH a resume handle. Without
+   *  this, reopening a chat from history spawns a FRESH pane instead of
+   *  continuing the conversation (the kind never learned its session id). */
+  onChatSession?: (info: { id: string; title: string; engine?: string; model?: string }) => void;
 }) {
   const nativeRuntime = useMemo(() => isTauriRuntime(), []);
   const webChatRuntime = !nativeRuntime;
@@ -674,6 +681,25 @@ export function ChatPane({
   // reactive mirror of claudeSessionIdRef — the engine session id currently open
   // in THIS pane, so the /resume picker can highlight "the one you're in".
   const [openSessionId, setOpenSessionId] = useState<string | null>(resume?.id ?? null);
+
+  // Report the live engine session id up to the owning pane the moment it's
+  // known (fresh chat establishes one, or a resume re-keys to a fork) so pane
+  // history records this chat WITH a resume handle — that's what makes
+  // reopening it from history CONTINUE the conversation instead of opening a
+  // fresh pane. The send path fires onChatSession again with a better title.
+  useEffect(() => {
+    if (!openSessionId) return;
+    const m = activeModelRef.current;
+    onChatSession?.({
+      id: openSessionId,
+      title: chatTitleRef.current || resume?.title || "chat",
+      engine: m.engine ?? "claude",
+      model: m.id,
+    });
+    // chatTitleRef is a ref (not reactive); resumedTitle drives its value, so we
+    // depend on it to re-fire when the human label is established.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openSessionId, onChatSession, resumedTitle]);
 
   const sessionIdRef = useRef<number | null>(null);
   const webAbortRef = useRef<AbortController | null>(null);
@@ -2082,6 +2108,9 @@ export function ChatPane({
         // Label the backend session for the background tray + done-notification.
         if (sessionIdRef.current != null)
           chatSetTitle(sessionIdRef.current, stableTitle).catch((e) => reportDiag("chat.title", e, { action: "setTitle" }));
+        // Re-report with the now-meaningful first-message title so pane history
+        // shows a real label (not "resumed chat · <dir>") when reopened.
+        onChatSession?.({ id: sid, title: stableTitle, engine, model: model.id });
       }
       setInput("");
       consumeComposerImages();
@@ -2118,6 +2147,11 @@ export function ChatPane({
         recentTurns: recentTurnsForContext(turnsRef.current),
         workspace: workspaceContext ?? null,
         runPhase: runEventState.phase,
+        missionBoard: {
+          mission: getMission(),
+          agents: listAgents().map((a) => ({ label: a.label, status: a.status ?? "idle" })),
+          openTasks: wrmsSeedTasks().map((t) => t.id),
+        },
       });
       setAttachedMemoryPaths([]);
       // images ride as native content blocks (opts.imagePaths), not text paths —

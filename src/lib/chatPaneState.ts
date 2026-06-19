@@ -124,6 +124,14 @@ export interface ChatContextCapsuleInput {
   recentTurns?: ChatContextTurn[];
   workspace?: ChatWorkspaceContext | null;
   runPhase?: string | null;
+  /** Live mission-control board so the chatpane AI always knows firaz's active
+   *  mission, each agent's status, and open tasks. Rides the bounded capsule —
+   *  NOT a per-turn preamble. Omitted when there's nothing meaningful to show. */
+  missionBoard?: {
+    mission: string;
+    agents: Array<{ label: string; status: string }>;
+    openTasks: string[];
+  } | null;
 }
 
 let queueSeq = 0;
@@ -452,6 +460,22 @@ export function buildChatContextCapsule(input: ChatContextCapsuleInput): string 
   if (cwd) lines.push(`cwd: ${cwd}`);
   lines.push(`model: ${input.engine}/${input.modelLabel}`);
   if (input.runPhase) lines.push(`run: ${clip(input.runPhase, 90)}`);
+
+  const board = input.missionBoard;
+  if (board && (board.mission || board.agents.length || board.openTasks.length)) {
+    lines.push("mission_board:");
+    if (board.mission) lines.push(`mission: ${clip(board.mission, 120)}`);
+    if (board.agents.length) {
+      lines.push(
+        `agents: ${board.agents
+          .map((a) => `${clip(a.label, 28)}[${a.status}]`)
+          .join(" · ")}`,
+      );
+    }
+    if (board.openTasks.length) {
+      lines.push(`open_tasks: ${board.openTasks.map((t) => clip(t, 40)).join("; ")}`);
+    }
+  }
 
   const active = input.workspace?.activePane;
   if (active) {

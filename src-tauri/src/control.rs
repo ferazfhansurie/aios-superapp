@@ -338,6 +338,97 @@ pub fn agent_list() -> Vec<serde_json::Value> {
     out
 }
 
+/// State dir root: `~/.aios/state`. Shared by the goal/loop readers below.
+fn aios_state_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".aios/state"))
+}
+
+/// Lists every active goal driver — the source-of-truth `state.json` under
+/// `~/.aios/state/goals/active/<id>/state.json` (written by aios-goal-tick).
+/// Each value is the opaque goal JSON (goal, priority, window, kind, status,
+/// nextStep, blocker, progress). The MissionBoard renders these as a Goals
+/// section so firaz sees every driver, not just the static WRMS seed lane.
+#[tauri::command]
+pub fn goal_list() -> Vec<serde_json::Value> {
+    let Some(dir) = aios_state_dir().map(|d| d.join("goals/active")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let cfg = entry.path().join("state.json");
+        if let Ok(text) = std::fs::read_to_string(&cfg) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+/// Lists active loops — one per `*.meta` under `~/.aios/state/loops/`. Each meta
+/// is a single tab-separated line `name<TAB>cadence<TAB>tick-path`; we also read
+/// the last non-empty line of the sibling `<name>.log` so firaz can see what each
+/// loop just did. Returns `{name, cadence, lastLog}` so the frontend never has to
+/// parse tab-delimited files itself.
+#[tauri::command]
+pub fn loop_list() -> Vec<serde_json::Value> {
+    let Some(dir) = aios_state_dir().map(|d| d.join("loops")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let line = text.lines().next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let cadence = parts.next().unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let log_path = dir.join(format!("{name}.log"));
+        let last_log = std::fs::read_to_string(&log_path)
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .last()
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        out.push(serde_json::json!({
+            "name": name,
+            "cadence": cadence,
+            "lastLog": last_log,
+        }));
+    }
+    out.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    });
+    out
+}
+
 /// Deletes an agent's config dir. Best-effort; a missing dir is not an error.
 #[tauri::command]
 pub fn agent_delete(id: String) -> Result<(), String> {

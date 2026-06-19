@@ -13,6 +13,7 @@ import {
 
 import type { AppDef } from "../App";
 import type { SidebarItem, SidebarState } from "../lib/sidebar";
+import { MissionBoard } from "./MissionBoard";
 
 const CORE_LAUNCHERS: Array<{
   label: string;
@@ -61,6 +62,7 @@ export function IdleControlCenter({
 
       <div className="relative z-10 shrink-0 border-t border-[var(--color-border)] px-6 pb-4 pt-4 backdrop-blur-sm">
         <div className="mx-auto flex w-full max-w-[1100px] flex-col gap-3">
+          <MissionBoard />
           <QuickActions onSpawn={onSpawn} onOpenPalette={onOpenPalette} onRevealSidebar={onRevealSidebar} />
           {pinned.length > 0 && (
             <div className="flex min-w-0 flex-wrap items-center justify-center gap-1.5 border-t border-[var(--color-border)] pt-3">
