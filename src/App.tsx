@@ -52,6 +52,8 @@ import { FileFinder } from "./components/FileFinder";
 import { GlobalSearch } from "./components/GlobalSearch";
 import { HistoryPane } from "./components/HistoryPane";
 import { IdleDashboard } from "./components/IdleDashboard";
+import { MissionBoard } from "./components/MissionBoard";
+import { LoopPane } from "./components/LoopPane";
 import { MirrorViewer } from "./components/MirrorViewer";
 import { PaneErrorBoundary } from "./components/PaneErrorBoundary";
 import { ResizableGrid } from "./components/ResizableGrid";
@@ -70,6 +72,8 @@ import {
   chatHandles,
   detachBusyChats,
   paneWriters,
+  paneSubmitters,
+  registerOrchestrator,
   paneImageDrop,
   paneDropSink,
   registerPane,
@@ -458,6 +462,10 @@ function App() {
   // the pane the user last interacted with — drives the "OPEN" rail highlight +
   // is where dictation / drops route. A ref alone wouldn't re-render the rail.
   const [activeKey, setActiveKey] = useState<string | null>(null);
+  // Live mirror of `panes` for closures (the control-command listener) that are
+  // registered once and would otherwise read a stale panes snapshot.
+  const panesRef = useRef(panes);
+  panesRef.current = panes;
   const toggleMax = useCallback(
     (key: string) => setMaximizedKey((cur) => (cur === key ? null : key)),
     [],
@@ -1744,6 +1752,31 @@ function App() {
   const talkToJarvis = useCallback((seed: string) => {
     spawn({ type: "chat", seed }, "jarvis");
   }, [spawn]);
+  // The ONE capable AI: open/focus a stable orchestrator chat rooted in
+  // ~/.aios/orchestrator (so it loads the orchestrator CLAUDE.md — board-aware,
+  // can spawn agents + make loops). `prefill` seeds the composer WITHOUT sending
+  // (firaz talks; no canned auto-dispatch). Stable key → reopen reattaches.
+  const openOrchestrator = useCallback(
+    (prefill?: string) => {
+      const key = "chat:orchestrator";
+      const cwd = home ? `${home}/.aios/orchestrator` : undefined;
+      const writeSoon = (n = 0) => {
+        if (!prefill) return;
+        const w = paneWriters.get(key);
+        if (w) w(prefill);
+        else if (n < 25) window.setTimeout(() => writeSoon(n + 1), 120);
+      };
+      if (panesRef.current.some((p) => p.key === key)) {
+        focusPane(key);
+        writeSoon();
+      } else {
+        spawn({ type: "chat", cwd }, "AIOS", key);
+        window.setTimeout(() => writeSoon(), 250);
+      }
+    },
+    [spawn, focusPane, home],
+  );
+  useEffect(() => registerOrchestrator(openOrchestrator), [openOrchestrator]);
   // Control hook (control.rs → `control-command` event): allow external callers
   // to open core panes only.
   // De-dupe guard: a single control command can reach the handler twice (effect
@@ -1791,6 +1824,11 @@ function App() {
           if (!background) {
             setHiddenKeys((h) => h.filter((k) => k !== explicitKey));
             focusPane(explicitKey);
+            if (seed) {
+              const sub = paneSubmitters.get(explicitKey);
+              if (sub) sub(seed);
+              else window.setTimeout(() => paneSubmitters.get(explicitKey)?.(seed), 250);
+            }
           }
           return;
         }
@@ -2039,6 +2077,19 @@ function App() {
                       ),
                     )
                   }
+                  onChatSession={(info) => {
+                    // Stamp the live session into this pane's kind + re-record
+                    // pane history WITH a resume handle, so reopening this chat
+                    // from history CONTINUES it (and repaints prior turns).
+                    if (pane.kind.type !== "chat") return;
+                    if (pane.kind.resume?.id === info.id && pane.kind.resume?.title === info.title) return;
+                    const kind: PaneContent = {
+                      ...pane.kind,
+                      resume: { id: info.id, title: info.title, engine: info.engine, model: info.model },
+                    };
+                    setPanes((ps) => ps.map((p) => (p.key === pane.key ? { ...p, kind } : p)));
+                    recordPaneHistory(kind, pane.label);
+                  }}
                   onVideoFullscreen={(on) => onVideoFullscreen(pane.key, on)}
                 />
                 );
@@ -3194,6 +3245,7 @@ function PaneCard({
   onOpenHistoryItem,
   onOpenUrl,
   onProfileChange,
+  onChatSession,
   onVideoFullscreen,
 }: {
   pane: Pane;
@@ -3220,6 +3272,7 @@ function PaneCard({
   onOpenHistoryItem: (kind: PaneContent, label: string) => void;
   onOpenUrl?: (url: string) => void;
   onProfileChange: (profile: string) => void;
+  onChatSession: (info: { id: string; title: string; engine?: string; model?: string }) => void;
   onVideoFullscreen?: (on: boolean) => void;
 }) {
   const t = pane.kind.type;
@@ -3483,6 +3536,12 @@ function PaneCard({
             <FilesPane initialRoot={pane.kind.root} onOpenFile={onOpenFile} />
           ) : pane.kind.type === "history" ? (
             <HistoryPane onOpenHistoryItem={onOpenHistoryItem} />
+          ) : pane.kind.type === "mission" ? (
+            <div className="h-full overflow-y-auto p-3">
+              <MissionBoard />
+            </div>
+          ) : pane.kind.type === "loop" ? (
+            <LoopPane />
           ) : pane.kind.type === "browser" ? (
             <BrowserPane
               label={pane.key}
@@ -3509,6 +3568,7 @@ function PaneCard({
               reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}
               workspaceContext={workspaceContext}
               onOpenUrl={onOpenUrl}
+              onChatSession={onChatSession}
             />
           )}
           </Suspense>

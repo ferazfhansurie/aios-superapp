@@ -8,6 +8,8 @@ import {
   Globe,
   History,
   MessageSquare,
+  Repeat,
+  Target,
   TerminalSquare,
 } from "lucide-react";
 
@@ -17,6 +19,8 @@ import type { PaneKind } from "../components/TerminalPane";
 export type PaneContent =
   | PaneKind
   | { type: "files"; root?: string }
+  | { type: "mission" }
+  | { type: "loop" }
   | { type: "history" }
   | { type: "git"; root?: string }
   | { type: "browser"; url?: string; profile?: string; memKey?: string; transient?: boolean }
@@ -55,6 +59,8 @@ export type AppDef = {
 
 /** Default app catalog — order here == the seeded default sidebar order. */
 export const SPAWN: AppDef[] = [
+  { id: "mission", kind: { type: "mission" }, icon: Target, label: "mission", group: "tools" },
+  { id: "loop", kind: { type: "loop" }, icon: Repeat, label: "loops", group: "tools" },
   { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "tools" },
   { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "tools" },
   { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools" },

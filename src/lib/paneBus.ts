@@ -268,6 +268,29 @@ export function spawnPane(kind: SpawnPaneKind, ctx?: SpawnCtx): boolean {
   return true;
 }
 
+// ── orchestrator channel ─────────────────────────────────────────────────────
+// The ONE capable AI firaz talks to. The mission board (and anywhere else) asks
+// App to open/focus the orchestrator chat pane (stable key, rooted in
+// ~/.aios/orchestrator so it gets the orchestrator CLAUDE.md). Optional prefill
+// is dropped into the composer WITHOUT sending — firaz talks, never canned auto-
+// dispatch. App registers the impl once; callers use talkToOrchestrator.
+let orchestratorImpl: ((prefill?: string) => void) | null = null;
+
+export function registerOrchestrator(fn: (prefill?: string) => void): () => void {
+  orchestratorImpl = fn;
+  return () => {
+    if (orchestratorImpl === fn) orchestratorImpl = null;
+  };
+}
+
+/** Open/focus the orchestrator chat. Optional `prefill` seeds the composer
+ *  (NOT sent). Returns false if no impl wired (App not mounted). */
+export function talkToOrchestrator(prefill?: string): boolean {
+  if (!orchestratorImpl) return false;
+  orchestratorImpl(prefill);
+  return true;
+}
+
 // ── pane-nav: the global keybind contract (FROZEN for wave-2 consumers) ──────
 // Cockpit-wide shortcuts fire as native menu accelerators in src-tauri/lib.rs
 // (so they work even when focus sits inside a child webview) and arrive in the

@@ -3,7 +3,7 @@ export interface PaneOrderState<T> {
   selected: number;
 }
 
-export const CORE_PANE_TYPES = ["browser", "chat", "files", "history", "oracle", "shell", "tmux"] as const;
+export const CORE_PANE_TYPES = ["browser", "chat", "files", "history", "oracle", "shell", "tmux", "mission", "loop"] as const;
 
 const CORE_PANE_TYPE_SET = new Set<string>(CORE_PANE_TYPES);
 

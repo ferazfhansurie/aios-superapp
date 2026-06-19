@@ -403,6 +403,15 @@ pub fn run() {
             control::agent_save,
             control::agent_list,
             control::agent_delete,
+            // Read-only mission-control feeds for the board: active goal drivers
+            // (goals/active/*/state.json) and running loops (loops/*.meta + log).
+            control::goal_list,
+            control::loop_list,
+            // Interactive loop control for the board's Loops section.
+            control::loop_start,
+            control::loop_stop,
+            control::loop_set_cadence,
+            control::loop_create,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,
