@@ -462,6 +462,14 @@ export async function setLoopCadence(name: string, cadence: string): Promise<voi
   return invoke("loop_set_cadence", { name, cadence });
 }
 
+/** Creates a new loop (wraps aios-loop create). `command` is an arg vector so a
+ *  multi-word agent prompt stays one ProgramArgument; a bare leading
+ *  "aios-agent" is resolved to its absolute path by the Rust side. `cadence` is
+ *  e.g. "30m" or "daily 09:00". */
+export async function addLoop(name: string, cadence: string, command: string[]): Promise<void> {
+  return invoke("loop_create", { name, cadence, command });
+}
+
 // ── control-hook payload shapes (the `control-command` Tauri event) ──────────
 // Emitted by control.rs on a valid POST. App.tsx listens and routes these.
 

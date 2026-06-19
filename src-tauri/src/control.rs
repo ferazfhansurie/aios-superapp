@@ -585,6 +585,61 @@ pub fn loop_set_cadence(name: String, cadence: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Creates a NEW loop through the SAME `aios-loop create` the CLI uses (writes
+/// the plist + meta + launchctl load), so the pane and CLI stay in lockstep.
+/// `command` is an arg VECTOR (not a string) so a multi-word agent prompt stays
+/// one ProgramArgument. A bare leading `aios-agent` is resolved to its absolute
+/// path — launchd has no shell PATH, so the plist needs the full path. Refuses to
+/// clobber an existing loop (edit its cadence instead). `cadence` may be a single
+/// token (`30m`) or `daily HH:MM` (split on whitespace into args).
+#[tauri::command]
+pub fn loop_create(name: String, cadence: String, command: Vec<String>) -> Result<(), String> {
+    let name = safe_loop_name(&name).ok_or("invalid loop name")?;
+    let cadence = cadence.trim().to_string();
+    if cadence.is_empty() {
+        return Err("empty cadence".into());
+    }
+    let parts: Vec<String> = command
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Err("empty command".into());
+    }
+    let state = aios_state_dir().ok_or("no HOME")?;
+    if state.join(format!("loops/{name}.meta")).exists() {
+        return Err(format!("loop '{name}' already exists — edit it instead"));
+    }
+    let aios_loop = state.join("bin/aios-loop");
+    if !aios_loop.exists() {
+        return Err("aios-loop CLI not found".into());
+    }
+    let mut cmd = std::process::Command::new(&aios_loop);
+    cmd.arg("create").arg(&name);
+    for tok in cadence.split_whitespace() {
+        cmd.arg(tok);
+    }
+    for (i, part) in parts.iter().enumerate() {
+        // launchd plists need absolute program paths (no shell PATH) — expand a
+        // bare leading `aios-agent` to ~/.aios/state/bin/aios-agent.
+        if i == 0 && part == "aios-agent" {
+            cmd.arg(state.join("bin/aios-agent"));
+        } else {
+            cmd.arg(part);
+        }
+    }
+    let out = cmd.output().map_err(|e| format!("aios-loop failed to run: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "aios-loop create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 /// Runs `launchctl <action> <plist>`, mapping a non-zero exit to an Err string.
 fn run_launchctl(action: &str, plist: &std::path::Path) -> Result<(), String> {
     let out = std::process::Command::new("launchctl")

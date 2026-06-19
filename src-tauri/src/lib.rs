@@ -411,6 +411,7 @@ pub fn run() {
             control::loop_start,
             control::loop_stop,
             control::loop_set_cadence,
+            control::loop_create,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,
