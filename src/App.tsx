@@ -399,6 +399,11 @@ function App() {
   const [panes, setPanes] = useState<Pane[]>(() =>
     loadSettings().reopenLastLayout ? loadLayout() : [],
   );
+  // Live mirror of `panes` for the control-command listener closure (registered
+  // once via listen()) so it can check whether a stable-keyed pane already exists
+  // without re-subscribing on every pane change.
+  const panesRef = useRef<Pane[]>(panes);
+  panesRef.current = panes;
   const [sidebarOpen, setSidebarOpen] = useState(() => !(!nativeRuntime && window.matchMedia("(max-width: 1024px)").matches));
   const [splash, setSplash] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -635,7 +640,7 @@ function App() {
     };
   }, [flash]);
 
-  const spawn = useCallback((kind: PaneContent, label: string, explicitKey?: string): string => {
+  const spawn = useCallback((kind: PaneContent, label: string, explicitKey?: string, background = false): string => {
     if (!isCorePaneKind(kind.type)) {
       reportUsage("pane.spawn.blocked", kind.type);
       return "";
@@ -650,15 +655,25 @@ function App() {
     // Carries only the pane-type enum, never any argument/label content.
     reportUsage("pane.spawn", kind.type);
     recordPaneHistory(kind, label);
-    // EXIT FULLSCREEN ON ANY NEW-PANE SPAWN (R2a FIX 3): if a pane currently owns
-    // OS fullscreen / maximize, a freshly-spawned pane would be invisible behind
-    // it (the maximized pane fills the window + every other pane deactivates). Drop
-    // fullscreen first so the new pane actually appears in the grid and firaz SEES
-    // it. Functional setState reads the live value without a deps dependency.
-    setMaximizedKey((m) => {
-      if (m !== null) setWindowFullscreen(false).catch((e) => reportDiag("app.window", e, { action: "exitFullscreen" }));
-      return null;
-    });
+    // BACKGROUND SPAWN (loop/agent-originated): a pane spawned with background=true
+    // must NOT disrupt firaz's current view — the dogfood/goal/maintainer loops
+    // fire panes every few minutes, and stealing focus or dropping his fullscreen
+    // each time is intolerable. So: skip the exit-fullscreen below, don't focus it,
+    // and open it HIDDEN (added to hiddenKeys → display:none, so the session still
+    // RUNS) — it's listed in the sidebar/OPEN rail, clickable to peek, hideable
+    // again without killing the session. Foreground spawns (firaz talking to the
+    // orchestrator) keep the focus-and-reveal behavior below.
+    if (!background) {
+      // EXIT FULLSCREEN ON ANY NEW-PANE SPAWN (R2a FIX 3): if a pane currently owns
+      // OS fullscreen / maximize, a freshly-spawned pane would be invisible behind
+      // it (the maximized pane fills the window + every other pane deactivates). Drop
+      // fullscreen first so the new pane actually appears in the grid and firaz SEES
+      // it. Functional setState reads the live value without a deps dependency.
+      setMaximizedKey((m) => {
+        if (m !== null) setWindowFullscreen(false).catch((e) => reportDiag("app.window", e, { action: "exitFullscreen" }));
+        return null;
+      });
+    }
     setPanes((p) => {
       // Make every pane label identifiable at a glance:
       //  - shell/claude panes with a cwd → suffix the dir basename ("terminal · shell")
@@ -678,6 +693,9 @@ function App() {
       }
       return [...p, { key, kind, label: next }];
     });
+    // Background panes open hidden (display:none) so they run without taking grid
+    // space or focus; firaz reveals them from the sidebar when he wants to peek.
+    if (background) setHiddenKeys((h) => (h.includes(key) ? h : [...h, key]));
     return key;
   }, []);
 
@@ -1739,19 +1757,38 @@ function App() {
         const seed = payload.seed != null ? String(payload.seed) : undefined;
         const cwd = payload.cwd != null ? String(payload.cwd) : undefined;
         const label = payload.label != null ? String(payload.label) : undefined;
+        // Optional stable key (e.g. aios-agent spawns `agent:<id>`) so a re-fire
+        // reattaches the SAME pane instead of stacking a duplicate every tick.
+        const explicitKey = payload.key != null ? String(payload.key) : undefined;
+        // Loop/agent-originated spawns set background:true (the aios-agent CLI
+        // wires it via AIOS_AGENT_BACKGROUND) → open HIDDEN, never steal focus or
+        // drop firaz's fullscreen. Orchestrator/foreground spawns omit it and keep
+        // the focus-and-reveal behavior. This is what makes the loop system
+        // non-intrusive — panes fire every few minutes without hijacking his view.
+        const background = payload.background === true;
+        // A re-fire of an already-open stable-keyed pane: don't duplicate. A
+        // foreground re-fire reveals + focuses it; a background re-fire leaves
+        // firaz's view untouched (the pane keeps running where it is).
+        if (explicitKey && panesRef.current.some((p) => p.key === explicitKey)) {
+          if (!background) {
+            setHiddenKeys((h) => h.filter((k) => k !== explicitKey));
+            focusPane(explicitKey);
+          }
+          return;
+        }
         switch (paneType) {
           case "chat":
-            spawn({ type: "chat", seed: seed || undefined, cwd }, label ?? "chat");
+            spawn({ type: "chat", seed: seed || undefined, cwd }, label ?? "chat", explicitKey, background);
             break;
           case "terminal":
           case "shell":
-            spawn({ type: "shell", cwd, cmd: seed || undefined }, label ?? "terminal");
+            spawn({ type: "shell", cwd, cmd: seed || undefined }, label ?? "terminal", explicitKey, background);
             break;
           case "browser":
-            spawn({ type: "browser" }, "browser");
+            spawn({ type: "browser" }, "browser", explicitKey, background);
             break;
           case "files":
-            spawn({ type: "files" }, "files");
+            spawn({ type: "files" }, "files", explicitKey, background);
             break;
           default:
             break;
