@@ -54,6 +54,7 @@ import { HistoryPane } from "./components/HistoryPane";
 import { IdleDashboard } from "./components/IdleDashboard";
 import { MissionBoard } from "./components/MissionBoard";
 import { LoopPane } from "./components/LoopPane";
+import { TicketPane } from "./components/TicketPane";
 import { MirrorViewer } from "./components/MirrorViewer";
 import { PaneErrorBoundary } from "./components/PaneErrorBoundary";
 import { ResizableGrid } from "./components/ResizableGrid";
@@ -3542,6 +3543,8 @@ function PaneCard({
             </div>
           ) : pane.kind.type === "loop" ? (
             <LoopPane />
+          ) : pane.kind.type === "ticket" ? (
+            <TicketPane />
           ) : pane.kind.type === "browser" ? (
             <BrowserPane
               label={pane.key}

@@ -20,9 +20,9 @@ test("gridTrackStorageKey scopes persisted sizes by grid shape", () => {
   assert.equal(gridTrackStorageKey("aios.grid", 2, 3), "aios.grid:2x3");
 });
 
-test("core pane policy keeps only browser, chat, terminal, files, history, and mission surfaces", () => {
-  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "history", "oracle", "shell", "tmux", "mission", "loop"]);
-  for (const type of ["browser", "chat", "files", "oracle", "shell", "tmux", "mission", "loop"]) {
+test("core pane policy keeps only browser, chat, terminal, files, history, mission, loop, and ticket surfaces", () => {
+  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "history", "oracle", "shell", "tmux", "mission", "loop", "ticket"]);
+  for (const type of ["browser", "chat", "files", "oracle", "shell", "tmux", "mission", "loop", "ticket"]) {
     assert.equal(isCorePaneKind(type), true, `${type} should be core`);
   }
   for (const type of ["app", "appcast", "apps", "bridges", "chrome", "editor", "file", "git", "memory", "money-agents", "notes", "notifications", "plugins", "pulse"]) {

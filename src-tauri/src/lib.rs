@@ -412,6 +412,9 @@ pub fn run() {
             control::loop_stop,
             control::loop_set_cadence,
             control::loop_create,
+            // Dogfood ticket intake for the TicketPane.
+            control::ticket_add,
+            control::ticket_list,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,
