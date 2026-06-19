@@ -429,6 +429,138 @@ pub fn loop_list() -> Vec<serde_json::Value> {
     out
 }
 
+// ── dogfood ticket intake (the TicketPane's surface) ────────────────────────
+// Tickets are markdown files under `~/.aios/state/dogfood/tickets/{open,done}/`
+// with a `--- source/priority/status/created ---` frontmatter + a body. The
+// dogfood loop picks firaz-authored open tickets first (oldest-first). These two
+// commands let the TicketPane FILE a ticket (wrapping the proven `aios-ticket`
+// CLI so the format never drifts) and LIST the queue.
+
+/// Files a firaz ticket by wrapping `~/.aios/state/bin/aios-ticket`. `urgent`
+/// adds the `--urgent` flag (priority that jumps the loop's queue).
+#[tauri::command]
+pub fn ticket_add(text: String, urgent: bool) -> Result<(), String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("empty ticket text".into());
+    }
+    let cli = aios_state_dir().ok_or("no HOME")?.join("bin/aios-ticket");
+    if !cli.exists() {
+        return Err("aios-ticket CLI not found".into());
+    }
+    let mut cmd = std::process::Command::new(&cli);
+    if urgent {
+        cmd.arg("--urgent");
+    }
+    cmd.arg(&text);
+    let out = cmd.output().map_err(|e| format!("aios-ticket failed to run: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "aios-ticket failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Lists dogfood tickets from `open/` and `done/`. Each entry carries the parsed
+/// frontmatter (source/priority/status/created) + a title (first non-empty body
+/// line) so the TicketPane can render the queue without parsing markdown itself.
+#[tauri::command]
+pub fn ticket_list() -> Vec<serde_json::Value> {
+    let Some(base) = aios_state_dir().map(|d| d.join("dogfood/tickets")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for queue in ["open", "done"] {
+        let dir = base.join(queue);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let (mut source, mut priority, mut status, mut created) =
+                (String::new(), String::new(), String::new(), String::new());
+            // Parse the leading `--- ... ---` frontmatter, then the first non-empty
+            // body line as the title.
+            let mut in_fm = false;
+            let mut fm_done = false;
+            let mut title = String::new();
+            for line in text.lines() {
+                let t = line.trim();
+                if !fm_done {
+                    if t == "---" {
+                        if in_fm {
+                            fm_done = true;
+                        } else {
+                            in_fm = true;
+                        }
+                        continue;
+                    }
+                    if in_fm {
+                        if let Some((k, v)) = t.split_once(':') {
+                            let v = v.trim().to_string();
+                            match k.trim() {
+                                "source" => source = v,
+                                "priority" => priority = v,
+                                "status" => status = v,
+                                "created" => created = v,
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+                    // No frontmatter — fall through to treat as body.
+                    fm_done = true;
+                }
+                if title.is_empty() && !t.is_empty() {
+                    title = t.chars().take(140).collect();
+                }
+            }
+            out.push(serde_json::json!({
+                "name": name,
+                "title": if title.is_empty() { name.clone() } else { title },
+                "queue": queue,
+                "source": source,
+                "priority": priority,
+                "status": if status.is_empty() { queue.to_string() } else { status },
+                "created": created,
+            }));
+        }
+    }
+    // Sort: open before done; firaz before self-found; oldest-first within (the
+    // loop's actual pickup order) so the pane mirrors what runs next.
+    out.sort_by(|a, b| {
+        let qa = a["queue"].as_str().unwrap_or("");
+        let qb = b["queue"].as_str().unwrap_or("");
+        qa.cmp(qb)
+            .then_with(|| {
+                let fa = a["source"].as_str().unwrap_or("") == "firaz";
+                let fb = b["source"].as_str().unwrap_or("") == "firaz";
+                fb.cmp(&fa) // firaz (true) first
+            })
+            .then_with(|| {
+                a["created"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["created"].as_str().unwrap_or(""))
+            })
+    });
+    out
+}
+
 /// Deletes an agent's config dir. Best-effort; a missing dir is not an error.
 #[tauri::command]
 pub fn agent_delete(id: String) -> Result<(), String> {

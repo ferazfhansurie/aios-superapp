@@ -407,6 +407,9 @@ pub fn run() {
             // (goals/active/*/state.json) and running loops (loops/*.meta + log).
             control::goal_list,
             control::loop_list,
+            // Dogfood ticket intake for the TicketPane.
+            control::ticket_add,
+            control::ticket_list,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,

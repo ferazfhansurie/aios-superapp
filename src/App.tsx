@@ -52,6 +52,7 @@ import { GlobalSearch } from "./components/GlobalSearch";
 import { HistoryPane } from "./components/HistoryPane";
 import { IdleDashboard } from "./components/IdleDashboard";
 import { MissionBoard } from "./components/MissionBoard";
+import { TicketPane } from "./components/TicketPane";
 import { MirrorViewer } from "./components/MirrorViewer";
 import { PaneErrorBoundary } from "./components/PaneErrorBoundary";
 import { ResizableGrid } from "./components/ResizableGrid";
@@ -3466,6 +3467,8 @@ function PaneCard({
             <div className="h-full overflow-y-auto p-3">
               <MissionBoard />
             </div>
+          ) : pane.kind.type === "ticket" ? (
+            <TicketPane />
           ) : pane.kind.type === "browser" ? (
             <BrowserPane
               label={pane.key}

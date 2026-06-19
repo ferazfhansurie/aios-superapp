@@ -441,6 +441,41 @@ export async function listLoops(): Promise<LoopInfo[]> {
   }
 }
 
+// ── dogfood ticket intake (the TicketPane) ───────────────────────────────────
+// Tickets live as markdown under ~/.aios/state/dogfood/tickets/{open,done}/. The
+// pane files them (wrapping the aios-ticket CLI) + lists the queue. Outside tauri
+// the invokes reject → empty/no-op so the web build degrades silently.
+
+/** One dogfood ticket (a row in the TicketPane queue). */
+export interface TicketInfo {
+  name: string;
+  title: string;
+  queue: "open" | "done";
+  source: string;
+  priority: string;
+  status: string;
+  created: string;
+}
+
+/** Lists dogfood tickets (open first, firaz-authored first, oldest-first = the
+ *  loop's actual pickup order). */
+export async function listTickets(): Promise<TicketInfo[]> {
+  try {
+    const disk = await invoke<unknown[]>("ticket_list");
+    if (!Array.isArray(disk)) return [];
+    return disk.filter(
+      (t): t is TicketInfo => Boolean(t && typeof t === "object" && (t as TicketInfo).name),
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Files a firaz ticket (wraps the aios-ticket CLI). `urgent` jumps the queue. */
+export async function addTicket(text: string, urgent = false): Promise<void> {
+  return invoke("ticket_add", { text, urgent });
+}
+
 // ── control-hook payload shapes (the `control-command` Tauri event) ──────────
 // Emitted by control.rs on a valid POST. App.tsx listens and routes these.
 
