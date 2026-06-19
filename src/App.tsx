@@ -91,7 +91,8 @@ import {
 } from "./lib/paneBus";
 import { containingDir, paneFileTarget } from "./lib/paneOpenActions";
 import { loadSettings, saveSettings, applyFlashLevel, subscribe as subscribeSettings } from "./lib/settings";
-import { fileSrc, homeDir, startupOpenPane } from "./lib/fs";
+import { homeDir, startupOpenPane } from "./lib/fs";
+import { VIEWER_EXT, extOf } from "./lib/fileKinds";
 import { recordPaneHistory } from "./lib/paneHistory";
 import { detectProject, type ProjectInfo } from "./lib/run";
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
@@ -249,8 +250,17 @@ const INTERACTIVE_SELECTOR = [
 
 /** Open files through the core browser pane. This keeps files useful without
  *  loading the editor/monaco surface on older machines. */
-function paneForFile(path: string, _name: string): PaneContent {
-  return { type: "browser", url: fileSrc(path), transient: true, memKey: `file:${path}` };
+/** Routes a local file to its DEDICATED pane by extension (the canonical
+ *  viewer-vs-editor split keyed off VIEWER_EXT — see fileKinds.ts). Media / pdf /
+ *  office / archives / markdown render in the viewer ("file") pane; everything
+ *  else (code, plain text, unknown) opens in the Monaco editor, which sniffs
+ *  UTF-8 and falls back to "open externally" if the file turns out binary.
+ *  NEVER a browser pane — opening a .txt/.md/etc as a `local://` browser url was
+ *  the bug (firaz-20260619-195632): files lost their dedicated viewer. */
+function paneForFile(path: string, name: string): PaneContent {
+  return VIEWER_EXT.has(extOf(path))
+    ? { type: "file", path, name }
+    : { type: "editor", path, name };
 }
 
 // STABLE PANE KEYS (wave 1B): keys are minted ONCE at spawn via
