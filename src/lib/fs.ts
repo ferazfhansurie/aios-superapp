@@ -218,3 +218,11 @@ export async function convertOfficeToPdf(path: string): Promise<string> {
 export async function saveImageTemp(data: string, ext: string): Promise<string> {
   return invoke<string>("save_image_temp", { data, ext });
 }
+
+/** Reveals a file or folder in the OS file manager (macOS Finder via `open -R`,
+ *  Windows Explorer via `/select`), selecting the item. Reuses the generic
+ *  reveal command the browser downloads panel already uses. Best-effort: a
+ *  missing path / failed spawn rejects with an error string. */
+export async function revealInFinder(path: string): Promise<void> {
+  return invoke("browser_reveal_in_finder", { path });
+}
