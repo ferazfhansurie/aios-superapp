@@ -343,3 +343,39 @@ function isRunEvent(value: unknown): value is RunEvent {
     event.type === "run.interrupted"
   );
 }
+
+// ── localStorage hygiene: bound the per-session run-event logs ────────────────
+// Each chat session persists its replay log under `aios.chat.run-events:<id>`.
+// These are write-guarded (a quota throw on persist is swallowed) but never
+// pruned, so they accumulate across hundreds of sessions until the ~5MB origin
+// quota is full — at which point the NEXT unguarded setItem anywhere in the app
+// throws QuotaExceededError uncaught, React unmounts, and the window goes blank.
+// (Seen 2026-06-19: 10MB of run-events → blank boot.) Call this once at boot,
+// BEFORE React mounts, so the store is slim before any new writes. Drops the
+// oldest entries (localStorage iteration order ≈ insertion order in WebKit)
+// until the combined run-event payload is under `maxBytes`. Never throws.
+export function pruneRunEventStores(maxBytes = 2_000_000): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const prefix = "aios.chat.run-events:";
+    const entries: Array<{ key: string; bytes: number }> = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith(prefix)) continue;
+      entries.push({ key, bytes: (localStorage.getItem(key) ?? "").length });
+    }
+    let total = entries.reduce((sum, e) => sum + e.bytes, 0);
+    let i = 0;
+    while (total > maxBytes && i < entries.length) {
+      try {
+        localStorage.removeItem(entries[i].key);
+      } catch {
+        /* ignore */
+      }
+      total -= entries[i].bytes;
+      i++;
+    }
+  } catch {
+    /* hygiene must never break boot */
+  }
+}
