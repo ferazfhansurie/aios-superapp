@@ -67,6 +67,8 @@ export const CODE_EXT = new Set([
   "sql", "lua", "dart", "dockerfile", "makefile", "gradle", "properties",
   "pl", "r", "scala", "clj", "ex", "exs", "elm",
   "graphql", "gql", "proto",
+  "tf", "tfvars", "hcl", "ps1", "psm1", "psd1", "bat", "cmd",
+  "coffee", "jl", "sol", "tcl", "vb", "hbs", "handlebars", "pug",
 ]);
 
 /** Plain-text-ish files — editor pane, text icon. */
@@ -139,6 +141,8 @@ const EDITOR_LANGUAGE: Record<string, string> = {
   toml: "ini",
   ini: "ini",
   env: "ini",
+  properties: "ini",
+  rst: "restructuredtext",
   sh: "shell",
   bash: "shell",
   zsh: "shell",
@@ -171,7 +175,25 @@ const EDITOR_LANGUAGE: Record<string, string> = {
   clj: "clojure",
   ex: "elixir",
   exs: "elixir",
-  proto: "protobuf",
+  proto: "proto",
+  // Common infra/scripting/markup grammars Monaco ships out of the box — these
+  // open in the editor (CODE_EXT) and would otherwise fall through to plaintext.
+  tf: "hcl",
+  tfvars: "hcl",
+  hcl: "hcl",
+  ps1: "powershell",
+  psm1: "powershell",
+  psd1: "powershell",
+  bat: "bat",
+  cmd: "bat",
+  coffee: "coffeescript",
+  jl: "julia",
+  sol: "sol",
+  tcl: "tcl",
+  vb: "vb",
+  hbs: "handlebars",
+  handlebars: "handlebars",
+  pug: "pug",
 };
 
 /** Map a file extension to a Monaco language id. Defaults to plaintext. */
