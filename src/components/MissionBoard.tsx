@@ -330,8 +330,9 @@ function LoopsSection({ loops, onChanged }: { loops: LoopInfo[]; onChanged: () =
 }
 
 /** One loop row — status dot, name, inline-editable cadence, start/stop toggle,
- *  last log line. Each control action invokes Rust then re-pulls via onChanged. */
-function LoopRow({ loop, onChanged }: { loop: LoopInfo; onChanged: () => void }) {
+ *  last log line. Each control action invokes Rust then re-pulls via onChanged.
+ *  Exported so the dedicated LoopPane reuses the exact same control row. */
+export function LoopRow({ loop, onChanged }: { loop: LoopInfo; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(loop.cadence);
