@@ -9,7 +9,7 @@
  * its config.json, pulled via syncAgentsFromDisk), and the open task list.
  */
 import { useEffect, useState } from "react";
-import { Check, MessageSquare, Pencil, Play, RefreshCw, Repeat, Target } from "lucide-react";
+import { Check, MessageSquare, Pause, Pencil, Play, RefreshCw, Repeat, Target } from "lucide-react";
 
 import { talkToOrchestrator } from "../lib/paneBus";
 import {
@@ -19,7 +19,10 @@ import {
   listLoops,
   missionTask,
   seedWrmsControlCentre,
+  setLoopCadence,
   setMission,
+  startLoop,
+  stopLoop,
   syncAgentsFromDisk,
   wrmsAgentSeeds,
   wrmsSeedTasks,
@@ -27,6 +30,7 @@ import {
   type BoardTask,
   type GoalDriver,
   type LoopInfo,
+  type LoopStatus,
 } from "../lib/agents";
 
 type Status = NonNullable<AgentConfig["status"]>;
@@ -170,7 +174,7 @@ export function MissionBoard() {
       </div>
 
       <GoalsSection goals={goals} mission={mission} />
-      <LoopsSection loops={loops} />
+      <LoopsSection loops={loops} onChanged={() => void pullFeeds()} />
 
       <TaskBacklog onPick={askTask} />
 
@@ -290,39 +294,128 @@ function GoalsSection({ goals, mission }: { goals: GoalDriver[]; mission: string
   );
 }
 
-/** Loops section — every running loop (loops/*.meta) with its cadence + last log
- *  line. Read-only; renders nothing when empty so it's additive. */
-function LoopsSection({ loops }: { loops: LoopInfo[] }) {
+/** Loop status → pill color. */
+function loopStatusColor(status: LoopStatus | undefined): string {
+  switch (status) {
+    case "running":
+      return "var(--color-success)";
+    case "paused":
+      return "var(--color-warning, var(--color-muted))";
+    case "stopped":
+      return "var(--color-danger)";
+    default:
+      return "var(--color-faint)";
+  }
+}
+
+/** Loops section — firaz's control panel for every loop (loops/*.meta): live
+ *  status, start/stop toggle, inline cadence edit. Renders null when empty so it
+ *  stays additive. `onChanged` re-pulls the feed after a control action. */
+function LoopsSection({ loops, onChanged }: { loops: LoopInfo[]; onChanged: () => void }) {
   if (loops.length === 0) return null;
 
   return (
     <div className="mt-3 border-t border-[var(--color-border)] pt-2.5">
       <div className="mb-1.5 flex items-center gap-1.5 text-[9px] font-medium uppercase tracking-widest text-[var(--color-muted)]">
         <Repeat size={10} />
-        loops · what's running
+        loops · control panel
       </div>
       <div className="flex flex-col gap-1">
         {loops.map((loop) => (
-          <div
-            key={loop.name}
-            className="flex min-w-0 items-center gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)]/40 px-3 py-1.5"
-          >
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="truncate text-[11.5px] font-medium text-[var(--color-text-2)]">{loop.name}</span>
-                {loop.cadence && (
-                  <span className="shrink-0 rounded-full bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[9px] text-[var(--color-muted)]">
-                    {loop.cadence}
-                  </span>
-                )}
-              </div>
-              {loop.lastLog && (
-                <div className="truncate font-mono text-[9.5px] text-[var(--color-faint)]">{loop.lastLog}</div>
-              )}
-            </div>
-          </div>
+          <LoopRow key={loop.name} loop={loop} onChanged={onChanged} />
         ))}
       </div>
+    </div>
+  );
+}
+
+/** One loop row — status dot, name, inline-editable cadence, start/stop toggle,
+ *  last log line. Each control action invokes Rust then re-pulls via onChanged. */
+function LoopRow({ loop, onChanged }: { loop: LoopInfo; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(loop.cadence);
+
+  const status = loop.status ?? "running";
+  const color = loopStatusColor(status);
+  const isOff = status === "stopped" || status === "paused";
+
+  const run = async (fn: () => Promise<void>) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await fn();
+    } catch {
+      /* surfaced by the unchanged status on re-pull */
+    } finally {
+      setBusy(false);
+      onChanged();
+    }
+  };
+
+  const toggle = () => run(() => (isOff ? startLoop(loop.name) : stopLoop(loop.name)));
+  const saveCadence = () => {
+    const next = draft.trim();
+    setEditing(false);
+    if (!next || next === loop.cadence) return;
+    void run(() => setLoopCadence(loop.name, next));
+  };
+
+  return (
+    <div className="flex min-w-0 items-center gap-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)]/40 px-3 py-1.5">
+      <span
+        className="h-2 w-2 shrink-0 rounded-full"
+        style={{ background: color }}
+        title={status}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-[11.5px] font-medium text-[var(--color-text-2)]">{loop.name}</span>
+          {editing ? (
+            <input
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={saveCadence}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") saveCadence();
+                else if (e.key === "Escape") {
+                  setDraft(loop.cadence);
+                  setEditing(false);
+                }
+              }}
+              className="w-16 shrink-0 rounded border border-[var(--color-accent)] bg-[var(--color-bg)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-text)] outline-none"
+            />
+          ) : (
+            loop.cadence && (
+              <button
+                type="button"
+                onClick={() => {
+                  setDraft(loop.cadence);
+                  setEditing(true);
+                }}
+                className="group/c shrink-0 rounded-full bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[9px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                title="edit cadence"
+              >
+                {loop.cadence}
+                <Pencil size={8} className="ml-1 inline opacity-0 group-hover/c:opacity-100" />
+              </button>
+            )
+          )}
+        </div>
+        {loop.lastLog && (
+          <div className="truncate font-mono text-[9.5px] text-[var(--color-faint)]">{loop.lastLog}</div>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={toggle}
+        disabled={busy}
+        className="grid h-6 w-6 shrink-0 place-items-center rounded text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)] disabled:opacity-40"
+        title={isOff ? "start loop" : "stop loop"}
+      >
+        {isOff ? <Play size={12} /> : <Pause size={12} />}
+      </button>
     </div>
   );
 }

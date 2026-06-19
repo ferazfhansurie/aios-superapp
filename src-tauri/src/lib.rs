@@ -407,6 +407,10 @@ pub fn run() {
             // (goals/active/*/state.json) and running loops (loops/*.meta + log).
             control::goal_list,
             control::loop_list,
+            // Interactive loop control for the board's Loops section.
+            control::loop_start,
+            control::loop_stop,
+            control::loop_set_cadence,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,

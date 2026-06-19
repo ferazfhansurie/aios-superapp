@@ -384,6 +384,9 @@ pub fn loop_list() -> Vec<serde_json::Value> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
+    // Snapshot the launchd-loaded loop labels ONCE (one `launchctl list` for the
+    // whole listing) rather than per-loop.
+    let loaded = launchctl_loaded_labels();
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -400,6 +403,9 @@ pub fn loop_list() -> Vec<serde_json::Value> {
         let mut parts = line.split('\t');
         let name = parts.next().unwrap_or("").trim().to_string();
         let cadence = parts.next().unwrap_or("").trim().to_string();
+        // 3rd meta field = the command the loop fires (needed to re-create it on a
+        // cadence edit). Joined back if it itself contained tabs (it won't).
+        let command = parts.collect::<Vec<_>>().join("\t").trim().to_string();
         if name.is_empty() {
             continue;
         }
@@ -414,9 +420,23 @@ pub fn loop_list() -> Vec<serde_json::Value> {
                     .map(|s| s.to_string())
             })
             .unwrap_or_default();
+        // status: launchctl-loaded → running; the dogfood loop has a reversible
+        // soft-pause via its STOP flag (loaded but idle) → paused; not loaded →
+        // stopped (plist on disk, restartable).
+        let loaded = loaded.contains(&format!("{LOOP_LABEL_PREFIX}-{name}"));
+        let paused = name == "aios-dogfood" && dogfood_stop_present();
+        let status = if paused {
+            "paused"
+        } else if loaded {
+            "running"
+        } else {
+            "stopped"
+        };
         out.push(serde_json::json!({
             "name": name,
             "cadence": cadence,
+            "command": command,
+            "status": status,
             "lastLog": last_log,
         }));
     }
@@ -427,6 +447,162 @@ pub fn loop_list() -> Vec<serde_json::Value> {
             .cmp(b["name"].as_str().unwrap_or(""))
     });
     out
+}
+
+// ── loop control (the MissionBoard Loops section's control panel) ────────────
+// Mirrors the launchd/plist conventions of `~/.aios/state/bin/aios-loop` so the
+// pane and the CLI stay in lockstep: each loop is a launchd agent labelled
+// `com.firaz.aios-loop-<name>`, its plist at `~/Library/LaunchAgents/<label>.plist`,
+// its `<name>.meta` (name<TAB>cadence<TAB>command) under `~/.aios/state/loops`.
+
+const LOOP_LABEL_PREFIX: &str = "com.firaz.aios-loop";
+
+/// `~/Library/LaunchAgents` (macOS launchd user-agent dir).
+fn launch_agents_dir() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join("Library/LaunchAgents"))
+}
+
+/// Slug guard for a loop name: alnum + dash/underscore only, so a crafted name
+/// can't escape the plist dir. Returns None for anything else.
+fn safe_loop_name(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.len() > 64 {
+        return None;
+    }
+    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+fn loop_plist_path(name: &str) -> Option<PathBuf> {
+    Some(launch_agents_dir()?.join(format!("{LOOP_LABEL_PREFIX}-{name}.plist")))
+}
+
+/// True when the dogfood loop's reversible soft-stop flag is present.
+fn dogfood_stop_present() -> bool {
+    aios_state_dir()
+        .map(|d| d.join("dogfood/STOP").exists())
+        .unwrap_or(false)
+}
+
+/// The set of currently launchd-loaded loop labels (one `launchctl list`).
+fn launchctl_loaded_labels() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Ok(out) = std::process::Command::new("launchctl").arg("list").output() {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // `launchctl list` rows are `<pid>\t<status>\t<label>`.
+            if let Some(label) = line.split('\t').nth(2) {
+                let label = label.trim();
+                if label.starts_with(LOOP_LABEL_PREFIX) {
+                    set.insert(label.to_string());
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Starts a loop. The dogfood loop uses its reversible STOP-flag soft-stop (rm
+/// the flag); every other loop is `launchctl load`-ed from its plist.
+#[tauri::command]
+pub fn loop_start(name: String) -> Result<(), String> {
+    let name = safe_loop_name(&name).ok_or("invalid loop name")?;
+    if name == "aios-dogfood" {
+        if let Some(stop) = aios_state_dir().map(|d| d.join("dogfood/STOP")) {
+            let _ = std::fs::remove_file(stop); // absent = already running
+        }
+        return Ok(());
+    }
+    let plist = loop_plist_path(&name).ok_or("no HOME")?;
+    if !plist.exists() {
+        return Err(format!("no plist for loop '{name}'"));
+    }
+    run_launchctl("load", &plist)
+}
+
+/// Stops a loop. The dogfood loop gets a reversible soft-stop (touch its STOP
+/// flag — keeps the launchd agent loaded but idle, so START just rm's it); every
+/// other loop is `launchctl unload`-ed (restartable from its on-disk plist).
+#[tauri::command]
+pub fn loop_stop(name: String) -> Result<(), String> {
+    let name = safe_loop_name(&name).ok_or("invalid loop name")?;
+    if name == "aios-dogfood" {
+        let stop = aios_state_dir()
+            .map(|d| d.join("dogfood/STOP"))
+            .ok_or("no HOME")?;
+        if let Some(parent) = stop.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&stop, "paused from MissionBoard\n").map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let plist = loop_plist_path(&name).ok_or("no HOME")?;
+    if !plist.exists() {
+        return Err(format!("no plist for loop '{name}'"));
+    }
+    run_launchctl("unload", &plist)
+}
+
+/// Changes a loop's cadence by re-creating it through the SAME `aios-loop create`
+/// the CLI uses (rewrites the plist schedule + meta + reloads), so the pane and
+/// CLI never drift. Reuses the proven bash rather than re-emitting plist XML in
+/// Rust. The command is read from the loop's `.meta` (3rd field) and preserved.
+#[tauri::command]
+pub fn loop_set_cadence(name: String, cadence: String) -> Result<(), String> {
+    let name = safe_loop_name(&name).ok_or("invalid loop name")?;
+    let cadence = cadence.trim().to_string();
+    if cadence.is_empty() {
+        return Err("empty cadence".into());
+    }
+    let state = aios_state_dir().ok_or("no HOME")?;
+    let meta_path = state.join(format!("loops/{name}.meta"));
+    let meta = std::fs::read_to_string(&meta_path).map_err(|e| format!("no meta: {e}"))?;
+    let first = meta.lines().next().unwrap_or("");
+    let command = first.split('\t').nth(2).unwrap_or("").trim().to_string();
+    if command.is_empty() {
+        return Err("loop has no recorded command — edit via CLI".into());
+    }
+    let aios_loop = state.join("bin/aios-loop");
+    if !aios_loop.exists() {
+        return Err("aios-loop CLI not found".into());
+    }
+    // command parts are whitespace-separated (aios-loop create takes them as
+    // distinct ProgramArguments) — matches how the CLI was originally invoked.
+    let mut cmd = std::process::Command::new(&aios_loop);
+    cmd.arg("create").arg(&name).arg(&cadence);
+    for part in command.split_whitespace() {
+        cmd.arg(part);
+    }
+    let out = cmd.output().map_err(|e| format!("aios-loop failed to run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "aios-loop create failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Runs `launchctl <action> <plist>`, mapping a non-zero exit to an Err string.
+fn run_launchctl(action: &str, plist: &std::path::Path) -> Result<(), String> {
+    let out = std::process::Command::new("launchctl")
+        .arg(action)
+        .arg(plist)
+        .output()
+        .map_err(|e| format!("launchctl {action} failed to run: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        if err.is_empty() {
+            Ok(()) // launchctl load/unload is often silent + exits 0-ish; treat empty as ok
+        } else {
+            Err(format!("launchctl {action}: {err}"))
+        }
+    }
 }
 
 /// Deletes an agent's config dir. Best-effort; a missing dir is not an error.

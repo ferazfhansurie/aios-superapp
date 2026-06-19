@@ -421,14 +421,20 @@ export async function listGoals(): Promise<GoalDriver[]> {
   }
 }
 
-/** One running loop — name, cadence, and its last log line. */
+/** Live status of a loop (from launchd + the dogfood STOP flag). */
+export type LoopStatus = "running" | "paused" | "stopped";
+
+/** One loop — name, cadence, the command it fires, live status, last log line. */
 export interface LoopInfo {
   name: string;
   cadence: string;
+  /** The command the loop fires (meta 3rd field) — preserved across edits. */
+  command?: string;
+  status?: LoopStatus;
   lastLog: string;
 }
 
-/** Lists active loops from `~/.aios/state/loops/*.meta` (+ last log line). */
+/** Lists active loops from `~/.aios/state/loops/*.meta` (+ status, last log). */
 export async function listLoops(): Promise<LoopInfo[]> {
   try {
     const disk = await invoke<unknown[]>("loop_list");
@@ -439,6 +445,21 @@ export async function listLoops(): Promise<LoopInfo[]> {
   } catch {
     return [];
   }
+}
+
+/** Starts a loop (dogfood → clears its STOP flag; others → launchctl load). */
+export async function startLoop(name: string): Promise<void> {
+  return invoke("loop_start", { name });
+}
+
+/** Stops a loop (dogfood → reversible STOP-flag pause; others → launchctl unload). */
+export async function stopLoop(name: string): Promise<void> {
+  return invoke("loop_stop", { name });
+}
+
+/** Changes a loop's cadence (re-creates it via the aios-loop CLI). */
+export async function setLoopCadence(name: string, cadence: string): Promise<void> {
+  return invoke("loop_set_cadence", { name, cadence });
 }
 
 // ── control-hook payload shapes (the `control-command` Tauri event) ──────────
