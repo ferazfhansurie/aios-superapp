@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "test:chatpane": "node --experimental-strip-types --test src/lib/chatPaneState.test.ts src/lib/chatScroll.test.ts src/lib/chatStream.test.ts src/lib/runEvents.test.ts src/lib/paneLayout.test.ts src/lib/paneHistory.test.ts src/lib/moneyAgents.test.ts src/lib/bundleBoundaries.test.ts src/lib/fileKinds.test.ts src/lib/safeStorage.test.ts",
     "test:lsp": "node --experimental-strip-types --test src/lib/lsp/protocol.test.ts",
+    "test:e2e": "playwright test",
     "install:mac-local": "bash scripts/install-mac-local.sh",
     "preview": "vite preview",
     "tauri": "tauri"
@@ -27,7 +28,9 @@
     "tailwindcss": "^4.3.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.0",
     "@tauri-apps/cli": "^2",
+    "@types/node": "^26.0.0",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",

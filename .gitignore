@@ -45,6 +45,12 @@ windows-*.png
 *.key
 src-tauri/.motion.key
 
+# playwright e2e harness artifacts (dogfood) — shots land in ~/.aios/state/dogfood/shots
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
 # agent worktrees + local session state
 .claude/
 scripts\aios-watch.log
