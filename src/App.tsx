@@ -17,6 +17,7 @@ import {
   ChevronRight,
   EllipsisVertical,
   Folder,
+  FolderOpen,
   FolderPlus,
   Globe,
   GripVertical,
@@ -91,7 +92,7 @@ import {
 } from "./lib/paneBus";
 import { containingDir, paneFileTarget } from "./lib/paneOpenActions";
 import { loadSettings, saveSettings, applyFlashLevel, subscribe as subscribeSettings } from "./lib/settings";
-import { homeDir, startupOpenPane } from "./lib/fs";
+import { fileSrc, homeDir, revealInFinder, startupOpenPane } from "./lib/fs";
 import { VIEWER_EXT, extOf } from "./lib/fileKinds";
 import { recordPaneHistory } from "./lib/paneHistory";
 import { detectProject, type ProjectInfo } from "./lib/run";
@@ -903,6 +904,13 @@ function App() {
     },
     [spawn],
   );
+
+  // Reveal a pane's underlying file/dir in the OS file manager (macOS Finder).
+  // Distinct from revealFile (which opens an in-APP files pane) — this is the
+  // native "show in Finder" firaz asked for on the per-pane overflow menu.
+  const revealPathInFinder = useCallback((path: string) => {
+    revealInFinder(path).catch((e) => reportDiag("app.reveal", e, { action: "revealInFinder" }));
+  }, []);
 
   // GENERIC cross-pane spawn (paneBus.spawnPane): any pane asks App to open a
   // fresh pane of a given kind carrying context. Maps (kind, ctx) → PaneContent +
@@ -2018,6 +2026,7 @@ function App() {
                   onOpenEditorFile={openEditorFile}
                   onOpenViewerFile={openViewerFile}
                   onRevealFile={revealFile}
+                  onRevealInFinder={revealPathInFinder}
                   onDuplicate={() => spawn(pane.kind, pane.label)}
                   onOpenHistoryItem={openHistoryItem}
                   onOpenUrl={openUrl}
@@ -3180,6 +3189,7 @@ function PaneCard({
   onOpenEditorFile,
   onOpenViewerFile,
   onRevealFile,
+  onRevealInFinder,
   onDuplicate,
   onOpenHistoryItem,
   onOpenUrl,
@@ -3205,6 +3215,7 @@ function PaneCard({
   onOpenEditorFile: (path: string, name: string) => void;
   onOpenViewerFile: (path: string, name: string) => void;
   onRevealFile: (path: string, name: string) => void;
+  onRevealInFinder: (path: string) => void;
   onDuplicate: () => void;
   onOpenHistoryItem: (kind: PaneContent, label: string) => void;
   onOpenUrl?: (url: string) => void;
@@ -3251,6 +3262,18 @@ function PaneCard({
           : fileTarget
             ? containingDir(fileTarget.path)
             : defaultCwd;
+  // Native "reveal in Finder" target: the file itself for file/editor panes (so
+  // Finder selects it), else the pane's OWN working dir. undefined for panes with
+  // no local path (browser/oracle/tmux) → the menu item is hidden for those.
+  const revealTarget =
+    fileTarget?.path ??
+    (pane.kind.type === "shell"
+      ? pane.kind.cwd
+      : pane.kind.type === "files"
+        ? pane.kind.root
+        : pane.kind.type === "chat"
+          ? pane.kind.cwd
+          : undefined);
   const toggleMon = () => {
     if (!monTarget) return;
     if (mon) monitorStop(monTarget.session).catch((e) => reportDiag("app.monitor", e, { action: "stop" }));
@@ -3338,6 +3361,16 @@ function PaneCard({
                       }}
                     />
                   </>
+                )}
+                {revealTarget && (
+                  <PaneActionItem
+                    icon={<FolderOpen size={13} />}
+                    label="reveal in finder"
+                    onClick={() => {
+                      onRevealInFinder(revealTarget);
+                      setOpenAsOpen(false);
+                    }}
+                  />
                 )}
                 <PaneActionItem
                   icon={<Layers size={13} />}
