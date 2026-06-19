@@ -1,6 +1,6 @@
 // @ts-nocheck -- executed directly by node's test runner, outside the browser app.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -151,4 +151,74 @@ test("languageForPath keeps its legacy mappings", () => {
   assert.equal(languageForPath("notes.md"), "markdown");
   assert.equal(languageForPath(".env"), "ini");
   assert.equal(languageForPath("unknown.xyz"), "plaintext");
+});
+
+test("languageForPath highlights the infra/scripting/markup grammars Monaco ships", () => {
+  assert.equal(languageForPath("main.tf"), "hcl");
+  assert.equal(languageForPath("vars.tfvars"), "hcl");
+  assert.equal(languageForPath("config.hcl"), "hcl");
+  assert.equal(languageForPath("deploy.ps1"), "powershell");
+  assert.equal(languageForPath("mod.psm1"), "powershell");
+  assert.equal(languageForPath("build.bat"), "bat");
+  assert.equal(languageForPath("run.cmd"), "bat");
+  assert.equal(languageForPath("app.coffee"), "coffeescript");
+  assert.equal(languageForPath("plot.jl"), "julia");
+  assert.equal(languageForPath("Token.sol"), "sol");
+  assert.equal(languageForPath("init.tcl"), "tcl");
+  assert.equal(languageForPath("Form.vb"), "vb");
+  assert.equal(languageForPath("page.hbs"), "handlebars");
+  assert.equal(languageForPath("view.pug"), "pug");
+  // already declared as code/text but previously fell through to plaintext:
+  assert.equal(languageForPath("app.properties"), "ini");
+  assert.equal(languageForPath("README.rst"), "restructuredtext");
+});
+
+// Pins the only extensions we intentionally leave as plaintext: Monaco ships no
+// grammar for them (Make, Gradle/Groovy, Elm). Any NEW CODE_EXT addition must
+// either get an EDITOR_LANGUAGE mapping or be consciously added to this list —
+// otherwise a code file silently opens with no syntax highlighting.
+test("every CODE_EXT extension highlights, except the known Monaco-unsupported ones", () => {
+  const NO_MONACO_GRAMMAR = ["elm", "gradle", "makefile"];
+  const plaintext = [...CODE_EXT]
+    .filter((ext) => languageForPath(`x.${ext}`) === "plaintext")
+    .sort();
+  assert.deepEqual(
+    plaintext,
+    NO_MONACO_GRAMMAR,
+    "CODE_EXT entries falling through to plaintext changed — add a mapping or update the allowlist",
+  );
+});
+
+// Guard against dead mappings: Monaco's setModelLanguage resolves by language
+// *id*, not display alias — mapping ".sol" to "solidity" (an alias of id "sol")
+// silently yields plaintext. Validate every value the language table can emit
+// against the ids the INSTALLED Monaco actually registers, read from disk the
+// same way the rust-sync guard above reads files.rs.
+test("every emitted language id is registered by the installed Monaco", () => {
+  const root = join(process.cwd(), "node_modules/monaco-editor/esm/vs");
+  const basicDir = join(root, "basic-languages");
+  const ids = new Set();
+  for (const lang of readdirSync(basicDir, { withFileTypes: true })) {
+    if (!lang.isDirectory()) continue;
+    const src = readFileSync(
+      join(basicDir, lang.name, `${lang.name}.contribution.js`),
+      "utf8",
+    );
+    // A single contribution can register several ids (e.g. cpp → "c" + "cpp").
+    for (const m of src.matchAll(/id:\s*["']([^"']+)["']/g)) ids.add(m[1]);
+  }
+  // Rich language-service ids (vs/language/*) + the manual Dart grammar
+  // (monaco.ts) + the built-in plaintext fallback — none live in basic-languages.
+  for (const id of ["typescript", "javascript", "json", "dart", "plaintext"]) {
+    ids.add(id);
+  }
+  const emitted = new Set(
+    [...CODE_EXT, ...TEXT_EXT].map((ext) => languageForPath(`x.${ext}`)),
+  );
+  const dead = [...emitted].filter((id) => !ids.has(id)).sort();
+  assert.deepEqual(
+    dead,
+    [],
+    `EDITOR_LANGUAGE maps to ids Monaco doesn't register (→ silent plaintext): ${dead.join(", ")}`,
+  );
 });
