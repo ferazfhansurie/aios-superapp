@@ -45,6 +45,16 @@ test("formatRelativeRunAge produces compact dashboard labels", () => {
   assert.equal(formatRelativeRunAge(1000 - 2 * 60 * 60_000, 1000), "2h ago");
 });
 
+test("formatRelativeRunAge reads sub-minute deltas as 'just now', not '1m ago'", () => {
+  const now = 10 * 60_000;
+  assert.equal(formatRelativeRunAge(now, now), "just now"); // 0s
+  assert.equal(formatRelativeRunAge(now - 5_000, now), "just now"); // 5s
+  assert.equal(formatRelativeRunAge(now - 59_999, now), "just now"); // 59.999s
+  assert.equal(formatRelativeRunAge(now - 60_000, now), "1m ago"); // exactly 1m flips over
+  // a future timestamp clamps to 0 delta, not a negative label.
+  assert.equal(formatRelativeRunAge(now + 5_000, now), "just now");
+});
+
 test("summarizeNotifications prioritizes unread warnings", () => {
   const summary = summarizeNotifications([
     { id: "n1", source: "chat", title: "read", level: "info", read: true, at: 100 },

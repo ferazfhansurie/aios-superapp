@@ -26,7 +26,8 @@ export interface JarvisBriefing {
 export function formatRelativeRunAge(lastRunAt: number | null | undefined, now = Date.now()): string {
   if (!lastRunAt) return "never";
   const delta = Math.max(0, now - lastRunAt);
-  const minute = Math.max(1, Math.floor(delta / 60_000));
+  if (delta < 60_000) return "just now";
+  const minute = Math.floor(delta / 60_000);
   if (minute < 60) return `${minute}m ago`;
   const hour = Math.floor(minute / 60);
   if (hour < 24) return `${hour}h ago`;
