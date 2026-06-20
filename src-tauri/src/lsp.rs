@@ -149,7 +149,10 @@ fn resolve_rust_analyzer() -> Result<ResolvedServer, String> {
     ];
     for c in candidates {
         if Path::new(&c).is_file() {
-            return Ok(ResolvedServer { program: c, args: vec![] });
+            return Ok(ResolvedServer {
+                program: c,
+                args: vec![],
+            });
         }
     }
     Err("rust-analyzer not found (checked ~/.cargo/bin, homebrew, /usr/local)".to_string())
@@ -301,8 +304,7 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, String> {
 /// JSON-RPC message string built by the frontend.
 #[tauri::command]
 pub fn lsp_send(server_id: u32, payload: String) -> Result<(), String> {
-    let entry =
-        with_servers(|m| m.get(&server_id).cloned()).ok_or("no such lsp server")?;
+    let entry = with_servers(|m| m.get(&server_id).cloned()).ok_or("no such lsp server")?;
     let mut stdin = entry.stdin.lock();
     let w = stdin.as_mut().ok_or("lsp server is shutting down")?;
     // Content-Length counts BYTES, not chars — multibyte payloads must use len()

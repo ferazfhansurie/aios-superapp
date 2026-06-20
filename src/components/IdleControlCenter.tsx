@@ -48,37 +48,35 @@ export function IdleControlCenter({
     .slice(0, 8);
 
   return (
-    <div className="relative flex h-full flex-col overflow-hidden">
-      <div className="relative z-10 flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-6 py-8">
-        <div className="flex w-full max-w-[760px] flex-col items-center gap-7">
-          <div className="flex flex-col items-center gap-3 text-center">
+    <div className="relative h-full min-h-0 overflow-y-auto">
+      <div className="relative z-10 mx-auto flex min-h-full w-full max-w-[1100px] flex-col gap-4 px-6 py-6">
+        <div className="flex shrink-0 flex-col items-center gap-5">
+          <div className="flex flex-col items-center gap-2 text-center">
             <Greeting />
             <HeroClock />
           </div>
 
-          <CommandLine onSeedChat={onTalkToJarvis} onOpenPalette={onOpenPalette} />
+          <div className="w-full max-w-[760px]">
+            <CommandLine onSeedChat={onTalkToJarvis} onOpenPalette={onOpenPalette} />
+          </div>
         </div>
-      </div>
 
-      <div className="relative z-10 shrink-0 border-t border-[var(--color-border)] px-6 pb-4 pt-4 backdrop-blur-sm">
-        <div className="mx-auto flex w-full max-w-[1100px] flex-col gap-3">
-          <MissionBoard />
-          <QuickActions onSpawn={onSpawn} onOpenPalette={onOpenPalette} onRevealSidebar={onRevealSidebar} />
-          {pinned.length > 0 && (
-            <div className="flex min-w-0 flex-wrap items-center justify-center gap-1.5 border-t border-[var(--color-border)] pt-3">
-              {pinned.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => onOpenSidebarItem(item)}
-                  className="rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/40 px-2.5 py-1 text-[11px] text-[var(--color-text-2)] transition-colors hover:border-[color-mix(in_srgb,var(--color-accent)_45%,var(--color-border))] hover:text-[var(--color-text)]"
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        <MissionBoard />
+        <QuickActions onSpawn={onSpawn} onOpenPalette={onOpenPalette} onRevealSidebar={onRevealSidebar} />
+        {pinned.length > 0 && (
+          <div className="flex min-w-0 flex-wrap items-center justify-center gap-1.5 border-t border-[var(--color-border)] pt-3">
+            {pinned.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onOpenSidebarItem(item)}
+                className="rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/40 px-2.5 py-1 text-[11px] text-[var(--color-text-2)] transition-colors hover:border-[color-mix(in_srgb,var(--color-accent)_45%,var(--color-border))] hover:text-[var(--color-text)]"
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -117,10 +115,10 @@ function HeroClock() {
   const ss = String(now.getSeconds()).padStart(2, "0");
   return (
     <div className="aios-fade-in flex items-baseline justify-center gap-2 font-mono tabular-nums text-[var(--color-text)]" style={{ animationDelay: "40ms" }}>
-      <span className="text-[clamp(72px,13vw,140px)] font-light leading-none">{hh}</span>
-      <span className="aios-colon text-[clamp(72px,13vw,140px)] font-light leading-none text-[var(--color-accent)]">:</span>
-      <span className="text-[clamp(72px,13vw,140px)] font-light leading-none">{mm}</span>
-      <span className="self-end pb-[0.9vw] font-mono text-[clamp(16px,2vw,22px)] font-light leading-none tracking-tight text-[var(--color-faint)]">{ss}</span>
+      <span className="text-[clamp(44px,7vw,86px)] font-light leading-none">{hh}</span>
+      <span className="aios-colon text-[clamp(44px,7vw,86px)] font-light leading-none text-[var(--color-accent)]">:</span>
+      <span className="text-[clamp(44px,7vw,86px)] font-light leading-none">{mm}</span>
+      <span className="self-end pb-[0.45vw] font-mono text-[clamp(13px,1.5vw,18px)] font-light leading-none tracking-tight text-[var(--color-faint)]">{ss}</span>
     </div>
   );
 }

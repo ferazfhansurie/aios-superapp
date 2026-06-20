@@ -26,6 +26,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter};
 
@@ -105,7 +106,10 @@ pub fn start(app: AppHandle) {
         return;
     };
     let Some((listener, port)) = bind_listener() else {
-        eprintln!("[aios control] no free port in {BASE_PORT}..{} — disabled", BASE_PORT + PORT_SCAN);
+        eprintln!(
+            "[aios control] no free port in {BASE_PORT}..{} — disabled",
+            BASE_PORT + PORT_SCAN
+        );
         return;
     };
     write_port_file(port);
@@ -157,7 +161,11 @@ fn handle_conn(mut stream: TcpStream, app: &AppHandle, secret: &str) {
 
     // GET /health → liveness probe (no auth — reveals nothing sensitive).
     if request_line.starts_with("GET") && request_line.contains("/health") {
-        let _ = write_response(&mut stream, 200, "{\"ok\":true,\"service\":\"aios-control\"}");
+        let _ = write_response(
+            &mut stream,
+            200,
+            "{\"ok\":true,\"service\":\"aios-control\"}",
+        );
         return;
     }
 
@@ -186,7 +194,11 @@ fn handle_conn(mut stream: TcpStream, app: &AppHandle, secret: &str) {
     let payload: serde_json::Value = match serde_json::from_str(body.trim()) {
         Ok(v) => v,
         Err(e) => {
-            let _ = write_response(&mut stream, 400, &format!("{{\"error\":\"bad json: {e}\"}}"));
+            let _ = write_response(
+                &mut stream,
+                400,
+                &format!("{{\"error\":\"bad json: {e}\"}}"),
+            );
             return;
         }
     };
@@ -196,7 +208,11 @@ fn handle_conn(mut stream: TcpStream, app: &AppHandle, secret: &str) {
             // DO NOT touch panes from Rust — emit so the frontend (where panes +
             // chat sessions live) handles it. This is the whole point of the hook.
             if let Err(e) = app.emit("control-command", payload) {
-                let _ = write_response(&mut stream, 500, &format!("{{\"error\":\"emit failed: {e}\"}}"));
+                let _ = write_response(
+                    &mut stream,
+                    500,
+                    &format!("{{\"error\":\"emit failed: {e}\"}}"),
+                );
                 return;
             }
             let _ = write_response(&mut stream, 200, "{\"ok\":true}");
@@ -246,7 +262,8 @@ fn read_request(stream: &mut TcpStream) -> Result<String, String> {
         .find_map(|l| {
             let lower = l.to_ascii_lowercase();
             if lower.starts_with("content-length:") {
-                l.split_once(':').and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                l.split_once(':')
+                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
             } else {
                 None
             }
@@ -344,6 +361,53 @@ fn aios_state_dir() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
     Some(PathBuf::from(home).join(".aios/state"))
+}
+
+fn loops_disabled_path() -> Option<PathBuf> {
+    Some(aios_state_dir()?.join("loops/DISABLED"))
+}
+
+fn loops_disabled_since(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn loop_global_status_value() -> serde_json::Value {
+    let path = loops_disabled_path();
+    let disabled = path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    serde_json::json!({
+        "disabled": disabled,
+        "disabledPath": path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+        "disabledSince": path.as_ref().and_then(|p| if disabled { loops_disabled_since(p) } else { None }),
+    })
+}
+
+#[tauri::command]
+pub fn loop_global_status() -> serde_json::Value {
+    loop_global_status_value()
+}
+
+#[tauri::command]
+pub fn loop_set_global_disabled(disabled: bool) -> Result<serde_json::Value, String> {
+    let path = loops_disabled_path().ok_or("no HOME")?;
+    if disabled {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::fs::write(&path, format!("disabled {now}\n")).map_err(|e| e.to_string())?;
+    } else if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(loop_global_status_value())
 }
 
 /// Lists every active goal driver — the source-of-truth `state.json` under
@@ -459,7 +523,9 @@ const LOOP_LABEL_PREFIX: &str = "com.firaz.aios-loop";
 
 /// `~/Library/LaunchAgents` (macOS launchd user-agent dir).
 fn launch_agents_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join("Library/LaunchAgents"))
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library/LaunchAgents"))
 }
 
 /// Slug guard for a loop name: alnum + dash/underscore only, so a crafted name
@@ -469,7 +535,9 @@ fn safe_loop_name(raw: &str) -> Option<String> {
     if t.is_empty() || t.len() > 64 {
         return None;
     }
-    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if t.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         Some(t.to_string())
     } else {
         None
@@ -575,7 +643,9 @@ pub fn loop_set_cadence(name: String, cadence: String) -> Result<(), String> {
     for part in command.split_whitespace() {
         cmd.arg(part);
     }
-    let out = cmd.output().map_err(|e| format!("aios-loop failed to run: {e}"))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("aios-loop failed to run: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "aios-loop create failed: {}",
@@ -629,7 +699,9 @@ pub fn loop_create(name: String, cadence: String, command: Vec<String>) -> Resul
             cmd.arg(part);
         }
     }
-    let out = cmd.output().map_err(|e| format!("aios-loop failed to run: {e}"))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("aios-loop failed to run: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -684,7 +756,9 @@ pub fn ticket_add(text: String, urgent: bool) -> Result<(), String> {
         cmd.arg("--urgent");
     }
     cmd.arg(&text);
-    let out = cmd.output().map_err(|e| format!("aios-ticket failed to run: {e}"))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("aios-ticket failed to run: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -813,7 +887,13 @@ fn safe_id(raw: &str) -> Option<String> {
         .trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let cleaned = cleaned.trim_matches('-').to_string();
     if cleaned.is_empty() {

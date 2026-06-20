@@ -12,6 +12,7 @@ import {
   removeQueuedMessage,
   resumeTitle,
   sendContract,
+  shouldApplyResumeProp,
   stopStrategy,
   updateQueuedMessage,
   usageStack,
@@ -347,6 +348,14 @@ test("resumeTitle compacts the first meaningful codex prompt", () => {
       meaningful: true,
     },
   );
+});
+
+test("shouldApplyResumeProp ignores the pane's own live session echo", () => {
+  const own = new Set(["live-123"]);
+
+  assert.equal(shouldApplyResumeProp("live-123", own), false);
+  assert.equal(shouldApplyResumeProp("history-456", own), true);
+  assert.equal(shouldApplyResumeProp("", own), false);
 });
 
 test("pane routing identifies browser links and local file targets", () => {

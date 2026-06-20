@@ -107,7 +107,7 @@ export function FileViewerPane({ path, paneKey }: { path: string; paneKey?: stri
 }
 
 function isMarkdown(path: string): boolean {
-  return /\.(md|markdown)$/i.test(path);
+  return /\.(md|markdown|mdx|mds)$/i.test(path);
 }
 
 function MarkdownDoc({ text, path, truncated }: { text: string; path: string; truncated: boolean }) {

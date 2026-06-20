@@ -20,12 +20,12 @@ test("gridTrackStorageKey scopes persisted sizes by grid shape", () => {
   assert.equal(gridTrackStorageKey("aios.grid", 2, 3), "aios.grid:2x3");
 });
 
-test("core pane policy keeps only browser, chat, terminal, files, history, mission, loop, and ticket surfaces", () => {
-  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "history", "oracle", "shell", "tmux", "mission", "loop", "ticket"]);
-  for (const type of ["browser", "chat", "files", "oracle", "shell", "tmux", "mission", "loop", "ticket"]) {
+test("core pane policy keeps browser, chat, terminal, files, local file, history, mission, loop, and ticket surfaces", () => {
+  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "mission", "loop", "ticket"]);
+  for (const type of ["browser", "chat", "files", "file", "editor", "oracle", "shell", "tmux", "mission", "loop", "ticket"]) {
     assert.equal(isCorePaneKind(type), true, `${type} should be core`);
   }
-  for (const type of ["app", "appcast", "apps", "bridges", "chrome", "editor", "file", "git", "memory", "money-agents", "notes", "notifications", "plugins", "pulse"]) {
+  for (const type of ["app", "appcast", "apps", "bridges", "chrome", "git", "memory", "money-agents", "notes", "notifications", "plugins", "pulse"]) {
     assert.equal(isCorePaneKind(type), false, `${type} should be cut from the runtime shell`);
   }
 });
@@ -82,6 +82,11 @@ test("migrateLayoutPanes drops non-core panes and persists the cleanup", () => {
       kind: { type: "editor", path: "/repo/a.ts", name: "a.ts" },
     },
     {
+      key: "k-file-dddd",
+      label: "readme",
+      kind: { type: "file", path: "/repo/readme.md", name: "readme.md" },
+    },
+    {
       key: "k-chat-good",
       label: "chat",
       kind: { type: "chat", cwd: "/repo", modelId: "x" },
@@ -93,10 +98,12 @@ test("migrateLayoutPanes drops non-core panes and persists the cleanup", () => {
   assert.equal(changed, true);
   assert.deepEqual(
     panes.map((p) => p.kind.type),
-    ["chat", "history", "browser"],
+    ["editor", "file", "chat", "history", "browser"],
   );
-  assert.equal(panes[0].key, "k-chat-good");
-  assert.equal(panes[0].kind.cwd, "/repo");
+  assert.equal(panes[0].key, "k-editor-bbbb");
+  assert.equal(panes[1].key, "k-file-dddd");
+  assert.equal(panes[2].key, "k-chat-good");
+  assert.equal(panes[2].kind.cwd, "/repo");
 });
 
 test("migrateLayoutPanes tolerates junk without nuking valid entries", () => {

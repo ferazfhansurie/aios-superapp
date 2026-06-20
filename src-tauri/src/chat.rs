@@ -34,6 +34,7 @@
 //! UTF-8 boundaries and re-joined into whole lines so multibyte sequences and
 //! split JSON lines never corrupt a frame.
 
+use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -152,6 +153,49 @@ fn which_on_path(exe: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Builds a PATH that prepends the user's real tool dirs (homebrew, `~/.local/bin`,
+/// the newest nvm-managed node bin) onto whatever the process inherited. A
+/// GUI-launched app (Finder/Dock) inherits only `/usr/bin:/bin:/usr/sbin:/sbin`,
+/// which starves anything `claude` spawns at session start — its MCP servers and
+/// SessionStart hooks are node/python launchers that can't resolve their runtime
+/// on the bare PATH, so the session DEADLOCKS on MCP init / hook resolution and the
+/// pane shows "Working…" forever. (Codex sidesteps this with a native binary + a
+/// stripped MCP profile; claude runs the real ~/.claude config, so it needs the
+/// PATH.) Order is preserved and dirs are de-duplicated.
+#[cfg(not(windows))]
+fn enriched_path() -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(format!("{home}/.local/bin"));
+        // nvm: newest versioned node bin (claude's node-based MCP launchers live
+        // here once installed via the nvm global).
+        let nvm = format!("{home}/.nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm) {
+            let mut versions: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            versions.sort();
+            versions.reverse();
+            if let Some(v) = versions.first() {
+                dirs.push(v.join("bin").to_string_lossy().to_string());
+            }
+        }
+    }
+    dirs.push("/opt/homebrew/bin".to_string());
+    dirs.push("/usr/local/bin".to_string());
+    dirs.push(
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string()),
+    );
+    let mut seen = std::collections::HashSet::new();
+    dirs.into_iter()
+        .flat_map(|d| {
+            d.split(':')
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|d| !d.is_empty() && seen.insert(d.clone()))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Resolves a CLI binary that's normally on PATH but may live under an
@@ -418,7 +462,10 @@ pub fn chat_start(
     // tailnet, not locally. We allocate a local id (shared id space so the
     // frontend treats it like any session), then attach over WS. The command
     // handlers below consult the remote table first. Box is claude-only in v1.
-    if node.as_deref().is_some_and(|n| !n.is_empty() && n != "local") {
+    if node
+        .as_deref()
+        .is_some_and(|n| !n.is_empty() && n != "local")
+    {
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         crate::remote::start(id, on_event, cwd, model, resume)?;
         return Ok(id);
@@ -453,8 +500,19 @@ pub fn chat_start(
         .arg("--include-partial-messages")
         .arg("--verbose");
 
-    // resume a prior session id (continues that conversation's history)
-    if let Some(r) = resume.as_deref().filter(|s| !s.is_empty()) {
+    // resume a prior session id only if the transcript still exists. Claude
+    // exits immediately on stale ids, leaving the pane with a broken stdin.
+    let requested_resume_id = resume.filter(|s| !s.is_empty());
+    let (resume_id, pruned_resume_id) = match std::env::var("HOME") {
+        Ok(home) => {
+            validate_claude_resume_in_home(std::path::Path::new(&home), requested_resume_id)
+        }
+        Err(_) => (requested_resume_id, None),
+    };
+    if let Some(stale) = pruned_resume_id.as_deref() {
+        prune_store_session(stale);
+    }
+    if let Some(r) = resume_id.as_deref().filter(|s| !s.is_empty()) {
         cmd.arg("--resume").arg(r);
     }
     if let Some(m) = model.as_deref().filter(|s| !s.is_empty()) {
@@ -467,6 +525,19 @@ pub fn chat_start(
     if let Some(ef) = effort.as_deref().filter(|s| !s.is_empty()) {
         cmd.arg("--effort").arg(ef);
     }
+    // Strip MCP servers for the chat pane. The user's ~/.claude config loads every
+    // configured MCP server on each spawn (memory, sentry, headroom, + plugin
+    // servers like blender via `uvx`, figma, vercel, …). claude blocks on the MCP
+    // init handshake before it will start a turn, so ONE slow/flaky server (e.g.
+    // `uvx blender-mcp` fetching a package or waiting on a Blender socket) wedges
+    // every chat turn on "Working…" forever with no reply. Codex's chat profile
+    // already strips MCP for exactly this reason — match it: load a single empty
+    // config and ignore all others, so the conversational chat pane spawns fast and
+    // reliably. (MCP-tool use belongs in the terminal/agent, not the chat pane.)
+    // Reversible: drop these two args to restore the full ~/.claude MCP set.
+    cmd.arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg("{\"mcpServers\":{}}");
     match cwd {
         Some(dir) if !dir.is_empty() => {
             cmd.current_dir(dir);
@@ -495,6 +566,14 @@ pub fn chat_start(
             .unwrap_or_else(|| "http://127.0.0.1:8899".to_string());
         cmd.env("ANTHROPIC_BASE_URL", url);
     }
+
+    // Give claude the user's real PATH. Without this, a GUI launch hands it the
+    // bare `/usr/bin:/bin:/usr/sbin:/sbin`, and the node/python MCP servers + hooks
+    // it spawns at session start can't resolve their runtime → the session
+    // deadlocks on MCP init and the pane "Working…"s forever (codex is unaffected:
+    // native binary + stripped MCP). Reversible: drop this line.
+    #[cfg(not(windows))]
+    cmd.env("PATH", enriched_path());
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -549,6 +628,14 @@ pub fn chat_start(
         answer_streamed: AtomicBool::new(false),
         pending_approvals: Mutex::new(HashMap::new()),
     });
+
+    if let Some(stale) = pruned_resume_id.as_deref() {
+        let line = format!(
+            "{{\"type\":\"aios_resume_pruned\",\"engine\":\"claude\",\"id\":\"{}\"}}",
+            json_escape(stale)
+        );
+        ingest_line(&session, &app, &line);
+    }
 
     // stdout reader: blocking reads → UTF-8-safe → whole lines. Each line is
     // appended to the replay buffer AND forwarded to the current sink (if any).
@@ -609,6 +696,12 @@ pub fn chat_start(
     if let Some(mut err) = stderr {
         let sess = Arc::clone(&session);
         let app_err = app.clone();
+        // The resume id we passed (if any) so we can detect claude REJECTING it.
+        // file-existence (our validation) ≠ resumable: claude can still exit with
+        // "No conversation found with session ID: …" and die. When that happens we
+        // emit `aios_resume_pruned` so the frontend drops the bad resume and respins
+        // a FRESH session instead of leaving a dead-stdin, wedged pane.
+        let resume_for_err = resume_id.clone();
         thread::spawn(move || {
             let mut pending_bytes: Vec<u8> = Vec::new();
             let mut buf = [0u8; 8192];
@@ -623,6 +716,17 @@ pub fn chat_start(
                             let line = raw.trim();
                             if line.is_empty() {
                                 continue;
+                            }
+                            // Resume rejected → tell the frontend to recover.
+                            if line.contains("No conversation found") {
+                                if let Some(stale) = resume_for_err.as_deref() {
+                                    prune_store_session(stale);
+                                    let pruned = format!(
+                                        "{{\"type\":\"aios_resume_pruned\",\"engine\":\"claude\",\"id\":\"{}\"}}",
+                                        json_escape(stale)
+                                    );
+                                    ingest_line(&sess, &app_err, &pruned);
+                                }
                             }
                             let ev = format!(
                                 "{{\"type\":\"aios_stderr\",\"text\":\"{}\"}}",
@@ -1074,7 +1178,23 @@ fn start_codex_appserver(
         Some("acceptEdits") => ("workspace-write", "never"),
         _ => ("danger-full-access", "never"), // full access = full bypass
     };
-    let resume_id = resume.filter(|s| !s.is_empty());
+    let requested_resume_id = resume.filter(|s| !s.is_empty());
+    let resume_id = requested_resume_id.and_then(|t| {
+        let Ok(home) = std::env::var("HOME") else {
+            return Some(t);
+        };
+        if find_codex_rollout_in_home(std::path::Path::new(&home), &t).is_some() {
+            Some(t)
+        } else {
+            prune_store_session(&t);
+            let line = format!(
+                "{{\"type\":\"aios_resume_pruned\",\"engine\":\"codex\",\"id\":\"{}\"}}",
+                json_escape(&t)
+            );
+            ingest_line_arc(&session, &line);
+            None
+        }
+    });
     let (method, mut params) = match &resume_id {
         Some(t) => ("thread/resume", json!({ "threadId": t })),
         None => ("thread/start", json!({})),
@@ -1782,6 +1902,28 @@ fn load_store() -> Vec<ChatSessionInfo> {
         .unwrap_or_default()
 }
 
+fn save_store(store: &[ChatSessionInfo]) {
+    if let Some(path) = sessions_store() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(json) = serde_json::to_string(store) {
+            let _ = std::fs::write(&tmp, json);
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+fn prune_store_session(id: &str) {
+    let mut store = load_store();
+    let before = store.len();
+    store.retain(|session| session.id != id);
+    if store.len() != before {
+        save_store(&store);
+    }
+}
+
 /// Records (upserts) a chat-pane session so `/resume` can list ONLY the chats
 /// started here. Called by the frontend when a session's `system init` arrives.
 #[tauri::command]
@@ -1842,16 +1984,7 @@ pub fn record_chat_session(
     }
     store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
     store.truncate(200);
-    if let Some(path) = sessions_store() {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string(&store) {
-            let _ = std::fs::write(&tmp, json);
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
+    save_store(&store);
     Ok(())
 }
 
@@ -1865,6 +1998,15 @@ pub fn list_chat_sessions(limit: Option<u32>) -> Vec<ChatSessionInfo> {
             if session.engine.is_empty() {
                 session.engine = infer_session_engine(home, &session.id).to_string();
             }
+        }
+        let before_prune = store.len();
+        store.retain(|session| match session.engine.as_str() {
+            "codex" => find_codex_rollout_in_home(home, &session.id).is_some(),
+            "claude" => find_claude_transcript_in_home(home, &session.id).is_some(),
+            _ => true,
+        });
+        if store.len() != before_prune {
+            save_store(&store);
         }
         for session in discover_codex_sessions(home, 200) {
             if !store.iter().any(|existing| existing.id == session.id) {
@@ -1892,19 +2034,12 @@ pub fn list_chat_sessions(limit: Option<u32>) -> Vec<ChatSessionInfo> {
 /// last user turn (trimmed, single-lined, capped) — what the user said last, i.e.
 /// where they left off. `None` if no transcript / no user turn is found.
 fn last_user_text(home: &std::path::Path, id: &str) -> Option<String> {
-    let projects = home.join(".claude/projects");
-    let mut turns: Option<Vec<ChatTurn>> = None;
-    if let Ok(dirs) = std::fs::read_dir(&projects) {
-        for dir in dirs.flatten() {
-            let cand = dir.path().join(format!("{id}.jsonl"));
-            if cand.is_file() {
-                if let Ok(text) = std::fs::read_to_string(&cand) {
-                    turns = Some(parse_claude_transcript(&text));
-                }
-                break;
-            }
-        }
-    }
+    let mut turns: Option<Vec<ChatTurn>> =
+        find_claude_transcript_in_home(home, id).and_then(|fp| {
+            std::fs::read_to_string(fp)
+                .ok()
+                .map(|text| parse_claude_transcript(&text))
+        });
     if turns.is_none() {
         if let Some(fp) = find_codex_rollout_in_home(home, id) {
             if let Ok(text) = std::fs::read_to_string(&fp) {
@@ -1939,16 +2074,9 @@ pub fn read_chat_transcript(id: String) -> Vec<ChatTurn> {
     let Ok(home) = std::env::var("HOME") else {
         return Vec::new();
     };
-    // ── claude: ~/.claude/projects/*/<id>.jsonl ──
-    let projects = std::path::PathBuf::from(&home).join(".claude/projects");
-    if let Ok(dirs) = std::fs::read_dir(&projects) {
-        for dir in dirs.flatten() {
-            let cand = dir.path().join(format!("{id}.jsonl"));
-            if cand.is_file() {
-                if let Ok(text) = std::fs::read_to_string(&cand) {
-                    return parse_claude_transcript(&text);
-                }
-            }
+    if let Some(fp) = find_claude_transcript_in_home(std::path::Path::new(&home), &id) {
+        if let Ok(text) = std::fs::read_to_string(fp) {
+            return parse_claude_transcript(&text);
         }
     }
     // ── codex: ~/.codex-chat/sessions OR ~/.codex/sessions ──
@@ -1961,6 +2089,25 @@ pub fn read_chat_transcript(id: String) -> Vec<ChatTurn> {
         }
     }
     Vec::new()
+}
+
+/// Fast batch existence check for history cleanup. This intentionally validates
+/// against transcript/rollout filenames, not arbitrary text matches inside a
+/// transcript body, so pasted "stale resume id" errors do not keep dead rows alive.
+#[tauri::command]
+pub fn chat_transcripts_exist(ids: Vec<String>) -> Vec<String> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    chat_transcripts_exist_in_home(std::path::Path::new(&home), ids)
+}
+
+fn chat_transcripts_exist_in_home(home: &std::path::Path, ids: Vec<String>) -> Vec<String> {
+    let known = known_chat_transcript_ids(home);
+    ids.into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty() && known.contains(id))
+        .collect()
 }
 
 /// Parses a claude `*.jsonl` transcript → user/assistant text turns.
@@ -1990,7 +2137,7 @@ fn parse_claude_transcript(text: &str) -> Vec<ChatTurn> {
                 }
             }
         }
-        let text_acc = text_acc.trim().to_string();
+        let text_acc = display_claude_turn_text(role, &text_acc);
         if !text_acc.is_empty() {
             turns.push(ChatTurn {
                 role: role.to_string(),
@@ -1999,6 +2146,42 @@ fn parse_claude_transcript(text: &str) -> Vec<ChatTurn> {
         }
     }
     turns
+}
+
+fn display_claude_turn_text(role: &str, text: &str) -> String {
+    let mut out = text.trim().to_string();
+    if role == "user" {
+        out = strip_aios_micro_context(&out);
+        out = strip_channel_message_header(&out);
+    }
+    out.trim().to_string()
+}
+
+fn strip_aios_micro_context(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("── AIOS MICRO-CONTEXT") {
+        return trimmed.to_string();
+    }
+    trimmed
+        .find("\n────")
+        .map(|idx| trimmed[idx + "\n────".len()..].trim().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn strip_channel_message_header(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('[') {
+        return trimmed.to_string();
+    }
+    let Some(end) = trimmed.find("]\n") else {
+        return trimmed.to_string();
+    };
+    let header = &trimmed[1..end];
+    if header.contains(" from ") {
+        trimmed[end + 2..].trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Finds the codex rollout file for a thread id by walking the YYYY/MM/DD tree
@@ -2030,17 +2213,17 @@ fn find_codex_rollout(root: &std::path::Path, id: &str) -> Option<std::path::Pat
     walk(root, &suffix, 0)
 }
 
-/// Finds a rollout in the ChatPane-specific Codex home first, then falls back to
-/// the user's normal Codex home for older sessions created before isolation.
+/// Finds a rollout in the user's normal Codex home first, then falls back to
+/// the old ChatPane-specific Codex home used by fast mode.
 fn find_codex_rollout_in_home(home: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
-    [".codex-chat/sessions", ".codex/sessions"]
+    [".codex/sessions", ".codex-chat/sessions"]
         .iter()
         .find_map(|rel| find_codex_rollout(&home.join(rel), id))
 }
 
 fn discover_codex_sessions(home: &std::path::Path, limit: usize) -> Vec<ChatSessionInfo> {
     let mut sessions = Vec::new();
-    for rel in [".codex-chat/sessions", ".codex/sessions"] {
+    for rel in [".codex/sessions", ".codex-chat/sessions"] {
         collect_codex_rollouts(&home.join(rel), &mut sessions, limit.saturating_mul(2), 0);
     }
     sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
@@ -2048,6 +2231,57 @@ fn discover_codex_sessions(home: &std::path::Path, limit: usize) -> Vec<ChatSess
     sessions.retain(|session| seen.insert(session.id.clone()));
     sessions.truncate(limit);
     sessions
+}
+
+fn known_chat_transcript_ids(home: &std::path::Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    collect_claude_transcript_ids(home, &mut ids);
+    for rel in [".codex/sessions", ".codex-chat/sessions"] {
+        collect_codex_rollout_ids(&home.join(rel), &mut ids, 0);
+    }
+    ids
+}
+
+fn collect_claude_transcript_ids(home: &std::path::Path, out: &mut HashSet<String>) {
+    let projects = home.join(".claude/projects");
+    let Ok(dirs) = std::fs::read_dir(&projects) else {
+        return;
+    };
+    for dir in dirs.flatten() {
+        let Ok(files) = std::fs::read_dir(dir.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                out.insert(stem.to_string());
+            }
+        }
+    }
+}
+
+fn collect_codex_rollout_ids(dir: &std::path::Path, out: &mut HashSet<String>, depth: u8) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_rollout_ids(&path, out, depth + 1);
+        } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    out.insert(id_from_codex_rollout_stem(stem));
+                }
+            }
+        }
+    }
 }
 
 fn collect_codex_rollouts(
@@ -2203,6 +2437,37 @@ fn id_from_codex_rollout_stem(stem: &str) -> String {
         .unwrap_or_else(|| stem.strip_prefix("rollout-").unwrap_or(stem).to_string())
 }
 
+fn find_claude_transcript_in_home(home: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
+    if id.trim().is_empty() {
+        return None;
+    }
+    let projects = home.join(".claude/projects");
+    let Ok(dirs) = std::fs::read_dir(&projects) else {
+        return None;
+    };
+    for dir in dirs.flatten() {
+        let cand = dir.path().join(format!("{id}.jsonl"));
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn validate_claude_resume_in_home(
+    home: &std::path::Path,
+    resume: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let Some(id) = resume.filter(|s| !s.trim().is_empty()) else {
+        return (None, None);
+    };
+    if find_claude_transcript_in_home(home, &id).is_some() {
+        (Some(id), None)
+    } else {
+        (None, Some(id))
+    }
+}
+
 fn infer_session_engine(home: &std::path::Path, id: &str) -> &'static str {
     if find_codex_rollout_in_home(home, id).is_some() {
         "codex"
@@ -2287,9 +2552,10 @@ fn parse_codex_rollout(text: &str) -> Vec<ChatTurn> {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapt_codex_appserver_frame, buffer_push, codex_config_without_mcp_servers,
-        discover_codex_sessions, find_codex_rollout_in_home, infer_session_engine,
-        slim_user_image_line, ChatSession, Engine,
+        adapt_codex_appserver_frame, buffer_push, chat_transcripts_exist_in_home,
+        codex_config_without_mcp_servers, discover_codex_sessions, find_claude_transcript_in_home,
+        find_codex_rollout_in_home, infer_session_engine, parse_claude_transcript,
+        slim_user_image_line, validate_claude_resume_in_home, ChatSession, Engine,
     };
     use aios_chat_core::session::REPLAY_BYTE_CAP;
     use parking_lot::Mutex;
@@ -2489,7 +2755,7 @@ js_repl = false
     }
 
     #[test]
-    fn finds_chatpane_codex_rollout_before_normal_codex_home() {
+    fn finds_normal_codex_rollout_before_chatpane_fast_home() {
         let root =
             std::env::temp_dir().join(format!("aios-chat-rollout-test-{}", std::process::id()));
         let chat = root.join(".codex-chat/sessions/2026/06/01");
@@ -2502,22 +2768,107 @@ js_repl = false
         std::fs::write(&chat_file, "").unwrap();
         std::fs::write(&normal_file, "").unwrap();
 
+        assert_eq!(find_codex_rollout_in_home(&root, id), Some(normal_file));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn falls_back_to_chatpane_fast_home_for_older_rollouts() {
+        let root =
+            std::env::temp_dir().join(format!("aios-normal-rollout-test-{}", std::process::id()));
+        let chat = root.join(".codex-chat/sessions/2026/06/01");
+        std::fs::create_dir_all(&chat).unwrap();
+        let id = "019e-old-thread";
+        let chat_file = chat.join(format!("rollout-chat-{id}.jsonl"));
+        std::fs::write(&chat_file, "").unwrap();
+
         assert_eq!(find_codex_rollout_in_home(&root, id), Some(chat_file));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn falls_back_to_normal_codex_home_for_older_rollouts() {
-        let root =
-            std::env::temp_dir().join(format!("aios-normal-rollout-test-{}", std::process::id()));
-        let normal = root.join(".codex/sessions/2026/06/01");
+    fn transcript_existence_uses_filenames_not_mentions_inside_rollouts() {
+        let root = std::env::temp_dir().join(format!(
+            "aios-transcript-exists-test-{}",
+            std::process::id()
+        ));
+        let normal = root.join(".codex/sessions/2026/06/20");
         std::fs::create_dir_all(&normal).unwrap();
-        let id = "019e-old-thread";
-        let normal_file = normal.join(format!("rollout-normal-{id}.jsonl"));
-        std::fs::write(&normal_file, "").unwrap();
+        let real_id = "019ee0ab-326f-7dd2-9568-4b36dd17f8d3";
+        let pasted_stale_id = "019ee09d-bef8-7173-bbd2-99076b7537ea";
+        let rollout = normal.join(format!("rollout-2026-06-20T00-16-16-{real_id}.jsonl"));
+        std::fs::write(
+            &rollout,
+            format!(
+                r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"stale codex resume id {pasted_stale_id}"}}]}}}}"#
+            ),
+        )
+        .unwrap();
 
-        assert_eq!(find_codex_rollout_in_home(&root, id), Some(normal_file));
+        let valid = chat_transcripts_exist_in_home(
+            &root,
+            vec![real_id.to_string(), pasted_stale_id.to_string()],
+        );
+
+        assert_eq!(valid, vec![real_id.to_string()]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finds_claude_transcript_before_resuming() {
+        let root = std::env::temp_dir().join(format!(
+            "aios-claude-transcript-test-{}",
+            std::process::id()
+        ));
+        let project = root.join(".claude/projects/-Users-firazfhansurie");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = "019ee0e5-a016-7b43-a0db-8a29ca2d35eb";
+        let transcript = project.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(find_claude_transcript_in_home(&root, id), Some(transcript));
+        assert_eq!(find_claude_transcript_in_home(&root, "missing"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_claude_resume_id_is_dropped_before_spawn() {
+        let root =
+            std::env::temp_dir().join(format!("aios-claude-resume-test-{}", std::process::id()));
+        let project = root.join(".claude/projects/-Users-firazfhansurie");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = "existing-claude-session";
+        std::fs::write(project.join(format!("{id}.jsonl")), "").unwrap();
+
+        assert_eq!(
+            validate_claude_resume_in_home(&root, Some(id.to_string())),
+            (Some(id.to_string()), None)
+        );
+        assert_eq!(
+            validate_claude_resume_in_home(&root, Some("missing".to_string())),
+            (None, Some("missing".to_string()))
+        );
+        assert_eq!(validate_claude_resume_in_home(&root, None), (None, None));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_transcript_repaints_bridge_message_without_transport_context() {
+        let transcript = r#"{"type":"queue-operation","operation":"enqueue","content":"ignored"}
+{"type":"user","message":{"role":"user","content":"\n── AIOS MICRO-CONTEXT ──\ntime: 2026-06-19 13:08 UTC (Fri)\n\nrecent cross-tool activity...\n────\n\n\n[discord from ferazfhansurie 21:08]\nyo"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"yo. what's up."}]}}"#;
+
+        let turns = parse_claude_transcript(transcript);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "yo");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].text, "yo. what's up.");
     }
 
     #[test]

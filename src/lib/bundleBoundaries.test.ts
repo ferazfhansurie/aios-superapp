@@ -32,10 +32,10 @@ test("app shell does not statically import heavy pane implementations", () => {
 
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/ChatPane"\)/);
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/BrowserPane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/EditorPane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/FileViewerPane"\)/);
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/FilesPane"\)/);
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/TerminalPane"\)/);
-  assert.doesNotMatch(app, /import\("\.\/components\/EditorPane"\)/);
-  assert.doesNotMatch(app, /import\("\.\/components\/FileViewerPane"\)/);
   assert.doesNotMatch(app, /import\("\.\/components\/GitPane"\)/);
   assert.doesNotMatch(app, /import\("\.\/components\/MoneyAgentsPane"\)/);
   assert.doesNotMatch(app, /import\("\.\/components\/MemoryPane"\)/);
@@ -204,7 +204,7 @@ test("hosted web shell is mobile and ipad first", () => {
   assert.match(app, /function MobileBottomNav/);
 });
 
-test("superapp runtime is core-only: browser, chat, terminal, files, and history", () => {
+test("superapp runtime keeps core panes plus local file/editor surfaces", () => {
   const app = read("src/App.tsx");
   const apps = read("src/lib/apps.ts");
   const commands = read("src/lib/appCommands.ts");
@@ -220,7 +220,9 @@ test("superapp runtime is core-only: browser, chat, terminal, files, and history
     assert.doesNotMatch(apps, new RegExp(`id: "${cut}"`));
   }
 
-  assert.doesNotMatch(app, /AttachAppsPane|AppAttachPane|AppCastPane|BridgesPane|CdpChromePane|EditorPane|FileViewerPane|GitPane|MoneyAgentsPane|MemoryPane|NotesPane|PluginsPane|PulsePane/);
+  assert.match(app, /const EditorPane = lazy/);
+  assert.match(app, /const FileViewerPane = lazy/);
+  assert.doesNotMatch(app, /AttachAppsPane|AppAttachPane|AppCastPane|BridgesPane|CdpChromePane|GitPane|MoneyAgentsPane|MemoryPane|NotesPane|PluginsPane|PulsePane/);
   assert.doesNotMatch(app, /moneyAgentBootstrapRef|loadConfiguredMoneyAgents|buildMoneyAgentRunCommand|MoneyAgentsSection|OracleRoster/);
   assert.doesNotMatch(commands, /oracle\.attach|project\.run\.(?!focused)|project\.rescan|oracle\.appshot|app\.settings\.open/);
   assert.doesNotMatch(palette, /CdpChromePane|dev\.cdp-chrome|cdp spike/);
@@ -340,7 +342,7 @@ test("sidebar leaves session resume to history and in-chat resume", () => {
 test("chat panes opened from sidebar history hydrate the resumed transcript", () => {
   const chatPane = read("src/components/ChatPane.tsx");
 
-  assert.match(chatPane, /useEffect\(\(\) => \{[\s\S]*if \(!resume\?\.id\) return;[\s\S]*readChatTranscript\(resume\.id\)[\s\S]*setTurns\(transcriptToTurns\(rows\)\)/);
+  assert.match(chatPane, /useEffect\(\(\) => \{[\s\S]*const incomingResume = resume;[\s\S]*shouldApplyResumeProp\(incomingResume\.id, ownSessionIdsRef\.current\)[\s\S]*readChatTranscript\(incomingResume\.id\)[\s\S]*setTurns\(transcriptToTurns\(rows\)\)/);
 });
 
 test("pane history is a lightweight core pane with reopen and cleanup controls", () => {
@@ -633,9 +635,9 @@ test("background utility panes are not mounted by the core shell runtime", () =>
   const app = read("src/App.tsx");
 
   assert.doesNotMatch(app, /windowVisible|visibilitychange|listChatSessions/);
-  assert.doesNotMatch(app, /<NotesPane|<BridgesPane|<PulsePane|<AppAttachPane|<EditorPane/);
+  assert.doesNotMatch(app, /<NotesPane|<BridgesPane|<PulsePane|<AppAttachPane/);
   assert.doesNotMatch(app, /import\("\.\/components\/NotesPane"\)|import\("\.\/components\/BridgesPane"\)|import\("\.\/components\/PulsePane"\)/);
-  assert.doesNotMatch(app, /import\("\.\/components\/AppAttachPane"\)|import\("\.\/components\/EditorPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/AppAttachPane"\)/);
 });
 
 test("files pane exposes fast core workspace context actions", () => {
@@ -647,7 +649,9 @@ test("files pane exposes fast core workspace context actions", () => {
   assert.match(files, /runContextProject/);
   assert.match(files, /copyPath/);
   assert.match(files, /openContextTerminal/);
-  assert.match(files, /openContextBrowser/);
+  assert.match(files, /openContextDefault/);
+  assert.match(files, /openContextEditor/);
+  assert.match(files, /openContextViewer/);
   assert.match(files, /openContextChat/);
   assert.match(files, /open containing files pane/);
   assert.doesNotMatch(files, /openContextGit|openGitPane|spawnPane\("git"|gitStatus|gitDecorations/);

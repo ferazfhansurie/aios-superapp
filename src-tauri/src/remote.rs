@@ -100,7 +100,11 @@ async fn http_post_json(
     let (head, json_body) = text
         .split_once("\r\n\r\n")
         .ok_or("malformed HTTP response from node")?;
-    let status_ok = head.lines().next().map(|l| l.contains(" 200 ")).unwrap_or(false);
+    let status_ok = head
+        .lines()
+        .next()
+        .map(|l| l.contains(" 200 "))
+        .unwrap_or(false);
     let parsed: Value =
         serde_json::from_str(json_body.trim()).map_err(|e| format!("bad node JSON: {e}"))?;
     if !status_ok {
@@ -136,7 +140,12 @@ async fn http_get_json(addr: &str, path: &str, secret: &str) -> Result<Value, St
     let (head, body) = text
         .split_once("\r\n\r\n")
         .ok_or("malformed HTTP response from node")?;
-    if !head.lines().next().map(|l| l.contains(" 200 ")).unwrap_or(false) {
+    if !head
+        .lines()
+        .next()
+        .map(|l| l.contains(" 200 "))
+        .unwrap_or(false)
+    {
         return Err("node returned non-200".to_string());
     }
     serde_json::from_str(body.trim()).map_err(|e| format!("bad node JSON: {e}"))
@@ -173,7 +182,8 @@ pub fn start(
     let addr_for_rpc = addr.clone();
     let secret_for_rpc = secret.clone();
     let box_id = tauri::async_runtime::block_on(async move {
-        let resp = http_post_json(&addr_for_rpc, "/chat/start", &secret_for_rpc, start_body).await?;
+        let resp =
+            http_post_json(&addr_for_rpc, "/chat/start", &secret_for_rpc, start_body).await?;
         resp.get("id")
             .and_then(|v| v.as_u64())
             .map(|n| n as u32)

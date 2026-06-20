@@ -41,7 +41,7 @@ export type PaneContent =
       type: "chat";
       cwd?: string;
       seed?: string;
-      resume?: { id: string; title: string; engine?: string; model?: string };
+      resume?: { id: string; title: string; engine?: string; model?: string; version?: number };
       reattach?: number;
       modelId?: string;
       agentLabel?: string;

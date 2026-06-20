@@ -106,7 +106,11 @@ struct Instance {
 pub fn tmux_bin() -> String {
     #[cfg(unix)]
     {
-        for candidate in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+        for candidate in [
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/usr/bin/tmux",
+        ] {
             if std::path::Path::new(candidate).exists() {
                 return candidate.to_string();
             }
@@ -202,7 +206,11 @@ pub fn list_oracles() -> Result<Vec<OracleInfo>, String> {
         }
 
         // Flat, open "agents" list — no special master. Attached first, then alpha.
-        oracles.sort_by(|a, b| b.attached.cmp(&a.attached).then(a.identity.cmp(&b.identity)));
+        oracles.sort_by(|a, b| {
+            b.attached
+                .cmp(&a.attached)
+                .then(a.identity.cmp(&b.identity))
+        });
         Ok(oracles)
     }
 
@@ -297,7 +305,11 @@ fn oracles_from_rows(rows: &[TmuxRaw], oracle_sock: &str) -> Vec<OracleInfo> {
             }
         })
         .collect();
-    oracles.sort_by(|a, b| b.attached.cmp(&a.attached).then(a.identity.cmp(&b.identity)));
+    oracles.sort_by(|a, b| {
+        b.attached
+            .cmp(&a.attached)
+            .then(a.identity.cmp(&b.identity))
+    });
     oracles
 }
 
@@ -485,7 +497,10 @@ pub fn appshot(identity: Option<String>) -> Result<String, String> {
     // Route into the chosen oracle, or the master (root) session by default.
     // `-l` sends the path literally (no key interpretation), no Enter.
     let keys = format!("{path} ");
-    match identity.map(|i| sanitize_identity(&i)).filter(|i| !i.is_empty()) {
+    match identity
+        .map(|i| sanitize_identity(&i))
+        .filter(|i| !i.is_empty())
+    {
         Some(id) => {
             let session = format!("aios-{id}");
             let _ = tmux_oracle(&["send-keys", "-t", &session, "-l", &keys]);
@@ -531,9 +546,8 @@ pub fn launch_box_app(node: Option<String>) -> Result<String, String> {
     let display = env_or("AIOS_BOX_DISPLAY", ":0");
     // Detach aios-shell from the ssh session so ssh returns the instant it's
     // spawned (setsid + full redirect), otherwise ssh blocks on the GUI process.
-    let remote = format!(
-        "DISPLAY={display} setsid aios-shell </dev/null >/dev/null 2>&1 & echo launched"
-    );
+    let remote =
+        format!("DISPLAY={display} setsid aios-shell </dev/null >/dev/null 2>&1 & echo launched");
     let out = std::process::Command::new("/usr/bin/ssh")
         .args([
             "-o",

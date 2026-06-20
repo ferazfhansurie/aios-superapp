@@ -112,11 +112,14 @@ fn install_standard_adblock(wk: &objc2_web_kit::WKWebView) {
     let controller = unsafe { wk.configuration().userContentController() };
     let identifier = NSString::from_str("aios-standard-adblock-v1");
     let rules = NSString::from_str(&standard_adblock_content_rules_json());
-    let block = RcBlock::new(move |rule_list: *mut objc2_web_kit::WKContentRuleList, _err: *mut objc2_foundation::NSError| {
-        if let Some(rule_list) = unsafe { rule_list.as_ref() } {
-            unsafe { controller.addContentRuleList(rule_list) };
-        }
-    });
+    let block = RcBlock::new(
+        move |rule_list: *mut objc2_web_kit::WKContentRuleList,
+              _err: *mut objc2_foundation::NSError| {
+            if let Some(rule_list) = unsafe { rule_list.as_ref() } {
+                unsafe { controller.addContentRuleList(rule_list) };
+            }
+        },
+    );
 
     unsafe {
         store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
@@ -186,7 +189,9 @@ mod nav_state {
 
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-    use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
+    use objc2::{
+        define_class, msg_send, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly,
+    };
     use objc2_foundation::{
         NSError, NSKeyValueObservingOptions, NSObject, NSObjectNSKeyValueObserverRegistration,
         NSObjectProtocol, NSString,
@@ -239,8 +244,7 @@ mod nav_state {
                 // We only ever register on a WKWebView; verify anyway before
                 // casting — a wrong-object crash here takes the whole app down.
                 let Some(object) = object else { return };
-                let is_wk: bool =
-                    unsafe { msg_send![object, isKindOfClass: WKWebView::class()] };
+                let is_wk: bool = unsafe { msg_send![object, isKindOfClass: WKWebView::class()] };
                 if !is_wk {
                     return;
                 }
@@ -410,13 +414,19 @@ mod nav_state {
     /// per label. Emits one initial `browser-nav-state` so the frontend has
     /// the state without waiting for the first change.
     pub fn attach(app: &AppHandle, label: &str) {
-        let Some(wv) = app.get_webview(label) else { return };
+        let Some(wv) = app.get_webview(label) else {
+            return;
+        };
         let app = app.clone();
         let label = label.to_string();
         let _ = wv.with_webview(move |pw| {
-            let Some(mtm) = MainThreadMarker::new() else { return };
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
             let ptr = pw.inner() as *mut WKWebView;
-            let Some(wk) = (unsafe { ptr.as_ref() }) else { return };
+            let Some(wk) = (unsafe { ptr.as_ref() }) else {
+                return;
+            };
             {
                 let Ok(map) = OBSERVERS.lock() else { return };
                 if map.contains_key(&label) {
@@ -424,7 +434,9 @@ mod nav_state {
                 }
             }
             let this = AiosNavObserver::new(mtm, app, label.clone());
-            this.ivars().inner.replace(unsafe { wk.navigationDelegate() });
+            this.ivars()
+                .inner
+                .replace(unsafe { wk.navigationDelegate() });
             unsafe { wk.setNavigationDelegate(Some(ProtocolObject::from_ref(&*this))) };
             for kp in KEY_PATHS {
                 unsafe {
@@ -450,11 +462,15 @@ mod nav_state {
     pub fn detach(app: &AppHandle, label: &str) {
         let cell = OBSERVERS.lock().ok().and_then(|mut m| m.remove(label));
         let Some(cell) = cell else { return };
-        let Some(wv) = app.get_webview(label) else { return };
+        let Some(wv) = app.get_webview(label) else {
+            return;
+        };
         let _ = wv.with_webview(move |pw| {
             let this = cell.take();
             let ptr = pw.inner() as *mut WKWebView;
-            let Some(wk) = (unsafe { ptr.as_ref() }) else { return };
+            let Some(wk) = (unsafe { ptr.as_ref() }) else {
+                return;
+            };
             if this.ivars().attached.replace(false) {
                 for kp in KEY_PATHS {
                     unsafe { wk.removeObserver_forKeyPath(&this, &NSString::from_str(kp)) };
@@ -655,13 +671,13 @@ pub async fn browser_show(
                         *slot = Some(destination.clone());
                     }
                 }
-                tauri::webview::DownloadEvent::Finished { url, path, success, .. } => {
+                tauri::webview::DownloadEvent::Finished {
+                    url, path, success, ..
+                } => {
                     if success {
                         // Prefer the event's path; fall back to the captured
                         // destination (macOS path is empty on Finished).
-                        let resolved = path.or_else(|| {
-                            dl_dest.lock().ok().and_then(|s| s.clone())
-                        });
+                        let resolved = path.or_else(|| dl_dest.lock().ok().and_then(|s| s.clone()));
                         if let Some(p) = resolved {
                             let name = p
                                 .file_name()
@@ -712,7 +728,10 @@ pub async fn browser_show(
     // platforms keep the default store for now: Windows WebView2 profile
     // partitioning needs a separate implementation, so don't make pulls fail.
     #[cfg(target_os = "macos")]
-    if let Some(name) = profile.as_deref().filter(|p| !p.is_empty() && *p != "default") {
+    if let Some(name) = profile
+        .as_deref()
+        .filter(|p| !p.is_empty() && *p != "default")
+    {
         builder = builder.data_store_identifier(profile_store_id(name));
     }
     #[cfg(not(target_os = "macos"))]
@@ -1014,11 +1033,7 @@ pub async fn browser_find(
                     let _ = tx2.send(found);
                 });
                 unsafe {
-                    wk.findString_withConfiguration_completionHandler(
-                        &q,
-                        Some(&cfg),
-                        &handler,
-                    );
+                    wk.findString_withConfiguration_completionHandler(&q, Some(&cfg), &handler);
                 }
             });
             return rx
@@ -1040,7 +1055,11 @@ pub async fn browser_find(
         if let Some(wv) = app.get_webview(&label) {
             let q = js_escape(&query);
             let backwards = if forward { "false" } else { "true" };
-            let wrap = if wraps.unwrap_or(true) { "true" } else { "false" };
+            let wrap = if wraps.unwrap_or(true) {
+                "true"
+            } else {
+                "false"
+            };
             let js = format!(
                 "try{{window.find(\"{q}\",false,{backwards},{wrap},false,false);}}catch(e){{}}"
             );
@@ -1101,7 +1120,8 @@ pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
         let _ = wv.eval(
             "try{document.querySelectorAll('video,audio').forEach(m=>{try{m.pause();m.removeAttribute('src');m.srcObject=null;m.load();}catch(e){}});if(document.fullscreenElement){try{document.exitFullscreen();}catch(e){}}}catch(e){}",
         );
-        let _ = wv.eval("try{location.replace('about:blank');}catch(e){location.href='about:blank';}");
+        let _ =
+            wv.eval("try{location.replace('about:blank');}catch(e){location.href='about:blank';}");
         let _ = wv.close();
     }
     Ok(())
@@ -1560,7 +1580,12 @@ pub fn read_clipboard() -> Result<String, String> {
     #[cfg(windows)]
     let mut cmd = {
         let mut c = std::process::Command::new("powershell.exe");
-        c.args(["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"]);
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Clipboard -Raw",
+        ]);
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         c
@@ -1628,10 +1653,15 @@ mod tests {
                 })
         }));
         assert!(rules.iter().any(|rule| {
-            rule.pointer("/action/type") == Some(&serde_json::Value::String("css-display-none".into()))
-                && rule.pointer("/action/selector").and_then(|v| v.as_str()).is_some_and(|selector| {
-                    selector.contains("[id*=\"ad-\"]") && selector.contains(".google-auto-placed")
-                })
+            rule.pointer("/action/type")
+                == Some(&serde_json::Value::String("css-display-none".into()))
+                && rule
+                    .pointer("/action/selector")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|selector| {
+                        selector.contains("[id*=\"ad-\"]")
+                            && selector.contains(".google-auto-placed")
+                    })
         }));
     }
 

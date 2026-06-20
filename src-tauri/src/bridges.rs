@@ -34,10 +34,193 @@
 //! deps: `chrono` for timestamp math, `serde_json` for the output shape.
 
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 /// `$HOME`, or `/` as a last resort.
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".into())
+}
+
+fn file_mtime_ms(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+fn discord_bridge_cwd(home: &str) -> String {
+    let candidates = [
+        PathBuf::from(home).join("Repo/firaz/aios/bridge"),
+        PathBuf::from(home).join("Repo/firaz/aios-bridge"),
+    ];
+    candidates
+        .into_iter()
+        .find(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from(home))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn claude_transcript_mtime(home: &str, session_id: &str) -> Option<u64> {
+    let projects = PathBuf::from(home).join(".claude/projects");
+    for dir in std::fs::read_dir(projects).ok()?.flatten() {
+        let cand = dir.path().join(format!("{session_id}.jsonl"));
+        if cand.is_file() {
+            return file_mtime_ms(&cand);
+        }
+    }
+    None
+}
+
+fn codex_rollout(root: &Path, id: &str) -> Option<PathBuf> {
+    let suffix = format!("{id}.jsonl");
+    fn walk(dir: &Path, suffix: &str, depth: u8) -> Option<PathBuf> {
+        if depth > 5 {
+            return None;
+        }
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, suffix, depth + 1) {
+                    return Some(found);
+                }
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(suffix))
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+    walk(root, &suffix, 0)
+}
+
+fn codex_rollout_mtime(home: &str, thread_id: &str) -> Option<u64> {
+    [".codex/sessions", ".codex-chat/sessions"]
+        .iter()
+        .find_map(|rel| codex_rollout(&PathBuf::from(home).join(rel), thread_id))
+        .and_then(|path| file_mtime_ms(&path))
+}
+
+fn codex_thread_for_bridge_session(home: &str, bridge_session_id: &str) -> Option<String> {
+    let path = PathBuf::from(home).join(".aios/messages/codex-session-map.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let parsed: Value = serde_json::from_str(&text).ok()?;
+    parsed
+        .get(bridge_session_id)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string())
+}
+
+fn discord_key_engine(key: &str) -> &str {
+    if key.contains(":codex:") {
+        "codex"
+    } else if key.contains(":opencode:") {
+        "opencode"
+    } else {
+        "claude"
+    }
+}
+
+fn discord_key_model(key: &str, engine: &str) -> Option<String> {
+    let mut parts = key.split(':');
+    let _user = parts.next()?;
+    let runtime = parts.next()?;
+    if runtime != engine {
+        return None;
+    }
+    parts
+        .next()
+        .filter(|model| !model.trim().is_empty() && *model != "default")
+        .map(|model| model.to_string())
+}
+
+struct DiscordSessionCandidate {
+    user_id: String,
+    bridge_session_id: String,
+    session_id: String,
+    engine: String,
+    model: Option<String>,
+    mtime: u64,
+}
+
+/// Returns the Discord bridge's active resumable session, if the bridge has
+/// written one. Discord codex runs use a bridge UUID first, then
+/// `~/.aios/messages/codex-session-map.json` maps that UUID to the real Codex
+/// thread id. Pick the freshest transcript-backed candidate so the shell follows
+/// the current Discord server runtime instead of the old bare Claude key.
+#[tauri::command]
+pub fn discord_bridge_session() -> Value {
+    let home = home();
+    let path = PathBuf::from(&home).join(".aios/messages/discord-bridge-session.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => return json!({ "ok": false, "error": format!("session map unavailable: {e}") }),
+    };
+    let parsed: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(e) => return json!({ "ok": false, "error": format!("bad session map json: {e}") }),
+    };
+    let Some(obj) = parsed.as_object() else {
+        return json!({ "ok": false, "error": "session map is not an object" });
+    };
+    let mut candidates: Vec<DiscordSessionCandidate> = Vec::new();
+    for (user_id, value) in obj.iter() {
+        let Some(bridge_session_id) = value.as_str().filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        let engine = discord_key_engine(user_id).to_string();
+        let model = discord_key_model(user_id, &engine);
+        if engine == "codex" {
+            let Some(thread_id) = codex_thread_for_bridge_session(&home, bridge_session_id) else {
+                continue;
+            };
+            let Some(mtime) = codex_rollout_mtime(&home, &thread_id) else {
+                continue;
+            };
+            candidates.push(DiscordSessionCandidate {
+                user_id: user_id.split(':').next().unwrap_or(user_id).to_string(),
+                bridge_session_id: bridge_session_id.to_string(),
+                session_id: thread_id,
+                engine,
+                model,
+                mtime,
+            });
+        } else if engine == "claude" {
+            let Some(mtime) = claude_transcript_mtime(&home, bridge_session_id) else {
+                continue;
+            };
+            candidates.push(DiscordSessionCandidate {
+                user_id: user_id.split(':').next().unwrap_or(user_id).to_string(),
+                bridge_session_id: bridge_session_id.to_string(),
+                session_id: bridge_session_id.to_string(),
+                engine,
+                model,
+                mtime,
+            });
+        }
+    }
+    let Some(best) = candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.mtime)
+    else {
+        return json!({ "ok": false, "error": "session map has no resumable transcript" });
+    };
+    json!({
+        "ok": true,
+        "userId": best.user_id,
+        "bridgeSessionId": best.bridge_session_id,
+        "sessionId": best.session_id,
+        "engine": best.engine,
+        "model": best.model,
+        "cwd": discord_bridge_cwd(&home),
+        "mtime": best.mtime,
+    })
 }
 
 /// The bridge's personal-WA pairing script (wwebjs, 8-digit pairing code).
@@ -65,7 +248,9 @@ pub fn pair_personal_wa() -> Value {
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return json!({ "ok": false, "error": format!("couldn't spawn node: {e} (is node on PATH?)") }),
+        Err(e) => {
+            return json!({ "ok": false, "error": format!("couldn't spawn node: {e} (is node on PATH?)") })
+        }
     };
 
     let Some(stdout) = child.stdout.take() else {
@@ -149,7 +334,13 @@ fn channel_probes() -> Vec<ChannelProbe> {
             name: "whatsapp",
             kind: "messaging",
             wiring: Wiring::Live,
-            proc_match: &["inbox-worker", "push.js", "meta-webhook", "aios-bridge", "aios/bridge"],
+            proc_match: &[
+                "inbox-worker",
+                "push.js",
+                "meta-webhook",
+                "aios-bridge",
+                "aios/bridge",
+            ],
             launchd_match: "bridge",
             log_candidates: &[
                 "Repo/firaz/aios/bridge/scripts/outbound-log.jsonl",
@@ -264,8 +455,13 @@ fn find_process(needles: &[&str]) -> Option<ProcHit> {
             // Don't match our own grep/probe or other false positives — require
             // the needle in the COMMAND portion only.
             if needles.iter().any(|n| command.contains(n)) {
-                let Ok(pid) = pid_raw.parse::<i64>() else { continue };
-                return Some(ProcHit { pid, uptime: humanize_etime(etime_raw) });
+                let Ok(pid) = pid_raw.parse::<i64>() else {
+                    continue;
+                };
+                return Some(ProcHit {
+                    pid,
+                    uptime: humanize_etime(etime_raw),
+                });
             }
         }
         None
@@ -291,7 +487,10 @@ fn humanize_etime(raw: &str) -> String {
         None => (0, raw),
     };
     // hms is one of mm:ss or hh:mm:ss.
-    let parts: Vec<i64> = hms.split(':').map(|p| p.parse::<i64>().unwrap_or(0)).collect();
+    let parts: Vec<i64> = hms
+        .split(':')
+        .map(|p| p.parse::<i64>().unwrap_or(0))
+        .collect();
     let (hours, mins) = match parts.len() {
         3 => (parts[0], parts[1]),
         2 => (0, parts[0]),
@@ -327,10 +526,15 @@ struct LaunchdHit {
 fn find_launchd(needle: &str) -> Option<LaunchdHit> {
     #[cfg(unix)]
     {
-        let output = std::process::Command::new("/bin/launchctl").arg("list").output();
+        let output = std::process::Command::new("/bin/launchctl")
+            .arg("list")
+            .output();
         let out = match output {
             Ok(o) if o.status.success() => o,
-            _ => std::process::Command::new("launchctl").arg("list").output().ok()?,
+            _ => std::process::Command::new("launchctl")
+                .arg("list")
+                .output()
+                .ok()?,
         };
         if !out.status.success() {
             return None;
@@ -351,7 +555,10 @@ fn find_launchd(needle: &str) -> Option<LaunchdHit> {
                 continue;
             }
             let running = pid_raw != "-" && pid_raw.parse::<i64>().is_ok();
-            return Some(LaunchdHit { label: label.to_string(), running });
+            return Some(LaunchdHit {
+                label: label.to_string(),
+                running,
+            });
         }
         None
     }
@@ -427,7 +634,12 @@ fn read_log(candidates: &[&str]) -> Option<LogStats> {
         .iter()
         .filter(|l| {
             extract_timestamp(l)
-                .map(|ts| ts.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string() == today_str)
+                .map(|ts| {
+                    ts.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d")
+                        .to_string()
+                        == today_str
+                })
                 .unwrap_or(false)
         })
         .count() as i64;
@@ -467,7 +679,9 @@ fn extract_timestamp(line: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         } else {
             (n, 0)
         };
-        if let chrono::LocalResult::Single(dt) = chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, nanos) {
+        if let chrono::LocalResult::Single(dt) =
+            chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, nanos)
+        {
             return Some(dt);
         }
     }
@@ -476,7 +690,9 @@ fn extract_timestamp(line: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Renders a UTC instant as local "YYYY-MM-DD HH:MM".
 fn format_local(ts: &chrono::DateTime<chrono::Utc>) -> String {
-    ts.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string()
+    ts.with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 /// "4m" / "3h" / "2d" since `ts`, or `None` if in the future / unparseable.
@@ -673,16 +889,22 @@ fn parse_feed_line(line: &str, default_dir: &str) -> Option<Value> {
     let peer = first_str(
         obj,
         &[
-            "peer", "name", "chatName", "to", "recipient", "chat", "from", "target", "phone",
+            "peer",
+            "name",
+            "chatName",
+            "to",
+            "recipient",
+            "chat",
+            "from",
+            "target",
+            "phone",
         ],
     )
     .unwrap_or_else(|| "unknown".to_string());
 
     // text: prefer real message bodies; fall back to a media tag.
     let text = first_str(obj, &["text", "body", "message", "content", "body_preview"])
-        .or_else(|| {
-            first_str(obj, &["media"]).map(|m| format!("[{m}]"))
-        })
+        .or_else(|| first_str(obj, &["media"]).map(|m| format!("[{m}]")))
         .unwrap_or_default();
 
     Some(json!({
@@ -756,4 +978,44 @@ pub fn bridge_activity(id: String, limit: u32) -> Value {
     }
 
     json!({ "messages": messages })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        codex_rollout_mtime, codex_thread_for_bridge_session, discord_key_engine, discord_key_model,
+    };
+
+    #[test]
+    fn discord_codex_key_exposes_runtime_model_and_thread_mapping() {
+        let root =
+            std::env::temp_dir().join(format!("aios-discord-bridge-test-{}", std::process::id()));
+        let messages = root.join(".aios/messages");
+        let sessions = root.join(".codex/sessions/2026/06/20");
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let bridge_id = "2ed7ce32-f0f9-481e-ac68-22f417b8ff1b";
+        let thread_id = "019ee0ab-326f-7dd2-9568-4b36dd17f8d3";
+        std::fs::write(
+            messages.join("codex-session-map.json"),
+            format!(r#"{{"{bridge_id}":"{thread_id}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-2026-06-20T00-16-16-{thread_id}.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        let key = "160347649269170176:codex:gpt-5.5:effort=low:config=full";
+
+        assert_eq!(discord_key_engine(key), "codex");
+        assert_eq!(discord_key_model(key, "codex").as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            codex_thread_for_bridge_session(root.to_str().unwrap(), bridge_id).as_deref(),
+            Some(thread_id)
+        );
+        assert!(codex_rollout_mtime(root.to_str().unwrap(), thread_id).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -101,6 +101,7 @@ import {
   removeQueuedMessage,
   resumeTitle,
   sendContract,
+  shouldApplyResumeProp,
   stopStrategy,
   updateQueuedMessage,
   usageStack,
@@ -145,6 +146,7 @@ import {
   type ScrollIntent,
 } from "../lib/chatScroll";
 import { invoke, isTauriRuntime } from "../lib/tauri";
+import { prunePaneHistoryResume } from "../lib/paneHistory";
 import {
   baseName,
   extFromMime,
@@ -172,6 +174,7 @@ import {
 } from "./chat/toolPresentation";
 import { CopyButton, Markdown, parseButtons } from "./chat/ChatMarkdown";
 import { ApprovalCard, QuestionCard } from "./chat/ApprovalCards";
+import { ModelIcon } from "./chat/modelIcons";
 import { PaneDropZone } from "./PaneDropZone";
 import { reportDiag } from "../lib/diag";
 import { pushNotification } from "../lib/notifications";
@@ -471,7 +474,7 @@ export function ChatPane({
    *  engine/model carry the saved session's backend so a resumed codex thread
    *  boots on codex (not the default claude) — otherwise --resume sends a codex
    *  thread-id to the claude binary and the pane comes up blank. */
-  resume?: { id: string; title: string; engine?: string; model?: string };
+  resume?: { id: string; title: string; engine?: string; model?: string; version?: number };
   /** Reattach to a still-live backgrounded session by its backend id (from the
    *  "running" tray) — replays its buffer and continues live instead of spawning. */
   reattach?: number;
@@ -672,6 +675,8 @@ export function ChatPane({
   // set by the /resume picker, cleared by a fresh chat / /clear. Seeded from
   // the `resume` prop so the idle "continue" rail lands straight in a session.
   const [resumeId, setResumeId] = useState<string | null>(resume?.id ?? null);
+  const resumeIdRef = useRef<string | null>(resume?.id ?? null);
+  resumeIdRef.current = resumeId;
   // the title of the resumed session, shown as a note once after resuming
   const [resumedTitle, setResumedTitle] = useState<string | null>(resume?.title ?? null);
   // best-known human label for THIS chat, mirrored into a ref so the stable-deps
@@ -681,6 +686,13 @@ export function ChatPane({
   // reactive mirror of claudeSessionIdRef — the engine session id currently open
   // in THIS pane, so the /resume picker can highlight "the one you're in".
   const [openSessionId, setOpenSessionId] = useState<string | null>(resume?.id ?? null);
+  const ownSessionIdsRef = useRef<Set<string>>(new Set());
+  const onChatSessionRef = useRef(onChatSession);
+  onChatSessionRef.current = onChatSession;
+  const reportChatSession = useCallback((info: { id: string; title: string; engine?: string; model?: string }) => {
+    ownSessionIdsRef.current.add(info.id);
+    onChatSessionRef.current?.(info);
+  }, []);
 
   // Report the live engine session id up to the owning pane the moment it's
   // known (fresh chat establishes one, or a resume re-keys to a fork) so pane
@@ -689,8 +701,9 @@ export function ChatPane({
   // fresh pane. The send path fires onChatSession again with a better title.
   useEffect(() => {
     if (!openSessionId) return;
+    if (!ownSessionIdsRef.current.has(openSessionId)) return;
     const m = activeModelRef.current;
-    onChatSession?.({
+    reportChatSession({
       id: openSessionId,
       title: chatTitleRef.current || resume?.title || "chat",
       engine: m.engine ?? "claude",
@@ -698,8 +711,16 @@ export function ChatPane({
     });
     // chatTitleRef is a ref (not reactive); resumedTitle drives its value, so we
     // depend on it to re-fire when the human label is established.
+    //
+    // `onChatSession` is DELIBERATELY excluded: it's a parent callback prop with
+    // an unstable identity. Including it caused an infinite render loop (React
+    // #185 "max update depth" + pane jitter + sends never landing): the effect
+    // calls onChatSession → parent records the session (setState) → parent
+    // re-renders with a NEW onChatSession identity → dep changed → effect re-runs
+    // → ∞. Firing on openSessionId/resumedTitle only is correct — React still runs
+    // the latest closure (current onChatSession) when those actually change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openSessionId, onChatSession, resumedTitle]);
+  }, [openSessionId, resumedTitle, reportChatSession]);
 
   const sessionIdRef = useRef<number | null>(null);
   const webAbortRef = useRef<AbortController | null>(null);
@@ -1213,12 +1234,51 @@ export function ChatPane({
         return;
       }
 
+      case "aios_resume_pruned": {
+        const staleId = typeof ev.id === "string" ? ev.id.trim() : "";
+        if (!staleId) return;
+        prunePaneHistoryResume(staleId);
+        // claude rejected this resume id (e.g. exits with "No conversation found")
+        // and the process is now dead — its stdin is broken, so the next send
+        // fails and the pane sits wedged on a corpse. Recover: drop the bad
+        // resume, clear any stuck stream state, and respin a FRESH session (no
+        // --resume) so the pane becomes usable instead of writing to dead stdin.
+        if (staleId === claudeSessionIdRef.current) {
+          ownSessionIdsRef.current.delete(staleId);
+          claudeSessionIdRef.current = null;
+          setOpenSessionId(null);
+          setResumedTitle(null);
+          setStreaming(false);
+          setBackendBusy(false);
+          setStarted(false);
+          setClaudeReady(false);
+          streamingTurnId.current = null;
+          thinkingTurnId.current = null;
+          turnStartRef.current = null;
+          setLiveStart(null);
+          recordedRef.current = false;
+          codexTitleLockedRef.current = false;
+          setTurns((prev) => [
+            ...prev,
+            { kind: "result", id: uid(), text: "resume unavailable — started a fresh chat." },
+          ]);
+          // Respin FRESH. Usually resumeId changes from stale -> null and that
+          // re-runs the session effect. If another recovery path already nulled
+          // it, bump restartKey so the pane cannot stay in "started but no
+          // sessionId" limbo where sends only enqueue and clear the composer.
+          if (resumeIdRef.current == null) setRestartKey((k) => k + 1);
+          setResumeId(null);
+        }
+        return;
+      }
+
       // surface a backend stderr line (missing binary / not logged in / bad flag)
       case "aios_stderr": {
         if (ev.text) {
+          const provider = activeModelRef.current.engine ?? "claude";
           setTurns((prev) => [
             ...prev,
-            { kind: "result", id: uid(), text: `claude: ${ev.text}` },
+            { kind: "result", id: uid(), text: `${provider}: ${ev.text}` },
           ]);
         }
         turnStartRef.current = null;
@@ -1269,6 +1329,7 @@ export function ChatPane({
             recordChatSession(ev.session_id, title, cwd ?? null, m.engine ?? "claude", m.id, false).catch((e) => reportDiag("chat.session", e, { action: "record" }));
           }
           claudeSessionIdRef.current = ev.session_id;
+          ownSessionIdsRef.current.add(ev.session_id);
           setOpenSessionId(ev.session_id);
           setRunEventsKey(runEventsStorageKey(ev.session_id));
         }
@@ -2110,7 +2171,7 @@ export function ChatPane({
           chatSetTitle(sessionIdRef.current, stableTitle).catch((e) => reportDiag("chat.title", e, { action: "setTitle" }));
         // Re-report with the now-meaningful first-message title so pane history
         // shows a real label (not "resumed chat · <dir>") when reopened.
-        onChatSession?.({ id: sid, title: stableTitle, engine, model: model.id });
+        reportChatSession({ id: sid, title: stableTitle, engine, model: model.id });
       }
       setInput("");
       consumeComposerImages();
@@ -2163,7 +2224,7 @@ export function ChatPane({
     // imagesRef.current (fresh after the pending-save await), so depending on the
     // images STATE would only re-create this closure on every attach for nothing.
     // `streaming` is read through activeRunRef (always-fresh), not as a dep.
-    [dispatch, cwd, model, attachedMemories, effectiveBudget, workspaceContext, runEventState.phase, setImagesSync, enqueue, restorePinnedImages, webChatRuntime],
+    [dispatch, cwd, model, attachedMemories, effectiveBudget, workspaceContext, runEventState.phase, setImagesSync, enqueue, restorePinnedImages, webChatRuntime, reportChatSession],
   );
 
   // The single submit entry — sendText routes per state: idle → normal send;
@@ -2317,7 +2378,12 @@ export function ChatPane({
 
   // true interrupt of the in-flight turn (process survives)
   const stop = useCallback(() => {
-    if (sessionIdRef.current == null) return;
+    // Always let stop clear a wedged UI — even if the backend session id was lost
+    // (a hung turn whose process died without a `result`). Previously this
+    // early-returned when sessionIdRef was null, leaving the pane permanently stuck
+    // on "Working…" with a dead stop button. finalizeStreaming already guards the
+    // backend interrupt on a non-null id, so resetting local stream state here is
+    // safe and guarantees stop is never a no-op while a turn appears in flight.
     const strategy = stopStrategy(model.engine);
     finalizeStreaming(
       strategy === "kill-and-restart"
@@ -2394,31 +2460,38 @@ export function ChatPane({
   }, []);
 
   useEffect(() => {
-    if (!resume?.id) return;
+    const incomingResume = resume;
+    if (!incomingResume?.id || !shouldApplyResumeProp(incomingResume.id, ownSessionIdsRef.current)) return;
     let cancelled = false;
-    claudeSessionIdRef.current = resume.id;
-    setOpenSessionId(resume.id);
-    setRunEventsKey(runEventsStorageKey(resume.id));
+    claudeSessionIdRef.current = incomingResume.id;
+    setOpenSessionId(incomingResume.id);
+    setRunEventsKey(runEventsStorageKey(incomingResume.id));
     recordedRef.current = true;
     codexTitleLockedRef.current = true;
-    setResumeId(resume.id);
-    setResumedTitle(resume.title);
+    setResumeId(incomingResume.id);
+    setResumedTitle(incomingResume.title);
     const resumeModel =
-      CHAT_MODELS.find((m) => resume.model && m.id === resume.model) ??
-      CHAT_MODELS.find((m) => (m.engine ?? "claude") === (resume.engine || "claude"));
+      CHAT_MODELS.find((m) => incomingResume.model && m.id === incomingResume.model) ??
+      CHAT_MODELS.find((m) => (m.engine ?? "claude") === (incomingResume.engine || "claude"));
     if (resumeModel && resumeModel.id !== activeModelRef.current.id) setModel(resumeModel);
     setRunEventState(emptyRunEventState());
-    readChatTranscript(resume.id)
+    setTurns([]);
+    readChatTranscript(incomingResume.id)
       .then((rows) => {
         if (!cancelled && rows.length) setTurns(transcriptToTurns(rows));
+        // empty rows ≠ dead session: a brand-new or tool-call-only transcript
+        // reads empty while the session is still perfectly resumable. Pruning +
+        // nulling resumeId here races the spin effect (dep: resumeId) into a
+        // double-spin that tears down the resumed session. rust's resume
+        // validation (→ aios_resume_pruned) is the ONLY authority that prunes.
       })
       .catch(() => {
-        /* transcript unavailable; the pane is still resumable */
+        /* transcript read failed; the pane is still resumable */
       });
     return () => {
       cancelled = true;
     };
-  }, [resume?.id, resume?.title, resume?.engine, resume?.model, transcriptToTurns]);
+  }, [resume?.id, resume?.title, resume?.engine, resume?.model, resume?.version, transcriptToTurns]);
 
   const resumeSession = useCallback(
     (session: ChatSessionInfo) => {
@@ -2453,10 +2526,12 @@ export function ChatPane({
       setRunEventState(emptyRunEventState());
       readChatTranscript(session.id)
         .then((rows) => {
+          // empty rows ≠ dead session — let rust's aios_resume_pruned be the
+          // only authority that prunes + forks fresh (see resume effect above).
           if (rows.length) setTurns(transcriptToTurns(rows));
         })
         .catch(() => {
-          // transcript unavailable → leave the pane empty but still resumable
+          /* transcript read failed; the pane is still resumable */
         });
       // bump restartKey too so re-picking the SAME session still re-spins
       setRestartKey((k) => k + 1);
@@ -3683,12 +3758,13 @@ export function ChatPane({
               }
               trigger={
                 <>
-                  {model.hot ? (
-                    <Sparkles size={13} className="shrink-0 text-[var(--color-accent)]" />
-                  ) : (
-                    <Brain size={13} className="shrink-0 text-[var(--color-accent)]" />
-                  )}
+                  <span className="shrink-0 text-[var(--color-accent)]">
+                    <ModelIcon model={model} size={13} />
+                  </span>
                   <span className="whitespace-nowrap">{model.label}</span>
+                  {model.hot && (
+                    <Sparkles size={11} className="shrink-0 text-[var(--color-accent)]" />
+                  )}
                   <ChevronDown size={12} className="text-[var(--color-faint)]" />
                 </>
               }
@@ -3724,7 +3800,9 @@ export function ChatPane({
                       }}
                     >
                       <span className="flex items-center gap-2">
-                        {m.hot && <Sparkles size={13} className="text-[var(--color-accent)]" />}
+                        <span className="shrink-0 text-[var(--color-accent)]">
+                          <ModelIcon model={m} size={13} />
+                        </span>
                         {m.label}
                         {m.hot && (
                           <span className="rounded-full bg-[var(--color-accent-soft)] px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-[0.08em] text-[var(--color-accent)]">

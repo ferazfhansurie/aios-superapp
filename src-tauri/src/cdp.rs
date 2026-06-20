@@ -250,7 +250,10 @@ async fn json_version(port: u16) -> Option<Value> {
 /// `(port, browser_ws_url)`. Reattach-first: if `DevToolsActivePort` names a
 /// port that answers `/json/version`, use it (a relaunch against a live
 /// profile would no-op into that instance anyway). Otherwise launch fresh.
-async fn ensure_chrome(info: &ChromeInfo, initial_url: Option<&str>) -> Result<(u16, String), String> {
+async fn ensure_chrome(
+    info: &ChromeInfo,
+    initial_url: Option<&str>,
+) -> Result<(u16, String), String> {
     let profile = profile_dir()?;
 
     // 1) reattach path.
@@ -355,11 +358,7 @@ impl CdpSession {
 
     /// Page-scoped command on the attached tab.
     async fn page(self: &Arc<Self>, method: &str, params: Value) -> Result<Value, String> {
-        let sid = self
-            .page_session
-            .lock()
-            .clone()
-            .ok_or("no attached page")?;
+        let sid = self.page_session.lock().clone().ok_or("no attached page")?;
         self.send(method, params, Some(sid)).await
     }
 
@@ -429,9 +428,7 @@ fn handle_ws_message(sess: &Arc<CdpSession>, v: Value) {
         // Top-frame navigations → keep the pane's address bar honest.
         "Page.frameNavigated" => {
             let frame = params.get("frame");
-            let is_top = frame
-                .map(|f| f.get("parentId").is_none())
-                .unwrap_or(false);
+            let is_top = frame.map(|f| f.get("parentId").is_none()).unwrap_or(false);
             if is_top {
                 if let Some(url) = frame.and_then(|f| f.get("url")).and_then(|u| u.as_str()) {
                     let _ = sess.channel.send(json!({ "type": "url", "url": url }));
@@ -557,7 +554,10 @@ pub async fn cdp_open(
         for t in infos {
             let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
             let turl = t.get("url").and_then(|x| x.as_str()).unwrap_or("");
-            if ty == "page" && !turl.starts_with("devtools://") && !turl.starts_with("chrome-extension://") {
+            if ty == "page"
+                && !turl.starts_with("devtools://")
+                && !turl.starts_with("chrome-extension://")
+            {
                 if let Some(id) = t.get("targetId").and_then(|x| x.as_str()) {
                     target = Some((id.to_string(), turl.to_string()));
                     break;
@@ -619,9 +619,7 @@ pub async fn cdp_open(
     }
     sess.start_screencast().await?;
 
-    let _ = sess
-        .channel
-        .send(json!({ "type": "url", "url": tab_url }));
+    let _ = sess.channel.send(json!({ "type": "url", "url": tab_url }));
     *SESSION.lock() = Some(sess);
     Ok(tab_url)
 }
@@ -650,9 +648,7 @@ pub async fn cdp_navigate(url: String) -> Result<(), String> {
 /// History step shared by back/forward. Returns whether a step happened.
 async fn history_step(delta: i64) -> Result<bool, String> {
     let sess = current_session()?;
-    let hist = sess
-        .page("Page.getNavigationHistory", json!({}))
-        .await?;
+    let hist = sess.page("Page.getNavigationHistory", json!({})).await?;
     let cur = hist
         .get("currentIndex")
         .and_then(|x| x.as_i64())
@@ -774,7 +770,9 @@ pub async fn cdp_key(
         params["text"] = json!(t);
         params["unmodifiedText"] = json!(t);
     }
-    sess.page("Input.dispatchKeyEvent", params).await.map(|_| ())
+    sess.page("Input.dispatchKeyEvent", params)
+        .await
+        .map(|_| ())
 }
 
 /// IME-grade text insertion (paste, emoji, composed input) — skips key events.
@@ -790,11 +788,7 @@ pub async fn cdp_insert_text(text: String) -> Result<(), String> {
 /// new max dims (screencast max size is fixed at start time, so a restart is
 /// the only way to keep frames matched to the pane rect).
 #[tauri::command]
-pub async fn cdp_set_viewport(
-    width: u32,
-    height: u32,
-    scale: Option<f64>,
-) -> Result<(), String> {
+pub async fn cdp_set_viewport(width: u32, height: u32, scale: Option<f64>) -> Result<(), String> {
     let sess = current_session()?;
     let (w, h) = (width.max(32), height.max(32));
     let dpr = {

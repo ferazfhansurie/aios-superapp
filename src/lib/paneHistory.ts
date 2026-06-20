@@ -184,6 +184,10 @@ function paneHistoryIdentity(kind: PaneContent, label: string): string {
   }
 }
 
+function chatCwdKey(kind: PaneContent): string | null {
+  return kind.type === "chat" ? `chat:cwd:${kind.cwd ?? ""}` : null;
+}
+
 function isPaneHistoryItem(item: unknown): item is PaneHistoryItem {
   return Boolean(
     item &&
@@ -210,8 +214,17 @@ function normalizePaneHistoryItems(items: PaneHistoryItem[]): { items: PaneHisto
   const next: PaneHistoryItem[] = [];
   let changed = false;
   const sorted = items.slice().sort((a, b) => b.openedAt - a.openedAt);
-  for (const item of sorted) {
-    const normalized = normalizePaneHistoryItem(item);
+  const normalizedSorted = sorted.map((item) => ({ item, normalized: normalizePaneHistoryItem(item) }));
+  const resumedChatCwds = new Set(
+    normalizedSorted
+      .map(({ normalized }) => (normalized.kind.type === "chat" && normalized.kind.resume ? chatCwdKey(normalized.kind) : null))
+      .filter((key): key is string => Boolean(key)),
+  );
+  for (const { item, normalized } of normalizedSorted) {
+    if (normalized.kind.type === "chat" && !normalized.kind.resume && resumedChatCwds.has(chatCwdKey(normalized.kind) ?? "")) {
+      changed = true;
+      continue;
+    }
     const key = paneHistoryIdentity(normalized.kind, normalized.label);
     if (seen.has(key)) {
       changed = true;
@@ -275,6 +288,7 @@ export function loadPaneHistory(): PaneHistoryItem[] {
     const parsed = JSON.parse(raw);
     const normalized = readPaneHistoryItems(parsed);
     if (normalized.changed) persistPaneHistoryCache(normalized.items, false);
+    schedulePaneHistoryResumeValidation();
     return normalized.items;
   } catch {
     return [];
@@ -298,7 +312,47 @@ async function savePaneHistoryDb(items: PaneHistoryItem[]): Promise<void> {
 
 let durableQueue: Promise<void> = Promise.resolve();
 let hydrationPromise: Promise<PaneHistoryItem[]> | null = null;
+let resumeValidationPromise: Promise<void> | null = null;
 let historyMutationVersion = 0;
+
+async function existingTranscripts(ids: string[]): Promise<Set<string> | null> {
+  try {
+    const existing = await invoke<string[]>("chat_transcripts_exist", { ids });
+    return new Set(existing);
+  } catch {
+    return null;
+  }
+}
+
+function schedulePaneHistoryResumeValidation(): void {
+  if (!isTauriRuntime() || resumeValidationPromise) return;
+  resumeValidationPromise = Promise.resolve()
+    .then(async () => {
+      const items = loadPaneHistory();
+      const ids = [
+        ...new Set(
+          items
+            .map((item) => (item.kind.type === "chat" ? item.kind.resume?.id?.trim() : ""))
+            .filter((id): id is string => Boolean(id)),
+        ),
+      ];
+      if (!ids.length) return;
+      const existing = await existingTranscripts(ids);
+      if (!existing) return;
+      const stale = new Set(ids.filter((id) => !existing.has(id)));
+      if (!stale.size) return;
+      savePaneHistory(
+        loadPaneHistory().filter(
+          (item) => item.kind.type !== "chat" || !item.kind.resume?.id || !stale.has(item.kind.resume.id),
+        ),
+        "replace",
+      );
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      resumeValidationPromise = null;
+    });
+}
 
 function queueDurablePaneHistory(
   items: PaneHistoryItem[],
@@ -339,6 +393,7 @@ export async function hydratePaneHistoryStore(): Promise<PaneHistoryItem[]> {
         persistPaneHistoryCache(merged, true);
       }
       await savePaneHistoryDb(merged);
+      schedulePaneHistoryResumeValidation();
       return merged;
     })
     .catch(() => loadPaneHistory())
@@ -374,6 +429,15 @@ export function recordPaneHistory(kind: PaneContent, label: string): PaneHistory
 
 export function removePaneHistory(id: string): PaneHistoryItem[] {
   return savePaneHistory(loadPaneHistory().filter((item) => item.id !== id), "replace");
+}
+
+export function prunePaneHistoryResume(id: string): PaneHistoryItem[] {
+  const clean = compactText(id);
+  if (!clean) return loadPaneHistory();
+  return savePaneHistory(
+    loadPaneHistory().filter((item) => item.kind.type !== "chat" || item.kind.resume?.id !== clean),
+    "replace",
+  );
 }
 
 export function clearPaneHistory(): PaneHistoryItem[] {

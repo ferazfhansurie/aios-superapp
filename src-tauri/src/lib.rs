@@ -19,9 +19,9 @@ mod monitor;
 mod oracles;
 mod pane_history;
 mod plugins;
-mod remote;
 mod pm2;
 mod pty;
+mod remote;
 mod stats;
 mod telemetry;
 mod usage;
@@ -368,6 +368,7 @@ pub fn run() {
             device::device_stats,
             bridges::list_bridges,
             bridges::bridge_activity,
+            bridges::discord_bridge_session,
             bridges::pair_personal_wa,
             mac_apps::mac_list_apps,
             mac_apps::mac_focus_app,
@@ -396,6 +397,7 @@ pub fn run() {
             chat::list_chat_sessions,
             chat::record_chat_session,
             chat::read_chat_transcript,
+            chat::chat_transcripts_exist,
             pane_history::load_pane_history,
             pane_history::save_pane_history,
             // Persistent-agents runtime: fs-mirrored agent config CRUD (the Rust
@@ -408,6 +410,8 @@ pub fn run() {
             control::goal_list,
             control::loop_list,
             // Interactive loop control for the board's Loops section.
+            control::loop_global_status,
+            control::loop_set_global_disabled,
             control::loop_start,
             control::loop_stop,
             control::loop_set_cadence,

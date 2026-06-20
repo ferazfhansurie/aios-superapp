@@ -374,7 +374,7 @@ pub fn browser_reveal_in_finder(path: String) -> Result<(), String> {
         cmd.arg(format!("/select,{path}"));
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        // explorer /select returns exit code 1 even on success, so don't gate on it.
+                                         // explorer /select returns exit code 1 even on success, so don't gate on it.
         cmd.spawn().map_err(|e| format!("explorer failed: {e}"))?;
         Ok(())
     }

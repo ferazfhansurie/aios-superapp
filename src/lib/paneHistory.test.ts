@@ -7,6 +7,7 @@ import {
   describePaneHistoryItem,
   hydratePaneHistoryStore,
   loadPaneHistory,
+  prunePaneHistoryResume,
   recordPaneHistory,
 } from "./paneHistory.ts";
 
@@ -74,6 +75,43 @@ test("pane history collapses repeated opens of the same resumed chat session", (
   if (items[0].kind.type === "chat") {
     assert.equal(items[0].kind.resume?.title, "resumed chat · firazfhansurie");
   }
+});
+
+test("pane history replaces a fresh chat placeholder with its resume-capable session row", () => {
+  recordPaneHistory({ type: "chat", cwd: "/Users/firazfhansurie/Repo/firaz/aios/shell" }, "chat");
+  recordPaneHistory(
+    {
+      type: "chat",
+      cwd: "/Users/firazfhansurie/Repo/firaz/aios/shell",
+      resume: {
+        id: "019ee07c-391b-79f0-b177-4b37e5bbd3a5",
+        title: "fix history resume",
+        engine: "codex",
+        model: "gpt-5.3-codex-spark",
+      },
+    },
+    "chat",
+  );
+
+  const items = loadPaneHistory();
+  assert.equal(items.length, 1);
+  assert.equal(items[0].label, "fix history resume");
+  assert.equal(items[0].kind.type, "chat");
+  if (items[0].kind.type === "chat") {
+    assert.equal(items[0].kind.resume?.id, "019ee07c-391b-79f0-b177-4b37e5bbd3a5");
+    assert.equal(items[0].kind.resume?.engine, "codex");
+    assert.equal(items[0].kind.resume?.model, "gpt-5.3-codex-spark");
+  }
+});
+
+test("pane history prunes a stale resumed chat session by id", () => {
+  recordPaneHistory(resumeKind, badInstructionsTitle);
+  recordPaneHistory({ type: "browser", url: "https://example.com" }, "example");
+
+  const items = prunePaneHistoryResume("019ec098-83a8-7c32-9509-6866c3f5db19");
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind.type, "browser");
 });
 
 test("pane history cleans and dedupes existing stored bad resume rows on load", () => {

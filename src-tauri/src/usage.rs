@@ -51,7 +51,9 @@ pub fn claude_usage_value(app: Option<&AppHandle>) -> Value {
 
     if let Ok(guard) = CLAUDE_USAGE_CACHE.lock() {
         if let Some((fetched_at, ref data)) = *guard {
-            if fetched_at.elapsed().as_secs() < CLAUDE_USAGE_CACHE_TTL_SECS && claude_usage_has_signal(data) {
+            if fetched_at.elapsed().as_secs() < CLAUDE_USAGE_CACHE_TTL_SECS
+                && claude_usage_has_signal(data)
+            {
                 return data.clone();
             }
         }
@@ -202,7 +204,11 @@ fn claude_web_session_from_cookies(cookies: &[(String, String)]) -> Option<Claud
     for (name, value) in cookies {
         let name = name.trim();
         let value = value.trim();
-        if name.is_empty() || value.is_empty() || !is_cookie_header_safe(name) || !is_cookie_header_safe(value) {
+        if name.is_empty()
+            || value.is_empty()
+            || !is_cookie_header_safe(name)
+            || !is_cookie_header_safe(value)
+        {
             continue;
         }
         if name == "sessionKey" && value.starts_with("sk-") {
@@ -301,7 +307,8 @@ fn find_uuid_like(s: &str) -> Option<String> {
 }
 
 fn is_cookie_header_safe(s: &str) -> bool {
-    s.chars().all(|c| c.is_ascii_graphic() && c != ';' && c != '"')
+    s.chars()
+        .all(|c| c.is_ascii_graphic() && c != ';' && c != '"')
 }
 
 fn curl_config_escape(s: &str) -> String {
@@ -361,7 +368,11 @@ fn claude_oauth_token_from_env_file() -> Option<String> {
         if key.trim() != "CLAUDE_CODE_OAUTH_TOKEN" {
             continue;
         }
-        let token = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        let token = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
         if !token.is_empty() {
             return Some(token);
         }
@@ -496,10 +507,9 @@ pub fn codex_usage() -> Value {
 
 fn codex_usage_from_wham() -> Option<Value> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let auth: Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{home}/.codex/auth.json")).ok()?,
-    )
-    .ok()?;
+    let auth: Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{home}/.codex/auth.json")).ok()?)
+            .ok()?;
     let token = auth.pointer("/tokens/access_token")?.as_str()?;
     let account = auth.pointer("/tokens/account_id")?.as_str()?;
     let mut child = std::process::Command::new("/usr/bin/curl")
@@ -621,7 +631,10 @@ fn codex_usage_from_sqlite() -> Value {
 
 fn map_model_windows_from_wham(payload: &Value) -> Value {
     let mut out = serde_json::Map::new();
-    let Some(additional) = payload.get("additional_rate_limits").and_then(|v| v.as_array()) else {
+    let Some(additional) = payload
+        .get("additional_rate_limits")
+        .and_then(|v| v.as_array())
+    else {
         return Value::Object(out);
     };
     for entry in additional {
@@ -763,7 +776,8 @@ mod tests {
             ]
         });
         assert_eq!(
-            map_wham_usage(&payload).and_then(|v| v.pointer("/models/gpt-5.3-codex-spark").cloned()),
+            map_wham_usage(&payload)
+                .and_then(|v| v.pointer("/models/gpt-5.3-codex-spark").cloned()),
             Some(json!({
                 "five_hour": { "pct": 80.0, "resets_at": 333 },
                 "seven_day": { "pct": 20.0, "resets_at": 444 }
@@ -784,10 +798,25 @@ mod tests {
             }
         });
         let mapped = map_claude_web_usage(&payload).expect("mapped");
-        assert_eq!(mapped.pointer("/fiveHour/pct").and_then(|v| v.as_f64()), Some(1.0));
-        assert_eq!(mapped.pointer("/sevenDay/pct").and_then(|v| v.as_f64()), Some(20.0));
-        assert_eq!(mapped.pointer("/source").and_then(|v| v.as_str()), Some("claude-web"));
-        assert!(mapped.pointer("/fiveHour/resetsAt").and_then(|v| v.as_i64()).unwrap_or(0) > 0);
+        assert_eq!(
+            mapped.pointer("/fiveHour/pct").and_then(|v| v.as_f64()),
+            Some(1.0)
+        );
+        assert_eq!(
+            mapped.pointer("/sevenDay/pct").and_then(|v| v.as_f64()),
+            Some(20.0)
+        );
+        assert_eq!(
+            mapped.pointer("/source").and_then(|v| v.as_str()),
+            Some("claude-web")
+        );
+        assert!(
+            mapped
+                .pointer("/fiveHour/resetsAt")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0
+        );
     }
 
     #[test]
@@ -806,9 +835,18 @@ mod tests {
             }
         });
         let mapped = map_claude_helper_usage(&payload).expect("mapped");
-        assert_eq!(mapped.pointer("/fiveHour/pct").and_then(|v| v.as_f64()), Some(0.0));
-        assert_eq!(mapped.pointer("/sevenDay/pct").and_then(|v| v.as_f64()), Some(20.0));
-        assert_eq!(mapped.pointer("/source").and_then(|v| v.as_str()), Some("claude-helper"));
+        assert_eq!(
+            mapped.pointer("/fiveHour/pct").and_then(|v| v.as_f64()),
+            Some(0.0)
+        );
+        assert_eq!(
+            mapped.pointer("/sevenDay/pct").and_then(|v| v.as_f64()),
+            Some(20.0)
+        );
+        assert_eq!(
+            mapped.pointer("/source").and_then(|v| v.as_str()),
+            Some("claude-helper")
+        );
     }
 
     #[test]
@@ -848,7 +886,9 @@ mod tests {
         let session = claude_web_session_from_cookies(&cookies).expect("session");
         assert_eq!(session.org_id, "18ec2fc4-cfd2-42f8-9a69-76ca3088f5d0");
         assert!(session.cookie_header.contains("lastActiveOrg=18ec2fc4"));
-        assert!(session.cookie_header.contains("sessionKey=sk-ant-sid01-test"));
+        assert!(session
+            .cookie_header
+            .contains("sessionKey=sk-ant-sid01-test"));
     }
 
     #[test]
@@ -868,10 +908,25 @@ mod tests {
             }
         });
         let mapped = map_claude_oauth_usage(&payload).expect("mapped");
-        assert_eq!(mapped.pointer("/fiveHour/pct").and_then(|v| v.as_f64()), Some(1.0));
-        assert_eq!(mapped.pointer("/sevenDay/pct").and_then(|v| v.as_f64()), Some(20.0));
-        assert_eq!(mapped.pointer("/source").and_then(|v| v.as_str()), Some("oauth"));
-        assert!(mapped.pointer("/fiveHour/resetsAt").and_then(|v| v.as_i64()).unwrap_or(0) > 0);
+        assert_eq!(
+            mapped.pointer("/fiveHour/pct").and_then(|v| v.as_f64()),
+            Some(1.0)
+        );
+        assert_eq!(
+            mapped.pointer("/sevenDay/pct").and_then(|v| v.as_f64()),
+            Some(20.0)
+        );
+        assert_eq!(
+            mapped.pointer("/source").and_then(|v| v.as_str()),
+            Some("oauth")
+        );
+        assert!(
+            mapped
+                .pointer("/fiveHour/resetsAt")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0
+        );
     }
 
     #[test]

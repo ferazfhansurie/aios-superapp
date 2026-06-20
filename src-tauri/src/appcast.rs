@@ -221,7 +221,13 @@ mod imp {
     /// Map an overlay view-local point (TOP-LEFT origin, points) to the GLOBAL
     /// screen point of the corresponding pixel on the real window. Returns None if
     /// the click lands in the letterbox bars (outside the displayed image).
-    fn view_to_global(g: &CaptureGeom, view_w: f64, view_h: f64, vx: f64, vy_tl: f64) -> Option<CGPoint> {
+    fn view_to_global(
+        g: &CaptureGeom,
+        view_w: f64,
+        view_h: f64,
+        vx: f64,
+        vy_tl: f64,
+    ) -> Option<CGPoint> {
         if g.win_w <= 0.0 || g.win_h <= 0.0 || view_w <= 0.0 || view_h <= 0.0 {
             return None;
         }
@@ -268,7 +274,13 @@ mod imp {
     }
 
     /// Synthesize + post a mouse CGEvent at `global` to `pid`. HID-private source.
-    fn post_mouse(pid: i32, kind: CGEventType, button: CGMouseButton, global: CGPoint, flags: CGEventFlags) {
+    fn post_mouse(
+        pid: i32,
+        kind: CGEventType,
+        button: CGMouseButton,
+        global: CGPoint,
+        flags: CGEventFlags,
+    ) {
         let Ok(src) = CGEventSource::new(CGEventSourceStateID::Private) else {
             return;
         };
@@ -505,13 +517,7 @@ mod imp {
     /// intact because the web content sits at the window's top edge in this app
     /// (no native titlebar inset); if a chrome inset is later added, subtract it
     /// from the height term.
-    fn slot_to_screen_frame(
-        parent: &NSWindow,
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-    ) -> CGRect {
+    fn slot_to_screen_frame(parent: &NSWindow, x: f64, y: f64, width: f64, height: f64) -> CGRect {
         let wf = parent.frame();
         let w = width.max(1.0);
         let h = height.max(1.0);
@@ -519,7 +525,10 @@ mod imp {
         let sy = wf.origin.y + wf.size.height - (y + h);
         CGRect {
             origin: CGPoint { x: sx, y: sy },
-            size: CGSize { width: w, height: h },
+            size: CGSize {
+                width: w,
+                height: h,
+            },
         }
     }
 
@@ -530,7 +539,7 @@ mod imp {
         const JUNK_NAMES: &[&str] = &[
             "Dock",
             "Control Center",
-            "Controle",            // localized Control Center variants
+            "Controle", // localized Control Center variants
             "WindowServer",
             "SystemUIServer",
             "Notification Center",
@@ -632,8 +641,9 @@ mod imp {
                 &handler,
             );
         }
-        rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "timed out waiting for SCShareableContent (Screen Recording permission?)".to_string())?
+        rx.recv_timeout(Duration::from_secs(10)).map_err(|_| {
+            "timed out waiting for SCShareableContent (Screen Recording permission?)".to_string()
+        })?
     }
 
     /// Find the SCWindow whose windowID matches, then build + start a stream that
@@ -683,7 +693,9 @@ mod imp {
                         return;
                     }
                 }
-                let _ = tx.send(Err(format!("window {window_id} not found / not capturable")));
+                let _ = tx.send(Err(format!(
+                    "window {window_id} not found / not capturable"
+                )));
             },
         );
         unsafe {
@@ -715,8 +727,7 @@ mod imp {
         // NSWindow + NSView are MainThreadOnly. This command is SYNC (see
         // appcast_start), so Tauri runs it on the main thread — assert + capture
         // the marker for alloc.
-        let mtm = MainThreadMarker::new()
-            .ok_or("appcast_start must run on the main thread")?;
+        let mtm = MainThreadMarker::new().ok_or("appcast_start must run on the main thread")?;
 
         // Borderless overlay window. Buffered backing, deferred creation off.
         // SAFETY: standard NSWindow designated initializer on a fresh allocation.
@@ -931,7 +942,8 @@ mod imp {
             // layer contents, detach the overlay from the parent + tear it down.
             let stop_handler = RcBlock::new(|_error: *mut objc2_foundation::NSError| {});
             unsafe {
-                s.stream.stopCaptureWithCompletionHandler(Some(&stop_handler));
+                s.stream
+                    .stopCaptureWithCompletionHandler(Some(&stop_handler));
                 s.layer.setContents(None);
             }
             s.parent.removeChildWindow(&s.overlay);

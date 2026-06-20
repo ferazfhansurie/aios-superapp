@@ -1,12 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { History, MessageSquare, RotateCcw, Trash2 } from "lucide-react";
 
 import type { PaneContent } from "../lib/apps";
+import { readChatTranscript } from "../lib/chat";
+import { isTauriRuntime } from "../lib/tauri";
 import {
   clearPaneHistory,
   hydratePaneHistoryStore,
   loadPaneHistory,
   paneHistoryKindLabel,
+  prunePaneHistoryResume,
   removePaneHistory,
   subscribePaneHistory,
   type PaneHistoryItem,
@@ -29,9 +32,10 @@ function historySubtitle(item: PaneHistoryItem): string {
 export function HistoryPane({
   onOpenHistoryItem,
 }: {
-  onOpenHistoryItem: (kind: PaneContent, label: string) => void;
+  onOpenHistoryItem: (kind: PaneContent, label: string) => void | Promise<void>;
 }) {
   const [items, setItems] = useState<PaneHistoryItem[]>(() => loadPaneHistory());
+  const checkedResumeIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let alive = true;
@@ -44,6 +48,34 @@ export function HistoryPane({
       unsubscribe();
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    const ids = items
+      .map((item) => (item.kind.type === "chat" ? item.kind.resume?.id?.trim() : ""))
+      .filter((id): id is string => Boolean(id && !checkedResumeIds.current.has(id)));
+    if (!ids.length) return;
+    ids.forEach((id) => checkedResumeIds.current.add(id));
+    let alive = true;
+    void Promise.all(
+      ids.map(async (id) => ({
+        id,
+        ok: (await readChatTranscript(id).catch(() => [])).length > 0,
+      })),
+    ).then((results) => {
+      if (!alive) return;
+      const stale = results.filter((result) => !result.ok).map((result) => result.id);
+      if (!stale.length) return;
+      for (const id of stale) {
+        checkedResumeIds.current.delete(id);
+        prunePaneHistoryResume(id);
+      }
+      setItems(loadPaneHistory());
+    });
+    return () => {
+      alive = false;
+    };
+  }, [items]);
 
   const grouped = useMemo(() => {
     const today = Date.now() - 24 * 3600_000;

@@ -1,8 +1,7 @@
 /** Files pane — a VS Code-style explorer tree. Nested expandable folders,
  *  file-type icons, and indent guides. Single-click a file opens it through the
- *  core browser path. Rows (files AND folders) stay draggable → drop onto a terminal
- *  to `cd`, onto a files pane to re-root, etc. Files open in the Monaco editor,
- *  so there's no inline preview.
+ *  in-app file/editor pane. Rows (files AND folders) stay draggable → drop onto
+ *  a terminal to `cd`, onto a files pane to re-root, etc.
  *
  *  Header affordances:
  *   - dotfile + junk toggles (persisted): hide `.env`/`.git`/… and prune
@@ -16,12 +15,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as R
 import {
   ChevronRight,
   Copy,
+  FileCode2,
+  FileText,
   Eye,
   EyeOff,
   FolderClosed,
   FolderGit2,
   FolderOpen,
-  Globe,
   Home,
   ListCollapse,
   MessageSquare,
@@ -32,7 +32,6 @@ import {
 } from "lucide-react";
 
 import {
-  fileSrc,
   homeDir,
   readDirTree,
   type DirEntry,
@@ -71,9 +70,13 @@ function entryDir(entry: DirEntry): string {
 export function FilesPane({
   initialRoot,
   onOpenFile,
+  onOpenEditorFile,
+  onOpenViewerFile,
 }: {
   initialRoot?: string;
   onOpenFile?: (path: string, name: string) => void;
+  onOpenEditorFile?: (path: string, name: string) => void;
+  onOpenViewerFile?: (path: string, name: string) => void;
 }) {
   const [root, setRoot] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -191,7 +194,7 @@ export function FilesPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showHidden, showAll]);
 
-  // The directory a "open terminal here" / "open in browser" acts on: the
+  // The directory a "open terminal here" acts on: the
   // selected node (its own dir if it's a folder, else its parent), else root.
   const focusDir = useMemo(() => {
     if (!selected) return root;
@@ -207,21 +210,19 @@ export function FilesPane({
     spawnPane("terminal", { cwd: focusDir });
   }, [focusDir]);
 
-  // "open in browser": the selected FILE → file:// in a browser pane.
-  const openInBrowser = useCallback(() => {
-    if (!selected) return;
-    // only meaningful for files; a folder selection has no file:// target.
-    let isFile = false;
+  const selectedEntry = useMemo(() => {
+    if (!selected) return null;
     for (const list of children.values()) {
       const hit = list.find((e) => e.path === selected);
-      if (hit) {
-        isFile = !hit.is_dir;
-        break;
-      }
+      if (hit) return hit;
     }
-    if (!isFile) return;
-    spawnPane("browser", { url: fileSrc(selected) });
+    return null;
   }, [selected, children]);
+
+  const openSelectedInPane = useCallback(() => {
+    if (!selectedEntry || selectedEntry.is_dir) return;
+    onOpenFile?.(selectedEntry.path, selectedEntry.name);
+  }, [onOpenFile, selectedEntry]);
 
   const openProjectPicker = useCallback(() => {
     setProjOpen((o) => !o);
@@ -248,12 +249,26 @@ export function FilesPane({
     closeContextMenu();
   }, [closeContextMenu, contextMenu]);
 
-  const openContextBrowser = useCallback(() => {
+  const openContextDefault = useCallback(() => {
     const entry = contextMenu?.entry;
     if (!entry || entry.is_dir) return;
-    spawnPane("browser", { url: fileSrc(entry.path), label: entry.name });
+    onOpenFile?.(entry.path, entry.name);
     closeContextMenu();
-  }, [closeContextMenu, contextMenu]);
+  }, [closeContextMenu, contextMenu, onOpenFile]);
+
+  const openContextEditor = useCallback(() => {
+    const entry = contextMenu?.entry;
+    if (!entry || entry.is_dir) return;
+    onOpenEditorFile?.(entry.path, entry.name);
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu, onOpenEditorFile]);
+
+  const openContextViewer = useCallback(() => {
+    const entry = contextMenu?.entry;
+    if (!entry || entry.is_dir) return;
+    onOpenViewerFile?.(entry.path, entry.name);
+    closeContextMenu();
+  }, [closeContextMenu, contextMenu, onOpenViewerFile]);
 
   const openContextChat = useCallback(() => {
     const entry = contextMenu?.entry;
@@ -289,15 +304,7 @@ export function FilesPane({
   const rootName = root.split("/").filter(Boolean).pop() ?? root;
   const f = filter.trim().toLowerCase();
 
-  // Whether the current selection is a file (enables "open in browser").
-  const selectedIsFile = useMemo(() => {
-    if (!selected) return false;
-    for (const list of children.values()) {
-      const hit = list.find((e) => e.path === selected);
-      if (hit) return !hit.is_dir;
-    }
-    return false;
-  }, [selected, children]);
+  const selectedIsFile = Boolean(selectedEntry && !selectedEntry.is_dir);
 
   // flatten the visible tree into rows (respecting expand state + filter)
   const rows = useMemo(() => {
@@ -334,8 +341,8 @@ export function FilesPane({
           <TerminalSquare size={13} />
         </button>
         {selectedIsFile && (
-          <button onClick={openInBrowser} className="rounded p-1 hover:text-[var(--color-text)]" title="Open selected file in browser">
-            <Globe size={13} />
+          <button onClick={openSelectedInPane} className="rounded p-1 hover:text-[var(--color-text)]" title="Open selected file in pane">
+            <FileText size={13} />
           </button>
         )}
         <button onClick={openProjectPicker} className="rounded p-1 hover:text-[var(--color-text)]" title="Open project (re-root this pane)">
@@ -477,7 +484,11 @@ export function FilesPane({
             <ContextAction icon={<TerminalSquare size={13} />} label="open terminal here" onClick={openContextTerminal} />
             <ContextAction icon={<Play size={13} />} label="run detected project" onClick={runContextProject} />
             {!contextMenu.entry.is_dir && (
-              <ContextAction icon={<Globe size={13} />} label="open in browser" onClick={openContextBrowser} />
+              <>
+                <ContextAction icon={<FileText size={13} />} label="open in pane" onClick={openContextDefault} />
+                <ContextAction icon={<FileCode2 size={13} />} label="open editor" onClick={openContextEditor} />
+                <ContextAction icon={<FileText size={13} />} label="open viewer" onClick={openContextViewer} />
+              </>
             )}
             <ContextAction icon={<FolderOpen size={13} />} label="open containing files pane" onClick={openContainingFilesPane} />
             <ContextAction icon={<MessageSquare size={13} />} label="open chat here" onClick={openContextChat} />

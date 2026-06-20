@@ -57,7 +57,9 @@ pub fn device_stats() -> Value {
 
     let load = System::load_average();
     let uptime = System::uptime();
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
     let (battery_pct, battery_charging) = battery();
 
     json!({
@@ -78,7 +80,10 @@ pub fn device_stats() -> Value {
 /// or if the command/format is unavailable.
 #[cfg(not(windows))]
 fn battery() -> (Option<f64>, Option<bool>) {
-    let out = match std::process::Command::new("pmset").args(["-g", "batt"]).output() {
+    let out = match std::process::Command::new("pmset")
+        .args(["-g", "batt"])
+        .output()
+    {
         Ok(o) if o.status.success() => o,
         _ => return (None, None),
     };
@@ -95,7 +100,8 @@ fn battery() -> (Option<f64>, Option<bool>) {
     let lower = text.to_lowercase();
     let charging = if lower.contains("discharging") {
         Some(false)
-    } else if lower.contains("charging") || lower.contains("charged") || lower.contains("ac power") {
+    } else if lower.contains("charging") || lower.contains("charged") || lower.contains("ac power")
+    {
         Some(true)
     } else {
         None

@@ -434,6 +434,12 @@ export interface LoopInfo {
   lastLog: string;
 }
 
+export interface LoopGlobalStatus {
+  disabled: boolean;
+  disabledPath: string;
+  disabledSince?: number | null;
+}
+
 /** Lists active loops from `~/.aios/state/loops/*.meta` (+ status, last log). */
 export async function listLoops(): Promise<LoopInfo[]> {
   try {
@@ -445,6 +451,23 @@ export async function listLoops(): Promise<LoopInfo[]> {
   } catch {
     return [];
   }
+}
+
+export async function getLoopGlobalStatus(): Promise<LoopGlobalStatus> {
+  try {
+    const status = await invoke<LoopGlobalStatus>("loop_global_status");
+    return {
+      disabled: Boolean(status.disabled),
+      disabledPath: status.disabledPath || "",
+      disabledSince: typeof status.disabledSince === "number" ? status.disabledSince : null,
+    };
+  } catch {
+    return { disabled: false, disabledPath: "", disabledSince: null };
+  }
+}
+
+export async function setLoopGlobalDisabled(disabled: boolean): Promise<LoopGlobalStatus> {
+  return invoke<LoopGlobalStatus>("loop_set_global_disabled", { disabled });
 }
 
 /** Starts a loop (dogfood → clears its STOP flag; others → launchctl load). */

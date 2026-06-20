@@ -444,6 +444,7 @@ html, body, #root {
 
 .status-dot { width: 8px; height: 8px; border-radius: 9999px; }
 .status-dot--active { background: var(--color-success); animation: aios-dot-pulse 3s ease-in-out infinite; }
+.status-dot--hot { background: var(--color-accent); animation: aios-dot-pulse 1.8s ease-in-out infinite; }
 .status-dot--idle { background: var(--color-warning); }
 .status-dot--dormant { background: var(--color-info); opacity: 0.6; }
 .status-dot--cold { background: var(--color-cold); opacity: 0.4; }

@@ -86,11 +86,10 @@ fn push_vault(out: &mut Vec<VaultDir>, path: std::path::PathBuf, label: String, 
         return;
     }
     let canon = std::fs::canonicalize(&path).unwrap_or(path.clone());
-    if out.iter().any(|v| {
-        std::fs::canonicalize(&v.path)
-            .unwrap_or_else(|_| v.path.clone())
-            == canon
-    }) {
+    if out
+        .iter()
+        .any(|v| std::fs::canonicalize(&v.path).unwrap_or_else(|_| v.path.clone()) == canon)
+    {
         return;
     }
     out.push(VaultDir {
@@ -131,7 +130,13 @@ fn vault_dirs() -> Vec<VaultDir> {
         // `C:\Users\user` → `C--Users-user` (matching the real on-disk dir name).
         let encoded: String = home_str
             .chars()
-            .map(|c| if matches!(c, '/' | '\\' | ':' | '.') { '-' } else { c })
+            .map(|c| {
+                if matches!(c, '/' | '\\' | ':' | '.') {
+                    '-'
+                } else {
+                    c
+                }
+            })
             .collect();
         let p = projects.join(&encoded).join("memory");
         if p.is_dir() {
@@ -659,9 +664,7 @@ pub fn memory_graph() -> Value {
     let vaults = vault_dirs();
     let items: Vec<(MemoryNode, String)> = vaults
         .iter()
-        .flat_map(|v| {
-            memory_nodes_from_vault(&v.path, &v.label).into_iter()
-        })
+        .flat_map(|v| memory_nodes_from_vault(&v.path, &v.label).into_iter())
         .collect();
     build_memory_graph(items, vaults)
 }
@@ -742,7 +745,9 @@ pub fn memory_focus() -> Value {
                 continue;
             }
             if node.id.starts_with("project_")
-                && newest_project.as_ref().map_or(true, |(t, _)| node.mtime > *t)
+                && newest_project
+                    .as_ref()
+                    .map_or(true, |(t, _)| node.mtime > *t)
             {
                 newest_project = Some((node.mtime, path.clone()));
             }
@@ -1002,12 +1007,23 @@ browser pane can feed context into memory.
             .and_then(|v| v.as_array())
             .unwrap()
             .iter()
-            .find(|node| node.get("id").and_then(|v| v.as_str()) == Some("feedback_no_context_bloat_ai"))
+            .find(|node| {
+                node.get("id").and_then(|v| v.as_str()) == Some("feedback_no_context_bloat_ai")
+            })
             .unwrap();
 
-        assert_eq!(project.get("cluster").and_then(|v| v.as_str()), Some("project"));
+        assert_eq!(
+            project.get("cluster").and_then(|v| v.as_str()),
+            Some("project")
+        );
         assert_eq!(project.get("orphan").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(feedback.get("backlinks").and_then(|v| v.as_array()).unwrap()[0], "project_aios_shell");
+        assert_eq!(
+            feedback
+                .get("backlinks")
+                .and_then(|v| v.as_array())
+                .unwrap()[0],
+            "project_aios_shell"
+        );
         assert!(project
             .get("suggested_links")
             .and_then(|v| v.as_array())
@@ -1019,7 +1035,8 @@ browser pane can feed context into memory.
             .and_then(|v| v.as_array())
             .unwrap()
             .iter()
-            .any(|edge| edge.get("target").and_then(|v| v.as_str()) == Some("feedback_no_context_bloat_ai")));
+            .any(|edge| edge.get("target").and_then(|v| v.as_str())
+                == Some("feedback_no_context_bloat_ai")));
 
         let _ = std::fs::remove_dir_all(root);
     }

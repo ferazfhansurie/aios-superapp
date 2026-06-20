@@ -23,6 +23,14 @@ export interface ResumeTitle {
   meaningful: boolean;
 }
 
+export function shouldApplyResumeProp(
+  resumeId: string | null | undefined,
+  ownSessionIds: ReadonlySet<string>,
+): boolean {
+  const clean = resumeId?.trim();
+  return Boolean(clean && !ownSessionIds.has(clean));
+}
+
 export type ComposerSendMode = "send" | "steer" | "queue" | "waiting";
 export type ChatStopStrategy = "interrupt" | "kill-and-restart";
 export type ContextBudgetMode = "lean" | "agent" | "ultracode";

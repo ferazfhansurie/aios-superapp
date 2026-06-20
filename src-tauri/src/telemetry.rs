@@ -105,14 +105,8 @@ pub fn collect() -> Telemetry {
             // cache_creation_input_tokens, cache_read_input_tokens}.
             let usage = v.pointer("/message/usage");
             if let Some(u) = usage {
-                let inp = u
-                    .get("input_tokens")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
-                let out = u
-                    .get("output_tokens")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
+                let inp = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                let out = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
                 let creation = u
                     .get("cache_creation_input_tokens")
                     .and_then(|x| x.as_u64())
@@ -182,7 +176,12 @@ pub fn collect() -> Telemetry {
         }
     }
     let active_7d = heatmap.iter().rev().take(7).filter(|c| c.count > 0).count() as u32;
-    let active_30d = heatmap.iter().rev().take(30).filter(|c| c.count > 0).count() as u32;
+    let active_30d = heatmap
+        .iter()
+        .rev()
+        .take(30)
+        .filter(|c| c.count > 0)
+        .count() as u32;
     let favorite = by_model
         .iter()
         .max_by_key(|(_, c)| *c)

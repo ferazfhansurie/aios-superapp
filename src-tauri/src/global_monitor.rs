@@ -67,7 +67,11 @@ pub fn start(app: AppHandle) {
                 }
                 was_both_down = both_down;
                 // Tight loop only while a command key is actually held.
-                thread::sleep(if left || right { ARMED_SLEEP } else { IDLE_SLEEP });
+                thread::sleep(if left || right {
+                    ARMED_SLEEP
+                } else {
+                    IDLE_SLEEP
+                });
             }
         });
 }

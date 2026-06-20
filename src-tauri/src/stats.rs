@@ -260,7 +260,10 @@ fn parse_tokens_total(v: &Value) -> Option<f64> {
     let mut saw_any = false;
     for entry in entries {
         let by_model = match entry {
-            Value::Object(o) => o.get("tokensByModel").and_then(|t| t.as_object()).or(Some(o)),
+            Value::Object(o) => o
+                .get("tokensByModel")
+                .and_then(|t| t.as_object())
+                .or(Some(o)),
             _ => None,
         };
         if let Some(map) = by_model {
@@ -298,7 +301,9 @@ fn parse_model_usage(v: &Value) -> HashMap<String, f64> {
 fn parse_cache(root: &Value) -> StatsCache {
     let get = |k: &str| root.get(k);
     StatsCache {
-        daily_activity: get("dailyActivity").map(parse_daily_activity).unwrap_or_default(),
+        daily_activity: get("dailyActivity")
+            .map(parse_daily_activity)
+            .unwrap_or_default(),
         tokens_total: get("dailyModelTokens").and_then(parse_tokens_total),
         model_usage: get("modelUsage").map(parse_model_usage).unwrap_or_default(),
         total_sessions: get("totalSessions").and_then(as_num),
@@ -397,10 +402,8 @@ pub fn usage_extras() -> Value {
     // telemetry. Streaks/heatmap/active-windows/tokens all key off this map. The
     // telemetry fallback is what lights up the homescreen on Windows, where
     // ccusage isn't installed and stats-cache.json doesn't exist. ---
-    let mut activity_owned: Option<HashMap<String, f64>> = live
-        .as_ref()
-        .map(|l| l.daily_activity.clone())
-        .or_else(|| {
+    let mut activity_owned: Option<HashMap<String, f64>> =
+        live.as_ref().map(|l| l.daily_activity.clone()).or_else(|| {
             cache
                 .as_ref()
                 .map(|c| c.daily_activity.clone())

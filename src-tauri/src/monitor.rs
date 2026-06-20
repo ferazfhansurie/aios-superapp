@@ -70,7 +70,11 @@ fn home() -> String {
 fn tmux_bin() -> String {
     #[cfg(unix)]
     {
-        for candidate in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+        for candidate in [
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/usr/bin/tmux",
+        ] {
             if std::path::Path::new(candidate).exists() {
                 return candidate.to_string();
             }
@@ -87,7 +91,9 @@ fn push_script() -> Option<String> {
         format!("{home}/Repo/firaz/aios/bridge/scripts/push.js"),
         format!("{home}/Repo/firaz/aios-bridge/scripts/push.js"),
     ];
-    candidates.into_iter().find(|p| std::path::Path::new(p).exists())
+    candidates
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -105,7 +111,10 @@ fn send_whatsapp(message: &str) {
     // script directly if node isn't resolvable.
     let node = node_bin();
     let spawn = match node {
-        Some(n) => std::process::Command::new(n).arg(&script).arg(&body).spawn(),
+        Some(n) => std::process::Command::new(n)
+            .arg(&script)
+            .arg(&body)
+            .spawn(),
         None => std::process::Command::new(&script).arg(&body).spawn(),
     };
     // Detach: we never wait on the child — fire-and-forget.
@@ -118,7 +127,11 @@ pub(crate) fn node_bin() -> Option<String> {
     #[cfg(unix)]
     {
         // Common fixed locations first.
-        for candidate in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
+        for candidate in [
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+        ] {
             if std::path::Path::new(candidate).exists() {
                 return Some(candidate.to_string());
             }
@@ -153,7 +166,11 @@ fn log_event(session: &str, kind: &str, message: &str) {
         "kind": kind,
         "message": message,
     });
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -222,7 +239,11 @@ fn capture_pane(socket: &str, session: &str) -> Option<String> {
 
 /// The last ~`n` non-empty lines of a pane snapshot, joined with newlines.
 fn last_nonempty_lines(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().map(|l| l.trim_end()).filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
 }
@@ -286,10 +307,7 @@ fn watch_loop(socket: String, session: String, keep: Arc<AtomicBool>) {
                 if let Some(prev) = &last_snapshot {
                     let errs = fresh_error_lines(prev, &current);
                     if !errs.is_empty() && may_notify(&last_notify) {
-                        let body = format!(
-                            "⚠️ {session} hit an error:\n{}",
-                            last_few(&errs, 6)
-                        );
+                        let body = format!("⚠️ {session} hit an error:\n{}", last_few(&errs, 6));
                         send_whatsapp(&body);
                         log_event(&session, "error", &body);
                         last_notify = Some(Instant::now());
@@ -323,7 +341,11 @@ fn watch_loop(socket: String, session: String, keep: Arc<AtomicBool>) {
                 // Session has been uncapturable for ~45s — assume it's gone and
                 // tear this watcher down so we don't leak a thread.
                 if missing_captures >= 3 {
-                    log_event(&session, "gone", &format!("{session} no longer capturable; stopping watcher"));
+                    log_event(
+                        &session,
+                        "gone",
+                        &format!("{session} no longer capturable; stopping watcher"),
+                    );
                     break;
                 }
             }
@@ -389,7 +411,11 @@ pub fn monitor_start(socket: String, session: String) -> Result<(), String> {
     if session.is_empty() {
         return Err("session must not be empty".into());
     }
-    let socket = if socket.is_empty() { "adletic".to_string() } else { socket };
+    let socket = if socket.is_empty() {
+        "adletic".to_string()
+    } else {
+        socket
+    };
 
     // Already monitoring → no-op.
     {

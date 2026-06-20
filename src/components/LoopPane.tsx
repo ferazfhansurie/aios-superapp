@@ -14,20 +14,35 @@
  * Rust cmd + structured/NL form) lands on top of this pane next.
  */
 import { useEffect, useState } from "react";
-import { MessageSquare, Plus, Repeat, RefreshCw, X } from "lucide-react";
+import { MessageSquare, Plus, Power, Repeat, RefreshCw, X } from "lucide-react";
 
-import { addLoop, listLoops, type LoopInfo } from "../lib/agents";
+import {
+  addLoop,
+  getLoopGlobalStatus,
+  listLoops,
+  setLoopGlobalDisabled,
+  type LoopGlobalStatus,
+  type LoopInfo,
+} from "../lib/agents";
 import { talkToOrchestrator } from "../lib/paneBus";
 import { LoopRow } from "./MissionBoard";
 
 export function LoopPane() {
   const [loops, setLoops] = useState<LoopInfo[]>([]);
+  const [globalStatus, setGlobalStatus] = useState<LoopGlobalStatus>({
+    disabled: false,
+    disabledPath: "",
+    disabledSince: null,
+  });
   const [loading, setLoading] = useState(false);
+  const [toggling, setToggling] = useState(false);
   const [creating, setCreating] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
-    setLoops(await listLoops());
+    const [nextLoops, nextStatus] = await Promise.all([listLoops(), getLoopGlobalStatus()]);
+    setLoops(nextLoops);
+    setGlobalStatus(nextStatus);
     setLoading(false);
   };
 
@@ -36,19 +51,57 @@ export function LoopPane() {
   }, []);
 
   const running = loops.filter((l) => (l.status ?? "running") === "running").length;
+  const disabled = globalStatus.disabled;
+  const since =
+    typeof globalStatus.disabledSince === "number"
+      ? new Date(globalStatus.disabledSince * 1000).toLocaleString(undefined, {
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : null;
+
+  const toggleGlobal = async () => {
+    if (toggling) return;
+    setToggling(true);
+    try {
+      const next = await setLoopGlobalDisabled(!disabled);
+      setGlobalStatus(next);
+      setLoops(await listLoops());
+    } finally {
+      setToggling(false);
+    }
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)] p-3">
-      <div className="mb-2.5 flex items-center gap-2">
+      <div className="mb-2.5 flex flex-wrap items-center gap-2">
         <Repeat size={14} className="shrink-0 text-[var(--color-accent)]" />
         <span className="text-[12px] font-medium text-[var(--color-text)]">loops</span>
         <span className="text-[10px] text-[var(--color-faint)]">
-          {running} running · {loops.length} total
+          {disabled ? "globally paused" : `${running} running`} · {loops.length} total
         </span>
         <button
           type="button"
+          role="switch"
+          aria-checked={!disabled}
+          onClick={() => void toggleGlobal()}
+          disabled={toggling}
+          className={`ml-auto flex h-7 items-center gap-1.5 rounded-md border px-2 text-[10px] font-medium transition-colors disabled:opacity-50 ${
+            disabled
+              ? "border-[var(--color-danger)]/50 bg-[var(--color-danger)]/10 text-[var(--color-danger)]"
+              : "border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text)] hover:border-[var(--color-accent)]/60"
+          }`}
+          title={disabled ? "enable every loop again" : "disable every loop until this is flipped back"}
+        >
+          <Power size={12} />
+          {disabled ? "disabled" : "enabled"}
+        </button>
+        <button
+          type="button"
           onClick={() => setCreating((v) => !v)}
-          className="ml-auto flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-[var(--color-muted)] transition-colors hover:text-[var(--color-text)]"
+          className="flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-[var(--color-muted)] transition-colors hover:text-[var(--color-text)]"
           title="create a new loop"
         >
           {creating ? <X size={12} /> : <Plus size={12} />}
@@ -64,6 +117,12 @@ export function LoopPane() {
           <RefreshCw size={11} className={loading ? "animate-spin" : ""} />
         </button>
       </div>
+
+      {disabled && (
+        <div className="mb-2.5 rounded-md border border-[var(--color-danger)]/35 bg-[var(--color-danger)]/10 px-2.5 py-2 text-[11px] text-[var(--color-danger)]">
+          all loop ticks are disabled{since ? ` since ${since}` : ""}. flip the switch to resume.
+        </div>
+      )}
 
       {creating && (
         <NewLoopForm

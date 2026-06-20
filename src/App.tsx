@@ -66,7 +66,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { appshotCapture, reapTerminals } from "./lib/pty";
-import { listChatLive } from "./lib/chat";
+import { listChatLive, readChatTranscript } from "./lib/chat";
+import { discordBridgeSession } from "./lib/bridges";
 import { initTheme } from "./lib/theme";
 import { monitorStart, monitorStop } from "./lib/monitor";
 import {
@@ -97,9 +98,9 @@ import {
 } from "./lib/paneBus";
 import { containingDir, paneFileTarget } from "./lib/paneOpenActions";
 import { loadSettings, saveSettings, applyFlashLevel, subscribe as subscribeSettings } from "./lib/settings";
-import { fileSrc, homeDir, revealInFinder, startupOpenPane } from "./lib/fs";
+import { homeDir, revealInFinder, startupOpenPane } from "./lib/fs";
 import { VIEWER_EXT, extOf } from "./lib/fileKinds";
-import { recordPaneHistory } from "./lib/paneHistory";
+import { prunePaneHistoryResume, recordPaneHistory } from "./lib/paneHistory";
 import { detectProject, type ProjectInfo } from "./lib/run";
 import { isHttpPaneTarget, resolvePaneFileTarget, targetLabel } from "./lib/paneRouting";
 import { buildAppCommands } from "./lib/appCommands";
@@ -154,7 +155,9 @@ export type { AppDef, PaneContent };
 
 const BrowserPane = lazy(() => import("./components/BrowserPane").then((m) => ({ default: m.BrowserPane })));
 const ChatPane = lazy(() => import("./components/ChatPane").then((m) => ({ default: m.ChatPane })));
+const EditorPane = lazy(() => import("./components/EditorPane").then((m) => ({ default: m.EditorPane })));
 const FilesPane = lazy(() => import("./components/FilesPane").then((m) => ({ default: m.FilesPane })));
+const FileViewerPane = lazy(() => import("./components/FileViewerPane").then((m) => ({ default: m.FileViewerPane })));
 const Settings = lazy(() => import("./components/Settings").then((m) => ({ default: m.Settings })));
 const TerminalPane = lazy(() =>
   import("./components/TerminalPane").then((m) => ({ default: m.TerminalPane })),
@@ -182,6 +185,7 @@ if (typeof window !== "undefined") {
     import("./components/ChatPane"),
     import("./components/TerminalPane"),
     import("./components/FilesPane"),
+    import("./components/FileViewerPane"),
     import("./components/BrowserPane"),
   ]));
 }
@@ -190,6 +194,7 @@ interface Pane {
   key: string;
   label: string;
   kind: PaneContent;
+  attention?: boolean;
 }
 
 const isTerminal = (k: PaneContent): k is PaneKind =>
@@ -205,6 +210,9 @@ function paneContextDetail(kind: PaneContent): string | undefined {
       return `${kind.socket}/${kind.session}`;
     case "files":
       return kind.root;
+    case "file":
+    case "editor":
+      return kind.path;
     case "browser":
       return kind.url;
     case "chat":
@@ -268,6 +276,9 @@ function paneForFile(path: string, name: string): PaneContent {
     ? { type: "file", path, name }
     : { type: "editor", path, name };
 }
+
+const DISCORD_PANE_KEY = "chat:discord";
+const DISCORD_PANE_LABEL = "Discord";
 
 // STABLE PANE KEYS (wave 1B): keys are minted ONCE at spawn via
 // paneLayout.newPaneKey (`k-<kind>-<shortid>`), persisted with the layout and
@@ -463,10 +474,6 @@ function App() {
   // the pane the user last interacted with — drives the "OPEN" rail highlight +
   // is where dictation / drops route. A ref alone wouldn't re-render the rail.
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  // Live mirror of `panes` for closures (the control-command listener) that are
-  // registered once and would otherwise read a stale panes snapshot.
-  const panesRef = useRef(panes);
-  panesRef.current = panes;
   const toggleMax = useCallback(
     (key: string) => setMaximizedKey((cur) => (cur === key ? null : key)),
     [],
@@ -727,7 +734,21 @@ function App() {
   );
 
   const openHistoryItem = useCallback(
-    (kind: PaneContent, label: string) => {
+    async (kind: PaneContent, label: string) => {
+      if (kind.type === "chat" && kind.resume?.id) {
+        const rows = await readChatTranscript(kind.resume.id).catch(() => []);
+        if (rows.length === 0) {
+          prunePaneHistoryResume(kind.resume.id);
+          pushNotification({
+            kind: "history.resume.pruned",
+            title: "stale chat removed",
+            body: "that resume id has no transcript anymore, so history will not open an empty resumed pane.",
+            level: "warning",
+            sourceLabel: "history",
+          });
+          return;
+        }
+      }
       spawn(kind, label);
     },
     [spawn],
@@ -893,16 +914,16 @@ function App() {
     [spawn, recordMru],
   );
   const openEditorFile = useCallback(
-    (path: string, name: string, _at?: { line?: number; col?: number }) => {
+    (path: string, name: string, at?: { line?: number; col?: number }) => {
       recordMru(path);
-      spawn(paneForFile(path, name), name);
+      spawn({ type: "editor", path, name, line: at?.line, col: at?.col }, name);
     },
     [spawn, recordMru],
   );
   const openViewerFile = useCallback(
     (path: string, name: string) => {
       recordMru(path);
-      spawn(paneForFile(path, name), name);
+      spawn({ type: "file", path, name }, name);
     },
     [spawn, recordMru],
   );
@@ -1187,6 +1208,7 @@ function App() {
   // so dictation / drops target it (and the rail row highlights).
   const focusPane = useCallback((key: string) => {
     setHiddenKeys((h) => h.filter((k) => k !== key));
+    setPanes((p) => p.map((x) => (x.key === key ? { ...x, attention: false } : x)));
     setFocusedPane(key);
   }, [setFocusedPane]);
   // Rename a pane (double-click its OPEN-rail row) — persists via the layout save.
@@ -1778,6 +1800,58 @@ function App() {
     [spawn, focusPane, home],
   );
   useEffect(() => registerOrchestrator(openOrchestrator), [openOrchestrator]);
+
+  const lastDiscordSessionRef = useRef<string>("");
+  useEffect(() => {
+    if (!nativeRuntime) return;
+    let cancelled = false;
+    const syncDiscord = async () => {
+      try {
+        const session = await discordBridgeSession();
+        if (cancelled || !session.ok || !session.sessionId) return;
+        const version = session.mtime ?? 0;
+        const signature = `${session.sessionId}:${version}`;
+        if (signature === lastDiscordSessionRef.current) return;
+        lastDiscordSessionRef.current = signature;
+        const kind: PaneContent = {
+          type: "chat",
+          cwd: session.cwd,
+          resume: {
+            id: session.sessionId,
+            title: DISCORD_PANE_LABEL,
+            engine: session.engine || "claude",
+            model: session.model,
+            version,
+          },
+          agentLabel: DISCORD_PANE_LABEL,
+        };
+        if (panesRef.current.some((p) => p.key === DISCORD_PANE_KEY)) {
+          const hidden = hiddenKeys.includes(DISCORD_PANE_KEY);
+          setPanes((p) =>
+            p.map((x) =>
+              x.key === DISCORD_PANE_KEY
+                ? { ...x, label: DISCORD_PANE_LABEL, kind, attention: hidden && version > 0 }
+                : x,
+            ),
+          );
+        } else {
+          spawn(kind, DISCORD_PANE_LABEL, DISCORD_PANE_KEY, true);
+          setPanes((p) =>
+            p.map((x) => (x.key === DISCORD_PANE_KEY ? { ...x, attention: version > 0 } : x)),
+          );
+        }
+      } catch {
+        /* bridge not configured yet */
+      }
+    };
+    void syncDiscord();
+    const timer = window.setInterval(syncDiscord, 8000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [hiddenKeys, nativeRuntime, spawn]);
+
   // Control hook (control.rs → `control-command` event): allow external callers
   // to open core panes only.
   // De-dupe guard: a single control command can reach the handler twice (effect
@@ -1792,7 +1866,7 @@ function App() {
     void listen<Record<string, unknown>>("control-command", (event) => {
       const payload = event.payload || {};
       const cmd = String(payload.cmd ?? "");
-      const dedupeKey = `${cmd}:${String(payload.paneType ?? "")}:${String(payload.seed ?? "")}`;
+      const dedupeKey = `${cmd}:${String(payload.paneType ?? "")}:${String(payload.key ?? "")}:${String(payload.seed ?? "")}:${String(payload.resume ?? "")}`;
       const nowTs = Date.now();
       if (
         dedupeKey === lastControlCmdRef.current.key &&
@@ -1809,6 +1883,16 @@ function App() {
         const seed = payload.seed != null ? String(payload.seed) : undefined;
         const cwd = payload.cwd != null ? String(payload.cwd) : undefined;
         const label = payload.label != null ? String(payload.label) : undefined;
+        const resume =
+          payload.resume != null
+            ? {
+                id: String(payload.resume),
+                title: label ?? "chat",
+                engine: payload.engine != null ? String(payload.engine) : "claude",
+                model: payload.model != null ? String(payload.model) : undefined,
+                version: Date.now(),
+              }
+            : undefined;
         // Optional stable key (e.g. aios-agent spawns `agent:<id>`) so a re-fire
         // reattaches the SAME pane instead of stacking a duplicate every tick.
         const explicitKey = payload.key != null ? String(payload.key) : undefined;
@@ -1822,6 +1906,15 @@ function App() {
         // foreground re-fire reveals + focuses it; a background re-fire leaves
         // firaz's view untouched (the pane keeps running where it is).
         if (explicitKey && panesRef.current.some((p) => p.key === explicitKey)) {
+          if (resume) {
+            setPanes((p) =>
+              p.map((x) =>
+                x.key === explicitKey && x.kind.type === "chat"
+                  ? { ...x, label: label ?? x.label, kind: { ...x.kind, cwd, resume }, attention: background }
+                  : x,
+              ),
+            );
+          }
           if (!background) {
             setHiddenKeys((h) => h.filter((k) => k !== explicitKey));
             focusPane(explicitKey);
@@ -1835,7 +1928,7 @@ function App() {
         }
         switch (paneType) {
           case "chat":
-            spawn({ type: "chat", seed: seed || undefined, cwd }, label ?? "chat", explicitKey, background);
+            spawn({ type: "chat", seed: seed || undefined, cwd, resume }, label ?? "chat", explicitKey, background);
             break;
           case "terminal":
           case "shell":
@@ -3177,7 +3270,10 @@ function OpenPanesList({
               } ${iconsOnly ? "justify-center gap-0 px-0 text-center" : ""}`}
               title={hidden ? `restore pane: ${p.label}` : `focus pane: ${p.label} · double-click to rename · middle-click to close`}
             >
-              <span className={`status-dot shrink-0 ${hidden ? "status-dot--cold" : DOT[p.kind.type] ?? "status-dot--cold"}`} />
+              <span className={`status-dot shrink-0 ${p.attention ? "status-dot--hot" : hidden ? "status-dot--cold" : DOT[p.kind.type] ?? "status-dot--cold"}`} />
+              {!iconsOnly && p.attention && (
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-accent)]" title="new activity" />
+              )}
               {!iconsOnly && <span className="truncate">{p.label}</span>}
               {!iconsOnly && maximized && <Maximize2 size={10} className="shrink-0 text-[var(--color-accent)]" />}
               {/* ⌘N jump hint — teaches the existing shortcut, hover-only */}
@@ -3533,8 +3629,24 @@ function PaneCard({
           <Suspense fallback={<PaneLoading />}>
             {isTerminal(pane.kind) ? (
             <TerminalPane kind={pane.kind} paneKey={pane.key} />
+          ) : pane.kind.type === "file" ? (
+            <FileViewerPane path={pane.kind.path} paneKey={pane.key} />
+          ) : pane.kind.type === "editor" ? (
+            <EditorPane
+              active={active}
+              path={pane.kind.path}
+              name={pane.kind.name}
+              paneKey={pane.key}
+              line={pane.kind.line}
+              col={pane.kind.col}
+            />
           ) : pane.kind.type === "files" ? (
-            <FilesPane initialRoot={pane.kind.root} onOpenFile={onOpenFile} />
+            <FilesPane
+              initialRoot={pane.kind.root}
+              onOpenFile={onOpenFile}
+              onOpenEditorFile={onOpenEditorFile}
+              onOpenViewerFile={onOpenViewerFile}
+            />
           ) : pane.kind.type === "history" ? (
             <HistoryPane onOpenHistoryItem={onOpenHistoryItem} />
           ) : pane.kind.type === "mission" ? (

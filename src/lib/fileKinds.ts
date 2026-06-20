@@ -73,7 +73,7 @@ export const CODE_EXT = new Set([
 
 /** Plain-text-ish files — editor pane, text icon. */
 export const TEXT_EXT = new Set([
-  "md", "markdown", "txt", "rst", "log", "env",
+  "md", "markdown", "mdx", "mds", "txt", "rst", "log", "env",
   "jsonl", "csv", "tsv", "cfg", "conf",
   "diff", "patch", "lock", "gitignore",
 ]);
@@ -85,7 +85,7 @@ export const TEXT_EXT = new Set([
 export const VIEWER_EXT = new Set([
   ...IMG_EXT, ...VIDEO_EXT, ...AUDIO_EXT, ...PDF_EXT, ...DOC_EXT,
   ...ARCHIVE_EXT, ...FONT_EXT,
-  "md", "markdown",
+  "md", "markdown", "mdx", "mds",
 ]);
 
 /** Lowercased extension of a path. Dotless basenames return the whole
@@ -136,6 +136,8 @@ const EDITOR_LANGUAGE: Record<string, string> = {
   svelte: "html",
   md: "markdown",
   markdown: "markdown",
+  mdx: "markdown",
+  mds: "markdown",
   yaml: "yaml",
   yml: "yaml",
   toml: "ini",

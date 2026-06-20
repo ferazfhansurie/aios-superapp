@@ -15,11 +15,7 @@ pub struct DirEntry {
 /// Lists a directory (dirs first, alphabetical, dotfiles hidden). Empty path → $HOME.
 #[tauri::command]
 pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
-    let p = if path.is_empty() {
-        home_dir()
-    } else {
-        path
-    };
+    let p = if path.is_empty() { home_dir() } else { path };
     let mut entries: Vec<DirEntry> = Vec::new();
     for e in std::fs::read_dir(&p).map_err(|e| e.to_string())? {
         let e = match e {
@@ -69,11 +65,7 @@ pub fn read_dir_tree(
 ) -> Result<Vec<DirEntry>, String> {
     let show_hidden = show_hidden.unwrap_or(false);
     let show_all = show_all.unwrap_or(false);
-    let p = if path.is_empty() {
-        home_dir()
-    } else {
-        path
-    };
+    let p = if path.is_empty() { home_dir() } else { path };
     let mut entries: Vec<DirEntry> = Vec::new();
     for e in std::fs::read_dir(&p).map_err(|e| e.to_string())? {
         let e = match e {
@@ -178,7 +170,10 @@ pub fn git_status(path: String) -> Result<GitStatus, String> {
         }
     };
     let entries = git_status_entries(&root)?;
-    Ok(GitStatus { root: Some(root), entries })
+    Ok(GitStatus {
+        root: Some(root),
+        entries,
+    })
 }
 
 #[tauri::command]
@@ -203,7 +198,16 @@ pub fn git_snapshot(path: String) -> Result<GitSnapshot, String> {
     let (ahead, behind) = git_ahead_behind(&root);
     let graph = git_stdout(
         &root,
-        &["log", "--graph", "--decorate", "--oneline", "--all", "-n", "28", "--date-order"],
+        &[
+            "log",
+            "--graph",
+            "--decorate",
+            "--oneline",
+            "--all",
+            "-n",
+            "28",
+            "--date-order",
+        ],
     )
     .unwrap_or_default()
     .lines()
@@ -433,7 +437,11 @@ fn git_branches(root: &str, current: &str) -> Vec<GitBranch> {
     }
 
     if let Some(remote) = git_stdout(root, &["branch", "-r", "--format=%(refname:short)"]) {
-        for name in remote.lines().map(str::trim).filter(|name| !name.is_empty()) {
+        for name in remote
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
             if name.ends_with("/HEAD") || name.contains(" -> ") {
                 continue;
             }
@@ -460,12 +468,7 @@ fn git_branches(root: &str, current: &str) -> Vec<GitBranch> {
 fn git_ahead_behind(root: &str) -> (u32, u32) {
     let Some(text) = git_stdout(
         root,
-        &[
-            "rev-list",
-            "--count",
-            "--left-right",
-            "@{upstream}...HEAD",
-        ],
+        &["rev-list", "--count", "--left-right", "@{upstream}...HEAD"],
     ) else {
         return (0, 0);
     };
@@ -533,9 +536,7 @@ pub fn git_pulse(paths: Vec<String>) -> Vec<RepoPulse> {
             .args(["-C", &path, "rev-parse", "--abbrev-ref", "HEAD"])
             .output()
         {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
-            }
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => String::new(),
         };
 
@@ -615,9 +616,18 @@ fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
         return Some((
             "flutter".into(),
             vec![
-                RunCommand { label: "flutter run".into(), cmd: "flutter run".into() },
-                RunCommand { label: "flutter run --release".into(), cmd: "flutter run --release".into() },
-                RunCommand { label: "flutter test".into(), cmd: "flutter test".into() },
+                RunCommand {
+                    label: "flutter run".into(),
+                    cmd: "flutter run".into(),
+                },
+                RunCommand {
+                    label: "flutter run --release".into(),
+                    cmd: "flutter run --release".into(),
+                },
+                RunCommand {
+                    label: "flutter test".into(),
+                    cmd: "flutter test".into(),
+                },
             ],
         ));
     }
@@ -628,9 +638,18 @@ fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
         return Some((
             "rust".into(),
             vec![
-                RunCommand { label: "cargo run".into(), cmd: "cargo run".into() },
-                RunCommand { label: "cargo test".into(), cmd: "cargo test".into() },
-                RunCommand { label: "cargo build".into(), cmd: "cargo build".into() },
+                RunCommand {
+                    label: "cargo run".into(),
+                    cmd: "cargo run".into(),
+                },
+                RunCommand {
+                    label: "cargo test".into(),
+                    cmd: "cargo test".into(),
+                },
+                RunCommand {
+                    label: "cargo build".into(),
+                    cmd: "cargo build".into(),
+                },
             ],
         ));
     }
@@ -638,8 +657,14 @@ fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
         return Some((
             "go".into(),
             vec![
-                RunCommand { label: "go run .".into(), cmd: "go run .".into() },
-                RunCommand { label: "go test ./...".into(), cmd: "go test ./...".into() },
+                RunCommand {
+                    label: "go run .".into(),
+                    cmd: "go run .".into(),
+                },
+                RunCommand {
+                    label: "go test ./...".into(),
+                    cmd: "go test ./...".into(),
+                },
             ],
         ));
     }
@@ -651,13 +676,19 @@ fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
         };
         return Some((
             "python".into(),
-            vec![RunCommand { label: cmd.into(), cmd: cmd.into() }],
+            vec![RunCommand {
+                label: cmd.into(),
+                cmd: cmd.into(),
+            }],
         ));
     }
     if has("Makefile") {
         return Some((
             "make".into(),
-            vec![RunCommand { label: "make".into(), cmd: "make".into() }],
+            vec![RunCommand {
+                label: "make".into(),
+                cmd: "make".into(),
+            }],
         ));
     }
     None
@@ -687,7 +718,11 @@ pub fn detect_project(path: String) -> ProjectRun {
             None => break,
         }
     }
-    ProjectRun { kind: "unknown".into(), root: None, commands: Vec::new() }
+    ProjectRun {
+        kind: "unknown".into(),
+        root: None,
+        commands: Vec::new(),
+    }
 }
 
 #[derive(Serialize)]
@@ -825,7 +860,9 @@ fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
                     &["dev", "start", "serve", "build", "test"]
                 };
                 names.sort_by_key(|n| {
-                    prio.iter().position(|p| *p == n.as_str()).unwrap_or(prio.len() + 1)
+                    prio.iter()
+                        .position(|p| *p == n.as_str())
+                        .unwrap_or(prio.len() + 1)
                 });
                 for name in names {
                     let run = if pm == "npm" {
@@ -833,7 +870,10 @@ fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
                     } else {
                         format!("{pm} {name}")
                     };
-                    out.push(RunCommand { label: run.clone(), cmd: run });
+                    out.push(RunCommand {
+                        label: run.clone(),
+                        cmd: run,
+                    });
                 }
             }
         }
@@ -852,7 +892,13 @@ fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
 pub fn home_dir() -> String {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| if cfg!(windows) { "C:\\".into() } else { "/".into() })
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "C:\\".into()
+            } else {
+                "/".into()
+            }
+        })
 }
 
 /// Builds a `file://` URL from an absolute path, cross-platform. On Windows
@@ -1065,14 +1111,79 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
     // KEEP IN SYNC with src/lib/fileKinds.ts CODE_EXT ∪ TEXT_EXT
     let texty = matches!(
         ext.as_str(),
-        "txt" | "md" | "markdown" | "json" | "jsonc" | "jsonl" | "csv" | "tsv" | "yaml" | "yml"
-            | "toml" | "log" | "rst" | "ini" | "cfg" | "conf" | "env" | "xml" | "html" | "htm"
-            | "css" | "scss" | "less" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
-            | "rs" | "py" | "rb" | "go" | "java" | "kt" | "kts" | "swift" | "c" | "h"
-            | "cpp" | "cc" | "hpp" | "cs" | "php" | "sh" | "bash" | "zsh" | "fish"
-            | "sql" | "dart" | "lua" | "pl" | "r" | "scala" | "clj" | "ex" | "exs"
-            | "elm" | "vue" | "svelte" | "graphql" | "gql" | "proto" | "dockerfile"
-            | "makefile" | "gradle" | "properties" | "diff" | "patch" | "lock" | "gitignore"
+        "txt"
+            | "md"
+            | "markdown"
+            | "json"
+            | "jsonc"
+            | "jsonl"
+            | "csv"
+            | "tsv"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "log"
+            | "rst"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "env"
+            | "xml"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "less"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "mjs"
+            | "cjs"
+            | "mts"
+            | "cts"
+            | "rs"
+            | "py"
+            | "rb"
+            | "go"
+            | "java"
+            | "kt"
+            | "kts"
+            | "swift"
+            | "c"
+            | "h"
+            | "cpp"
+            | "cc"
+            | "hpp"
+            | "cs"
+            | "php"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "sql"
+            | "dart"
+            | "lua"
+            | "pl"
+            | "r"
+            | "scala"
+            | "clj"
+            | "ex"
+            | "exs"
+            | "elm"
+            | "vue"
+            | "svelte"
+            | "graphql"
+            | "gql"
+            | "proto"
+            | "dockerfile"
+            | "makefile"
+            | "gradle"
+            | "properties"
+            | "diff"
+            | "patch"
+            | "lock"
+            | "gitignore"
     );
 
     match std::str::from_utf8(&bytes) {
@@ -1107,9 +1218,30 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
 fn is_office_ext(ext: &str) -> bool {
     matches!(
         ext,
-        "doc" | "docx" | "docm" | "dot" | "dotx" | "rtf" | "odt" | "ott" | "fodt"
-            | "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" | "ots" | "fods"
-            | "ppt" | "pptx" | "pptm" | "pps" | "ppsx" | "odp" | "otp" | "fodp"
+        "doc"
+            | "docx"
+            | "docm"
+            | "dot"
+            | "dotx"
+            | "rtf"
+            | "odt"
+            | "ott"
+            | "fodt"
+            | "xls"
+            | "xlsx"
+            | "xlsm"
+            | "xlsb"
+            | "ods"
+            | "ots"
+            | "fods"
+            | "ppt"
+            | "pptx"
+            | "pptm"
+            | "pps"
+            | "ppsx"
+            | "odp"
+            | "otp"
+            | "fodp"
     )
 }
 
@@ -1283,12 +1415,23 @@ pub fn save_image_temp(data: String, ext: String) -> Result<String, String> {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect();
-    let safe_ext = if safe_ext.is_empty() { "png".into() } else { safe_ext };
+    let safe_ext = if safe_ext.is_empty() {
+        "png".into()
+    } else {
+        safe_ext
+    };
 
     let dir = std::env::temp_dir().join("aios-paste");
     let dir = dir.as_path();
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let key = fnv1a(&format!("{}|{}", bytes.len(), bytes.iter().take(4096).fold(0u64, |a, &b| a.wrapping_add(b as u64))));
+    let key = fnv1a(&format!(
+        "{}|{}",
+        bytes.len(),
+        bytes
+            .iter()
+            .take(4096)
+            .fold(0u64, |a, &b| a.wrapping_add(b as u64))
+    ));
     let path = dir.join(format!("paste-{key:x}.{safe_ext}"));
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
@@ -1365,10 +1508,7 @@ pub fn find_files(root: String, max: Option<usize>) -> Result<Vec<String>, Strin
         };
         // Files only (depth 0 is the root dir itself).
         if dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            let rel = dent
-                .path()
-                .strip_prefix(root_path)
-                .unwrap_or(dent.path());
+            let rel = dent.path().strip_prefix(root_path).unwrap_or(dent.path());
             out.push(rel.to_string_lossy().to_string());
         }
     }
@@ -1449,11 +1589,7 @@ fn cap_hit_text(s: &str) -> String {
 /// in which case the Rust fallback scanner is used. (We avoid bare "rg" /
 /// PATH lookup because the GUI-launched process has a minimal PATH.)
 fn ripgrep_bin() -> Option<String> {
-    let candidates = [
-        "/opt/homebrew/bin/rg",
-        "/usr/local/bin/rg",
-        "/usr/bin/rg",
-    ];
+    let candidates = ["/opt/homebrew/bin/rg", "/usr/local/bin/rg", "/usr/bin/rg"];
     for c in candidates {
         if std::path::Path::new(c).exists() {
             return Some(c.to_string());
@@ -1590,7 +1726,11 @@ fn search_with_ignore(
             continue;
         }
         // Skip very large files outright (binary or generated blobs).
-        if dent.metadata().map(|m| m.len() > EDIT_TEXT_CAP).unwrap_or(false) {
+        if dent
+            .metadata()
+            .map(|m| m.len() > EDIT_TEXT_CAP)
+            .unwrap_or(false)
+        {
             continue;
         }
         let bytes = match std::fs::read(dent.path()) {

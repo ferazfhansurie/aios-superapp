@@ -195,13 +195,50 @@ fn windows_shell() -> String {
             return s;
         }
     }
-    let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
     let pwsh = format!(r"{program_files}\PowerShell\7\pwsh.exe");
     if std::path::Path::new(&pwsh).exists() {
         return pwsh;
     }
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     format!(r"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// GUI-launched macOS apps often inherit a thin LaunchServices PATH, not the
+/// rich terminal PATH. Seed the PTY shell with known CLI locations before zsh
+/// reads dotfiles, so shims like `codex` work in a fresh superapp terminal.
+#[cfg(not(windows))]
+fn seed_unix_cli_path(cmd: &mut CommandBuilder) {
+    let mut entries: Vec<String> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        entries.push(format!("{home}/.local/bin"));
+
+        let nvm_nodes = std::path::Path::new(&home).join(".nvm/versions/node");
+        if let Ok(nodes) = std::fs::read_dir(nvm_nodes) {
+            let mut bins: Vec<String> = nodes
+                .flatten()
+                .map(|entry| entry.path().join("bin"))
+                .filter(|path| path.is_dir())
+                .filter_map(|path| path.to_str().map(|s| s.to_string()))
+                .collect();
+            bins.sort();
+            bins.reverse();
+            entries.extend(bins);
+        }
+    }
+
+    entries.extend([
+        "/Applications/Codex.app/Contents/Resources".to_string(),
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+    ]);
+    entries.retain(|path| std::path::Path::new(path).is_dir());
+
+    let current =
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    entries.push(current);
+    cmd.env("PATH", entries.join(":"));
 }
 
 /// Spawns the user's login shell in a new PTY pane.
@@ -226,6 +263,8 @@ pub fn pty_spawn(
     };
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    #[cfg(not(windows))]
+    seed_unix_cli_path(&mut cmd);
     match cwd {
         Some(dir) if !dir.is_empty() => cmd.cwd(dir),
         _ => {
@@ -493,7 +532,8 @@ pub fn pty_paste(state: State<PtyState>, id: u32, text: String) -> Result<(), St
     let sanitized = text.replace("\x1b[201~", "");
     let mut w = s.writer.lock();
     w.write_all(b"\x1b[200~").map_err(|e| e.to_string())?;
-    w.write_all(sanitized.as_bytes()).map_err(|e| e.to_string())?;
+    w.write_all(sanitized.as_bytes())
+        .map_err(|e| e.to_string())?;
     w.write_all(b"\x1b[201~").map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())?;
     Ok(())
@@ -562,10 +602,7 @@ pub fn pty_reap_terminals(keep: Vec<String>) -> Result<Vec<String>, String> {
         use std::collections::HashSet;
         let tmux = tmux_bin();
         // The full session names we must preserve, e.g. `aios-term-k3-abcd`.
-        let keep: HashSet<String> = keep
-            .into_iter()
-            .map(|n| format!("aios-term-{n}"))
-            .collect();
+        let keep: HashSet<String> = keep.into_iter().map(|n| format!("aios-term-{n}")).collect();
         let output = std::process::Command::new(&tmux)
             .args(["-L", "adletic", "list-sessions", "-F", "#{session_name}"])
             .output()
