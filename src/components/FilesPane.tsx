@@ -15,20 +15,14 @@ import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as R
 import {
   ChevronRight,
   Copy,
-  FileCode2,
-  FileText,
   Eye,
   EyeOff,
-  FolderClosed,
   FolderGit2,
-  FolderOpen,
   Home,
   ListCollapse,
-  MessageSquare,
   Play,
   RefreshCw,
   Search,
-  TerminalSquare,
 } from "lucide-react";
 
 import {
@@ -39,6 +33,7 @@ import {
 import { detectProject, listProjects, type ProjectInfo } from "../lib/run";
 import { AIOS_DIR_MIME, AIOS_PATH_MIME, beginPathDrag, consumeDragClick, spawnPane } from "../lib/paneBus";
 import { fileIcon } from "../lib/fileIcons";
+import { AppSvgIcon } from "./AppSvgIcon";
 import { PaneDropZone } from "./PaneDropZone";
 
 // Persisted toggles (VS Code-style defaults: both hidden).
@@ -338,11 +333,11 @@ export function FilesPane({
         </button>
         <span className="flex-1" />
         <button onClick={openTerminalHere} className="rounded p-1 hover:text-[var(--color-text)]" title={`Open terminal here\n${focusDir}`}>
-          <TerminalSquare size={13} />
+          <AppSvgIcon name="terminal" size={15} />
         </button>
         {selectedIsFile && (
           <button onClick={openSelectedInPane} className="rounded p-1 hover:text-[var(--color-text)]" title="Open selected file in pane">
-            <FileText size={13} />
+            <AppSvgIcon name="file" size={15} />
           </button>
         )}
         <button onClick={openProjectPicker} className="rounded p-1 hover:text-[var(--color-text)]" title="Open project (re-root this pane)">
@@ -481,17 +476,17 @@ export function FilesPane({
               <div className="truncate text-[12px] font-medium text-[var(--color-text)]">{contextMenu.entry.name}</div>
               <div className="truncate font-mono text-[9.5px] text-[var(--color-faint)]">{entryDir(contextMenu.entry)}</div>
             </div>
-            <ContextAction icon={<TerminalSquare size={13} />} label="open terminal here" onClick={openContextTerminal} />
+            <ContextAction icon={<AppSvgIcon name="terminal" size={15} />} label="open terminal here" onClick={openContextTerminal} />
             <ContextAction icon={<Play size={13} />} label="run detected project" onClick={runContextProject} />
             {!contextMenu.entry.is_dir && (
               <>
-                <ContextAction icon={<FileText size={13} />} label="open in pane" onClick={openContextDefault} />
-                <ContextAction icon={<FileCode2 size={13} />} label="open editor" onClick={openContextEditor} />
-                <ContextAction icon={<FileText size={13} />} label="open viewer" onClick={openContextViewer} />
+                <ContextAction icon={<AppSvgIcon name="file" size={15} />} label="open in pane" onClick={openContextDefault} />
+                <ContextAction icon={<AppSvgIcon name="editor" size={15} />} label="open editor" onClick={openContextEditor} />
+                <ContextAction icon={<AppSvgIcon name="file" size={15} />} label="open viewer" onClick={openContextViewer} />
               </>
             )}
-            <ContextAction icon={<FolderOpen size={13} />} label="open containing files pane" onClick={openContainingFilesPane} />
-            <ContextAction icon={<MessageSquare size={13} />} label="open chat here" onClick={openContextChat} />
+            <ContextAction icon={<AppSvgIcon name="files" size={15} />} label="open containing files pane" onClick={openContainingFilesPane} />
+            <ContextAction icon={<AppSvgIcon name="chat" size={15} />} label="open chat here" onClick={openContextChat} />
             <ContextAction icon={<Copy size={13} />} label="copy path" onClick={copyPath} />
           </div>
         </>
@@ -594,11 +589,7 @@ function TreeRow({
 
       {/* icon */}
       {isDir ? (
-        open ? (
-          <FolderOpen size={14} className="shrink-0 text-[var(--color-accent)]/80" />
-        ) : (
-          <FolderClosed size={14} className="shrink-0 text-[var(--color-accent)]/80" />
-        )
+        <AppSvgIcon name="files" size={15} className={`shrink-0 transition-transform ${open ? "scale-105" : ""}`} />
       ) : (
         <Icon size={14} className="shrink-0" style={{ color }} />
       )}

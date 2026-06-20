@@ -21,8 +21,8 @@ type Engine = NonNullable<ChatModel["engine"]>;
 // warm clay/coral, OpenAI's green, a violet for opencode.
 const ENGINE_COLOR: Record<Engine, string> = {
   claude: "#D97757",
-  codex: "#10A37F",
-  opencode: "#A78BFA",
+  codex: "#8B5CF6",
+  opencode: "#050505",
 };
 
 function ClaudeMark({ size = 14, color }: { size?: number; color: string }) {
@@ -65,21 +65,23 @@ function CodexMark({ size = 14, color }: { size?: number; color: string }) {
 }
 
 function OpencodeMark({ size = 14, color }: { size?: number; color: string }) {
-  // angle brackets — "open / code"
+  // black badge + white brackets — keeps the opencode mark visible on dark UI.
   return (
     <svg
       width={size}
       height={size}
       viewBox="0 0 24 24"
       fill="none"
-      stroke={color}
-      strokeWidth="1.6"
-      strokeLinecap="round"
-      strokeLinejoin="round"
       aria-hidden="true"
     >
-      <polyline points="9 7 4 12 9 17" />
-      <polyline points="15 7 20 12 15 17" />
+      <rect x="3" y="3" width="18" height="18" rx="6" fill={color} />
+      <path
+        d="M9 8 5.5 12 9 16M15 8l3.5 4-3.5 4"
+        stroke="#fff"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }

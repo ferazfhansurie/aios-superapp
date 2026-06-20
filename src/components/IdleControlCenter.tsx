@@ -1,31 +1,27 @@
 /** Instant home screen for the core shell. */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
-  Folder,
-  Globe,
-  History,
-  MessageSquare,
   PanelLeft,
   Search,
-  Terminal,
 } from "lucide-react";
 
 import type { AppDef } from "../App";
 import type { SidebarItem, SidebarState } from "../lib/sidebar";
+import { AppSvgIcon, iconKeyForSidebarItem, type AppIconKey } from "./AppSvgIcon";
 import { MissionBoard } from "./MissionBoard";
 
 const CORE_LAUNCHERS: Array<{
   label: string;
   hint: string;
-  icon: ReactNode;
+  icon: AppIconKey;
   kind: AppDef["kind"];
 }> = [
-  { label: "new chat", hint: "chat", icon: <MessageSquare size={14} />, kind: { type: "chat" } },
-  { label: "new terminal", hint: "shell", icon: <Terminal size={14} />, kind: { type: "shell" } },
-  { label: "new browser", hint: "web", icon: <Globe size={14} />, kind: { type: "browser" } },
-  { label: "new files", hint: "files", icon: <Folder size={14} />, kind: { type: "files" } },
-  { label: "history", hint: "open", icon: <History size={14} />, kind: { type: "history" } },
+  { label: "new chat", hint: "chat", icon: "chat", kind: { type: "chat" } },
+  { label: "new terminal", hint: "shell", icon: "terminal", kind: { type: "shell" } },
+  { label: "new browser", hint: "web", icon: "browser", kind: { type: "browser" } },
+  { label: "new files", hint: "files", icon: "files", kind: { type: "files" } },
+  { label: "history", hint: "open", icon: "history", kind: { type: "history" } },
 ];
 
 export function IdleControlCenter({
@@ -70,8 +66,9 @@ export function IdleControlCenter({
                 key={item.id}
                 type="button"
                 onClick={() => onOpenSidebarItem(item)}
-                className="rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/40 px-2.5 py-1 text-[11px] text-[var(--color-text-2)] transition-colors hover:border-[color-mix(in_srgb,var(--color-accent)_45%,var(--color-border))] hover:text-[var(--color-text)]"
+                className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/40 px-2.5 py-1 text-[11px] text-[var(--color-text-2)] transition-colors hover:border-[color-mix(in_srgb,var(--color-accent)_45%,var(--color-border))] hover:text-[var(--color-text)]"
               >
+                <AppSvgIcon name={iconKeyForSidebarItem(item)} size={14} className="shrink-0" />
                 {item.label}
               </button>
             ))}
@@ -204,7 +201,7 @@ function QuickActions({
           onClick={() => onSpawn(action.kind, action.label.replace(/^new /, ""))}
           className="group flex items-center gap-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/35 px-3 py-2 text-left transition-colors hover:border-[var(--color-accent)]/45 hover:bg-[var(--color-panel-2)]"
         >
-          <span className="text-[var(--color-muted)] group-hover:text-[var(--color-accent)]">{action.icon}</span>
+          <AppSvgIcon name={action.icon} size={17} className="shrink-0 transition-transform group-hover:scale-110" />
           <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">{action.label}</span>
           <span className="shrink-0 font-mono text-[9px] uppercase tracking-wider text-[var(--color-faint)]">{action.hint}</span>
         </button>
@@ -214,7 +211,7 @@ function QuickActions({
         onClick={onOpenPalette}
         className="group flex items-center gap-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/35 px-3 py-2 text-left transition-colors hover:border-[var(--color-accent)]/45 hover:bg-[var(--color-panel-2)]"
       >
-        <Search size={14} className="text-[var(--color-muted)] group-hover:text-[var(--color-accent)]" />
+        <AppSvgIcon name="panes" size={17} className="shrink-0 transition-transform group-hover:scale-110" />
         <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">palette</span>
         <span className="shrink-0 font-mono text-[9px] uppercase tracking-wider text-[var(--color-faint)]">cmd k</span>
       </button>
@@ -223,7 +220,7 @@ function QuickActions({
         onClick={onRevealSidebar}
         className="group flex items-center gap-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/35 px-3 py-2 text-left transition-colors hover:border-[var(--color-accent)]/45 hover:bg-[var(--color-panel-2)]"
       >
-        <PanelLeft size={14} className="text-[var(--color-muted)] group-hover:text-[var(--color-accent)]" />
+        <PanelLeft size={14} className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-accent)]" />
         <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--color-text-2)] group-hover:text-[var(--color-text)]">rail</span>
         <span className="shrink-0 font-mono text-[9px] uppercase tracking-wider text-[var(--color-faint)]">spaces</span>
       </button>

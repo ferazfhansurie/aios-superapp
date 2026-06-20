@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { History, MessageSquare, RotateCcw, Trash2 } from "lucide-react";
+import { RotateCcw, Trash2 } from "lucide-react";
 
 import type { PaneContent } from "../lib/apps";
 import { readChatTranscript } from "../lib/chat";
@@ -14,6 +14,7 @@ import {
   subscribePaneHistory,
   type PaneHistoryItem,
 } from "../lib/paneHistory";
+import { AppSvgIcon, iconKeyForPane } from "./AppSvgIcon";
 
 function timeAgo(ts: number): string {
   const delta = Math.max(0, Date.now() - ts);
@@ -94,7 +95,7 @@ export function HistoryPane({
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-bg)]">
       <div className="flex shrink-0 items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
-          <History size={16} className="text-[var(--color-accent)]" />
+          <AppSvgIcon name="history" size={18} className="shrink-0" />
           <div className="min-w-0">
             <div className="text-[13px] font-medium text-[var(--color-text)]">history</div>
             <div className="truncate text-[10px] text-[var(--color-muted)]">
@@ -157,7 +158,7 @@ function HistoryGroup({
             className="group flex min-w-0 items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/35 px-2.5 py-2 transition-colors hover:border-[var(--color-border-strong)] hover:bg-[var(--color-panel-2)]"
           >
             <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-[var(--color-panel-2)] text-[var(--color-muted)]">
-              {chatResume ? <MessageSquare size={15} /> : <History size={15} />}
+              <AppSvgIcon name={chatResume ? "chat" : iconKeyForPane(item.kind, item.label)} size={18} />
             </span>
             <button
               type="button"

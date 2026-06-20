@@ -11,22 +11,15 @@ import {
 } from "react";
 
 import {
-  Bot,
   Camera,
   ChevronDown,
   ChevronRight,
   EllipsisVertical,
-  Folder,
-  FolderOpen,
   FolderPlus,
-  Globe,
   GripVertical,
-  History as HistoryIcon,
   Layers,
   Maximize2,
   Minimize2,
-  MessageSquare,
-  MessageCircle,
   MonitorUp,
   MoveRight,
   PanelLeft,
@@ -35,8 +28,6 @@ import {
   Plus,
   Radio,
   Search,
-  Settings as SettingsIcon,
-  TerminalSquare,
   Trash2,
   Wand2,
   Eye,
@@ -47,6 +38,7 @@ import {
 import { recallUrl, recallPaneUrl, forgetUrl } from "./lib/browser-mem";
 import { browserOpenDevtools, setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
+import { AppSvgIcon, iconKeyForPane, iconKeyForSidebarItem, type AppIconKey } from "./components/AppSvgIcon";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FileFinder } from "./components/FileFinder";
 import { GlobalSearch } from "./components/GlobalSearch";
@@ -2325,11 +2317,11 @@ function MobileBottomNav({
   onOpenSettings: () => void;
 }) {
   const items = [
-    { label: "chat", icon: MessageSquare, action: onNewChat },
-    { label: "search", icon: Search, action: onOpenPalette },
-    { label: "web", icon: Globe, action: onOpenBrowser },
-    { label: "panes", icon: Layers, action: panesCount > 0 ? onShowPanes : onOpenPalette },
-    { label: "settings", icon: SettingsIcon, action: onOpenSettings },
+    { label: "chat", icon: "chat" as AppIconKey, action: onNewChat },
+    { label: "search", icon: "aios" as AppIconKey, action: onOpenPalette },
+    { label: "web", icon: "browser" as AppIconKey, action: onOpenBrowser },
+    { label: "panes", icon: "panes" as AppIconKey, action: panesCount > 0 ? onShowPanes : onOpenPalette },
+    { label: "settings", icon: "settings" as AppIconKey, action: onOpenSettings },
   ];
   return (
     <nav
@@ -2337,9 +2329,7 @@ function MobileBottomNav({
       aria-label="mobile navigation"
       data-no-window-drag
     >
-      {items.map((item) => {
-        const Icon = item.icon;
-        return (
+      {items.map((item) => (
           <button
             key={item.label}
             type="button"
@@ -2347,7 +2337,7 @@ function MobileBottomNav({
             className="relative flex min-w-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[10px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
             title={item.label}
           >
-            <Icon size={19} />
+            <AppSvgIcon name={item.icon} size={21} />
             <span className="w-full truncate text-center leading-none">{item.label}</span>
             {item.label === "panes" && panesCount > 0 && (
               <span className="absolute right-3 top-1.5 grid h-4 min-w-4 place-items-center rounded-full bg-[var(--color-accent)] px-1 text-[9px] font-semibold leading-none text-black">
@@ -2355,8 +2345,7 @@ function MobileBottomNav({
               </span>
             )}
           </button>
-        );
-      })}
+        ))}
     </nav>
   );
 }
@@ -2601,22 +2590,18 @@ function SidebarRail({
   );
 }
 
-const SIDEBAR_ICON_CHOICES: { name: string; label: string; icon: typeof Folder }[] = [
-  { name: "chat", label: "chat", icon: MessageSquare },
-  { name: "terminal", label: "terminal", icon: TerminalSquare },
-  { name: "bot", label: "agent", icon: Bot },
-  { name: "files", label: "files", icon: Folder },
-  { name: "browser", label: "web", icon: Globe },
-  { name: "contacts", label: "people", icon: MessageCircle },
-  { name: "studio", label: "studio", icon: Wand2 },
-  { name: "pin", label: "pin", icon: Pin },
-  { name: "settings", label: "settings", icon: SettingsIcon },
-  { name: "layers", label: "layers", icon: Layers },
+const SIDEBAR_ICON_CHOICES: { name: string; label: string; icon: AppIconKey }[] = [
+  { name: "chat", label: "chat", icon: "chat" },
+  { name: "terminal", label: "terminal", icon: "terminal" },
+  { name: "bot", label: "agent", icon: "agent" },
+  { name: "files", label: "files", icon: "files" },
+  { name: "browser", label: "web", icon: "browser" },
+  { name: "contacts", label: "people", icon: "whatsapp" },
+  { name: "studio", label: "studio", icon: "studio" },
+  { name: "pin", label: "pin", icon: "pin" },
+  { name: "settings", label: "settings", icon: "settings" },
+  { name: "layers", label: "layers", icon: "panes" },
 ];
-
-const SIDEBAR_ICON_BY_NAME: Record<string, typeof Folder> = Object.fromEntries(
-  SIDEBAR_ICON_CHOICES.map((choice) => [choice.name, choice.icon]),
-) as Record<string, typeof Folder>;
 
 /** One sidebar row — draggable, resolves to a custom lucide icon or a cached
  *  favicon (links), with a hover ⋯ menu (rename / icon / hide / unpin). */
@@ -2654,8 +2639,7 @@ function SidebarRow({
   const menuRef = useRef<HTMLDivElement>(null);
 
   const isLink = item.kind.type === "link";
-  const app = item.kind.type === "app" ? SPAWN_BY_ID[item.kind.appId] : undefined;
-  const Icon = SIDEBAR_ICON_BY_NAME[item.iconName] ?? app?.icon ?? Globe;
+  const iconKey = iconKeyForSidebarItem(item);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -2738,9 +2722,10 @@ function SidebarRow({
             className={`${iconsOnly ? "h-[22px] w-[22px]" : "h-[15px] w-[15px]"} shrink-0 rounded-sm`}
           />
         ) : (
-          <Icon
-            size={iconsOnly ? 23 : 15}
-            className="shrink-0 text-[var(--color-muted)] group-hover:text-[var(--color-text)]"
+          <AppSvgIcon
+            name={iconKey}
+            size={iconsOnly ? 24 : 17}
+            className="shrink-0 transition-transform group-hover:scale-110"
           />
         )}
         {!iconsOnly && <span className="truncate">{item.label}</span>}
@@ -2795,9 +2780,7 @@ function SidebarRow({
                       <img src={item.faviconUrl} alt="" className="h-4 w-4 rounded-sm" />
                     </button>
                   )}
-                  {SIDEBAR_ICON_CHOICES.map((choice) => {
-                    const ChoiceIcon = choice.icon;
-                    return (
+                  {SIDEBAR_ICON_CHOICES.map((choice) => (
                       <button
                         key={choice.name}
                         type="button"
@@ -2812,10 +2795,9 @@ function SidebarRow({
                             : "border-transparent text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
                         }`}
                       >
-                        <ChoiceIcon size={15} />
+                        <AppSvgIcon name={choice.icon} size={17} />
                       </button>
-                    );
-                  })}
+                  ))}
                 </div>
               )}
             </div>
@@ -2972,17 +2954,6 @@ function PinSiteModal({ spaceId, onClose }: { spaceId: string | null; onClose: (
   );
 }
 
-/** Type → glyph for the overview cards (Mission-Control-style window thumbnails). */
-const PANE_GLYPH: Record<string, typeof Folder> = {
-  shell: TerminalSquare,
-  oracle: Bot,
-  tmux: TerminalSquare,
-  files: Folder,
-  history: HistoryIcon,
-  browser: Globe,
-  chat: MessageSquare,
-};
-
 /** Mission-control-style pane overview: a full-screen scrim that fans out every
  *  open pane as a big window-thumbnail card so you can SEE them all and switch.
  *  Opened by three-finger swipe-up (wheel-fling), ⌘` / Ctrl+↑, or the palette.
@@ -3081,7 +3052,6 @@ function PaneOverview({
           {panes.map((p, i) => {
             const hidden = hiddenKeys.includes(p.key);
             const isSel = i === sel;
-            const Glyph = PANE_GLYPH[p.kind.type] ?? Layers;
             return (
               <div key={p.key} className="flex flex-col items-center gap-2" style={{ width: cardW }}>
                 <button
@@ -3108,7 +3078,11 @@ function PaneOverview({
                   </div>
                   {/* body — big type glyph on a faint gradient "screen" */}
                   <div className="relative flex min-h-0 flex-1 items-center justify-center bg-gradient-to-br from-[var(--color-pane)] to-[var(--color-bg)]">
-                    <Glyph size={Math.round(cardW * 0.16)} className="text-[var(--color-faint)] opacity-50 transition-opacity group-hover:opacity-80" />
+                    <AppSvgIcon
+                      name={iconKeyForPane(p.kind, p.label)}
+                      size={Math.round(cardW * 0.18)}
+                      className="opacity-80 drop-shadow-[0_16px_35px_rgba(0,0,0,0.45)] transition-transform group-hover:scale-110"
+                    />
                     {hidden && (
                       <span className="absolute bottom-2 right-2 rounded bg-[var(--color-panel)]/80 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-[var(--color-faint)]">minimized</span>
                     )}
@@ -3227,7 +3201,7 @@ function OpenPanesList({
         if (editKey === p.key) {
           return (
             <div key={p.key} className="flex items-center gap-2 rounded-md px-2.5 py-1">
-              <span className={`status-dot shrink-0 ${DOT[p.kind.type] ?? "status-dot--cold"}`} />
+              <AppSvgIcon name={iconKeyForPane(p.kind, p.label)} size={17} className="shrink-0" />
               <input
                 autoFocus
                 value={draft}
@@ -3270,7 +3244,14 @@ function OpenPanesList({
               } ${iconsOnly ? "justify-center gap-0 px-0 text-center" : ""}`}
               title={hidden ? `restore pane: ${p.label}` : `focus pane: ${p.label} · double-click to rename · middle-click to close`}
             >
-              <span className={`status-dot shrink-0 ${p.attention ? "status-dot--hot" : hidden ? "status-dot--cold" : DOT[p.kind.type] ?? "status-dot--cold"}`} />
+              <span className="relative shrink-0">
+                <AppSvgIcon
+                  name={iconKeyForPane(p.kind, p.label)}
+                  size={iconsOnly ? 23 : 17}
+                  className={hidden ? "opacity-55 grayscale" : "transition-transform group-hover:scale-110"}
+                />
+                <span className={`absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full ring-1 ring-[var(--color-panel)] ${p.attention ? "bg-[var(--color-accent)]" : hidden ? "bg-[var(--color-faint)]" : "bg-emerald-400"}`} />
+              </span>
               {!iconsOnly && p.attention && (
                 <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-accent)]" title="new activity" />
               )}
@@ -3449,7 +3430,10 @@ function PaneCard({
     >
       <div className="flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-white/[0.02] px-2.5">
         <div className="flex min-w-0 items-center gap-1.5">
-          <span className={`status-dot ${DOT[t] ?? "status-dot--cold"}`} />
+          <span className="relative grid h-4 w-4 shrink-0 place-items-center">
+            <AppSvgIcon name={iconKeyForPane(pane.kind, label)} size={16} />
+            <span className={`absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full ring-1 ring-[var(--color-pane)] ${active ? "bg-emerald-400" : "bg-[var(--color-faint)]"}`} />
+          </span>
           <span className="truncate font-mono text-[11px] text-[var(--color-muted)]">{label}</span>
         </div>
         <div className="flex items-center gap-0.5">
@@ -3487,7 +3471,7 @@ function PaneCard({
                 {fileTarget && (
                   <>
                     <PaneActionItem
-                      icon={<Pencil size={13} />}
+                      icon={<AppSvgIcon name="editor" size={15} />}
                       label="open editor"
                       onClick={() => {
                         onOpenEditorFile(fileTarget.path, fileTarget.name);
@@ -3495,7 +3479,7 @@ function PaneCard({
                       }}
                     />
                     <PaneActionItem
-                      icon={<Eye size={13} />}
+                      icon={<AppSvgIcon name="file" size={15} />}
                       label="open viewer"
                       onClick={() => {
                         onOpenViewerFile(fileTarget.path, fileTarget.name);
@@ -3503,7 +3487,7 @@ function PaneCard({
                       }}
                     />
                     <PaneActionItem
-                      icon={<Folder size={13} />}
+                      icon={<AppSvgIcon name="files" size={15} />}
                       label="reveal files"
                       onClick={() => {
                         onRevealFile(fileTarget.path, fileTarget.name);
@@ -3514,7 +3498,7 @@ function PaneCard({
                 )}
                 {revealTarget && (
                   <PaneActionItem
-                    icon={<FolderOpen size={13} />}
+                    icon={<AppSvgIcon name="files" size={15} />}
                     label="reveal in finder"
                     onClick={() => {
                       onRevealInFinder(revealTarget);
@@ -3523,7 +3507,7 @@ function PaneCard({
                   />
                 )}
                 <PaneActionItem
-                  icon={<Layers size={13} />}
+                  icon={<AppSvgIcon name="panes" size={15} />}
                   label="duplicate pane"
                   onClick={() => {
                     onDuplicate();
@@ -3532,7 +3516,7 @@ function PaneCard({
                 />
                 <div className="my-1 border-t border-[var(--color-border)]" />
                 <PaneActionItem
-                  icon={<Globe size={13} />}
+                  icon={<AppSvgIcon name="browser" size={15} />}
                   label="new browser"
                   onClick={() => {
                     requestSpawnPane("browser", { url: "https://google.com", label: "browser" });
@@ -3540,7 +3524,7 @@ function PaneCard({
                   }}
                 />
                 <PaneActionItem
-                  icon={<TerminalSquare size={13} />}
+                  icon={<AppSvgIcon name="terminal" size={15} />}
                   label="terminal here"
                   onClick={() => {
                     requestSpawnPane("terminal", { cwd: paneCwd, label: paneCwd ? `terminal · ${paneCwd.split("/").filter(Boolean).pop()}` : "terminal" });
@@ -3548,7 +3532,7 @@ function PaneCard({
                   }}
                 />
                 <PaneActionItem
-                  icon={<Folder size={13} />}
+                  icon={<AppSvgIcon name="files" size={15} />}
                   label="files here"
                   onClick={() => {
                     requestSpawnPane("files", { path: paneCwd, label: paneCwd ? `files · ${paneCwd.split("/").filter(Boolean).pop()}` : "files" });
@@ -3556,7 +3540,7 @@ function PaneCard({
                   }}
                 />
                 <PaneActionItem
-                  icon={<MessageSquare size={13} />}
+                  icon={<AppSvgIcon name="chat" size={15} />}
                   label="chat here"
                   onClick={() => {
                     requestSpawnPane("chat", { cwd: paneCwd, label: paneCwd ? `chat · ${paneCwd.split("/").filter(Boolean).pop()}` : "chat" });

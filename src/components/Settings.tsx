@@ -67,7 +67,7 @@ import {
   resetSidebar,
   subscribe as subscribeSidebar,
 } from "../lib/sidebar";
-import { SPAWN_BY_ID } from "../lib/apps";
+import { AppSvgIcon, iconKeyForSidebarItem } from "./AppSvgIcon";
 
 import {
   type Accent,
@@ -1348,8 +1348,6 @@ export function Settings({
                   </div>
                   {sidebar.items.map((it) => {
                     const isLink = it.kind.type === "link";
-                    const app = it.kind.type === "app" ? SPAWN_BY_ID[it.kind.appId] : undefined;
-                    const Icon = app?.icon ?? PanelLeft;
                     return (
                       <div
                         key={it.id}
@@ -1359,7 +1357,7 @@ export function Settings({
                           {isLink && it.faviconUrl ? (
                             <img src={it.faviconUrl} alt="" className="h-4 w-4 shrink-0 rounded-sm" />
                           ) : (
-                            <Icon size={14} className="shrink-0 text-[var(--color-muted)]" />
+                            <AppSvgIcon name={iconKeyForSidebarItem(it)} size={16} className="shrink-0" />
                           )}
                           <span
                             className="truncate text-[13px]"
