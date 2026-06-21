@@ -38,13 +38,13 @@ import {
 import { recallUrl, recallPaneUrl, forgetUrl } from "./lib/browser-mem";
 import { browserOpenDevtools, setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
+import { AnalyticsPane } from "./components/AnalyticsPane";
 import { AppSvgIcon, iconKeyForPane, iconKeyForSidebarItem, type AppIconKey } from "./components/AppSvgIcon";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FileFinder } from "./components/FileFinder";
 import { GlobalSearch } from "./components/GlobalSearch";
 import { HistoryPane } from "./components/HistoryPane";
 import { IdleDashboard } from "./components/IdleDashboard";
-import { MissionBoard } from "./components/MissionBoard";
 import { LoopPane } from "./components/LoopPane";
 import { TicketPane } from "./components/TicketPane";
 import { MirrorViewer } from "./components/MirrorViewer";
@@ -150,7 +150,9 @@ const ChatPane = lazy(() => import("./components/ChatPane").then((m) => ({ defau
 const EditorPane = lazy(() => import("./components/EditorPane").then((m) => ({ default: m.EditorPane })));
 const FilesPane = lazy(() => import("./components/FilesPane").then((m) => ({ default: m.FilesPane })));
 const FileViewerPane = lazy(() => import("./components/FileViewerPane").then((m) => ({ default: m.FileViewerPane })));
+const LiveRoomPane = lazy(() => import("./components/LiveRoomPane").then((m) => ({ default: m.LiveRoomPane })));
 const Settings = lazy(() => import("./components/Settings").then((m) => ({ default: m.Settings })));
+const WrmsDevicePane = lazy(() => import("./components/WrmsDevicePane").then((m) => ({ default: m.WrmsDevicePane })));
 const TerminalPane = lazy(() =>
   import("./components/TerminalPane").then((m) => ({ default: m.TerminalPane })),
 );
@@ -179,6 +181,8 @@ if (typeof window !== "undefined") {
     import("./components/FilesPane"),
     import("./components/FileViewerPane"),
     import("./components/BrowserPane"),
+    import("./components/LiveRoomPane"),
+    import("./components/WrmsDevicePane"),
   ]));
 }
 
@@ -187,6 +191,9 @@ interface Pane {
   label: string;
   kind: PaneContent;
   attention?: boolean;
+  /** Background `aios-agent` worker: mounted/running, but hidden from OPEN and
+   *  excluded from restore until Firaz explicitly opens it from the parent chat. */
+  backgroundAgent?: boolean;
 }
 
 const isTerminal = (k: PaneContent): k is PaneKind =>
@@ -202,6 +209,8 @@ function paneContextDetail(kind: PaneContent): string | undefined {
       return `${kind.socket}/${kind.session}`;
     case "files":
       return kind.root;
+    case "analytics":
+      return "aios.adleticagency.com";
     case "file":
     case "editor":
       return kind.path;
@@ -211,6 +220,8 @@ function paneContextDetail(kind: PaneContent): string | undefined {
       return kind.cwd ?? kind.resume?.title ?? kind.agentLabel;
     case "history":
       return "opened panes";
+    case "wrms-device":
+      return "collector device qa";
     default:
       return undefined;
   }
@@ -302,6 +313,14 @@ const GRID_TRACK_KEY = "aios.grid.tracks";
 const AGENT_AUDIT_KEY = "aios.agent.audit.v1";
 const AGENT_AUDIT_LIMIT = 200;
 
+function isAgentPaneKey(key: string): boolean {
+  return key.startsWith("agent:");
+}
+
+function isDormantBackgroundAgent(pane: Pane, hiddenKeys: string[]): boolean {
+  return pane.backgroundAgent === true && hiddenKeys.includes(pane.key);
+}
+
 function recordAgentAudit(entry: AgentAuditEntry) {
   try {
     const raw = localStorage.getItem(AGENT_AUDIT_KEY);
@@ -334,7 +353,14 @@ function loadLayout(): Pane[] {
     // saved BEFORE keys existed get one minted ONCE here (non-destructive —
     // migrateLayoutPanes never sheds entries or fields) and written straight
     // back, so the next launch sees the same keys.
-    const { panes: saved, changed } = migrateLayoutPanes(JSON.parse(raw));
+    const migrated = migrateLayoutPanes(JSON.parse(raw));
+    // Repair old installs: pre-fix background workers were persisted as normal
+    // `agent:*` chat panes, so relaunch restored every worker and could freeze
+    // the shell. New opened agents are saved with `agentOpened:true`.
+    const saved = migrated.panes.filter(
+      (p) => !isAgentPaneKey(p.key) || (p as { agentOpened?: unknown }).agentOpened === true,
+    );
+    const changed = migrated.changed || saved.length !== migrated.panes.length;
     if (changed) {
       try {
         localStorage.setItem(LAYOUT_KEY, JSON.stringify(saved));
@@ -365,10 +391,18 @@ function saveLayout(panes: Pane[]) {
   try {
     const out = panes
       .map((p) => {
+        if (p.backgroundAgent) return null;
         const kind = persistableKind(p.kind);
         // Persist the pane KEY (B1) — it's the seed for `termSessionName`, so a
         // restored terminal pane must keep the same key to reattach its session.
-        return kind ? { key: p.key, label: p.label, kind } : null;
+        if (!kind) return null;
+        const record: { key: string; label: string; kind: PaneContent; agentOpened?: true } = {
+          key: p.key,
+          label: p.label,
+          kind,
+        };
+        if (isAgentPaneKey(p.key)) record.agentOpened = true;
+        return record;
       })
       .filter(Boolean);
     localStorage.setItem(LAYOUT_KEY, JSON.stringify(out));
@@ -518,15 +552,16 @@ function App() {
   // and a terminal/editor goes edge-to-edge. Target = the selected/focused pane,
   // else the single pane if there's only one. Toggle: a second ⌘F restores.
   const toggleFullscreenSelected = useCallback((): boolean => {
-    if (panes.length === 0) return false;
+    const candidates = panes.filter((pane) => !isDormantBackgroundAgent(pane, hiddenKeys));
+    if (candidates.length === 0) return false;
     const sel = activeKey ?? focusedPane.current;
     const target =
-      panes.find((p) => p.key === sel) ?? (panes.length === 1 ? panes[0] : null);
+      candidates.find((p) => p.key === sel) ?? (candidates.length === 1 ? candidates[0] : null);
     if (!target) return false; // no clear target → let ⌘F fall through to find
     const isOn = maximizedKey === target.key;
     onVideoFullscreen(target.key, !isOn);
     return true;
-  }, [panes, activeKey, maximizedKey, onVideoFullscreen]);
+  }, [panes, hiddenKeys, activeKey, maximizedKey, onVideoFullscreen]);
 
   // ⌘F reconciliation (R5 item 4 vs R2a pane-fullscreen). When the FOCUSED pane
   // is a browser, ⌘F means find-in-page → dispatch a window event the matching
@@ -535,8 +570,9 @@ function App() {
   // preventDefaults). The ⌘. exit-fullscreen path is untouched.
   const handleCmdF = useCallback((): boolean => {
     const sel = activeKey ?? focusedPane.current;
+    const candidates = panes.filter((pane) => !isDormantBackgroundAgent(pane, hiddenKeys));
     const target =
-      panes.find((p) => p.key === sel) ?? (panes.length === 1 ? panes[0] : null);
+      candidates.find((p) => p.key === sel) ?? (candidates.length === 1 ? candidates[0] : null);
     if (target?.kind.type === "browser") {
       window.dispatchEvent(
         new CustomEvent("aios-browser-find", { detail: { label: target.key } }),
@@ -544,7 +580,7 @@ function App() {
       return true;
     }
     return toggleFullscreenSelected();
-  }, [panes, activeKey, toggleFullscreenSelected]);
+  }, [panes, hiddenKeys, activeKey, toggleFullscreenSelected]);
   // personalizable sidebar — items + order live in lib/sidebar (localStorage).
   const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
   useEffect(() => subscribeSidebar(setSidebar), []);
@@ -613,6 +649,19 @@ function App() {
   useEffect(() => {
     saveLayout(panes);
   }, [panes]);
+
+  const restoredHistoryRecorded = useRef(false);
+  useEffect(() => {
+    if (restoredHistoryRecorded.current) return;
+    restoredHistoryRecorded.current = true;
+    for (const pane of panes) {
+      if (pane.backgroundAgent) continue;
+      recordPaneHistory(pane.kind, pane.label);
+    }
+    // mount-only: record restored panes as recently opened without re-recording
+    // every later pane state update.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const flash = useCallback((msg: string) => {
     setToast(msg);
@@ -710,7 +759,7 @@ function App() {
         while (taken.has(`${base} ${n}`)) n++;
         next = `${base} ${n}`;
       }
-      return [...p, { key, kind, label: next }];
+      return [...p, { key, kind, label: next, backgroundAgent: background && isAgentPaneKey(key) }];
     });
     // Background panes open hidden (display:none) so they run without taking grid
     // space or focus; firaz reveals them from the sidebar when he wants to peek.
@@ -957,7 +1006,10 @@ function App() {
           spawn({ type: "browser", url: ctx?.url }, ctx?.label ?? "browser");
           break;
         case "chat":
-          spawn({ type: "chat", cwd: ctx?.cwd, seed: ctx?.seed }, ctx?.label ?? "chat");
+          spawn(
+            { type: "chat", cwd: ctx?.cwd, seed: ctx?.seed, modelId: ctx?.modelId },
+            ctx?.label ?? "chat",
+          );
           break;
       }
     },
@@ -1071,7 +1123,8 @@ function App() {
           break;
         case "goto": {
           const idx = (ev.index ?? 0) - 1;
-          const p = idx >= 0 ? panes[idx] : null;
+          const candidates = panes.filter((pane) => !isDormantBackgroundAgent(pane, hiddenKeys));
+          const p = idx >= 0 ? candidates[idx] : null;
           if (p) {
             setHiddenKeys((h) => h.filter((k) => k !== p.key));
             setFocusedPane(p.key);
@@ -1097,7 +1150,7 @@ function App() {
           break;
       }
     },
-    [activeKey, handleCmdF, newPaneForContext, panes, requestClose, setFocusedPane],
+    [activeKey, handleCmdF, hiddenKeys, newPaneForContext, panes, requestClose, setFocusedPane],
   );
   // Workspace project context stays local and cheap. Full chat-session resume is
   // owned by the chat pane's `/resume` picker and the pane history surface.
@@ -1200,15 +1253,27 @@ function App() {
   // so dictation / drops target it (and the rail row highlights).
   const focusPane = useCallback((key: string) => {
     setHiddenKeys((h) => h.filter((k) => k !== key));
-    setPanes((p) => p.map((x) => (x.key === key ? { ...x, attention: false } : x)));
+    setPanes((p) => p.map((x) => (x.key === key ? { ...x, attention: false, backgroundAgent: false } : x)));
     setFocusedPane(key);
   }, [setFocusedPane]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const key = (event as CustomEvent<{ key?: unknown }>).detail?.key;
+      if (typeof key !== "string" || !key) return;
+      focusPane(key);
+    };
+    window.addEventListener("aios-focus-pane", handler);
+    return () => window.removeEventListener("aios-focus-pane", handler);
+  }, [focusPane]);
+
   // Rename a pane (double-click its OPEN-rail row) — persists via the layout save.
   const renamePane = useCallback((key: string, label: string) => {
     const v = label.trim();
     if (!v) return;
     setPanes((p) => p.map((x) => (x.key === key ? { ...x, label: v } : x)));
   }, []);
+
   const handleTranscript = useCallback(
     (text: string) => {
       const k = focusedPane.current;
@@ -1279,7 +1344,9 @@ function App() {
         // ⌘` / Ctrl+↑ — toggle the mission-control pane overview (switch panes).
         // Ctrl+↑ mirrors macOS Mission Control; ⌘` mirrors window-cycle.
         e.preventDefault();
-        if (panes.length > 0) setOverviewOpen((v) => !v);
+        if (panes.some((pane) => !isDormantBackgroundAgent(pane, hiddenKeys))) {
+          setOverviewOpen((v) => !v);
+        }
       } else if (mod && e.key.toLowerCase() === "f") {
         // ⌘F — context-aware: browser pane focused → find-in-page; else fullscreen
         // the selected pane. Only preventDefault when we actually handled it.
@@ -1289,7 +1356,7 @@ function App() {
         // ⌘M — minimize (hide) the selected pane to the OPEN rail. ⇧ restores all.
         e.preventDefault();
         if (e.shiftKey) {
-          setHiddenKeys([]);
+          setHiddenKeys((cur) => cur.filter((key) => panes.some((pane) => pane.key === key && pane.backgroundAgent)));
           setMaximizedKey(null);
         } else {
           const k = activeKey ?? focusedPane.current;
@@ -1323,7 +1390,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addShell, fireAppshot, runF5, routePaneNav, toggleHide, activeKey, maximizedKey, panes]);
+  }, [addShell, fireAppshot, hiddenKeys, runF5, routePaneNav, toggleHide, activeKey, maximizedKey, panes]);
 
   // NATIVE PANE-NAV BRIDGE (wave 1B). Rust emits this frozen shortcut contract
   // for pane-routed actions so ⌘F/⌘W/⌘K/⌘1-9 still work when a native child
@@ -1414,11 +1481,14 @@ function App() {
           break;
         }
         case "overview":
-          if (panes.length > 0) setOverviewOpen((v) => !v);
+          if (panes.some((pane) => !isDormantBackgroundAgent(pane, hiddenKeys))) {
+            setOverviewOpen((v) => !v);
+          }
           break;
         case "jump": {
           const idx = (payload.arg ?? 0) - 1;
-          const p = idx >= 0 ? panes[idx] : null;
+          const candidates = panes.filter((pane) => !isDormantBackgroundAgent(pane, hiddenKeys));
+          const p = idx >= 0 ? candidates[idx] : null;
           if (p) focusPane(p.key);
           break;
         }
@@ -1442,6 +1512,7 @@ function App() {
     toggleHide,
     focusPane,
     activeKey,
+    hiddenKeys,
     panes,
   ]);
 
@@ -1532,9 +1603,19 @@ function App() {
     };
   }, [flash]);
 
+  const dormantAgentKeys = useMemo(
+    () => panes.filter((pane) => isDormantBackgroundAgent(pane, hiddenKeys)).map((pane) => pane.key),
+    [panes, hiddenKeys],
+  );
+  const exposedPanes = useMemo(
+    () => panes.filter((pane) => !isDormantBackgroundAgent(pane, hiddenKeys)),
+    [panes, hiddenKeys],
+  );
+
   // grid is sized to the VISIBLE panes — hidden ones are display:none (out of
-  // grid flow), so they leave no empty cell behind.
-  const visibleCount = panes.length - hiddenKeys.length;
+  // grid flow), so they leave no empty cell behind. Dormant background workers
+  // are not mounted until explicitly opened from the parent chat fleet.
+  const visibleCount = exposedPanes.filter((pane) => !hiddenKeys.includes(pane.key)).length;
   const { cols, rows } = useMemo(() => {
     const n = visibleCount || 1;
     if (compactWebLayout) return { cols: 1, rows: n };
@@ -1545,7 +1626,7 @@ function App() {
   const commands: Command[] = useMemo(() => {
     return buildAppCommands({
       activeKey,
-      panesCount: panes.length,
+      panesCount: exposedPanes.length,
       spawn,
       runF5,
       setSidebarOpen,
@@ -1554,16 +1635,16 @@ function App() {
         saveSettings({ topBarMode: mode });
       },
       setOverviewOpen,
-      setHiddenKeys,
+      setHiddenKeys: (keys) => setHiddenKeys(keys.length === 0 ? dormantAgentKeys : keys),
       setMaximizedKey,
     });
-  }, [spawn, runF5, panes.length, activeKey]);
+  }, [spawn, runF5, exposedPanes.length, activeKey, dormantAgentKeys]);
 
   const agentController = useMemo(
     () =>
       createAgentController({
         getPanes: () =>
-          panes.map((pane) => ({
+          exposedPanes.map((pane) => ({
             key: pane.key,
             label: pane.label,
             type: pane.kind.type,
@@ -1588,7 +1669,7 @@ function App() {
         detachChat: (key) => chatHandles.get(key)?.detach(true),
         audit: recordAgentAudit,
       }),
-    [panes, hiddenKeys, activeKey, focusPane, closePane],
+    [exposedPanes, hiddenKeys, activeKey, focusPane, closePane],
   );
 
   useEffect(() => {
@@ -1894,15 +1975,41 @@ function App() {
         // the focus-and-reveal behavior. This is what makes the loop system
         // non-intrusive — panes fire every few minutes without hijacking his view.
         const background = payload.background === true;
+        const parentSessionId =
+          payload.parentSessionId != null ? Number(payload.parentSessionId) : null;
+        const emitAgentSpawned = () => {
+          if (!parentSessionId || !Number.isFinite(parentSessionId)) return;
+          if (!explicitKey?.startsWith("agent:")) return;
+          window.dispatchEvent(
+            new CustomEvent("chat-agent-spawned", {
+              detail: {
+                parentSessionId,
+                parentEngine: payload.parentEngine != null ? String(payload.parentEngine) : undefined,
+                paneKey: explicitKey,
+                label: label ?? explicitKey.replace(/^agent:/, ""),
+                cwd,
+                prompt: seed,
+                background,
+              },
+            }),
+          );
+        };
         // A re-fire of an already-open stable-keyed pane: don't duplicate. A
         // foreground re-fire reveals + focuses it; a background re-fire leaves
         // firaz's view untouched (the pane keeps running where it is).
         if (explicitKey && panesRef.current.some((p) => p.key === explicitKey)) {
+          emitAgentSpawned();
           if (resume) {
             setPanes((p) =>
               p.map((x) =>
                 x.key === explicitKey && x.kind.type === "chat"
-                  ? { ...x, label: label ?? x.label, kind: { ...x.kind, cwd, resume }, attention: background }
+                  ? {
+                      ...x,
+                      label: label ?? x.label,
+                      kind: { ...x.kind, cwd, resume },
+                      attention: background,
+                      backgroundAgent: background ? x.backgroundAgent : false,
+                    }
                   : x,
               ),
             );
@@ -1921,6 +2028,7 @@ function App() {
         switch (paneType) {
           case "chat":
             spawn({ type: "chat", seed: seed || undefined, cwd, resume }, label ?? "chat", explicitKey, background);
+            emitAgentSpawned();
             break;
           case "terminal":
           case "shell":
@@ -1931,6 +2039,9 @@ function App() {
             break;
           case "files":
             spawn({ type: "files" }, "files", explicitKey, background);
+            break;
+          case "wrms-device":
+            spawn({ type: "wrms-device" }, label ?? "wrms device", explicitKey, background);
             break;
           default:
             break;
@@ -1965,7 +2076,7 @@ function App() {
       <IconBtn
         title="Show all panes"
         onClick={() => {
-          if (panes.length > 0) setOverviewOpen(true);
+          if (exposedPanes.length > 0) setOverviewOpen(true);
         }}
         active={overviewOpen}
       >
@@ -2005,7 +2116,7 @@ function App() {
       <IconBtn
         title="Show all panes"
         onClick={() => {
-          if (panes.length > 0) setOverviewOpen(true);
+          if (exposedPanes.length > 0) setOverviewOpen(true);
         }}
         active={overviewOpen}
       >
@@ -2055,9 +2166,9 @@ function App() {
                 topBarHidden ? "pt-8" : ""
               }`}
             >
-              {panes.length > 0 && (
+              {exposedPanes.length > 0 && (
                 <OpenPanesList
-                  panes={panes}
+                  panes={exposedPanes}
                   hiddenKeys={hiddenKeys}
                   maximizedKey={maximizedKey}
                   activeKey={activeKey}
@@ -2109,13 +2220,13 @@ function App() {
             // No panes at all → idle. If panes exist but ALL are hidden, keep them
             // mounted (state-preserving) in the grid and overlay idle on top — else
             // the grid is all-`display:none` and the screen goes blank.
-            if (panes.length === 0) return idleDash;
+            if (exposedPanes.length === 0) return idleDash;
             return (
               <>
                 {visibleCount === 0 && <div className="absolute inset-0 z-10">{idleDash}</div>}
             <ResizableGrid cols={cols} rows={rows} gap={8} storageKey={gridTrackStorageKey(GRID_TRACK_KEY, cols, rows)}>
-              {panes.map((pane) => {
-                const visibleIndex = panes
+              {exposedPanes.map((pane) => {
+                const visibleIndex = exposedPanes
                   .filter((p) => !hiddenKeys.includes(p.key))
                   .findIndex((p) => p.key === pane.key);
                 const paneStyle =
@@ -2145,7 +2256,7 @@ function App() {
                     setFocusedPane(pane.key);
                   }}
                   onAnnotate={routeToChat}
-                  workspaceContext={buildWorkspaceContext(pane, panes, projects, activeKey, hiddenKeys)}
+                  workspaceContext={buildWorkspaceContext(pane, exposedPanes, projects, activeKey, hiddenKeys)}
                   onOpenFile={openFile}
                   onOpenEditorFile={openEditorFile}
                   onOpenViewerFile={openViewerFile}
@@ -2153,6 +2264,9 @@ function App() {
                   onRevealInFinder={revealPathInFinder}
                   onDuplicate={() => spawn(pane.kind, pane.label)}
                   onOpenHistoryItem={openHistoryItem}
+                  openPanes={exposedPanes}
+                  activeKey={activeKey}
+                  onFocusPane={focusPane}
                   onOpenUrl={openUrl}
                   onProfileChange={(profile) =>
                     setPanes((ps) =>
@@ -2162,6 +2276,9 @@ function App() {
                           : p,
                       ),
                     )
+                  }
+                  onUpdatePaneKind={(kind) =>
+                    setPanes((ps) => ps.map((p) => (p.key === pane.key ? { ...p, kind } : p)))
                   }
                   onChatSession={(info) => {
                     // Stamp the live session into this pane's kind + re-record
@@ -2189,12 +2306,12 @@ function App() {
 
       {compactWebLayout && (
         <MobileBottomNav
-          panesCount={panes.length}
+          panesCount={exposedPanes.length}
           onNewChat={() => spawn({ type: "chat" }, "chat")}
           onOpenPalette={() => setPaletteOpen(true)}
           onOpenBrowser={() => spawn({ type: "browser" }, "browser")}
           onShowPanes={() => {
-            if (panes.length > 0) setOverviewOpen(true);
+            if (exposedPanes.length > 0) setOverviewOpen(true);
           }}
           onOpenSettings={() => setSettingsOpen(true)}
         />
@@ -2253,7 +2370,7 @@ function App() {
       <PinSiteModal spaceId={pinSiteSpace} onClose={() => setPinSiteSpace(null)} />
       <PaneOverview
         open={overviewOpen}
-        panes={panes}
+        panes={exposedPanes}
         hiddenKeys={hiddenKeys}
         activeKey={activeKey}
         onClose={() => setOverviewOpen(false)}
@@ -2265,7 +2382,7 @@ function App() {
         onClosePane={requestClose}
         onShowAll={() => {
           // un-minimize + un-maximize everything (tile all panes into the grid).
-          setHiddenKeys([]);
+          setHiddenKeys(dormantAgentKeys);
           setMaximizedKey(null);
           setOverviewOpen(false);
         }}
@@ -2594,6 +2711,7 @@ const SIDEBAR_ICON_CHOICES: { name: string; label: string; icon: AppIconKey }[] 
   { name: "chat", label: "chat", icon: "chat" },
   { name: "terminal", label: "terminal", icon: "terminal" },
   { name: "bot", label: "agent", icon: "agent" },
+  { name: "analytics", label: "analytics", icon: "analytics" },
   { name: "files", label: "files", icon: "files" },
   { name: "browser", label: "web", icon: "browser" },
   { name: "contacts", label: "people", icon: "whatsapp" },
@@ -3222,7 +3340,7 @@ function OpenPanesList({
             key={p.key}
             className={`group relative flex items-center rounded-md transition-colors ${
               active
-                ? "bg-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent)]/40"
+                ? "bg-white/[0.07] ring-1 ring-white/15 backdrop-blur-md"
                 : "hover:bg-[var(--color-panel-2)]"
             }`}
           >
@@ -3323,8 +3441,12 @@ function PaneCard({
   onOpenHistoryItem,
   onOpenUrl,
   onProfileChange,
+  onUpdatePaneKind,
   onChatSession,
   onVideoFullscreen,
+  openPanes,
+  activeKey,
+  onFocusPane,
 }: {
   pane: Pane;
   defaultCwd?: string;
@@ -3350,10 +3472,15 @@ function PaneCard({
   onOpenHistoryItem: (kind: PaneContent, label: string) => void;
   onOpenUrl?: (url: string) => void;
   onProfileChange: (profile: string) => void;
+  onUpdatePaneKind: (kind: PaneContent) => void;
   onChatSession: (info: { id: string; title: string; engine?: string; model?: string }) => void;
   onVideoFullscreen?: (on: boolean) => void;
+  openPanes: Pane[];
+  activeKey: string | null;
+  onFocusPane: (key: string) => void;
 }) {
   const t = pane.kind.type;
+  const liveRoomKind = pane.kind.type === "live-room" ? pane.kind : null;
   // Register this pane in the canonical rect registry so the OS-drop hit-test can
   // target it without `elementFromPoint` (which fails over native webviews). The
   // wrapper ref gives a live rect; canAccept lets a pane opt a payload out.
@@ -3632,15 +3759,20 @@ function PaneCard({
               onOpenViewerFile={onOpenViewerFile}
             />
           ) : pane.kind.type === "history" ? (
-            <HistoryPane onOpenHistoryItem={onOpenHistoryItem} />
-          ) : pane.kind.type === "mission" ? (
-            <div className="h-full overflow-y-auto p-3">
-              <MissionBoard />
-            </div>
+            <HistoryPane
+              onOpenHistoryItem={onOpenHistoryItem}
+              openPanes={openPanes}
+              activeKey={activeKey}
+              onFocusPane={onFocusPane}
+            />
           ) : pane.kind.type === "loop" ? (
             <LoopPane />
           ) : pane.kind.type === "ticket" ? (
             <TicketPane />
+          ) : pane.kind.type === "analytics" ? (
+            <AnalyticsPane active={active && !hidden} />
+          ) : pane.kind.type === "wrms-device" ? (
+            <WrmsDevicePane />
           ) : pane.kind.type === "browser" ? (
             <BrowserPane
               label={pane.key}
@@ -3651,6 +3783,24 @@ function PaneCard({
               onAnnotate={onAnnotate}
               onProfileChange={onProfileChange}
               onVideoFullscreen={onVideoFullscreen}
+            />
+          ) : liveRoomKind ? (
+            <LiveRoomPane
+              paneKey={pane.key}
+              active={active}
+              hidden={hidden}
+              initialMode={liveRoomKind.mode}
+              sessionId={liveRoomKind.sessionId}
+              initialWindowId={liveRoomKind.windowId}
+              onModeChange={(mode) =>
+                onUpdatePaneKind({ type: "live-room", mode, sessionId: liveRoomKind.sessionId, windowId: liveRoomKind.windowId })
+              }
+              onSessionChange={(sessionId) =>
+                onUpdatePaneKind({ type: "live-room", mode: liveRoomKind.mode, sessionId, windowId: liveRoomKind.windowId })
+              }
+              onWindowChange={(windowId) =>
+                onUpdatePaneKind({ type: "live-room", mode: liveRoomKind.mode, sessionId: liveRoomKind.sessionId, windowId })
+              }
             />
           ) : !chatCwd ? (
             <PaneLoading />

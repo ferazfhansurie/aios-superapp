@@ -5,6 +5,7 @@ import type { SidebarItem } from "../lib/sidebar";
 export type AppIconKey =
   | "aios"
   | "agent"
+  | "analytics"
   | "browser"
   | "chat"
   | "chrome"
@@ -15,6 +16,7 @@ export type AppIconKey =
   | "github"
   | "google"
   | "history"
+  | "live-room"
   | "loop"
   | "mission"
   | "panes"
@@ -37,10 +39,12 @@ type MarkProps = {
 };
 
 const CORE_BY_APP_ID: Record<string, AppIconKey> = {
+  analytics: "analytics",
   browser: "browser",
   chat: "chat",
   files: "files",
   history: "history",
+  "live-room": "live-room",
   loop: "loop",
   mission: "mission",
   terminal: "terminal",
@@ -81,11 +85,12 @@ export function iconKeyForAppId(appId?: string | null): AppIconKey {
 }
 
 export function iconKeyForPane(kind: PaneContent, label?: string): AppIconKey {
+  if (kind.type === "analytics") return "analytics";
   if (kind.type === "browser") return brandIconKeyFor(textHaystack(kind.url, label)) ?? "browser";
   if (kind.type === "chat") return "chat";
   if (kind.type === "files") return "files";
   if (kind.type === "history") return "history";
-  if (kind.type === "mission") return "mission";
+  if (kind.type === "live-room") return "live-room";
   if (kind.type === "loop") return "loop";
   if (kind.type === "ticket") return "ticket";
   if (kind.type === "editor") return "editor";
@@ -139,6 +144,16 @@ function AiosMark({ title }: MarkProps) {
       </defs>
       <circle cx="12" cy="12" r="9" fill="url(#aios-a)" />
       <path d="M7.5 13.7 10.5 7h3l3 6.7M9 11.7h6" fill="none" stroke="#06110D" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+    </>
+  );
+}
+
+function AnalyticsMark() {
+  return (
+    <>
+      <rect x="3.5" y="4" width="17" height="16" rx="5" fill="#14B8A6" />
+      <path d="M8 15.5V11m4 4.5V7.5m4 8v-6" stroke="#042F2E" strokeWidth="2" strokeLinecap="round" />
+      <path d="M7.3 17.7h9.4" stroke="#CCFBF1" strokeWidth="1.4" strokeLinecap="round" />
     </>
   );
 }
@@ -214,6 +229,18 @@ function LoopMark() {
       <rect x="3" y="4" width="18" height="16" rx="6" fill="#06B6D4" />
       <path d="M8 9h5.2c2 0 3.6 1.6 3.6 3.6S15.2 16.2 13.2 16.2H7.4" fill="none" stroke="#ECFEFF" strokeWidth="1.8" strokeLinecap="round" />
       <path d="m9.2 6.8-2.4 2.3 2.4 2.3M14.7 18.5l2.4-2.3-2.4-2.3" fill="none" stroke="#083344" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+    </>
+  );
+}
+
+function LiveRoomMark() {
+  return (
+    <>
+      <rect x="3" y="5" width="18" height="14" rx="4" fill="#0EA5E9" />
+      <rect x="5.2" y="7.2" width="10.2" height="7.6" rx="2" fill="#E0F2FE" />
+      <path d="m15.4 10 3.4-2v8l-3.4-2Z" fill="#BAE6FD" />
+      <circle cx="8.2" cy="16.7" r="1.1" fill="#082F49" />
+      <path d="M10.6 16.7h4.2" stroke="#082F49" strokeWidth="1.2" strokeLinecap="round" />
     </>
   );
 }
@@ -356,6 +383,7 @@ function ChromeMark() {
 const MARKS: Record<AppIconKey, () => ReactElement> = {
   aios: () => <AiosMark />,
   agent: AgentMark,
+  analytics: AnalyticsMark,
   browser: BrowserMark,
   chat: ChatMark,
   chrome: ChromeMark,
@@ -366,6 +394,7 @@ const MARKS: Record<AppIconKey, () => ReactElement> = {
   github: GithubMark,
   google: GoogleMark,
   history: HistoryMark,
+  "live-room": LiveRoomMark,
   loop: LoopMark,
   mission: MissionMark,
   panes: PanesMark,

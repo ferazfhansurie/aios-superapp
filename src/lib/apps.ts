@@ -4,32 +4,34 @@
  *  fine to import here. */
 
 import {
+  BarChart3,
+  Clapperboard,
   Folder,
   Globe,
   History,
   MessageSquare,
   Repeat,
-  Target,
+  Smartphone,
   TerminalSquare,
   Ticket,
 } from "lucide-react";
 
 import type { PaneKind } from "../components/TerminalPane";
+import type { LiveRoomMode } from "./liveRoom";
 
 /** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
 export type PaneContent =
   | PaneKind
   | { type: "files"; root?: string }
-  | { type: "mission" }
   | { type: "loop" }
   | { type: "ticket" }
+  | { type: "analytics" }
+  | { type: "live-room"; mode?: LiveRoomMode; sessionId?: string; windowId?: number }
   | { type: "history" }
-  | { type: "git"; root?: string }
   | { type: "browser"; url?: string; profile?: string; memKey?: string; transient?: boolean }
   | { type: "chrome"; url?: string }
   | { type: "appcast"; windowId?: number }
-  | { type: "notes" }
-  | { type: "memory" }
+  | { type: "wrms-device" }
   | { type: "bridges" }
   | { type: "plugins" }
   | { type: "pulse" }
@@ -61,14 +63,16 @@ export type AppDef = {
 
 /** Default app catalog — order here == the seeded default sidebar order. */
 export const SPAWN: AppDef[] = [
-  { id: "mission", kind: { type: "mission" }, icon: Target, label: "mission", group: "tools" },
-  { id: "loop", kind: { type: "loop" }, icon: Repeat, label: "loops", group: "tools" },
-  { id: "ticket", kind: { type: "ticket" }, icon: Ticket, label: "tickets", group: "tools" },
   { id: "chat", kind: { type: "chat" }, icon: MessageSquare, label: "chat", group: "tools" },
   { id: "terminal", kind: { type: "shell" }, icon: TerminalSquare, label: "terminal", group: "tools" },
   { id: "files", kind: { type: "files" }, icon: Folder, label: "files", group: "tools" },
   { id: "browser", kind: { type: "browser" }, icon: Globe, label: "browser", group: "tools" },
+  { id: "live-room", kind: { type: "live-room" }, icon: Clapperboard, label: "live room", group: "tools" },
   { id: "history", kind: { type: "history" }, icon: History, label: "history", group: "tools" },
+  { id: "loop", kind: { type: "loop" }, icon: Repeat, label: "loops", group: "tools" },
+  { id: "ticket", kind: { type: "ticket" }, icon: Ticket, label: "tickets", group: "tools" },
+  { id: "analytics", kind: { type: "analytics" }, icon: BarChart3, label: "analytics", group: "tools" },
+  { id: "wrms-device", kind: { type: "wrms-device" }, icon: Smartphone, label: "wrms device", group: "tools" },
 ];
 
 /** Stable id → AppDef, for sidebar render-time lookup. */

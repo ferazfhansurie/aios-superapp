@@ -88,6 +88,8 @@ export function paneHistoryKindLabel(kind: PaneContent): string {
       return "files";
     case "history":
       return "history";
+    case "live-room":
+      return "live";
     case "oracle":
     case "shell":
     case "tmux":
@@ -132,11 +134,29 @@ export function describePaneHistoryItem(kind: PaneContent, label: string): Pick<
         detail: kind.root || "home",
         indicator: "files",
       };
+    case "file":
+      return {
+        label: label || kind.name || basename(kind.path) || "file",
+        detail: kind.path,
+        indicator: "file",
+      };
+    case "editor":
+      return {
+        label: label || kind.name || basename(kind.path) || "editor",
+        detail: kind.path,
+        indicator: "edit",
+      };
     case "history":
       return {
         label: "history",
         detail: "opened panes",
         indicator: "history",
+      };
+    case "live-room":
+      return {
+        label: label || "live room",
+        detail: [kind.mode ?? "meeting", kind.sessionId].filter(Boolean).join(" · ") || "meeting",
+        indicator: "live",
       };
     case "shell":
       return {
@@ -173,6 +193,12 @@ function paneHistoryIdentity(kind: PaneContent, label: string): string {
       return `browser:${kind.profile ?? ""}:${kind.memKey ?? ""}:${kind.url ?? ""}`;
     case "files":
       return `files:${kind.root ?? ""}`;
+    case "file":
+      return `file:${kind.path}`;
+    case "editor":
+      return `editor:${kind.path}`;
+    case "live-room":
+      return `live-room:${kind.sessionId ?? kind.mode ?? label}`;
     case "shell":
       return `shell:${kind.cwd ?? ""}:${kind.cmd ?? ""}`;
     case "oracle":

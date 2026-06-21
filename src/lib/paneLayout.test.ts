@@ -20,12 +20,12 @@ test("gridTrackStorageKey scopes persisted sizes by grid shape", () => {
   assert.equal(gridTrackStorageKey("aios.grid", 2, 3), "aios.grid:2x3");
 });
 
-test("core pane policy keeps browser, chat, terminal, files, local file, history, mission, loop, and ticket surfaces", () => {
-  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "mission", "loop", "ticket"]);
-  for (const type of ["browser", "chat", "files", "file", "editor", "oracle", "shell", "tmux", "mission", "loop", "ticket"]) {
+test("core pane policy keeps the lean shell surfaces plus terminal-backed restores", () => {
+  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "loop", "ticket", "analytics", "wrms-device", "live-room"]);
+  for (const type of ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "loop", "ticket", "analytics", "wrms-device", "live-room"]) {
     assert.equal(isCorePaneKind(type), true, `${type} should be core`);
   }
-  for (const type of ["app", "appcast", "apps", "bridges", "chrome", "git", "memory", "money-agents", "notes", "notifications", "plugins", "pulse"]) {
+  for (const type of ["app", "appcast", "apps", "bridges", "chrome", "git", "memory", "mission", "money-agents", "notes", "notifications", "plugins", "pulse", "agents", "oracle-roster"]) {
     assert.equal(isCorePaneKind(type), false, `${type} should be cut from the runtime shell`);
   }
 });
@@ -72,9 +72,9 @@ test("migrateLayoutPanes passes through existing keys untouched (changed=false)"
 test("migrateLayoutPanes drops non-core panes and persists the cleanup", () => {
   const { panes, changed } = migrateLayoutPanes([
     {
-      key: "k-git-aaaa",
-      label: "git",
-      kind: { type: "git", root: "/repo" },
+      key: "k-plugins-aaaa",
+      label: "plugins",
+      kind: { type: "plugins" },
     },
     {
       key: "k-editor-bbbb",
@@ -93,7 +93,7 @@ test("migrateLayoutPanes drops non-core panes and persists the cleanup", () => {
     },
     { key: "k-history-good", label: "history", kind: { type: "history" } },
     { key: "k-browser-good", label: "browser", kind: { type: "browser", url: "https://x.com" } },
-    { key: "k-memory-cccc", label: "memory", kind: { type: "memory" } },
+    { key: "k-pulse-cccc", label: "pulse", kind: { type: "pulse" } },
   ]);
   assert.equal(changed, true);
   assert.deepEqual(

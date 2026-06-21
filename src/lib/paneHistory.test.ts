@@ -104,6 +104,23 @@ test("pane history replaces a fresh chat placeholder with its resume-capable ses
   }
 });
 
+test("pane history keeps distinct file and editor panes that share a basename", () => {
+  recordPaneHistory({ type: "file", path: "/repo/a/README.md", name: "README.md" }, "README.md");
+  recordPaneHistory({ type: "file", path: "/repo/b/README.md", name: "README.md" }, "README.md");
+  recordPaneHistory({ type: "editor", path: "/repo/c/README.md", name: "README.md" }, "README.md");
+
+  const items = loadPaneHistory();
+  assert.equal(items.length, 3);
+  assert.deepEqual(
+    items.map((item) => item.detail).sort(),
+    ["/repo/a/README.md", "/repo/b/README.md", "/repo/c/README.md"],
+  );
+  assert.deepEqual(
+    items.map((item) => item.indicator).sort(),
+    ["edit", "file", "file"],
+  );
+});
+
 test("pane history prunes a stale resumed chat session by id", () => {
   recordPaneHistory(resumeKind, badInstructionsTitle);
   recordPaneHistory({ type: "browser", url: "https://example.com" }, "example");
@@ -137,6 +154,15 @@ test("clearPaneHistory works with the test storage", () => {
   assert.equal(loadPaneHistory().length, 1);
   clearPaneHistory();
   assert.equal(loadPaneHistory().length, 0);
+});
+
+test("pane history describes live room panes by mode and session", () => {
+  const item = describePaneHistoryItem({ type: "live-room", mode: "content", sessionId: "lr-abc123" }, "live room");
+
+  assert.equal(item.label, "live room");
+  assert.equal(item.indicator, "live");
+  assert.match(item.detail, /content/);
+  assert.match(item.detail, /lr-abc123/);
 });
 
 test("hydratePaneHistoryStore keeps the instant cache when tauri db is unavailable", async () => {
