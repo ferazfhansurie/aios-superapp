@@ -53,4 +53,5 @@ playwright/.cache/
 
 # agent worktrees + local session state
 .claude/
+.superpowers/
 scripts\aios-watch.log
