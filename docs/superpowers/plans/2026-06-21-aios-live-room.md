@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the first shippable AIOS live room pane: a hybrid Google Meet / OBS-style capture surface with meeting/content/mirror modes, source preview, markers, snapshots, durable manifests, and a native recording spike that saves separate screen + mic tracks.
+**Goal:** Build the first shippable AIOS live room pane: a polished first-class core pane with hybrid Google Meet / OBS-style capture, meeting/content/mirror modes, source preview, markers, snapshots, durable manifests, and a native recording spike that saves separate screen + mic tracks.
 
 **Architecture:** Start with pure TypeScript state and manifest helpers so pane integration is testable without touching native capture. Add a new `live-room` pane that wraps the existing ScreenCaptureKit `appcast` preview path instead of replacing it. Native work extends the current Tauri backend with live-room storage and recording commands, while v1 keeps mp4 export best-effort and post-capture AI disabled/stubbed.
 
@@ -28,6 +28,13 @@
 - Modify `src-tauri/capabilities/default.json`: allow new live-room commands if capabilities list is explicit.
 - Modify `src-tauri/Cargo.toml`: add AVFoundation/CoreAudio bindings only when implementing the native mic recorder task.
 - Create/extend Rust tests if the repo has suitable test harnesses for pure storage helpers; otherwise keep storage helpers small and test through commands/manual checklist.
+
+First-class pane quality is non-optional:
+
+- `live-room` is a core pane in sidebar, command palette, layout restore, history, duplicate, minimize, maximize, close, and error boundary flows.
+- UI must have polished empty, loading, permission-blocked, preview, recording, saved, partial, and failed states before the work is considered done.
+- Primary viewport must not show raw implementation terms (`ffmpeg`, `screencapturekit`, `manifest`) or raw session paths. Put technical details in secondary saved-state details only.
+- Controls are icon-first with accessible labels/tooltips, but text must remain readable and non-overlapping at narrow pane widths.
 
 ## Task 1: Pure Live Room State Model
 
@@ -308,6 +315,11 @@ UI required in first pass:
 - `.live-room__rail`
 - mode buttons from `LIVE_ROOM_MODES`
 - disabled state with `disabledReason`
+- tooltips/accessible labels for every icon-only control
+- empty state that invites source selection, not a blank stage
+- loading state for source enumeration
+- permission-blocked state with direct action copy
+- visible pane-level error state inside the standard pane error boundary
 
 Mode-specific first pass requirements:
 
@@ -317,6 +329,15 @@ Mode-specific first pass requirements:
 - `control`, `annotate`, `observe`: mode buttons are visible but disabled and show their `disabledReason`.
 - top bar always shows room title, selected source label or `no source`, recording status, elapsed time placeholder, and permission health.
 - bottom dock always shows `mic`, `camera`, `share window`, `record`, `snapshot`, `add marker`, `stop`; unavailable controls are disabled with a short reason.
+
+Polish requirements:
+
+- stage must stay dominant at all pane sizes; right rail collapses before it squeezes the stage.
+- bottom dock uses stable button dimensions so hover/disabled/recording states do not shift layout.
+- recording state uses a clear red indicator plus elapsed timer.
+- saved/partial/failed states use plain product copy: `saved`, `partial recording saved`, `recording failed`, `mp4 export unavailable`.
+- no nested cards; use pane-native bands/rails.
+- no raw file paths in the live viewport. show save path only under a secondary `details` disclosure after saving.
 
 - [ ] **Step 2: Wire rendering in `src/App.tsx`**
 
@@ -369,13 +390,27 @@ Run: `pnpm exec tsc --noEmit`
 
 Expected: pass or fail only on unrelated dirty-tree issues. If failure is from live room, fix before continuing.
 
-- [ ] **Step 6: Run focused node tests**
+- [ ] **Step 6: Manual pane polish check**
+
+Run: `pnpm tauri dev`
+
+Manual expected before committing:
+
+- open from sidebar.
+- open from command palette.
+- duplicate pane.
+- minimize/maximize/close pane.
+- reopen from history.
+- resize narrow/wide; controls and text do not overlap.
+- empty/loading/permission-blocked states look intentional, not debug/default browser UI.
+
+- [ ] **Step 7: Run focused node tests**
 
 Run: `node --experimental-strip-types --test src/lib/liveRoom.test.ts src/lib/paneLayout.test.ts src/lib/paneHistory.test.ts src/lib/bundleBoundaries.test.ts`
 
 Expected: pass. Update bundle-boundary test only if the new pane follows the repo's lazy pane boundary rules.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/components/LiveRoomPane.tsx src/App.tsx src/App.css src/lib/bundleBoundaries.test.ts
@@ -940,6 +975,10 @@ Manual checklist:
 - built `.app` fresh permission flow works after TCC reset.
 - selected window preview resizes with pane.
 - source picker hides native overlay while open.
+- live room opens from sidebar and command palette.
+- live room duplicates, minimizes, maximizes, closes, and reopens from history.
+- no live viewport state looks like a debug/prototype surface.
+- narrow and wide pane sizes do not overlap controls, rail text, or native preview.
 - 5-minute recording produces screen + mic tracks and manifest.
 - manifest drift/offset fields exist and are plausible.
 - source disappearance mid-record preserves partial output.
@@ -955,6 +994,8 @@ Take screenshots of:
 - content mode with source rail.
 - recording state with red indicator and elapsed time.
 - saved state with manifest/session path.
+- permission-blocked state.
+- partial/failed state if reachable through test hooks or manual simulation.
 
 Check mobile-sized/narrow pane behavior in the Tauri app if the layout can be resized that small.
 

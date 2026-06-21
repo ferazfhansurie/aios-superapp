@@ -10,6 +10,7 @@ the feature belongs in supershell because recording is not the end state. aios c
 
 - create a first-class `live room` pane inside the existing pane grid.
 - make the first viewport feel like google meet: large live preview, obvious camera/mic/screen/record controls, visible permission and recording state.
+- make the pane visually and behaviorally as polished as existing core panes: sidebar/palette/history integration, consistent pane chrome, refined empty/loading/error states, responsive layout, icon-first controls, and no debug-looking surfaces.
 - support a hybrid mode model where the same room morphs based on selected mode, without making every mode fully functional in the first slice.
 - make v1 technically shippable on macos without promising full obs/system-audio complexity.
 - produce durable local recording artifacts that later aios panes/agents can process.
@@ -46,6 +47,22 @@ default behavior:
 - pane chrome: same resize, minimize, maximize, history, and command palette behavior as other aios panes.
 
 the live preview must be the largest object. generated artifacts, history, analytics, and content queues are after-capture surfaces, not the live room's first state.
+
+### first-class pane quality
+
+live room is a core pane, not an experimental utility hidden behind a debug route.
+
+requirements:
+
+- appears in the sidebar and command palette as `live room` with an appropriate icon.
+- opens, duplicates, minimizes, maximizes, closes, and restores through history like other panes.
+- uses the standard pane chrome and error boundary behavior.
+- has polished empty, loading, permission-blocked, preview, recording, saved, partial, and failed states.
+- uses icon-first controls with tooltips/labels for unfamiliar actions.
+- keeps text inside controls readable at narrow and wide pane sizes.
+- does not expose implementation jargon such as `screencapturekit`, `ffmpeg`, `manifest`, or raw file paths in the primary live viewport.
+- shows raw session paths only in a secondary details/action area after saving.
+- survives pane resizing without overlapping controls, rails, or native preview layers.
 
 ## modes
 
@@ -332,6 +349,8 @@ integration/manual tests:
 
 - built mac `.app` can request screen, mic, and camera permission.
 - selected window preview appears and resizes with the pane.
+- sidebar, command palette, history, duplicate, minimize, maximize, and close behavior match other core panes.
+- empty, loading, permission-blocked, preview, recording, saved, partial, and failed states are visually checked.
 - recording start/stop creates required separate tracks and `manifest.json`.
 - marker timestamps are saved.
 - snapshot saves a visible frame.
