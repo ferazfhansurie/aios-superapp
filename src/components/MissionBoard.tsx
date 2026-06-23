@@ -340,6 +340,8 @@ export function LoopRow({ loop, onChanged }: { loop: LoopInfo; onChanged: () => 
   const status = loop.status ?? "running";
   const color = loopStatusColor(status);
   const isOff = status === "stopped" || status === "paused";
+  const editable = loop.editable !== false && loop.source !== "launchagent";
+  const controllable = loop.controllable !== false;
 
   const run = async (fn: () => Promise<void>) => {
     if (busy) return;
@@ -354,8 +356,15 @@ export function LoopRow({ loop, onChanged }: { loop: LoopInfo; onChanged: () => 
     }
   };
 
-  const toggle = () => run(() => (isOff ? startLoop(loop.name) : stopLoop(loop.name)));
+  const toggle = () => {
+    if (!controllable) return;
+    void run(() => (isOff ? startLoop(loop.name) : stopLoop(loop.name)));
+  };
   const saveCadence = () => {
+    if (!editable) {
+      setEditing(false);
+      return;
+    }
     const next = draft.trim();
     setEditing(false);
     if (!next || next === loop.cadence) return;
@@ -389,19 +398,33 @@ export function LoopRow({ loop, onChanged }: { loop: LoopInfo; onChanged: () => 
             />
           ) : (
             loop.cadence && (
-              <button
-                type="button"
-                onClick={() => {
-                  setDraft(loop.cadence);
-                  setEditing(true);
-                }}
-                className="group/c shrink-0 rounded-full bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[9px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                title="edit cadence"
-              >
-                {loop.cadence}
-                <Pencil size={8} className="ml-1 inline opacity-0 group-hover/c:opacity-100" />
-              </button>
+              editable ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDraft(loop.cadence);
+                    setEditing(true);
+                  }}
+                  className="group/c shrink-0 rounded-full bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[9px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                  title="edit cadence"
+                >
+                  {loop.cadence}
+                  <Pencil size={8} className="ml-1 inline opacity-0 group-hover/c:opacity-100" />
+                </button>
+              ) : (
+                <span
+                  className="shrink-0 rounded-full bg-[var(--color-panel-2)] px-1.5 py-0.5 font-mono text-[9px] text-[var(--color-muted)]"
+                  title={loop.label || "launchd schedule"}
+                >
+                  {loop.cadence}
+                </span>
+              )
             )
+          )}
+          {loop.source === "launchagent" && (
+            <span className="shrink-0 rounded-full border border-[var(--color-border)] px-1.5 py-0.5 text-[8px] uppercase tracking-wide text-[var(--color-faint)]">
+              launchd
+            </span>
           )}
         </div>
         {loop.lastLog && (
@@ -411,7 +434,7 @@ export function LoopRow({ loop, onChanged }: { loop: LoopInfo; onChanged: () => 
       <button
         type="button"
         onClick={toggle}
-        disabled={busy}
+        disabled={busy || !controllable}
         className="grid h-6 w-6 shrink-0 place-items-center rounded text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)] disabled:opacity-40"
         title={isOff ? "start loop" : "stop loop"}
       >

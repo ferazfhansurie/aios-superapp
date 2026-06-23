@@ -92,7 +92,7 @@ export function mirrorPaneCapabilities(kind: PaneContent): MirrorCapability[] {
   if (kind.type === "browser") {
     caps.push("pixel_stream", "navigate", "history", "reload", "screenshot");
   }
-  if (kind.type === "editor" || kind.type === "notes") caps.push("input");
+  if (kind.type === "editor") caps.push("input");
   if (kind.type === "file") caps.push("pixel_stream", "screenshot");
 
   return unique(caps);

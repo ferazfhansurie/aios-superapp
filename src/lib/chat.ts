@@ -236,26 +236,35 @@ export interface ChatModel {
  */
 export const CHAT_MODELS: ChatModel[] = [
   // ChatGPT-subscription models via Codex — no API key, no per-token billing.
-  // The whole gpt-5.x family Codex serves on the sub (verified each returns a
-  // turn over `codex exec -m <id>`): 5.5 (flagship), 5.4 + a fast mini, the
-  // 5.3 codex-tuned build, and 5.2. NOT gpt-4o/o3/image — those are raw-API
-  // only (need a key), so they're intentionally absent.
-  { id: "gpt-5.3-codex-spark", label: "gpt-5.3 codex spark", engine: "codex" },
-  { id: "gpt-5.3-codex", label: "gpt-5.3 codex", engine: "codex" },
-  { id: "gpt-5.5", label: "gpt-5.5 · codex", engine: "codex" },
-  { id: "gpt-5.4", label: "gpt-5.4 · codex", engine: "codex" },
-  { id: "gpt-5.4-mini", label: "gpt-5.4 mini · codex", engine: "codex" },
-  { id: "gpt-5.2", label: "gpt-5.2 · codex", engine: "codex" },
-  { id: "claude-fable-5", label: "fable 5", engine: "claude", hot: true },
+  // Trimmed to the two that matter: spark (gpt-5.3-codex-spark, the fast
+  // codex-tuned default) and gpt 5.5 (the flagship). Both verified over
+  // `codex exec -m <id>`.
+  { id: "gpt-5.3-codex-spark", label: "spark", engine: "codex" },
+  { id: "gpt-5.5", label: "gpt 5.5", engine: "codex" },
   { id: "claude-opus-4-8", label: "opus 4.8", engine: "claude" },
   { id: "claude-sonnet-4-6", label: "sonnet 4.6", engine: "claude" },
   { id: "claude-haiku-4-5", label: "haiku 4.5", engine: "claude" },
-  // ONE free fallback for when the ChatGPT sub hits its rate window:
-  // NVIDIA Nemotron (Llama-based, US) via opencode — best free non-Chinese
-  // model in the catalog. Deliberately the only free entry; no model sprawl.
+  // Free fallbacks via opencode (no API key, no per-token billing) for when the
+  // ChatGPT sub hits its rate window. IDs verified live against `opencode models`
+  // (the free `-free` tier). nemotron (NVIDIA, US) leads; the rest are options.
   {
-    id: "opencode/nemotron-3-super-free",
+    id: "opencode/nemotron-3-ultra-free",
     label: "nemotron · free",
+    engine: "opencode",
+  },
+  {
+    id: "opencode/north-mini-code-free",
+    label: "north mini code · free",
+    engine: "opencode",
+  },
+  {
+    id: "opencode/deepseek-v4-flash-free",
+    label: "deepseek v4 flash · free",
+    engine: "opencode",
+  },
+  {
+    id: "opencode/mimo-v2.5-free",
+    label: "mimo v2.5 · free",
     engine: "opencode",
   },
   // Box-backed: this opus session RUNS on the bisnesgpt box (aios-noded) over
@@ -301,6 +310,17 @@ export async function chatStart(
     resume: opts.resume ?? null,
     headroom: opts.headroom ?? null,
     node: opts.node ?? null,
+  });
+}
+
+/** Starts a full-tool codex app-server for a profile before the first message.
+ *  The next matching chatStart claims it instead of cold-spawning. */
+export async function chatPrewarmCodex(opts: ChatStartOpts = {}): Promise<number> {
+  return invoke<number>("chat_prewarm_codex", {
+    cwd: opts.cwd ?? null,
+    model: opts.model ?? null,
+    permissionMode: opts.permissionMode ?? null,
+    effort: opts.effort ?? null,
   });
 }
 

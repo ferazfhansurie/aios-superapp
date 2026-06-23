@@ -26,6 +26,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter};
@@ -445,72 +446,146 @@ pub fn loop_list() -> Vec<serde_json::Value> {
     let Some(dir) = aios_state_dir().map(|d| d.join("loops")) else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
     // Snapshot the launchd-loaded loop labels ONCE (one `launchctl list` for the
     // whole listing) rather than per-loop.
     let loaded = launchctl_loaded_labels();
+    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
-            continue;
+
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let line = text.lines().next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let name = parts.next().unwrap_or("").trim().to_string();
+            let cadence = parts.next().unwrap_or("").trim().to_string();
+            // 3rd meta field = the command the loop fires (needed to re-create it on a
+            // cadence edit). Joined back if it itself contained tabs (it won't).
+            let command = parts.collect::<Vec<_>>().join("\t").trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let label = format!("{LOOP_LABEL_PREFIX}-{name}");
+            let log_path = dir.join(format!("{name}.log"));
+            let last_log = last_non_empty_line(&log_path).unwrap_or_default();
+            // status: launchctl-loaded → running; the dogfood loop has a reversible
+            // soft-pause via its STOP flag (loaded but idle) → paused; not loaded →
+            // stopped (plist on disk, restartable).
+            let is_loaded = loaded.contains(&label);
+            let paused = name == "aios-dogfood" && dogfood_stop_present();
+            let status = if paused {
+                "paused"
+            } else if is_loaded {
+                "running"
+            } else {
+                "stopped"
+            };
+            seen.insert(name.clone());
+            out.push(serde_json::json!({
+                "name": name,
+                "cadence": cadence,
+                "command": command,
+                "label": label,
+                "source": "managed",
+                "editable": true,
+                "controllable": true,
+                "logPath": log_path.to_string_lossy().to_string(),
+                "status": status,
+                "lastLog": last_log,
+            }));
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let line = text.lines().next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split('\t');
-        let name = parts.next().unwrap_or("").trim().to_string();
-        let cadence = parts.next().unwrap_or("").trim().to_string();
-        // 3rd meta field = the command the loop fires (needed to re-create it on a
-        // cadence edit). Joined back if it itself contained tabs (it won't).
-        let command = parts.collect::<Vec<_>>().join("\t").trim().to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let log_path = dir.join(format!("{name}.log"));
-        let last_log = std::fs::read_to_string(&log_path)
-            .ok()
-            .and_then(|t| {
-                t.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .last()
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_default();
-        // status: launchctl-loaded → running; the dogfood loop has a reversible
-        // soft-pause via its STOP flag (loaded but idle) → paused; not loaded →
-        // stopped (plist on disk, restartable).
-        let loaded = loaded.contains(&format!("{LOOP_LABEL_PREFIX}-{name}"));
-        let paused = name == "aios-dogfood" && dogfood_stop_present();
-        let status = if paused {
-            "paused"
-        } else if loaded {
-            "running"
-        } else {
-            "stopped"
-        };
-        out.push(serde_json::json!({
-            "name": name,
-            "cadence": cadence,
-            "command": command,
-            "status": status,
-            "lastLog": last_log,
-        }));
     }
+
+    for row in launchagent_loop_rows(&loaded, &seen) {
+        if let Some(name) = row.get("name").and_then(serde_json::Value::as_str) {
+            seen.insert(name.to_string());
+        }
+        out.push(row);
+    }
+
     out.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
+        let source_rank = |v: &serde_json::Value| match v["source"].as_str().unwrap_or("") {
+            "managed" => 0,
+            _ => 1,
+        };
+        source_rank(a)
+            .cmp(&source_rank(b))
+            .then_with(|| {
+                a["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["name"].as_str().unwrap_or(""))
+            })
     });
     out
+}
+
+/// The overnight loop activity ledger — one parsed row per JSON object in
+/// `~/.aios/state/loops/changes.jsonl` (each loop appends a line as it lands
+/// work). Returned newest-first by `ts`, capped at `limit` (default 100).
+/// Malformed lines are skipped so one bad append can't blank the whole ledger.
+/// This is the source of truth for "what did the loops actually do?".
+#[tauri::command]
+pub fn loop_changes(limit: Option<usize>) -> Vec<serde_json::Value> {
+    let Some(path) = aios_state_dir().map(|d| d.join("loops/changes.jsonl")) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(serde_json::Value::is_object)
+        .collect();
+    // newest first by `ts` (a row missing/invalid `ts` sorts oldest).
+    rows.sort_by(|a, b| {
+        let ta = a.get("ts").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let tb = b.get("ts").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+    rows.truncate(limit.unwrap_or(100));
+    rows
+}
+
+/// Tail of a single loop's run log — the last `lines` non-empty lines of
+/// `~/.aios/state/loops/<name>.log` (default 20). `name` is slug-guarded with the
+/// same rule as the loop-control commands so it can't path-traverse out of the
+/// loops dir. Returns an empty vec if the log is missing/unreadable.
+#[tauri::command]
+pub fn loop_log(name: String, lines: Option<usize>) -> Vec<String> {
+    let Some(name) = safe_loop_name(&name) else {
+        return Vec::new();
+    };
+    let state_path = aios_state_dir().map(|d| d.join(format!("loops/{name}.log")));
+    let path = state_path
+        .filter(|p| p.exists())
+        .or_else(|| launchagent_log_path(&name));
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let all: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let start = all.len().saturating_sub(lines.unwrap_or(20));
+    all[start..].to_vec()
 }
 
 // ── loop control (the MissionBoard Loops section's control panel) ────────────
@@ -526,6 +601,197 @@ fn launch_agents_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(|h| PathBuf::from(h).join("Library/LaunchAgents"))
+}
+
+fn last_non_empty_line(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().and_then(|text| {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .last()
+            .map(str::to_string)
+    })
+}
+
+fn plist_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn plist_value_after_key(text: &str, key: &str, tag: &str) -> Option<String> {
+    let key_tag = format!("<key>{key}</key>");
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let after_key = text.get(text.find(&key_tag)? + key_tag.len()..)?;
+    let value_start = after_key.find(&start_tag)? + start_tag.len();
+    let after_start = after_key.get(value_start..)?;
+    let value_end = after_start.find(&end_tag)?;
+    Some(plist_unescape(after_start.get(..value_end)?.trim()))
+}
+
+fn plist_string_after_key(text: &str, key: &str) -> Option<String> {
+    plist_value_after_key(text, key, "string")
+}
+
+fn plist_integer_after_key(text: &str, key: &str) -> Option<u64> {
+    plist_value_after_key(text, key, "integer")?.parse().ok()
+}
+
+fn plist_bool_after_key(text: &str, key: &str) -> Option<bool> {
+    let key_tag = format!("<key>{key}</key>");
+    let after_key = text.get(text.find(&key_tag)? + key_tag.len()..)?;
+    let trimmed = after_key.trim_start();
+    if trimmed.starts_with("<true/>") {
+        Some(true)
+    } else if trimmed.starts_with("<false/>") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn plist_array_strings_after_key(text: &str, key: &str) -> Vec<String> {
+    let key_tag = format!("<key>{key}</key>");
+    let Some(after_key) = text
+        .find(&key_tag)
+        .and_then(|i| text.get(i + key_tag.len()..))
+    else {
+        return Vec::new();
+    };
+    let Some(array_start) = after_key.find("<array>") else {
+        return Vec::new();
+    };
+    let Some(after_array) = after_key.get(array_start + "<array>".len()..) else {
+        return Vec::new();
+    };
+    let Some(array_end) = after_array.find("</array>") else {
+        return Vec::new();
+    };
+    let Some(array) = after_array.get(..array_end) else {
+        return Vec::new();
+    };
+    let mut values = Vec::new();
+    let mut rest = array;
+    while let Some(start) = rest.find("<string>") {
+        let after = &rest[start + "<string>".len()..];
+        let Some(end) = after.find("</string>") else {
+            break;
+        };
+        values.push(plist_unescape(after[..end].trim()));
+        rest = &after[end + "</string>".len()..];
+    }
+    values
+}
+
+fn launchagent_name_from_label(label: &str) -> Option<String> {
+    let loop_prefix = format!("{LOOP_LABEL_PREFIX}-");
+    let name = label
+        .strip_prefix(&loop_prefix)
+        .or_else(|| label.strip_prefix("com.firaz.aios-"))
+        .or_else(|| label.strip_prefix("com.aios."))?;
+    safe_loop_name(name)
+}
+
+fn format_interval(seconds: u64) -> String {
+    if seconds >= 3600 && seconds % 3600 == 0 {
+        format!("{}h", seconds / 3600)
+    } else if seconds >= 60 && seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn plist_cadence(text: &str) -> String {
+    if let Some(seconds) = plist_integer_after_key(text, "StartInterval") {
+        return format_interval(seconds);
+    }
+    if let Some(after_key) = text
+        .find("<key>StartCalendarInterval</key>")
+        .and_then(|i| text.get(i + "<key>StartCalendarInterval</key>".len()..))
+    {
+        if let (Some(hour), Some(minute)) = (
+            plist_integer_after_key(after_key, "Hour"),
+            plist_integer_after_key(after_key, "Minute"),
+        ) {
+            return format!("daily {hour:02}:{minute:02}");
+        }
+    }
+    if plist_bool_after_key(text, "RunAtLoad").unwrap_or(false) {
+        "at load".to_string()
+    } else {
+        "manual".to_string()
+    }
+}
+
+fn launchagent_loop_rows(
+    loaded: &std::collections::HashSet<String>,
+    seen: &std::collections::HashSet<String>,
+) -> Vec<serde_json::Value> {
+    let Some(dir) = launch_agents_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("plist") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let label = plist_string_after_key(&text, "Label").or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        });
+        let Some(label) = label else {
+            continue;
+        };
+        if !(label.starts_with("com.firaz.aios-") || label.starts_with("com.aios.")) {
+            continue;
+        }
+        let Some(name) = launchagent_name_from_label(&label) else {
+            continue;
+        };
+        if seen.contains(&name) {
+            continue;
+        }
+        let log_path = plist_string_after_key(&text, "StandardOutPath")
+            .or_else(|| plist_string_after_key(&text, "StandardErrorPath"))
+            .unwrap_or_default();
+        let last_log = if log_path.is_empty() {
+            String::new()
+        } else {
+            last_non_empty_line(&PathBuf::from(&log_path)).unwrap_or_default()
+        };
+        let command = plist_array_strings_after_key(&text, "ProgramArguments").join(" ");
+        let status = if loaded.contains(&label) {
+            "running"
+        } else {
+            "stopped"
+        };
+        out.push(serde_json::json!({
+            "name": name,
+            "cadence": plist_cadence(&text),
+            "command": command,
+            "label": label,
+            "source": "launchagent",
+            "editable": false,
+            "controllable": true,
+            "logPath": log_path,
+            "status": status,
+            "lastLog": last_log,
+        }));
+    }
+    out
 }
 
 /// Slug guard for a loop name: alnum + dash/underscore only, so a crafted name
@@ -544,8 +810,26 @@ fn safe_loop_name(raw: &str) -> Option<String> {
     }
 }
 
-fn loop_plist_path(name: &str) -> Option<PathBuf> {
-    Some(launch_agents_dir()?.join(format!("{LOOP_LABEL_PREFIX}-{name}.plist")))
+fn launchagent_plist_path(name: &str) -> Option<PathBuf> {
+    let dir = launch_agents_dir()?;
+    let candidates = [
+        format!("{LOOP_LABEL_PREFIX}-{name}.plist"),
+        format!("com.firaz.aios-{name}.plist"),
+        format!("com.aios.{name}.plist"),
+    ];
+    candidates
+        .iter()
+        .map(|file| dir.join(file))
+        .find(|path| path.exists())
+}
+
+fn launchagent_log_path(name: &str) -> Option<PathBuf> {
+    let plist = launchagent_plist_path(name)?;
+    let text = std::fs::read_to_string(plist).ok()?;
+    plist_string_after_key(&text, "StandardOutPath")
+        .or_else(|| plist_string_after_key(&text, "StandardErrorPath"))
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
 }
 
 /// True when the dogfood loop's reversible soft-stop flag is present.
@@ -563,7 +847,7 @@ fn launchctl_loaded_labels() -> std::collections::HashSet<String> {
             // `launchctl list` rows are `<pid>\t<status>\t<label>`.
             if let Some(label) = line.split('\t').nth(2) {
                 let label = label.trim();
-                if label.starts_with(LOOP_LABEL_PREFIX) {
+                if !label.is_empty() {
                     set.insert(label.to_string());
                 }
             }
@@ -583,7 +867,7 @@ pub fn loop_start(name: String) -> Result<(), String> {
         }
         return Ok(());
     }
-    let plist = loop_plist_path(&name).ok_or("no HOME")?;
+    let plist = launchagent_plist_path(&name).ok_or("no HOME")?;
     if !plist.exists() {
         return Err(format!("no plist for loop '{name}'"));
     }
@@ -606,7 +890,7 @@ pub fn loop_stop(name: String) -> Result<(), String> {
         std::fs::write(&stop, "paused from MissionBoard\n").map_err(|e| e.to_string())?;
         return Ok(());
     }
-    let plist = loop_plist_path(&name).ok_or("no HOME")?;
+    let plist = launchagent_plist_path(&name).ok_or("no HOME")?;
     if !plist.exists() {
         return Err(format!("no plist for loop '{name}'"));
     }
@@ -640,9 +924,15 @@ pub fn loop_set_cadence(name: String, cadence: String) -> Result<(), String> {
     // distinct ProgramArguments) — matches how the CLI was originally invoked.
     let mut cmd = std::process::Command::new(&aios_loop);
     cmd.arg("create").arg(&name).arg(&cadence);
-    for part in command.split_whitespace() {
-        cmd.arg(part);
-    }
+    append_loop_command_args(
+        &mut cmd,
+        &state,
+        command.split_whitespace().map(str::to_string),
+    );
+    // GUI launch hands children the bare PATH; the aios-loop CLI (and what it
+    // spawns) needs the user's real PATH. Mirrors the chat.rs fix.
+    #[cfg(not(windows))]
+    cmd.env("PATH", crate::chat::enriched_path());
     let out = cmd
         .output()
         .map_err(|e| format!("aios-loop failed to run: {e}"))?;
@@ -690,15 +980,11 @@ pub fn loop_create(name: String, cadence: String, command: Vec<String>) -> Resul
     for tok in cadence.split_whitespace() {
         cmd.arg(tok);
     }
-    for (i, part) in parts.iter().enumerate() {
-        // launchd plists need absolute program paths (no shell PATH) — expand a
-        // bare leading `aios-agent` to ~/.aios/state/bin/aios-agent.
-        if i == 0 && part == "aios-agent" {
-            cmd.arg(state.join("bin/aios-agent"));
-        } else {
-            cmd.arg(part);
-        }
-    }
+    append_loop_command_args(&mut cmd, &state, parts);
+    // GUI launch hands children the bare PATH; the aios-loop CLI (and what it
+    // spawns) needs the user's real PATH. Mirrors the chat.rs fix.
+    #[cfg(not(windows))]
+    cmd.env("PATH", crate::chat::enriched_path());
     let out = cmd
         .output()
         .map_err(|e| format!("aios-loop failed to run: {e}"))?;
@@ -710,6 +996,140 @@ pub fn loop_create(name: String, cadence: String, command: Vec<String>) -> Resul
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
+}
+
+fn append_loop_command_args<I>(cmd: &mut std::process::Command, state: &std::path::Path, parts: I)
+where
+    I: IntoIterator<Item = String>,
+{
+    let parts: Vec<String> = parts.into_iter().collect();
+    if parts.is_empty() {
+        return;
+    }
+    let agent_path = state.join("bin/aios-agent");
+    let first = parts.first().map(String::as_str).unwrap_or("");
+    let is_agent = first == "aios-agent"
+        || std::path::Path::new(first)
+            .file_name()
+            .and_then(|s| s.to_str())
+            == Some("aios-agent");
+    if is_agent {
+        // Agent loops are recurring/background work. `aios-agent` converts this
+        // env flag into `background:true`, so the frontend defers mounting the
+        // worker pane until Firaz explicitly opens it.
+        cmd.arg("/usr/bin/env").arg("AIOS_AGENT_BACKGROUND=1");
+        if first == "aios-agent" {
+            cmd.arg(agent_path);
+        } else {
+            cmd.arg(first);
+        }
+        for part in parts.into_iter().skip(1) {
+            cmd.arg(part);
+        }
+        return;
+    }
+    for part in parts {
+        cmd.arg(part);
+    }
+}
+
+/// Deletes a loop entirely: unload its launchd agent (so the job stops before
+/// the plist vanishes), then remove the plist and — for managed loops — the
+/// `.meta` (and any dogfood STOP flag). Irreversible; the pane double-confirms
+/// and warns louder for high-blast-radius loops. Errors only if nothing was
+/// found to delete (so a double-tap is harmlessly idempotent on the second go).
+#[tauri::command]
+pub fn loop_delete(name: String) -> Result<(), String> {
+    let name = safe_loop_name(&name).ok_or("invalid loop name")?;
+    let mut removed = false;
+    if let Some(plist) = launchagent_plist_path(&name) {
+        let _ = run_launchctl("unload", &plist); // best-effort stop first
+        std::fs::remove_file(&plist).map_err(|e| format!("rm plist: {e}"))?;
+        removed = true;
+    }
+    if let Some(state) = aios_state_dir() {
+        let meta = state.join(format!("loops/{name}.meta"));
+        if meta.exists() {
+            let _ = std::fs::remove_file(&meta);
+            removed = true;
+        }
+    }
+    if removed {
+        Ok(())
+    } else {
+        Err(format!("no loop '{name}' to delete"))
+    }
+}
+
+/// Reads the projects registry (~/.aios/state/loops/projects.json) → the
+/// `projects` array, so the pane can group loops by project and offer add-project.
+/// Empty vec if the file is missing/malformed (pane falls back to functional groups).
+#[tauri::command]
+pub fn loop_projects() -> Vec<serde_json::Value> {
+    let Some(state) = aios_state_dir() else {
+        return vec![];
+    };
+    let path = state.join("loops/projects.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return vec![];
+    };
+    val.get("projects")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Appends a project to the registry so a new project gets its own grouping +
+/// (when wired) loop coverage. Rejects a duplicate key. posture is normalized to
+/// `prep-only` (employer-prod safety) or `branch-only`.
+#[tauri::command]
+pub fn loop_add_project(
+    key: String,
+    label: String,
+    posture: String,
+    repos: Vec<String>,
+    loops: Vec<String>,
+) -> Result<(), String> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err("empty project key".into());
+    }
+    let label = {
+        let l = label.trim();
+        if l.is_empty() { key.clone() } else { l.to_string() }
+    };
+    let posture = if posture.trim() == "prep-only" { "prep-only" } else { "branch-only" };
+    let clean = |v: Vec<String>| -> Vec<String> {
+        v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    };
+    let state = aios_state_dir().ok_or("no HOME")?;
+    let path = state.join("loops/projects.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("read registry: {e}"))?;
+    let mut val: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse registry: {e}"))?;
+    let arr = val
+        .get_mut("projects")
+        .and_then(|p| p.as_array_mut())
+        .ok_or("registry has no projects array")?;
+    if arr
+        .iter()
+        .any(|p| p.get("key").and_then(|k| k.as_str()) == Some(key.as_str()))
+    {
+        return Err(format!("project '{key}' already exists"));
+    }
+    arr.push(serde_json::json!({
+        "key": key,
+        "label": label,
+        "posture": posture,
+        "repos": clean(repos),
+        "loops": clean(loops),
+    }));
+    let out = serde_json::to_string_pretty(&val).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out).map_err(|e| format!("write registry: {e}"))?;
+    Ok(())
 }
 
 /// Runs `launchctl <action> <plist>`, mapping a non-zero exit to an Err string.
@@ -756,6 +1176,10 @@ pub fn ticket_add(text: String, urgent: bool) -> Result<(), String> {
         cmd.arg("--urgent");
     }
     cmd.arg(&text);
+    // GUI launch hands children the bare PATH; the aios-ticket CLI (and what it
+    // spawns) needs the user's real PATH. Mirrors the chat.rs fix.
+    #[cfg(not(windows))]
+    cmd.env("PATH", crate::chat::enriched_path());
     let out = cmd
         .output()
         .map_err(|e| format!("aios-ticket failed to run: {e}"))?;
@@ -796,8 +1220,27 @@ pub fn ticket_list() -> Vec<serde_json::Value> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            let (mut source, mut priority, mut status, mut created) =
-                (String::new(), String::new(), String::new(), String::new());
+            let (
+                mut source,
+                mut priority,
+                mut status,
+                mut created,
+                mut repo,
+                mut owner,
+                mut branch,
+                mut result,
+                mut blocker,
+            ) = (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            );
             // Parse the leading `--- ... ---` frontmatter, then the first non-empty
             // body line as the title.
             let mut in_fm = false;
@@ -822,6 +1265,11 @@ pub fn ticket_list() -> Vec<serde_json::Value> {
                                 "priority" => priority = v,
                                 "status" => status = v,
                                 "created" => created = v,
+                                "repo" => repo = v,
+                                "owner" => owner = v,
+                                "branch" => branch = v,
+                                "result" => result = v,
+                                "blocker" => blocker = v,
                                 _ => {}
                             }
                         }
@@ -842,6 +1290,12 @@ pub fn ticket_list() -> Vec<serde_json::Value> {
                 "priority": priority,
                 "status": if status.is_empty() { queue.to_string() } else { status },
                 "created": created,
+                "repo": repo,
+                "owner": owner,
+                "branch": branch,
+                "result": result,
+                "blocker": blocker,
+                "mergeStatus": ticket_branch_merge_status(&branch),
             }));
         }
     }
@@ -864,6 +1318,190 @@ pub fn ticket_list() -> Vec<serde_json::Value> {
             })
     });
     out
+}
+
+fn ticket_branch_merge_status(branch: &str) -> &'static str {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return "";
+    }
+    let repo = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(_) => return "unknown",
+    };
+    let branch_exists = Command::new("git")
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(branch)
+        .current_dir(&repo)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !branch_exists {
+        return "unknown";
+    }
+    if Command::new("git")
+        .args(["merge-base", "--is-ancestor", branch, "HEAD"])
+        .current_dir(&repo)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return "merged";
+    }
+    match Command::new("git")
+        .args(["cherry", "HEAD", branch])
+        .current_dir(&repo)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if !text.trim().is_empty() && text.lines().all(|line| line.starts_with('-')) {
+                "merged"
+            } else {
+                "not-merged"
+            }
+        }
+        _ => "unknown",
+    }
+}
+
+/// Reads one ticket's full markdown (frontmatter + body) for the detail view.
+/// `queue` is "open" or "done". Slug-guarded so a crafted name can't escape the
+/// tickets dir. Returns the raw file text.
+#[tauri::command]
+pub fn ticket_read(name: String, queue: String) -> Result<String, String> {
+    // ticket slugs are alnum + dash/underscore, longer than a loop name (timestamp
+    // + 40-char slug) — guard inline so a crafted name can't escape the dir.
+    let name = name.trim().to_string();
+    if name.is_empty()
+        || name.len() > 128
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("invalid ticket name".into());
+    }
+    let queue = if queue == "done" { "done" } else { "open" };
+    let base = aios_state_dir()
+        .map(|d| d.join(format!("dogfood/tickets/{queue}")))
+        .ok_or("no HOME")?;
+    let path = base.join(format!("{name}.md"));
+    std::fs::read_to_string(&path).map_err(|e| format!("read ticket: {e}"))
+}
+
+/// Slug guard for a ticket name (alnum + dash/underscore, ≤128).
+fn safe_ticket_name(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.len() > 128 {
+        return None;
+    }
+    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+fn ticket_path(name: &str, queue: &str) -> Result<PathBuf, String> {
+    let name = safe_ticket_name(name).ok_or("invalid ticket name")?;
+    let queue = if queue == "done" { "done" } else { "open" };
+    aios_state_dir()
+        .map(|d| d.join(format!("dogfood/tickets/{queue}/{name}.md")))
+        .ok_or("no HOME".into())
+}
+
+/// Appends a firaz comment to a ticket — the fixer reads these as STEERING
+/// instructions (fix this way / ignore that / focus here). Timestamped.
+#[tauri::command]
+pub fn ticket_comment(name: String, queue: String, text: String) -> Result<(), String> {
+    let body = text.trim();
+    if body.is_empty() {
+        return Err("empty comment".into());
+    }
+    let path = ticket_path(&name, &queue)?;
+    let mut content = std::fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
+    let stamp = std::process::Command::new("date")
+        .arg("+%F %H:%M")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&format!("\n## comment — firaz ({stamp})\n{body}\n"));
+    std::fs::write(&path, content).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+/// Sets a ticket's `status:` frontmatter (e.g. "ignored" so the fixer skips it,
+/// or "open" to reopen). Adds the field if missing.
+#[tauri::command]
+pub fn ticket_set_status(name: String, queue: String, status: String) -> Result<(), String> {
+    let status = status.trim();
+    if status.is_empty() || status.len() > 32 || !status.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("invalid status".into());
+    }
+    ticket_set_frontmatter_field(&name, &queue, "status", status)
+}
+
+/// Sets a ticket's `priority:` frontmatter (`urgent`, `high`, or `normal`).
+#[tauri::command]
+pub fn ticket_set_priority(name: String, queue: String, priority: String) -> Result<(), String> {
+    let priority = priority.trim();
+    if !matches!(priority, "urgent" | "high" | "normal") {
+        return Err("invalid priority".into());
+    }
+    ticket_set_frontmatter_field(&name, &queue, "priority", priority)
+}
+
+fn ticket_set_frontmatter_field(name: &str, queue: &str, field: &str, value: &str) -> Result<(), String> {
+    let path = ticket_path(&name, &queue)?;
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
+    let mut out = String::new();
+    let mut replaced = false;
+    let mut in_fm = false;
+    let mut fm_seen = false;
+    for line in content.lines() {
+        if line.trim() == "---" {
+            if !fm_seen {
+                in_fm = true;
+                fm_seen = true;
+            } else if in_fm {
+                // closing the frontmatter — inject field if it was never present.
+                if !replaced {
+                    out.push_str(&format!("{field}: {value}\n"));
+                    replaced = true;
+                }
+                in_fm = false;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_fm && line.trim_start().starts_with(&format!("{field}:")) {
+            out.push_str(&format!("{field}: {value}\n"));
+            replaced = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+/// Deletes a ticket — moved to tickets/.trash (reversible), not hard-removed.
+#[tauri::command]
+pub fn ticket_delete(name: String, queue: String) -> Result<(), String> {
+    let path = ticket_path(&name, &queue)?;
+    let name = safe_ticket_name(&name).ok_or("invalid ticket name")?;
+    let trash = aios_state_dir()
+        .map(|d| d.join("dogfood/tickets/.trash"))
+        .ok_or("no HOME")?;
+    let _ = std::fs::create_dir_all(&trash);
+    std::fs::rename(&path, trash.join(format!("{name}.md"))).map_err(|e| format!("delete: {e}"))?;
+    Ok(())
 }
 
 /// Deletes an agent's config dir. Best-effort; a missing dir is not an error.

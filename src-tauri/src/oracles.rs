@@ -402,12 +402,19 @@ pub fn create_oracle(identity: String, command: Option<String>) -> Result<String
     // oracle — not a bare shell. A bare `tmux new-session` is the fallback only
     // when the script isn't present (non-bridge machines / OSS installs).
     if let Some(script) = oracle_spawn_script() {
-        let _ = std::process::Command::new("bash")
+        let mut spawn_cmd = std::process::Command::new("bash");
+        spawn_cmd
             .arg(&script)
             .arg(&id)
             .env("AIOS_SPAWN_FROM_SHELL", "1")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // GUI launch hands children the bare PATH; oracle-spawn.sh launches claude
+        // (node/python MCP launchers) so it needs the user's real PATH or the
+        // spawned oracle deadlocks on MCP init. Mirrors the chat.rs fix.
+        #[cfg(not(windows))]
+        spawn_cmd.env("PATH", crate::chat::enriched_path());
+        let _ = spawn_cmd
             .spawn()
             .map_err(|e| format!("couldn't run oracle-spawn.sh: {e}"))?;
         // The script creates the tmux session early, then opens the AIOS window;

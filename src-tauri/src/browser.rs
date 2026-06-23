@@ -6,6 +6,9 @@
 //!
 //! Requires the tauri `unstable` feature (child webviews via `Window::add_child`).
 
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl};
 
@@ -31,6 +34,29 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 
 fn parse(url: &str) -> Result<Url, String> {
     Url::parse(url).map_err(|e| format!("bad url: {e}"))
+}
+
+static BROWSER_LIFECYCLE: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn begin_browser_lifecycle(label: &str) -> bool {
+    BROWSER_LIFECYCLE
+        .lock()
+        .map(|mut labels| labels.insert(label.to_string()))
+        .unwrap_or(false)
+}
+
+fn browser_lifecycle_is_active(label: &str) -> bool {
+    BROWSER_LIFECYCLE
+        .lock()
+        .map(|labels| labels.contains(label))
+        .unwrap_or(false)
+}
+
+fn end_browser_lifecycle(label: &str) {
+    if let Ok(mut labels) = BROWSER_LIFECYCLE.lock() {
+        labels.remove(label);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -584,11 +610,19 @@ pub async fn browser_show(
     profile: Option<String>,
 ) -> Result<(), String> {
     if let Some(wv) = app.get_webview(&label) {
+        if !browser_lifecycle_is_active(&label) {
+            return Ok(());
+        }
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(0.0), height.max(0.0)));
         return Ok(());
     }
     let parsed = parse(&url)?;
+    if !begin_browser_lifecycle(&label) {
+        // A create or close for this label is already in flight. Let the next
+        // frontend bounds tick retry after the native child webview settles.
+        return Ok(());
+    }
     let window = match app.get_window("main") {
         Some(w) => w,
         None => {
@@ -601,6 +635,7 @@ pub async fn browser_show(
                 }
                 None => {
                     eprintln!("[aios browser] FAIL: no windows at all");
+                    end_browser_lifecycle(&label);
                     return Err("no main window".into());
                 }
             }
@@ -742,7 +777,10 @@ pub async fn browser_show(
             LogicalPosition::new(x, y),
             LogicalSize::new(width.max(1.0), height.max(1.0)),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            end_browser_lifecycle(&label);
+            e.to_string()
+        })?;
     // WKWebView ships with element (HTML) fullscreen DISABLED, so YouTube etc.
     // show "your browser doesn't support full screen". Flip the preference on the
     // freshly-created native webview. macOS-only; best-effort.
@@ -783,6 +821,9 @@ pub fn browser_set_bounds(
     height: f64,
 ) -> Result<(), String> {
     if let Some(wv) = app.get_webview(&label) {
+        if !browser_lifecycle_is_active(&label) {
+            return Ok(());
+        }
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(0.0), height.max(0.0)));
     }
@@ -794,6 +835,9 @@ pub fn browser_set_bounds(
 /// (b) remember a pinned site's last location so reopening returns there.
 #[tauri::command]
 pub fn browser_current_url(app: AppHandle, label: String) -> Option<String> {
+    if !browser_lifecycle_is_active(&label) {
+        return None;
+    }
     app.get_webview(&label)
         .and_then(|wv| wv.url().ok().map(|u| u.to_string()))
 }
@@ -801,6 +845,9 @@ pub fn browser_current_url(app: AppHandle, label: String) -> Option<String> {
 #[tauri::command]
 pub fn browser_navigate(app: AppHandle, label: String, url: String) -> Result<(), String> {
     let parsed = parse(&url)?;
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     let wv = app.get_webview(&label).ok_or("browser not open")?;
     wv.navigate(parsed).map_err(|e| e.to_string())?;
     Ok(())
@@ -816,6 +863,10 @@ pub async fn browser_fullscreen_state(app: AppHandle, label: String) -> i64 {
     // `with_webview` needs a Send + 'static closure (dispatched to the main
     // thread), so we ship the read back over a channel. async → this runs off
     // the main thread, so the brief blocking recv can't deadlock the dispatch.
+    #[cfg(target_os = "macos")]
+    if !browser_lifecycle_is_active(&label) {
+        return 0;
+    }
     #[cfg(target_os = "macos")]
     if let Some(wv) = app.get_webview(&label) {
         let (tx, rx) = std::sync::mpsc::channel::<i64>();
@@ -867,6 +918,9 @@ fn with_wk<F: FnOnce(&objc2_web_kit::WKWebView) + Send + 'static>(
     label: &str,
     f: F,
 ) {
+    if !browser_lifecycle_is_active(label) {
+        return;
+    }
     if let Some(wv) = app.get_webview(label) {
         let _ = wv.with_webview(move |pw| {
             let ptr = pw.inner() as *mut objc2_web_kit::WKWebView;
@@ -881,6 +935,9 @@ fn with_wk<F: FnOnce(&objc2_web_kit::WKWebView) + Send + 'static>(
 
 #[tauri::command]
 pub fn browser_back(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     with_wk(&app, &label, |wk| unsafe {
         let _ = wk.goBack();
@@ -894,6 +951,9 @@ pub fn browser_back(app: AppHandle, label: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn browser_forward(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     with_wk(&app, &label, |wk| unsafe {
         let _ = wk.goForward();
@@ -907,6 +967,9 @@ pub fn browser_forward(app: AppHandle, label: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn browser_reload(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     with_wk(&app, &label, |wk| unsafe {
         let _ = wk.reload();
@@ -923,6 +986,9 @@ pub fn browser_reload(app: AppHandle, label: String) -> Result<(), String> {
 /// menu item just called `browser_reload` (a lie — identical to normal reload).
 #[tauri::command]
 pub fn browser_force_reload(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     with_wk(&app, &label, |wk| unsafe {
         let _ = wk.reloadFromOrigin();
@@ -945,6 +1011,10 @@ pub fn browser_force_reload(app: AppHandle, label: String) -> Result<(), String>
 /// polls, and as the only source on non-mac platforms.
 #[tauri::command]
 pub async fn browser_nav_state(app: AppHandle, label: String) -> [bool; 2] {
+    #[cfg(target_os = "macos")]
+    if !browser_lifecycle_is_active(&label) {
+        return [false, false];
+    }
     #[cfg(target_os = "macos")]
     if let Some(wv) = app.get_webview(&label) {
         let (tx, rx) = std::sync::mpsc::channel::<[bool; 2]>();
@@ -980,6 +1050,9 @@ pub async fn browser_nav_state(app: AppHandle, label: String) -> [bool; 2] {
 /// Cargo.toml — otherwise `open_devtools` only exists under `debug_assertions`.
 #[tauri::command]
 pub fn browser_open_devtools(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     let wv = app.get_webview(&label).ok_or("browser not open")?;
     wv.open_devtools();
     Ok(())
@@ -999,6 +1072,9 @@ pub async fn browser_find(
     forward: bool,
     wraps: Option<bool>,
 ) -> bool {
+    if !browser_lifecycle_is_active(&label) {
+        return false;
+    }
     #[cfg(target_os = "macos")]
     {
         use block2::RcBlock;
@@ -1094,6 +1170,9 @@ fn js_escape(s: &str) -> String {
 #[tauri::command]
 pub fn browser_hide(app: AppHandle, label: String) -> Result<(), String> {
     if let Some(wv) = app.get_webview(&label) {
+        if !browser_lifecycle_is_active(&label) {
+            return Ok(());
+        }
         let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
     }
     Ok(())
@@ -1107,6 +1186,7 @@ pub fn browser_hide(app: AppHandle, label: String) -> Result<(), String> {
 /// fullscreen, then blank the document so no background media context survives.
 #[tauri::command]
 pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
+    end_browser_lifecycle(&label);
     // FIRST: tear down the KVO observers + restore wry's navigation delegate.
     // Must precede the about:blank dance + close() below — a WKWebView that
     // deallocates with observers still registered is a crash, and the detach
@@ -1134,6 +1214,9 @@ pub fn browser_close(app: AppHandle, label: String) -> Result<(), String> {
 /// elsewhere fall back to the CSS approach.
 #[tauri::command]
 pub fn browser_zoom(app: AppHandle, label: String, factor: f64) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     with_wk(&app, &label, move |wk| unsafe {
         wk.setPageZoom(factor);
@@ -1151,6 +1234,9 @@ pub fn browser_zoom(app: AppHandle, label: String, factor: f64) -> Result<(), St
 /// the on-disk cache the old `document.cookie` eval could never touch.
 #[cfg(target_os = "macos")]
 fn remove_website_data(app: &AppHandle, label: &str, types: &[&str]) {
+    if !browser_lifecycle_is_active(label) {
+        return;
+    }
     use block2::RcBlock;
     use objc2_foundation::{NSDate, NSSet, NSString};
     let types: Vec<String> = types.iter().map(|s| s.to_string()).collect();
@@ -1191,6 +1277,9 @@ fn remove_website_data(app: &AppHandle, label: &str, types: &[&str]) {
 /// elsewhere fall back to the JS-accessible clears.
 #[tauri::command]
 pub fn browser_clear_cookies(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         remove_website_data(
@@ -1227,6 +1316,9 @@ pub fn browser_clear_cookies(app: AppHandle, label: String) -> Result<(), String
 /// of clear-cookies). macOS-only native path; elsewhere a cache-bypass reload.
 #[tauri::command]
 pub fn browser_clear_cache(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         remove_website_data(&app, &label, &["disk-cache", "memory-cache"]);
@@ -1247,6 +1339,9 @@ pub fn browser_clear_cache(app: AppHandle, label: String) -> Result<(), String> 
 /// document width to a phone-ish 420px centered; turning it off resets those.
 #[tauri::command]
 pub fn browser_device_mode(app: AppHandle, label: String, mobile: bool) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     if let Some(wv) = app.get_webview(&label) {
         if mobile {
             let _ = wv.eval(
@@ -1385,6 +1480,9 @@ pub fn browser_screenshot(
 /// (the frontend polls `read_clipboard` to pick it up).
 #[tauri::command]
 pub fn browser_enter_annotate(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     let wv = app.get_webview(&label).ok_or("browser not open")?;
     // Wrapped in an IIFE; all state hangs off `window.__aiosAnnot` so
     // `browser_exit_annotate` can clean up listeners + DOM precisely.
@@ -1492,6 +1590,9 @@ pub fn browser_enter_annotate(app: AppHandle, label: String) -> Result<(), Strin
 /// `browser_enter_annotate`. Safe to call even if annotate mode isn't active.
 #[tauri::command]
 pub fn browser_exit_annotate(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     if let Some(wv) = app.get_webview(&label) {
         let _ = wv.eval(
             "(function(){try{if(window.__aiosAnnot&&window.__aiosAnnot.teardown){window.__aiosAnnot.teardown();}}catch(e){}})()",
@@ -1506,6 +1607,9 @@ pub fn browser_exit_annotate(app: AppHandle, label: String) -> Result<(), String
 /// an `AIOS_CONTEXT:` sentinel, and let the React chrome poll it.
 #[tauri::command]
 pub fn browser_install_context_probe(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     let wv = app.get_webview(&label).ok_or("browser not open")?;
     let _ = wv.eval(
         r#"(function(){
@@ -1554,6 +1658,9 @@ pub fn browser_install_context_probe(app: AppHandle, label: String) -> Result<()
 /// (note carries the selection, text is empty) so one parser handles both.
 #[tauri::command]
 pub fn browser_copy_selection(app: AppHandle, label: String) -> Result<(), String> {
+    if !browser_lifecycle_is_active(&label) {
+        return Ok(());
+    }
     let wv = app.get_webview(&label).ok_or("browser not open")?;
     let _ = wv.eval(
         r#"(function(){

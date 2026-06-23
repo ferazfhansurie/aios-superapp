@@ -7,6 +7,7 @@ import {
   composerContextChips,
   contextLedger,
   cycleQueueSelection,
+  describeModelSwitch,
   moveQueuedMessage,
   queueMessage,
   removeQueuedMessage,
@@ -371,4 +372,22 @@ test("pane routing resolves markdown links relative to the current file", () => 
     "/Users/firaz/project/docs/notes/todo.md",
   );
   assert.equal(targetLabel("/Users/firaz/project/docs/notes/todo.md:44"), "todo.md");
+});
+
+test("describeModelSwitch clears + announces on a real switch, no-ops on same model", () => {
+  // re-picking the active model: no clear, no notice
+  assert.deepEqual(describeModelSwitch("claude-opus-4-8", { id: "claude-opus-4-8", label: "Opus 4.8" }), {
+    shouldClear: false,
+    notice: null,
+  });
+  // switching within an engine (claude → claude sibling): clears + announces
+  assert.deepEqual(describeModelSwitch("claude-opus-4-8", { id: "claude-sonnet-4-6", label: "Sonnet 4.6" }), {
+    shouldClear: true,
+    notice: "switched to Sonnet 4.6 — fresh chat",
+  });
+  // switching engine (claude → codex): clears + announces
+  assert.deepEqual(describeModelSwitch("claude-opus-4-8", { id: "gpt-5-codex", label: "Codex" }), {
+    shouldClear: true,
+    notice: "switched to Codex — fresh chat",
+  });
 });

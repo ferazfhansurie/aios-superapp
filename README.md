@@ -24,6 +24,18 @@ and it runs on your own AI subscriptions with no keys baked in.
 
 <sub>actively developed — it's the author's daily driver, updated most days. see the **[changelog](./CHANGELOG.md)**.</sub>
 
+<br /><br />
+
+<a href="https://aios.adleticagency.com"><strong>website</strong></a>
+· <a href="https://aios.adleticagency.com/use-cases">use cases</a>
+· <a href="https://aios.adleticagency.com/demo">interactive demo</a>
+· <a href="https://aios.adleticagency.com/agency-os-lite">early access</a>
+
+<br /><br />
+
+<sub>early access installers are distributed through the paid discord build room:
+7-day trial, then rm99/month.</sub>
+
 </div>
 
 ---

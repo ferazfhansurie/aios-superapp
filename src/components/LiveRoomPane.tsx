@@ -1,18 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
-  Circle,
   Clapperboard,
   Loader2,
   Mic,
   MonitorUp,
   MousePointer2,
-  Pause,
   Radio,
   RefreshCw,
   Search,
   ShieldAlert,
-  Square,
   Video,
   Wand2,
 } from "lucide-react";
@@ -29,7 +26,7 @@ import {
 import type { Rect } from "../lib/browser";
 import {
   LIVE_ROOM_MODES,
-  describeLiveRoomControls,
+  LIVE_ROOM_RECORDING_UNAVAILABLE_REASON,
   liveRoomPermissionSummary,
   liveRoomStatusLabel,
   restoreLiveRoomMode,
@@ -38,6 +35,7 @@ import {
   type LiveRoomStatus,
 } from "../lib/liveRoom";
 import { reportDiag } from "../lib/diag";
+import { useSharedInterval } from "../lib/ticker";
 
 interface AppGroup {
   app: string;
@@ -58,7 +56,7 @@ function modeRail(mode: LiveRoomMode, picked: WindowInfo | null): RailSection[] 
       ["scenes", ["window", "camera", "window + camera"]],
       ["sources", [picked ? `${picked.app_name} · ${picked.window_title || "untitled"}` : "no window selected", "mic", "camera preview"]],
       ["takes", ["take 1", "markers", "snapshots"]],
-      ["clips", ["disabled until recording lands"]],
+      ["clips", ["unavailable until recording backend lands"]],
     ];
   }
   if (mode === "mirror") {
@@ -112,6 +110,9 @@ export function LiveRoomPane({
   const pickerRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const startedRef = useRef(false);
+  // Latest steady-poll `sync` for the shared 1Hz ticker — set while the mirror
+  // effect is live, nulled on teardown so a stale closure never fires.
+  const syncRef = useRef<((force?: boolean) => void) | null>(null);
 
   const [mode, setMode] = useState<LiveRoomMode>(() => restoreLiveRoomMode(initialMode));
   const [status, setStatus] = useState<LiveRoomStatus>("idle");
@@ -130,7 +131,6 @@ export function LiveRoomPane({
     camera: "unknown",
   };
   const permissionSummary = liveRoomPermissionSummary(permissions);
-  const controls = describeLiveRoomControls({ status, permissions });
 
   const rect = useCallback((): Rect | null => {
     const el = slotRef.current;
@@ -148,6 +148,7 @@ export function LiveRoomPane({
       .then((rows) => {
         setWindows(rows);
         if (rows.length === 0) {
+          setPicked(null);
           setStatus("idle");
           setError("no app windows found");
         } else if (!picked) {
@@ -157,11 +158,15 @@ export function LiveRoomPane({
       .catch((e) => {
         const msg = typeof e === "string" ? e : String(e);
         setError(msg);
-        setStatus(permissionBlocked ? "permission-blocked" : "failed");
+        setStatus(isScreenPermissionError(msg) ? "permission-blocked" : "failed");
+        if (startedRef.current) {
+          startedRef.current = false;
+          appcastClose(paneKey).catch((closeErr) => reportDiag("live-room.close", closeErr, { action: "list-error" }));
+        }
         reportDiag("live-room.list", e, { action: "listWindows" });
       })
       .finally(() => setLoadingList(false));
-  }, [permissionBlocked, picked]);
+  }, [paneKey, picked]);
 
   const pickWindow = useCallback(
     (w: WindowInfo) => {
@@ -213,6 +218,13 @@ export function LiveRoomPane({
   }, [onSessionChange, sessionId]);
 
   useEffect(() => {
+    if (error) {
+      if (startedRef.current) {
+        startedRef.current = false;
+        appcastClose(paneKey).catch((e) => reportDiag("live-room.close", e, { action: "error" }));
+      }
+      return;
+    }
     if (!active || hidden || pickerOpen) {
       if (startedRef.current) appcastHide(paneKey).catch((e) => reportDiag("live-room.hide", e, { action: "hide" }));
       return;
@@ -256,16 +268,21 @@ export function LiveRoomPane({
     if (slotRef.current) ro.observe(slotRef.current);
     window.addEventListener("resize", syncSettled);
     document.addEventListener("fullscreenchange", syncSettled);
-    const poll = setInterval(() => sync(), 1000);
+    // Steady tick rides the shared 1Hz ticker (see useSharedInterval below).
+    syncRef.current = sync;
     return () => {
       cancelAnimationFrame(raf);
       timers.forEach(clearTimeout);
       ro.disconnect();
       window.removeEventListener("resize", syncSettled);
       document.removeEventListener("fullscreenchange", syncSettled);
-      clearInterval(poll);
+      syncRef.current = null;
     };
-  }, [active, hidden, paneKey, picked, pickerOpen, rect]);
+  }, [active, error, hidden, paneKey, picked, pickerOpen, rect]);
+
+  // Steady-state catch-all poll on the shared 1Hz interval — only while the
+  // mirror effect is live (active, not hidden, picker closed, a window picked).
+  useSharedInterval(1000, () => syncRef.current?.(), active && !hidden && !pickerOpen && picked != null && !error);
 
   useEffect(() => {
     return () => {
@@ -331,7 +348,7 @@ export function LiveRoomPane({
                 <div className="live-room__empty">
                   <MonitorUp size={34} />
                   <h3>choose a window to start</h3>
-                  <p>share one app or screen surface into the room. camera, mic, record and snapshots are staged here.</p>
+                  <p>share one app or screen surface into the room. camera, mic, recording, and snapshots are unavailable until their backends exist.</p>
                 </div>
               )}
               {loadingList && (
@@ -406,18 +423,10 @@ export function LiveRoomPane({
                 </div>
               )}
             </div>
-            <button type="button" title="record" disabled={!controls.canStartRecording} onClick={() => setStatus("recording")}>
-              <Circle size={16} />
-              <span>record</span>
-            </button>
-            <button type="button" title="pause recording" disabled={status !== "recording"} onClick={() => setStatus("paused")}>
-              <Pause size={16} />
-              <span>pause</span>
-            </button>
-            <button type="button" title="stop capture" disabled={!controls.canStopRecording} onClick={() => setStatus("saved")}>
-              <Square size={16} />
-              <span>stop</span>
-            </button>
+            <div className="live-room__dock-unavailable" title={LIVE_ROOM_RECORDING_UNAVAILABLE_REASON}>
+              <Video size={16} />
+              <span>recording unavailable</span>
+            </div>
           </div>
         </div>
 
@@ -430,7 +439,7 @@ export function LiveRoomPane({
             <div className="live-room__health-row"><span>screen</span><b>{permissions.screen}</b></div>
             <div className="live-room__health-row"><span>mic</span><b>{permissions.mic}</b></div>
             <div className="live-room__health-row"><span>camera</span><b>{permissions.camera}</b></div>
-            {!permissionSummary.canRecord && <p>record unlocks after screen and mic are ready.</p>}
+            {!permissionSummary.canRecord && <p>recording is unavailable until a durable capture backend exists.</p>}
           </div>
           {rail.map(([title, items]) => (
             <div key={title} className="live-room__rail-card">

@@ -301,7 +301,7 @@ pub fn pty_spawn_oracle(
         // enable mouse so the wheel scrolls inside tmux (it owns the alt-screen, so
         // xterm's own scrollback is bypassed), then attach.
         cmd.arg(format!(
-        "{tmux} -L adletic set -g mouse on 2>/dev/null; exec {tmux} -L adletic attach -t aios-{identity}"
+        "{tmux} -L adletic set -g mouse on \\; set -g status off \\; set -ag terminal-overrides ',xterm-256color:RGB,alacritty:RGB' 2>/dev/null; exec {tmux} -L adletic attach -t aios-{identity}"
     ));
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -441,7 +441,7 @@ pub fn pty_spawn_terminal(
     // inline set is a belt-and-braces fallback for a server started without it.
     cmdb.arg(format!(
         "{create} 2>/dev/null; \
-         {tmux} -L adletic set -g mouse on 2>/dev/null; \
+         {tmux} -L adletic set -g mouse on \\; set -g status off \\; set -ag terminal-overrides ',xterm-256color:RGB,alacritty:RGB' 2>/dev/null; \
          exec {tmux} -L adletic attach -t {session}"
     ));
     cmdb.env("TERM", "xterm-256color");
@@ -482,7 +482,7 @@ pub fn pty_spawn_tmux(
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.arg("-c");
         cmd.arg(format!(
-        "{tmux} -L {socket} set -g mouse on 2>/dev/null; exec {tmux} -L {socket} attach -t {session}"
+        "{tmux} -L {socket} set -g mouse on \\; set -g status off \\; set -ag terminal-overrides ',xterm-256color:RGB,alacritty:RGB' 2>/dev/null; exec {tmux} -L {socket} attach -t {session}"
     ));
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");

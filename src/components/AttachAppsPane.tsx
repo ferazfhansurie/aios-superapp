@@ -11,6 +11,7 @@ import {
 
 import { focusMacApp, listMacApps, type MacAppInfo } from "../lib/macApps";
 import { useVisible } from "../lib/useVisible";
+import { useSharedInterval } from "../lib/ticker";
 
 export function AttachAppsPane({
   onAttachApp,
@@ -39,14 +40,13 @@ export function AttachAppsPane({
   }, []);
 
   useEffect(() => {
-    // One load on mount so the pane isn't blank before first becoming visible,
-    // then poll only while visible. Interval backed off 10s → 30s (the native
-    // side also caches for 5s, so a manual refresh stays snappy).
+    // One load on mount / when becoming visible so the pane isn't blank. The
+    // steady poll rides the shared 30s interval below (the native side also
+    // caches for 5s, so a manual refresh stays snappy).
     void refresh();
-    if (!paneVisible) return;
-    const timer = window.setInterval(refresh, 30_000);
-    return () => window.clearInterval(timer);
   }, [refresh, paneVisible]);
+  // Poll only while visible — hidden pane doesn't subscribe → zero I/O.
+  useSharedInterval(30_000, refresh, paneVisible);
 
   const visible = useMemo(
     () => apps.filter((app) => app.bundle_id !== "com.adletic.aios"),

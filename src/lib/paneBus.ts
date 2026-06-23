@@ -231,13 +231,16 @@ export type SpawnPaneKind = "terminal" | "files" | "browser" | "chat";
  *  - terminal → `cwd` (shell starts there)
  *  - files    → `path` (pane is rooted there)
  *  - browser  → `url`  (initial url; e.g. a `file://` for a selected file)
- *  - chat     → `cwd` + `seed` (chat working dir and optional opening prompt)
+ *  - chat     → `cwd` + `seed` + `modelId` (chat working dir, opening prompt,
+ *               and optional model to boot)
  */
 export interface SpawnCtx {
   cwd?: string;
   path?: string;
   url?: string;
   seed?: string;
+  /** chat only: model id to boot the new chat pane with. */
+  modelId?: string;
   /** terminal only: a command to seed + run in the freshly-spawned shell. Maps
    *  to the shell pane's startup `cmd`, so it runs as soon as the PTY is ready
    *  (no need to look the new pane up in paneWriters/paneSubmitters after mount).
@@ -266,6 +269,17 @@ export function spawnPane(kind: SpawnPaneKind, ctx?: SpawnCtx): boolean {
   if (!spawnPaneImpl) return false;
   spawnPaneImpl(kind, ctx);
   return true;
+}
+
+/** Open a fresh chat pane for a slash-command handoff. Keeps the public contract
+ *  explicit instead of making ChatPane know App's pane shape. */
+export function requestChatHandoffPane(ctx: {
+  cwd?: string;
+  seed: string;
+  modelId: string;
+  label?: string;
+}): boolean {
+  return spawnPane("chat", ctx);
 }
 
 // ── orchestrator channel ─────────────────────────────────────────────────────

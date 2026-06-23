@@ -352,6 +352,32 @@ export function wrmsSeedTasks(): BoardTask[] {
   ];
 }
 
+/** Reads the on-disk chat-agents (config.json per agent, written by loop-spawned
+ *  threads themselves) — the cross-process source of which threads are live. Used
+ *  by the idle dashboard's "loops" section to show currently-active loop threads.
+ *  Outside tauri → []. */
+export async function listDiskAgents(): Promise<AgentConfig[]> {
+  try {
+    const disk = await invoke<unknown[]>("agent_list");
+    if (!Array.isArray(disk)) return [];
+    return disk.filter((a): a is AgentConfig => Boolean(a && typeof a === "object" && (a as AgentConfig).id));
+  } catch {
+    return [];
+  }
+}
+
+/** True if an agent id is a LOOP-spawned thread (maintainers, goal workers,
+ *  builders) rather than a hand-made/mission agent — so the dashboard's loops
+ *  section shows loop work, not every chat agent. */
+export function isLoopThread(id: string): boolean {
+  return (
+    id === "aios-maintainer" ||
+    id === "wrms-maintainer" ||
+    id === "aios-dogfood" ||
+    /^(goal-|aios-build-|wrms-build-)/.test(id)
+  );
+}
+
 /** Reads the fs mirror (config.json per agent, possibly updated by the agent
  *  itself) and merges the status-board fields back into localStorage. This is
  *  what turns the board into a control CENTRE rather than a launcher — the
@@ -430,6 +456,13 @@ export interface LoopInfo {
   cadence: string;
   /** The command the loop fires (meta 3rd field) — preserved across edits. */
   command?: string;
+  /** LaunchAgent label backing the loop, when known. */
+  label?: string;
+  /** `managed` rows have ~/.aios/state/loops/*.meta and can edit cadence. */
+  source?: "managed" | "launchagent";
+  editable?: boolean;
+  controllable?: boolean;
+  logPath?: string;
   status?: LoopStatus;
   lastLog: string;
 }
@@ -485,12 +518,95 @@ export async function setLoopCadence(name: string, cadence: string): Promise<voi
   return invoke("loop_set_cadence", { name, cadence });
 }
 
+/** Deletes a loop entirely (unloads the launchd agent + removes plist + meta).
+ *  Irreversible — callers must confirm. Rejects if there's nothing to delete. */
+export async function deleteLoop(name: string): Promise<void> {
+  return invoke("loop_delete", { name });
+}
+
+/** One project in the registry (~/.aios/state/loops/projects.json) — the source
+ *  the maintainer loops + the pane both read. `loops` lists the loop names that
+ *  belong to this project (display/grouping); `posture` gates what they may do. */
+export interface LoopProject {
+  key: string;
+  label?: string;
+  posture?: "branch-only" | "prep-only";
+  repos?: string[];
+  loops?: string[];
+  owner?: string;
+  note?: string;
+}
+
+/** Reads the projects registry. Outside tauri / missing file → []. */
+export async function listLoopProjects(): Promise<LoopProject[]> {
+  try {
+    const disk = await invoke<unknown[]>("loop_projects");
+    if (!Array.isArray(disk)) return [];
+    return disk.filter((p): p is LoopProject => Boolean(p && typeof p === "object" && (p as LoopProject).key));
+  } catch {
+    return [];
+  }
+}
+
+/** Appends a project to the registry (rejects a duplicate key). */
+export async function addLoopProject(input: {
+  key: string;
+  label: string;
+  posture: "branch-only" | "prep-only";
+  repos: string[];
+  loops: string[];
+}): Promise<void> {
+  return invoke("loop_add_project", input);
+}
+
 /** Creates a new loop (wraps aios-loop create). `command` is an arg vector so a
  *  multi-word agent prompt stays one ProgramArgument; a bare leading
  *  "aios-agent" is resolved to its absolute path by the Rust side. `cadence` is
  *  e.g. "30m" or "daily 09:00". */
 export async function addLoop(name: string, cadence: string, command: string[]): Promise<void> {
   return invoke("loop_create", { name, cadence, command });
+}
+
+/** One row of the overnight loop activity ledger (a line in changes.jsonl). */
+export interface LoopChange {
+  /** unix seconds when the loop landed this work. */
+  ts: number;
+  /** which loop produced it (e.g. "shell-improve"). */
+  loop: string;
+  /** the loop/* branch the work landed on, if any. */
+  branch?: string;
+  /** what the loop set out to do this fire. */
+  item: string;
+  /** outcome marker — "ready" | "failed" | "blocked" | … (free-form). */
+  result: string;
+  /** one-line description of what actually changed. */
+  summary?: string;
+}
+
+/** Reads the overnight loop activity ledger (~/.aios/state/loops/changes.jsonl),
+ *  newest-first, capped. Outside tauri (web build) → []. */
+export async function listLoopChanges(limit = 100): Promise<LoopChange[]> {
+  try {
+    const disk = await invoke<unknown[]>("loop_changes", { limit });
+    if (!Array.isArray(disk)) return [];
+    return disk.filter(
+      (c): c is LoopChange =>
+        Boolean(c && typeof c === "object" && typeof (c as LoopChange).item === "string"),
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Tail of one loop's run log (last n non-empty lines). Outside tauri → []. */
+export async function getLoopLog(name: string, lines = 20): Promise<string[]> {
+  try {
+    const disk = await invoke<unknown[]>("loop_log", { name, lines });
+    if (!Array.isArray(disk)) return [];
+    return disk.filter((l): l is string => typeof l === "string");
+  } catch {
+    return [];
+  }
 }
 
 // ── dogfood ticket intake (the TicketPane) ───────────────────────────────────
@@ -507,6 +623,12 @@ export interface TicketInfo {
   priority: string;
   status: string;
   created: string;
+  repo?: string;
+  owner?: string;
+  branch?: string;
+  result?: string;
+  blocker?: string;
+  mergeStatus?: "merged" | "not-merged" | "unknown" | "";
 }
 
 /** Lists dogfood tickets (open first, firaz-authored first, oldest-first = the
@@ -528,6 +650,35 @@ export async function addTicket(text: string, urgent = false): Promise<void> {
   return invoke("ticket_add", { text, urgent });
 }
 
+/** Reads one ticket's full markdown (frontmatter + body) for the detail view. */
+export async function readTicket(name: string, queue: "open" | "done"): Promise<string> {
+  try {
+    return await invoke<string>("ticket_read", { name, queue });
+  } catch {
+    return "";
+  }
+}
+
+/** Appends a firaz steering comment to a ticket. The fixer reads this before work. */
+export async function commentTicket(name: string, queue: "open" | "done", text: string): Promise<void> {
+  return invoke("ticket_comment", { name, queue, text });
+}
+
+/** Updates ticket status, e.g. ignored/open/in-progress/done. */
+export async function setTicketStatus(name: string, queue: "open" | "done", status: string): Promise<void> {
+  return invoke("ticket_set_status", { name, queue, status });
+}
+
+/** Updates ticket priority (`urgent`, `high`, `normal`). */
+export async function setTicketPriority(name: string, queue: "open" | "done", priority: string): Promise<void> {
+  return invoke("ticket_set_priority", { name, queue, priority });
+}
+
+/** Moves a ticket into tickets/.trash. Reversible from disk, destructive in UI. */
+export async function deleteTicket(name: string, queue: "open" | "done"): Promise<void> {
+  return invoke("ticket_delete", { name, queue });
+}
+
 // ── control-hook payload shapes (the `control-command` Tauri event) ──────────
 // Emitted by control.rs on a valid POST. App.tsx listens and routes these.
 
@@ -544,6 +695,8 @@ export interface OpenPaneCommand {
   cmd: "open-pane";
   paneType?: string;
   key?: string;
+  /** true for loop/agent-originated panes: defer mounting and do not steal focus. */
+  background?: boolean;
   /** chat: initial prompt to auto-run (zero-paste handoff). shell: command to run. */
   seed?: string;
   /** working dir for the spawned pane. */

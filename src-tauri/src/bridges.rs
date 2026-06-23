@@ -241,12 +241,17 @@ pub fn pair_personal_wa() -> Value {
         return json!({ "ok": false, "error": "connect-personal-code.js not found under ~/Repo/firaz/aios/bridge (or aios-bridge)." });
     };
 
-    let mut child = match std::process::Command::new("node")
+    let mut pair_cmd = std::process::Command::new("node");
+    pair_cmd
         .arg(&script)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    // GUI launch hands children the bare PATH; `node` itself (and its module
+    // resolution / any binaries wwebjs shells out to) needs the user's real
+    // PATH or the spawn fails / hangs. Mirrors the chat.rs fix.
+    #[cfg(not(windows))]
+    pair_cmd.env("PATH", crate::chat::enriched_path());
+    let mut child = match pair_cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return json!({ "ok": false, "error": format!("couldn't spawn node: {e} (is node on PATH?)") })

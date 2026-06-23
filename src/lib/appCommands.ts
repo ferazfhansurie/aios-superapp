@@ -97,7 +97,7 @@ export function buildAppCommands(deps: AppCommandDeps): PaletteCommand[] {
         description: "⌘`",
         scope: "pane",
         icon: createElement(Layers, { size: 14 }),
-        keywords: ["overview", "mission", "control", "switch", "panes", "windows", "fan", "out"],
+        keywords: ["overview", "control", "switch", "panes", "windows", "fan", "out"],
         enabled: () => deps.panesCount > 0,
         run: () => deps.setOverviewOpen(true),
       }),

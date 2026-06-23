@@ -543,3 +543,25 @@ export function buildChatContextCapsule(input: ChatContextCapsuleInput): string 
   lines.push("</aios_context>", "");
   return trimCapsule(`${lines.join("\n")}\n`, limits.maxChars);
 }
+
+// ── model switch ────────────────────────────────────────────────────────────
+// Switching the active model (engine or sibling within an engine) must NOT
+// repaint the prior conversation under a new backend — that's the confusing
+// behavior the engine-split plan calls out. Picking a *different* model clears
+// the transcript + run-events and starts a fresh session (like /clear), with a
+// visible notice so the reset isn't silent. Re-picking the active model is a
+// no-op (no clear, no notice).
+export interface ModelSwitchDecision {
+  /** clear transcript + run-events and re-spin a fresh session */
+  shouldClear: boolean;
+  /** one-line result bubble to seed the fresh transcript, or null when no-op */
+  notice: string | null;
+}
+
+export function describeModelSwitch(
+  prevModelId: string,
+  next: { id: string; label: string },
+): ModelSwitchDecision {
+  if (next.id === prevModelId) return { shouldClear: false, notice: null };
+  return { shouldClear: true, notice: `switched to ${next.label} — fresh chat` };
+}

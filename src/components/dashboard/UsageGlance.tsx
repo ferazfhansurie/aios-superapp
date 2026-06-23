@@ -29,20 +29,32 @@ const FIVE_HOURS = 5 * 3600;
 const SEVEN_DAYS = 7 * 24 * 3600;
 
 /** accent < 65% · warning < 85% · danger above — matches IdleDashboard's Meter. */
-function barColor(pct: number): string {
+// Per-provider identity colors — the subtle "splash" so the two usage blocks
+// read as distinct (claude clay, codex violet) instead of a wall of brand
+// orange. Mirrors the engine palette in chat/modelIcons.tsx. Brand color only
+// shows at safe usage; thresholds still override to amber/red as it fills.
+const PROVIDER_COLOR: Record<string, string> = {
+  claude: "#D97757",
+  codex: "#8B5CF6",
+  opencode: "#A78BFA",
+};
+
+function barColor(pct: number, base: string): string {
   if (pct >= 85) return "var(--color-danger)";
   if (pct >= 65) return "var(--color-warning)";
-  return "var(--color-accent)";
+  return base;
 }
 
 function UsageBar({
   label,
   pct,
   resetsAt,
+  base = "var(--color-accent)",
 }: {
   label: string;
   pct: number | null;
   resetsAt: number | null;
+  base?: string;
 }) {
   if (pct == null) return null;
   const clamped = Math.min(Math.max(pct, 0), 100);
@@ -61,7 +73,7 @@ function UsageBar({
       <div className="h-1 w-full overflow-hidden rounded-full bg-[var(--color-panel-2)]">
         <div
           className="h-full rounded-full transition-[width] duration-700"
-          style={{ width: `${clamped}%`, background: barColor(pct) }}
+          style={{ width: `${clamped}%`, background: barColor(pct, base) }}
         />
       </div>
     </div>
@@ -99,6 +111,7 @@ export function ProviderBlock({
   sevenDay: { pct: number | null; resetsAt: number | null };
 }) {
   if (fiveHour.pct == null && sevenDay.pct == null) return null;
+  const accent = PROVIDER_COLOR[name] ?? "var(--color-accent)";
   const fiveHourRisk = usagePaceRisk({
     pct: fiveHour.pct,
     resetsAt: fiveHour.resetsAt,
@@ -112,11 +125,12 @@ export function ProviderBlock({
   const risk = topRisk(fiveHourRisk, sevenDayRisk);
   return (
     <div className="flex flex-col gap-2">
-      <span className="text-[10px] font-medium lowercase tracking-wide text-[var(--color-text-2)]">
+      <span className="flex items-center gap-1.5 text-[10px] font-medium lowercase tracking-wide text-[var(--color-text-2)]">
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: accent }} />
         {name}
       </span>
-      <UsageBar label="5h" pct={fiveHour.pct} resetsAt={fiveHour.resetsAt} />
-      <UsageBar label="7d" pct={sevenDay.pct} resetsAt={sevenDay.resetsAt} />
+      <UsageBar label="5h" pct={fiveHour.pct} resetsAt={fiveHour.resetsAt} base={accent} />
+      <UsageBar label="7d" pct={sevenDay.pct} resetsAt={sevenDay.resetsAt} base={accent} />
       <PaceWarning risk={risk} />
     </div>
   );

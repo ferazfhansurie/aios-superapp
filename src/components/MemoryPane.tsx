@@ -39,6 +39,7 @@ import {
 } from "../lib/memory";
 import { reportDiag } from "../lib/diag";
 import { useVisible } from "../lib/useVisible";
+import { useSharedInterval } from "../lib/ticker";
 
 type GraphFilter = "all" | "project" | "user" | "feedback" | "reference" | "orphaned";
 type ViewMode = "web" | "editor";
@@ -458,12 +459,12 @@ function MemoryGraphView({
             })}
           </div>
         </div>
-        <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]/82 px-2.5 py-2 shadow-[0_12px_30px_rgba(0,0,0,0.28)] backdrop-blur">
+        <div className="pointer-events-none absolute left-3 top-3 z-20 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]/95 px-2.5 py-2 shadow-[0_12px_30px_rgba(0,0,0,0.28)]">
           <div className="font-mono text-[10px] uppercase tracking-widest text-[var(--color-faint)]">visible</div>
           <div className="mt-0.5 text-[18px] font-medium leading-none text-[var(--color-text)]">{visibleNodes.length}</div>
         </div>
         {selectedNode && (
-          <div className="absolute bottom-3 left-3 right-3 z-20 flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]/86 px-2.5 py-2 shadow-[0_14px_36px_rgba(0,0,0,0.32)] backdrop-blur">
+          <div className="absolute bottom-3 left-3 right-3 z-20 flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]/95 px-2.5 py-2 shadow-[0_14px_36px_rgba(0,0,0,0.32)]">
             <span
               className="h-2.5 w-2.5 shrink-0 rounded-full"
               style={{ background: clusterColor(selectedNode.cluster) }}
@@ -787,16 +788,10 @@ export function MemoryPane({ onSend }: { onSend?: (text: string) => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Background refresh: only while visible, backed off 12s → 30s. Hidden pane =
-  // zero disk I/O. (Live edits/search still refresh via the query-debounce +
-  // save() effects below regardless of this poll.)
-  useEffect(() => {
-    if (!visible) return;
-    const t = window.setInterval(() => load(query), 30_000);
-    return () => window.clearInterval(t);
-    // intentionally reads the latest query through the reload call.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible]);
+  // Background refresh: only while visible, on the shared 30s interval. Hidden
+  // pane = zero disk I/O (it doesn't subscribe). (Live edits/search still
+  // refresh via the query-debounce + save() effects below regardless.)
+  useSharedInterval(30_000, () => load(query), visible);
 
   useEffect(() => {
     const t = window.setTimeout(() => load(query), 220);

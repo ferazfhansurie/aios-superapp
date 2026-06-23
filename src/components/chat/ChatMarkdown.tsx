@@ -105,9 +105,16 @@ export function splitFences(
 export const Markdown = memo(function Markdown({
   text,
   onOpenUrl,
+  streaming = false,
 }: {
   text: string;
   onOpenUrl?: (url: string) => void;
+  /** While the bubble is still streaming, skip the expensive block/inline parse
+   *  (which re-scans the WHOLE growing message every frame → O(n²) over the turn,
+   *  the dominant streaming jank). Render prose as plain pre-wrap text and only
+   *  keep the cheap fence split so code blocks still look right. The full
+   *  markdown parse runs ONCE on settle (streaming → false). */
+  streaming?: boolean;
 }) {
   const segments = useMemo(() => splitFences(text), [text]);
   return (
@@ -115,6 +122,10 @@ export const Markdown = memo(function Markdown({
       {segments.map((seg, i) =>
         seg.code ? (
           <CodeBlock key={i} lang={seg.lang} body={seg.body} />
+        ) : streaming ? (
+          <p key={i} className="whitespace-pre-wrap break-words">
+            {seg.body}
+          </p>
         ) : (
           <MarkdownBlocks key={i} text={seg.body} onOpenUrl={onOpenUrl} />
         ),
@@ -129,7 +140,7 @@ export const Markdown = memo(function Markdown({
  *  whole block so it's typed in). */
 export const SHELL_LANGS = new Set(["bash", "sh", "shell", "zsh", "console", "shell-session"]);
 
-export function CodeBlock({ lang, body }: { lang: string; body: string }) {
+export const CodeBlock = memo(function CodeBlock({ lang, body }: { lang: string; body: string }) {
   // strip a single trailing newline so the block isn't bottom-heavy
   const code = body.replace(/\n$/, "");
   const cwd = useChatCwd();
@@ -163,7 +174,7 @@ export function CodeBlock({ lang, body }: { lang: string; body: string }) {
       </pre>
     </div>
   );
-}
+});
 
 /** Render the non-code body: split into block-level lines (headings / lists /
  *  paragraphs), each with inline formatting. The whole line-split + per-line
@@ -283,7 +294,7 @@ const MarkdownBlocks = memo(function MarkdownBlocks({
 /** Inline span formatting: `code`, **bold**, *italic* / _italic_, [text](url).
  *  Single-pass tokenizer — partial markers (e.g. a lone trailing `**` during
  *  streaming) just render literally, never throw. */
-function Inline({
+const Inline = memo(function Inline({
   text,
   onOpenUrl,
 }: {
@@ -431,4 +442,4 @@ function Inline({
   }
   flush();
   return <>{nodes}</>;
-}
+});

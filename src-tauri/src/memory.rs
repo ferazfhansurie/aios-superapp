@@ -395,6 +395,11 @@ fn score_memory(
     let path = node.path.to_lowercase();
     let mut score = if q.is_empty() { 1 } else { 0 };
     let mut reasons = Vec::new();
+    // Did the query (or cwd) actually match this node? Baseline bonuses below
+    // must NOT qualify a node on their own — otherwise the same well-connected
+    // user/feedback notes surface for EVERY query ("always the same 3 auto
+    // memories"). A real query requires a real match to be eligible.
+    let mut relevance_hit = false;
 
     if !q.is_empty() {
         for token in q.split_whitespace() {
@@ -403,18 +408,22 @@ fn score_memory(
             }
             if id.contains(token) {
                 score += 18;
+                relevance_hit = true;
                 reasons.push(format!("id matches `{token}`"));
             }
             if title.contains(token) {
                 score += 24;
+                relevance_hit = true;
                 reasons.push(format!("title matches `{token}`"));
             }
             if description.contains(token) {
                 score += 14;
+                relevance_hit = true;
                 reasons.push(format!("description matches `{token}`"));
             }
             if body_l.contains(token) {
                 score += 6;
+                relevance_hit = true;
                 reasons.push(format!("body mentions `{token}`"));
             }
         }
@@ -422,19 +431,27 @@ fn score_memory(
 
     if !cwd.is_empty() && (path.contains(&cwd) || body_l.contains(&cwd)) {
         score += 16;
+        relevance_hit = true;
         reasons.push("matches current project path".to_string());
     }
 
+    // Baseline relevance — TIEBREAKERS among already-matched notes only. Kept
+    // small (and degree capped low) so query relevance dominates the ranking.
     match node.node_type.as_str() {
-        "user" | "identity" | "preference" => score += 7,
-        "project" | "plan" | "workflow" | "decision" => score += 5,
+        "user" | "identity" | "preference" => score += 4,
+        "project" | "plan" | "workflow" | "decision" => score += 3,
         _ => {}
     }
-    score += (node.links.len() as i32).min(8);
+    score += (node.links.len() as i32).min(4);
     if node.mtime > 0 {
         score += 1;
     }
 
+    // With a real query, baseline alone can't surface a memory — it must have
+    // hit the query or the cwd. (Empty query → browse mode, baseline ranks.)
+    if !q.is_empty() && !relevance_hit {
+        return None;
+    }
     if score <= 0 {
         return None;
     }
@@ -706,7 +723,7 @@ pub fn memory_save_raw(path: String, body: String) -> Result<(), String> {
     if target.extension().and_then(|e| e.to_str()) != Some("md") {
         return Err("not a markdown file".into());
     }
-    std::fs::write(&target, body).map_err(|e| e.to_string())
+    atomic_write(&target, body.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Deletes a memory file by path. Guarded to known vaults.
@@ -828,7 +845,7 @@ pub fn memory_save(
     out.push('\n');
 
     let path = dir.join(format!("{name}.md"));
-    std::fs::write(&path, &out).map_err(|e| e.to_string())?;
+    atomic_write(&path, out.as_bytes()).map_err(|e| e.to_string())?;
 
     // Rename: drop the previous file + index line if the slug changed.
     if let Some(old) = old_name.as_deref() {
@@ -856,6 +873,34 @@ pub fn memory_delete(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Atomically writes `data` to `path` via a unique tmp file + rename. firaz runs
+/// several oracle sessions against the SAME `~/.aios/state` vault concurrently, so
+/// a plain `fs::write` can interleave (partial write seen by a reader) or two
+/// writers can clobber. tmp+rename makes the swap atomic on POSIX (rename is a
+/// single inode flip), and the pid+nanos suffix keeps two concurrent writers from
+/// fighting over one tmp path. The final `rename` is still last-writer-wins at the
+/// content level — but the file is NEVER left half-written / truncated.
+fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let nonce = format!(
+        "{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp = path.with_extension(format!("tmp.{nonce}"));
+    std::fs::write(&tmp, data)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Don't leak the tmp file if the rename failed.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Inserts or replaces the `MEMORY.md` pointer line for a note. Best-effort —
 /// the index is a convenience, so failures here don't fail the save.
 fn update_index_upsert(dir: &std::path::Path, name: &str, description: &str) {
@@ -879,7 +924,7 @@ fn update_index_upsert(dir: &std::path::Path, name: &str, description: &str) {
         }
         lines.push(line);
     }
-    let _ = std::fs::write(&index, lines.join("\n") + "\n");
+    let _ = atomic_write(&index, (lines.join("\n") + "\n").as_bytes());
 }
 
 /// Removes a note's `MEMORY.md` pointer line, if present. Best-effort.
@@ -891,7 +936,7 @@ fn update_index_remove(dir: &std::path::Path, name: &str) {
         Err(_) => return,
     };
     let kept: Vec<&str> = existing.lines().filter(|l| !l.contains(&marker)).collect();
-    let _ = std::fs::write(&index, kept.join("\n") + "\n");
+    let _ = atomic_write(&index, (kept.join("\n") + "\n").as_bytes());
 }
 
 #[cfg(test)]

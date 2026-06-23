@@ -10,9 +10,7 @@ import {
 } from "react";
 
 import {
-  Activity,
   Bell,
-  Brain,
   Check,
   Cpu,
   FolderGit2,
@@ -33,6 +31,7 @@ import {
   Settings as SettingsIcon,
   Sun,
   Type,
+  User,
   X,
 } from "lucide-react";
 
@@ -93,6 +92,26 @@ import {
   type DiagEvent,
   type DiagInfo,
 } from "../lib/diag";
+
+/* ── model / engine helpers ─────────────────────────────────────────── */
+
+/** The three chat engines the cockpit drives. Mirrors ChatModel["engine"]. */
+type Engine = "claude" | "codex" | "opencode";
+
+/** Identity dot colors per engine — meaningful color, not theme orange.
+ *  Matches ENGINE_COLOR in chat/modelIcons.tsx (claude clay, codex violet). */
+const ENGINE_DOT: Record<Engine, string> = {
+  claude: "#D97757",
+  codex: "#8B5CF6",
+  opencode: "#A78BFA",
+};
+
+/** Derive the engine from a stored provider id like "codex-cli". */
+function engineFromProvider(provider: string): Engine {
+  const head = provider.split("-")[0];
+  if (head === "claude" || head === "codex" || head === "opencode") return head;
+  return "codex";
+}
 
 /* ── control primitives ─────────────────────────────────────────────── */
 
@@ -620,26 +639,40 @@ function GroupLabel({ children }: { children: ReactNode }) {
 /* ── sections ───────────────────────────────────────────────────────── */
 
 type SectionId =
-  | "general"
+  | "account"
+  | "model"
   | "appearance"
   | "sidebar"
   | "notifications"
   | "projects"
-  | "oracles"
-  | "memory"
-  | "diagnostics"
+  | "advanced"
   | "shortcuts"
   | "about";
 
+/** Accept legacy section ids (deep-links / saved state) and map them onto the
+ *  reorganized nav so old notification deep-links still land somewhere sane. */
+const SECTION_ALIASES: Record<string, SectionId> = {
+  general: "account",
+  oracles: "advanced",
+  memory: "advanced",
+  diagnostics: "advanced",
+};
+
+function normalizeSection(id: string | null | undefined): SectionId | null {
+  if (!id) return null;
+  if (SECTION_ALIASES[id]) return SECTION_ALIASES[id];
+  if (NAV.some((n) => n.id === id)) return id as SectionId;
+  return null;
+}
+
 const NAV: { id: SectionId; label: string; icon: ComponentType<{ size?: number }> }[] = [
-  { id: "general", label: "general", icon: SettingsIcon },
+  { id: "account", label: "account", icon: User },
+  { id: "model", label: "model & ai", icon: Cpu },
   { id: "appearance", label: "appearance", icon: Palette },
   { id: "sidebar", label: "sidebar", icon: PanelLeft },
   { id: "notifications", label: "notifications", icon: Bell },
   { id: "projects", label: "projects", icon: FolderGit2 },
-  { id: "oracles", label: "oracles", icon: Cpu },
-  { id: "memory", label: "memory", icon: Brain },
-  { id: "diagnostics", label: "diagnostics", icon: Activity },
+  { id: "advanced", label: "advanced", icon: SettingsIcon },
   { id: "shortcuts", label: "shortcuts", icon: Keyboard },
   { id: "about", label: "about", icon: Info },
 ];
@@ -656,7 +689,6 @@ function Keycap({ children }: { children: ReactNode }) {
 const SHORTCUTS: { keys: string[]; action: string }[] = [
   { keys: ["⌘", "B"], action: "toggle sidebar" },
   { keys: ["⌘", "K"], action: "command palette" },
-  { keys: ["⌘", "⌘"], action: "appshot" },
   { keys: ["⌘", "T"], action: "new terminal" },
   { keys: ["⌘", "W"], action: "close pane" },
   { keys: ["⌘", ","], action: "open settings" },
@@ -1015,7 +1047,7 @@ export function Settings({
   /** Copy the mirror url to the clipboard (App owns the clipboard + flash). */
   onCopyMirrorUrl?: () => void;
 }) {
-  const [section, setSection] = useState<SectionId>("general");
+  const [section, setSection] = useState<SectionId>("account");
   const [s, setS] = useState<AppSettings>(loadSettings);
   const [sidebar, setSidebar] = useState<SidebarState>(loadSidebar);
   useEffect(() => subscribeSidebar(setSidebar), []);
@@ -1030,9 +1062,8 @@ export function Settings({
       setLocalTheme(getTheme());
       setLocalAccent(getAccent());
       setLocalDensity(getDensity());
-      if (initialSection && NAV.some((n) => n.id === initialSection)) {
-        setSection(initialSection as SectionId);
-      }
+      const target = normalizeSection(initialSection);
+      if (target) setSection(target);
     }
   }, [open, initialSection]);
 
@@ -1124,74 +1155,155 @@ export function Settings({
               {section}
             </h2>
             <div className="divide-y divide-[var(--color-border)]">
-              {section === "general" && (
-                <>
-                  <Row
-                    label="your name"
-                    sub="shown in the homescreen greeting + account row"
-                  >
-                    <input
-                      value={s.userName}
-                      onChange={(e) => patch({ userName: e.target.value })}
-                      placeholder="your name"
-                      spellCheck={false}
-                      className="w-[160px] rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
-                    />
-                  </Row>
-                  <Row
-                    label="reopen last layout"
-                    sub="restore your panes + sizes on startup"
-                  >
-                    <Toggle
-                      checked={s.reopenLastLayout}
-                      onChange={(v) => patch({ reopenLastLayout: v })}
-                    />
-                  </Row>
-                  <Row
-                    label="confirm before closing oracle pane"
-                    sub="ask before killing a live oracle session"
-                  >
-                    <Toggle
-                      checked={s.confirmCloseOraclePane}
-                      onChange={(v) => patch({ confirmCloseOraclePane: v })}
-                    />
-                  </Row>
-                  <Row label="default new-pane type">
-                    <Segmented<PaneType>
-                      value={s.defaultPaneType}
-                      onChange={(v) => patch({ defaultPaneType: v })}
-                      options={[
-                        { value: "terminal", label: "terminal" },
-                        { value: "files", label: "files" },
-                        { value: "browser", label: "browser" },
-                      ]}
-                    />
-                  </Row>
-                  <Row
-                    label="headroom compression"
-                    sub="route claude chat through the local headroom proxy — compresses tool outputs before the LLM (fewer tokens, easier on usage caps). never touches your prompt."
-                  >
-                    <Toggle
-                      checked={s.headroomCompression}
-                      onChange={(v) => patch({ headroomCompression: v })}
-                    />
-                  </Row>
-                  {mirrorUrl && (
+              {section === "account" && (
+                <div className="-mt-1 divide-y divide-[var(--color-border)]">
+                  {/* identity */}
+                  <div className="py-3">
+                    <GroupLabel>identity</GroupLabel>
                     <Row
-                      label="desktop mirror link"
-                      sub={`copy the pairing link to view this cockpit elsewhere · ${mirrorStatus ?? "off"}`}
+                      label="your name"
+                      sub="how the cockpit greets you on the homescreen"
                     >
-                      <button
-                        type="button"
-                        onClick={() => onCopyMirrorUrl?.()}
-                        className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 text-[12px] text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)]"
-                      >
-                        <MonitorUp size={13} />
-                        copy link
-                      </button>
+                      <input
+                        value={s.userName}
+                        onChange={(e) => patch({ userName: e.target.value })}
+                        placeholder="your name"
+                        spellCheck={false}
+                        className="w-[160px] rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+                      />
                     </Row>
+                  </div>
+
+                  {/* plan — honest placeholder for the freemium ladder */}
+                  <div className="py-3">
+                    <GroupLabel>plan</GroupLabel>
+                    <div className="flex items-center justify-between gap-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-panel-2)]/30 px-3.5 py-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[13px] text-[var(--color-text)]">local</span>
+                          <span className="rounded-full border border-[var(--color-border)] bg-[var(--color-panel-2)]/60 px-2 py-0.5 text-[10px] uppercase tracking-wide text-[var(--color-muted)]">
+                            current
+                          </span>
+                        </div>
+                        <div className="mt-1 text-[11px] leading-snug text-[var(--color-muted)]">
+                          running on your own machine + your own model keys. always-on
+                          automations and managed models arrive with premium.
+                        </div>
+                      </div>
+                      <span className="shrink-0 text-[11px] text-[var(--color-faint)]">
+                        soon
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* startup + behavior */}
+                  <div className="py-3">
+                    <GroupLabel>startup &amp; behavior</GroupLabel>
+                    <Row
+                      label="reopen last layout"
+                      sub="restore your panes + sizes on startup"
+                    >
+                      <Toggle
+                        checked={s.reopenLastLayout}
+                        onChange={(v) => patch({ reopenLastLayout: v })}
+                      />
+                    </Row>
+                    <Row
+                      label="confirm before closing a chat pane"
+                      sub="ask before killing a live AI session so you don't lose work"
+                    >
+                      <Toggle
+                        checked={s.confirmCloseOraclePane}
+                        onChange={(v) => patch({ confirmCloseOraclePane: v })}
+                      />
+                    </Row>
+                    <Row
+                      label="default new pane"
+                      sub="what opens when you create a pane with no type"
+                    >
+                      <Segmented<PaneType>
+                        value={s.defaultPaneType}
+                        onChange={(v) => patch({ defaultPaneType: v })}
+                        options={[
+                          { value: "terminal", label: "terminal" },
+                          { value: "files", label: "files" },
+                          { value: "browser", label: "browser" },
+                        ]}
+                      />
+                    </Row>
+                  </div>
+
+                  {mirrorUrl && (
+                    <div className="py-3">
+                      <GroupLabel>devices</GroupLabel>
+                      <Row
+                        label="desktop mirror link"
+                        sub={`copy the pairing link to view this cockpit elsewhere · ${mirrorStatus ?? "off"}`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onCopyMirrorUrl?.()}
+                          className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 text-[12px] text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)]"
+                        >
+                          <MonitorUp size={13} />
+                          copy link
+                        </button>
+                      </Row>
+                    </div>
                   )}
-                </>
+                </div>
+              )}
+
+              {section === "model" && (
+                <div className="-mt-1 divide-y divide-[var(--color-border)]">
+                  <p className="pb-3 pt-1 text-[12px] leading-snug text-[var(--color-muted)]">
+                    choose the engine new chats start on. pick the exact model per
+                    chat from the picker in the chat composer — this just sets the
+                    default.
+                  </p>
+
+                  {/* engine — drives chatProvider; persisted + read by the chat pane. */}
+                  <div className="py-3">
+                    <Row
+                      label="default engine"
+                      sub="which AI runtime new chats boot with"
+                    >
+                      <Segmented<Engine>
+                        value={engineFromProvider(s.chatProvider)}
+                        onChange={(e) =>
+                          patch({ chatProvider: `${e}-cli`, chatModel: null })
+                        }
+                        options={[
+                          { value: "claude", label: "claude" },
+                          { value: "codex", label: "codex" },
+                          { value: "opencode", label: "opencode" },
+                        ]}
+                      />
+                    </Row>
+                    <div className="flex items-center gap-2 pt-1.5 text-[11px] text-[var(--color-muted)]">
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full"
+                        style={{ background: ENGINE_DOT[engineFromProvider(s.chatProvider)] }}
+                      />
+                      {s.chatModel
+                        ? `last used model · ${s.chatModel}`
+                        : "using the engine's default model"}
+                    </div>
+                  </div>
+
+                  {/* headroom — real, wired control. */}
+                  <div className="py-3">
+                    <Row
+                      label="headroom compression"
+                      sub="route claude chat through the local headroom proxy — compresses tool outputs before the model (fewer tokens, easier on usage caps). never touches your prompt. requires the headroom proxy running."
+                    >
+                      <Toggle
+                        checked={s.headroomCompression}
+                        onChange={(v) => patch({ headroomCompression: v })}
+                      />
+                    </Row>
+                  </div>
+                </div>
               )}
 
               {section === "appearance" && (
@@ -1438,57 +1550,71 @@ export function Settings({
 
               {section === "projects" && <ProjectsSection />}
 
-              {section === "diagnostics" && <DiagnosticsSection />}
+              {section === "advanced" && (
+                <div className="-mt-1 divide-y divide-[var(--color-border)]">
+                  <p className="pb-3 pt-1 text-[12px] leading-snug text-[var(--color-muted)]">
+                    power-user controls for the agent runtime, memory graph, and
+                    on-device diagnostics. safe to ignore — sensible defaults are
+                    set.
+                  </p>
 
-              {section === "oracles" && (
-                <>
-                  <Row label="default socket name" sub="tmux socket oracles bind to">
-                    <input
-                      value={s.defaultSocketName}
-                      onChange={(e) => patch({ defaultSocketName: e.target.value })}
-                      spellCheck={false}
-                      className="w-[160px] rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 font-mono text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
-                    />
-                  </Row>
-                  <Row label="auto-refresh interval">
-                    <Stepper
-                      value={s.autoRefreshSeconds}
-                      min={5}
-                      max={120}
-                      step={5}
-                      suffix="s"
-                      onChange={(v) => patch({ autoRefreshSeconds: v })}
-                    />
-                  </Row>
-                  <Row
-                    label="show non-aios tmux sessions"
-                    sub="include sessions not started by aios"
-                  >
-                    <Toggle
-                      checked={s.showNonAiosSessions}
-                      onChange={(v) => patch({ showNonAiosSessions: v })}
-                    />
-                  </Row>
-                </>
-              )}
+                  {/* oracle runtime */}
+                  <div className="py-3">
+                    <GroupLabel>oracle runtime</GroupLabel>
+                    <Row label="default socket name" sub="tmux socket oracles bind to">
+                      <input
+                        value={s.defaultSocketName}
+                        onChange={(e) => patch({ defaultSocketName: e.target.value })}
+                        spellCheck={false}
+                        className="w-[160px] rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 font-mono text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+                      />
+                    </Row>
+                    <Row label="auto-refresh interval" sub="how often roster + status repoll">
+                      <Stepper
+                        value={s.autoRefreshSeconds}
+                        min={5}
+                        max={120}
+                        step={5}
+                        suffix="s"
+                        onChange={(v) => patch({ autoRefreshSeconds: v })}
+                      />
+                    </Row>
+                    <Row
+                      label="show non-aios tmux sessions"
+                      sub="include sessions not started by aios"
+                    >
+                      <Toggle
+                        checked={s.showNonAiosSessions}
+                        onChange={(v) => patch({ showNonAiosSessions: v })}
+                      />
+                    </Row>
+                  </div>
 
-              {section === "memory" && (
-                <>
-                  <Row label="vault path" sub="read-only — where memories live">
-                    <code className="block max-w-[260px] truncate rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 font-mono text-[11px] text-[var(--color-muted)]">
-                      {MEMORY_VAULT_PATH}
-                    </code>
-                  </Row>
-                  <Row
-                    label="graph physics strength"
-                    sub="how hard the memory graph pulls together"
-                  >
-                    <Slider
-                      value={s.graphPhysicsStrength}
-                      onChange={(v) => patch({ graphPhysicsStrength: v })}
-                    />
-                  </Row>
-                </>
+                  {/* memory graph */}
+                  <div className="py-3">
+                    <GroupLabel>memory</GroupLabel>
+                    <Row label="vault path" sub="read-only — where memories live">
+                      <code className="block max-w-[260px] truncate rounded-lg border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2.5 py-1 font-mono text-[11px] text-[var(--color-muted)]">
+                        {MEMORY_VAULT_PATH}
+                      </code>
+                    </Row>
+                    <Row
+                      label="graph physics strength"
+                      sub="how hard the memory graph pulls together"
+                    >
+                      <Slider
+                        value={s.graphPhysicsStrength}
+                        onChange={(v) => patch({ graphPhysicsStrength: v })}
+                      />
+                    </Row>
+                  </div>
+
+                  {/* diagnostics — local-first, on-device */}
+                  <div className="py-3">
+                    <GroupLabel>diagnostics</GroupLabel>
+                    <DiagnosticsSection />
+                  </div>
+                </div>
               )}
 
               {section === "shortcuts" && (

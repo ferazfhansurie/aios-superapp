@@ -174,7 +174,7 @@ test("hosted web opens the real shell unless the url is a mirror link", () => {
   assert.match(app, /const webMirrorMode = !nativeRuntime && mirrorPairing != null/);
   assert.match(app, /if \(webMirrorMode\) \{/);
   assert.doesNotMatch(app, /if \(!nativeRuntime\) \{\s+return \(\s+<MirrorViewer/);
-  assert.match(app, /if \(panes\.length === 0\) return idleDash/);
+  assert.match(app, /if \(exposedPanes\.length === 0\) return idleDash/);
 });
 
 test("hosted web chat uses a cloud chat transport instead of a dead preview", () => {
@@ -213,17 +213,19 @@ test("superapp runtime keeps core panes plus local file/editor surfaces", () => 
   const palette = read("src/components/CommandPalette.tsx");
   const settings = read("src/components/Settings.tsx");
 
-  for (const id of ["chat", "terminal", "files", "browser", "history"]) {
+  // Keep the sidebar/app catalog intentionally small. Everything here is a
+  // first-rank daily surface; retired panes must not creep back into defaults.
+  for (const id of ["chat", "terminal", "files", "browser", "history", "loop", "ticket", "wrms-device"]) {
     assert.match(apps, new RegExp(`id: "${id}"`));
   }
-  for (const cut of ["notes", "memory", "git", "chrome", "appcast", "apps", "money-agents"]) {
+  for (const cut of ["agents", "apps", "appcast", "chrome", "git", "memory", "mission", "money-agents", "notes", "oracle-roster"]) {
     assert.doesNotMatch(apps, new RegExp(`id: "${cut}"`));
   }
 
   assert.match(app, /const EditorPane = lazy/);
   assert.match(app, /const FileViewerPane = lazy/);
-  assert.doesNotMatch(app, /AttachAppsPane|AppAttachPane|AppCastPane|BridgesPane|CdpChromePane|GitPane|MoneyAgentsPane|MemoryPane|NotesPane|PluginsPane|PulsePane/);
-  assert.doesNotMatch(app, /moneyAgentBootstrapRef|loadConfiguredMoneyAgents|buildMoneyAgentRunCommand|MoneyAgentsSection|OracleRoster/);
+  assert.doesNotMatch(app, /AttachAppsPane|AppAttachPane|AppCastPane|BridgesPane|CdpChromePane|MoneyAgentsPane|PluginsPane|PulsePane/);
+  assert.doesNotMatch(app, /moneyAgentBootstrapRef|loadConfiguredMoneyAgents|buildMoneyAgentRunCommand|MoneyAgentsSection/);
   assert.doesNotMatch(commands, /oracle\.attach|project\.run\.(?!focused)|project\.rescan|oracle\.appshot|app\.settings\.open/);
   assert.doesNotMatch(palette, /CdpChromePane|dev\.cdp-chrome|cdp spike/);
   assert.doesNotMatch(settings, /BridgesPane|PluginsPane|channels|plugins/);
@@ -378,7 +380,9 @@ test("pane history is a lightweight core pane with reopen and cleanup controls",
   assert.match(rustHistory, /\.aios\/state\/pane-history\.json/);
   assert.match(rustHistory, /pub fn load_pane_history/);
   assert.match(rustHistory, /pub fn save_pane_history/);
-  assert.match(rustHistory, /with_extension\("json\.tmp"\)/);
+  // atomic write via a UNIQUE per-writer tmp (pid/nonce) + rename — concurrent
+  // oracle sessions must not clobber a shared tmp.
+  assert.match(rustHistory, /with_extension\(format!\("json\.tmp/);
   assert.match(rustHistory, /std::fs::rename\(&tmp, &path\)/);
   assert.match(tauriLib, /mod pane_history/);
   assert.match(tauriLib, /pane_history::load_pane_history/);
@@ -497,11 +501,26 @@ test("spark model labeling is explicitly gpt-5.3, never 5.5", () => {
 
 test("chatpane handoff can target any model", () => {
   const chatPane = read("src/components/ChatPane.tsx");
+  const paneBus = read("src/lib/paneBus.ts");
+  const app = read("src/App.tsx");
 
   assert.match(chatPane, /handoffPanelOpen/);
   assert.match(chatPane, /handoff target/);
   assert.match(chatPane, /CHAT_MODELS\.map\(\(target\)/);
-  assert.match(chatPane, /continuing this exact session in \$\{target\.label\}/);
+  assert.match(chatPane, /requestChatHandoffPane/);
+  assert.match(chatPane, /modelId: target\.id/);
+  assert.match(chatPane, /handoff · \$\{target\.label\}/);
+  assert.match(paneBus, /requestChatHandoffPane/);
+  assert.match(app, /modelId: ctx\?\.modelId/);
+});
+
+test("resume picker rows stay human-readable", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+
+  assert.match(chatPane, /function resumeAbsoluteTime/);
+  assert.match(chatPane, /last: \$\{preview\}/);
+  assert.match(chatPane, /line-clamp-2/);
+  assert.match(chatPane, /title=\{tooltip\}/);
 });
 
 test("chatpane does not auto-timeout long agent runs", () => {
@@ -520,7 +539,7 @@ test("chatpane memory search is explicit slash command only", () => {
   assert.doesNotMatch(chatPane, /q\.length < 4/);
 });
 
-test("memory pane is cut; chat memory stays inline", () => {
+test("memory pane is pruned while chat memory stays inline", () => {
   const app = read("src/App.tsx");
   const apps = read("src/lib/apps.ts");
   const chatPane = read("src/components/ChatPane.tsx");
@@ -528,7 +547,7 @@ test("memory pane is cut; chat memory stays inline", () => {
   const lib = read("src-tauri/src/lib.rs");
 
   assert.doesNotMatch(apps, /id: "memory"/);
-  assert.doesNotMatch(app, /MemoryPane|type: "memory"/);
+  assert.doesNotMatch(app, /MemoryPane/);
   assert.match(chatPane, /memoryPanelOpen/);
   assert.match(chatPane, /setMemoryPanelOpen\(true\)/);
   assert.match(chatPane, /memorySearch\(/);
@@ -602,6 +621,21 @@ test("appcast separates screen recording from accessibility control", () => {
   assert.match(rust, /Accessibility not enabled/);
 });
 
+test("live room disables recording controls until durable capture exists", () => {
+  const pane = read("src/components/LiveRoomPane.tsx");
+  const liveRoom = read("src/lib/liveRoom.ts");
+
+  assert.match(liveRoom, /LIVE_ROOM_RECORDING_AVAILABLE = false/);
+  assert.match(pane, /LIVE_ROOM_RECORDING_UNAVAILABLE_REASON/);
+  assert.match(pane, /recording unavailable/);
+  assert.doesNotMatch(pane, /title="record"/);
+  assert.doesNotMatch(pane, /pause recording/);
+  assert.doesNotMatch(pane, /stop capture/);
+  assert.doesNotMatch(pane, /\bCircle\b/);
+  assert.doesNotMatch(pane, /\bPause\b/);
+  assert.doesNotMatch(pane, /\bSquare\b/);
+});
+
 test("local mac install keeps a stable tcc identity", () => {
   const pkg = read("package.json");
   const script = read("scripts/install-mac-local.sh");
@@ -621,9 +655,11 @@ test("native browser and appcast panes resync through fullscreen settle", () => 
     assert.match(source, /syncSettled/);
     assert.match(source, /fullscreenchange/);
   }
-  // AppCast still uses the staged settle cadence, with a slow 1s safety poll.
+  // AppCast still uses the staged settle cadence, with a slow 1s safety poll —
+  // now riding the shared 1Hz ticker (gated on the pane being live) instead of
+  // its own setInterval.
   assert.match(appcast, /\[40, 120, 260, 520, 900\]/);
-  assert.match(appcast, /setInterval\(\(\) => sync\(\), 1000\)/);
+  assert.match(appcast, /useSharedInterval\(1000, \(\) => syncRef\.current\?\.\(\),/);
   // BrowserPane was reworked: debounced settle (no timer storm) + RO-driven
   // bounds with a slow 1s safety poll instead of the 250ms hammer.
   assert.match(browser, /resizeTimer = setTimeout\(sync, 120\)/);
@@ -635,8 +671,10 @@ test("background utility panes are not mounted by the core shell runtime", () =>
   const app = read("src/App.tsx");
 
   assert.doesNotMatch(app, /windowVisible|visibilitychange|listChatSessions/);
-  assert.doesNotMatch(app, /<NotesPane|<BridgesPane|<PulsePane|<AppAttachPane/);
-  assert.doesNotMatch(app, /import\("\.\/components\/NotesPane"\)|import\("\.\/components\/BridgesPane"\)|import\("\.\/components\/PulsePane"\)/);
+  // TicketPane is now a first-class CORE pane (peer to LoopPane), intentionally
+  // rendered in the App.tsx pane switch — so it's excluded from this guard.
+  assert.doesNotMatch(app, /<BridgesPane|<PulsePane|<AppAttachPane|<NotesPane|<AgentsSection|<OracleRoster/);
+  assert.doesNotMatch(app, /import\("\.\/components\/BridgesPane"\)|import\("\.\/components\/PulsePane"\)/);
   assert.doesNotMatch(app, /import\("\.\/components\/AppAttachPane"\)/);
 });
 
@@ -657,39 +695,41 @@ test("files pane exposes fast core workspace context actions", () => {
   assert.doesNotMatch(files, /openContextGit|openGitPane|spawnPane\("git"|gitStatus|gitDecorations/);
 });
 
-test("git pane is cut from the core shell runtime", () => {
+test("git pane is pruned from the core shell runtime", () => {
   const app = read("src/App.tsx");
   const apps = read("src/lib/apps.ts");
-  const paneBus = read("src/lib/paneBus.ts");
   const tauriFiles = read("src-tauri/src/files.rs");
   const tauriLib = read("src-tauri/src/lib.rs");
-  const filesPane = read("src/components/FilesPane.tsx");
 
   assert.doesNotMatch(apps, /id: "git"/);
-  assert.doesNotMatch(app, /GitPane|pane\.kind\.type === "git"|type: "git"/);
-  assert.doesNotMatch(paneBus, /"git"/);
-  assert.doesNotMatch(filesPane, /spawnPane\("git"|openContextGit|gitStatus/);
+  assert.doesNotMatch(app, /GitPane/);
+  assert.doesNotMatch(app, /pane\.kind\.type === "git"/);
+  const filesPane = read("src/components/FilesPane.tsx");
+  assert.doesNotMatch(filesPane, /spawnPane\("git"|openContextGit/);
   assert.match(tauriFiles, /pub fn git_snapshot/);
   assert.match(tauriFiles, /pub fn git_checkout/);
   assert.match(tauriLib, /files::git_snapshot/);
   assert.match(tauriLib, /files::git_checkout/);
 });
 
-test("global appshot attaches to chat instead of only the focused webview", () => {
+test("manual appshot attaches to chat (the ⌘⌘ gesture was removed)", () => {
   const app = read("src/App.tsx");
   const pty = read("src/lib/pty.ts");
   const oracles = read("src-tauri/src/oracles.rs");
   const lib = read("src-tauri/src/lib.rs");
   const commands = read("src/lib/appCommands.ts");
 
-  assert.equal(exists("src-tauri/src/global_monitor.rs"), true);
-  assert.match(lib, /mod global_monitor/);
-  assert.match(lib, /global_monitor::start\(app\.handle\(\)\.clone\(\)\)/);
+  // The double-command global gesture is gone: no polling monitor thread, no
+  // in-webview ⌘⌘ keydown, no "global-appshot" listener.
+  assert.equal(exists("src-tauri/src/global_monitor.rs"), false);
+  assert.doesNotMatch(lib, /global_monitor/);
+  assert.doesNotMatch(app, /global-appshot/);
+
+  // The MANUAL appshot path (toolbar button → capture → attach to chat) stays.
   assert.match(lib, /oracles::appshot_capture/);
   assert.match(oracles, /pub fn appshot_capture/);
   assert.match(pty, /export async function appshotCapture/);
   assert.match(app, /import \{ appshotCapture/);
-  assert.match(app, /listen<\{ source: string \}>\("global-appshot"/);
   assert.match(app, /paneImageDrop\.get\(key\)/);
   assert.match(app, /appshot attached to chat/);
   assert.doesNotMatch(commands, /appshot - attach to chat|oracle\.appshot/);

@@ -11,7 +11,6 @@ mod control;
 mod device;
 mod diag;
 mod files;
-mod global_monitor;
 mod lsp;
 mod mac_apps;
 mod memory;
@@ -25,6 +24,7 @@ mod remote;
 mod stats;
 mod telemetry;
 mod usage;
+mod wrms_qa;
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager};
@@ -271,7 +271,6 @@ pub fn run() {
             if let Err(e) = build_app_menu(app.handle()) {
                 eprintln!("[aios menu] failed to install app menu: {e}");
             }
-            global_monitor::start(app.handle().clone());
 
             // Local control hook (control.rs): 127.0.0.1-only HTTP listener that
             // re-emits `run-agent` / `open-pane` commands into the frontend as a
@@ -366,6 +365,10 @@ pub fn run() {
             memory::memory_focus,
             stats::usage_extras,
             device::device_stats,
+            wrms_qa::wrms_qa_latest_collector_shot,
+            wrms_qa::wrms_qa_latest_shot,
+            wrms_qa::wrms_qa_run,
+            wrms_qa::wrms_qa_run_collector_login,
             bridges::list_bridges,
             bridges::bridge_activity,
             bridges::discord_bridge_session,
@@ -385,6 +388,7 @@ pub fn run() {
             lsp::lsp_status,
             lsp::lsp_find_root,
             chat::chat_start,
+            chat::chat_prewarm_codex,
             chat::chat_send,
             chat::chat_steer,
             chat::chat_interrupt,
@@ -409,6 +413,10 @@ pub fn run() {
             // (goals/active/*/state.json) and running loops (loops/*.meta + log).
             control::goal_list,
             control::loop_list,
+            // Read-only loop visibility for the LoopPane: the overnight activity
+            // ledger (changes.jsonl) + per-loop log tail.
+            control::loop_changes,
+            control::loop_log,
             // Interactive loop control for the board's Loops section.
             control::loop_global_status,
             control::loop_set_global_disabled,
@@ -416,9 +424,17 @@ pub fn run() {
             control::loop_stop,
             control::loop_set_cadence,
             control::loop_create,
+            control::loop_delete,
+            control::loop_projects,
+            control::loop_add_project,
             // Dogfood ticket intake for the TicketPane.
             control::ticket_add,
             control::ticket_list,
+            control::ticket_read,
+            control::ticket_comment,
+            control::ticket_set_status,
+            control::ticket_set_priority,
+            control::ticket_delete,
             browser::browser_show,
             browser::browser_set_bounds,
             browser::browser_current_url,

@@ -1,5 +1,6 @@
 import {
   lazy,
+  memo,
   Suspense,
   useCallback,
   useEffect,
@@ -38,15 +39,12 @@ import {
 import { recallUrl, recallPaneUrl, forgetUrl } from "./lib/browser-mem";
 import { browserOpenDevtools, setWindowFullscreen } from "./lib/browser";
 import { AccountMenu } from "./components/AccountMenu";
-import { AnalyticsPane } from "./components/AnalyticsPane";
 import { AppSvgIcon, iconKeyForPane, iconKeyForSidebarItem, type AppIconKey } from "./components/AppSvgIcon";
 import { CommandPalette, type Command } from "./components/CommandPalette";
 import { FileFinder } from "./components/FileFinder";
 import { GlobalSearch } from "./components/GlobalSearch";
 import { HistoryPane } from "./components/HistoryPane";
 import { IdleDashboard } from "./components/IdleDashboard";
-import { LoopPane } from "./components/LoopPane";
-import { TicketPane } from "./components/TicketPane";
 import { MirrorViewer } from "./components/MirrorViewer";
 import { PaneErrorBoundary } from "./components/PaneErrorBoundary";
 import { ResizableGrid } from "./components/ResizableGrid";
@@ -156,6 +154,12 @@ const WrmsDevicePane = lazy(() => import("./components/WrmsDevicePane").then((m)
 const TerminalPane = lazy(() =>
   import("./components/TerminalPane").then((m) => ({ default: m.TerminalPane })),
 );
+// Secondary panes — rarely the user's first action, so keep them out of the main
+// bundle. They render inside the same <Suspense fallback={<PaneLoading/>}> as the
+// other lazy panes, so deferring them is transparent.
+const AnalyticsPane = lazy(() => import("./components/AnalyticsPane").then((m) => ({ default: m.AnalyticsPane })));
+const LoopPane = lazy(() => import("./components/LoopPane").then((m) => ({ default: m.LoopPane })));
+const TicketPane = lazy(() => import("./components/TicketPane").then((m) => ({ default: m.TicketPane })));
 
 // Idle prefetch of the heavy lazy chunks. Opening a pane for the first time
 // used to pay its chunk fetch + parse ON CLICK — worst case the editor pulls
@@ -1231,24 +1235,6 @@ function App() {
     }
   }, [activeKey, panes, spawn, flash]);
 
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listen<{ source: string }>("global-appshot", () => {
-      void fireAppshot();
-    })
-      .then((stop) => {
-        if (disposed) stop();
-        else unlisten = stop;
-      })
-      .catch((e) => reportDiag("app.listen", e, { action: "globalAppshot" }));
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [fireAppshot]);
-
   // Focus a pane from the "OPEN" rail: restore it if minimized, mark it active
   // so dictation / drops target it (and the rail row highlights).
   const focusPane = useCallback((key: string) => {
@@ -1292,7 +1278,11 @@ function App() {
   // Browser annotations / selections → into a chat pane (the shell loop).
   const routeToChat = useCallback(
     (text: string) => {
-      const chatPane = panes.find((p) => p.kind.type === "chat");
+      // Read panes from the ref (not the closed-over `panes`) so this handler is
+      // referentially stable across renders — it's passed to every memo'd
+      // PaneCard as `onAnnotate`, and a fresh identity per pane add/remove would
+      // needlessly re-render all panes.
+      const chatPane = panesRef.current.find((p) => p.kind.type === "chat");
       const w = chatPane ? paneWriters.get(chatPane.key) : null;
       if (w) {
         w(text);
@@ -1303,11 +1293,47 @@ function App() {
         flash("opened chat · annotation copied (⌘V)");
       }
     },
-    [panes, flash, spawn],
+    [flash, spawn],
   );
 
-  // ---- keyboard: ⌘B sidebar · ⌘K palette · ⌘T terminal · ⌘, settings · ⌘⌘ appshot
-  const lastMeta = useRef(0);
+  // ---- per-pane mutators (key-threaded so PaneCard can be memo'd) ----
+  // These were previously inline closures created per-pane on every App render,
+  // which defeated PaneCard memoization. Hoisted to stable useCallbacks that take
+  // the pane key; PaneCard wraps them with its own key. setPanes is a stable
+  // setState identity so deps are empty. Behavior is byte-identical to the old
+  // inline versions.
+  const handlePaneProfileChange = useCallback((key: string, profile: string) => {
+    setPanes((ps) =>
+      ps.map((p) =>
+        p.key === key && p.kind.type === "browser"
+          ? { ...p, kind: { ...p.kind, profile } }
+          : p,
+      ),
+    );
+  }, []);
+  const handleUpdatePaneKind = useCallback((key: string, kind: PaneContent) => {
+    setPanes((ps) => ps.map((p) => (p.key === key ? { ...p, kind } : p)));
+  }, []);
+  const handleChatSession = useCallback(
+    (key: string, info: { id: string; title: string; engine?: string; model?: string }) => {
+      // Stamp the live session into this pane's kind + re-record pane history
+      // WITH a resume handle, so reopening this chat from history CONTINUES it
+      // (and repaints prior turns). Read the live pane from the ref so the guards
+      // see current state without widening deps.
+      const pane = panesRef.current.find((p) => p.key === key);
+      if (!pane || pane.kind.type !== "chat") return;
+      if (pane.kind.resume?.id === info.id && pane.kind.resume?.title === info.title) return;
+      const kind: PaneContent = {
+        ...pane.kind,
+        resume: { id: info.id, title: info.title, engine: info.engine, model: info.model },
+      };
+      setPanes((ps) => ps.map((p) => (p.key === key ? { ...p, kind } : p)));
+      recordPaneHistory(kind, pane.label);
+    },
+    [],
+  );
+
+  // ---- keyboard: ⌘B sidebar · ⌘K palette · ⌘T terminal · ⌘, settings
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
@@ -1378,19 +1404,10 @@ function App() {
         setWindowFullscreen(false).catch((e) => reportDiag("app.window", e, { action: "exitFullscreen" }));
         setMaximizedKey(null);
       }
-      if (e.key === "Meta") {
-        const now = e.timeStamp || performance.now();
-        if (now - lastMeta.current < 400) {
-          lastMeta.current = 0;
-          fireAppshot();
-        } else {
-          lastMeta.current = now;
-        }
-      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addShell, fireAppshot, hiddenKeys, runF5, routePaneNav, toggleHide, activeKey, maximizedKey, panes]);
+  }, [addShell, hiddenKeys, runF5, routePaneNav, toggleHide, activeKey, maximizedKey, panes]);
 
   // NATIVE PANE-NAV BRIDGE (wave 1B). Rust emits this frozen shortcut contract
   // for pane-routed actions so ⌘F/⌘W/⌘K/⌘1-9 still work when a native child
@@ -1611,6 +1628,19 @@ function App() {
     () => panes.filter((pane) => !isDormantBackgroundAgent(pane, hiddenKeys)),
     [panes, hiddenKeys],
   );
+
+  // Pre-build each pane's ChatWorkspaceContext ONCE per layout change instead of
+  // freshly per App render at the map call site (the old inline
+  // buildWorkspaceContext(...) created a new object every render, defeating
+  // PaneCard memoization). Same inputs → same value identity, so memo'd panes
+  // only re-render when the workspace actually changes.
+  const workspaceCtxByKey = useMemo(() => {
+    const m = new Map<string, ChatWorkspaceContext>();
+    for (const pane of exposedPanes) {
+      m.set(pane.key, buildWorkspaceContext(pane, exposedPanes, projects, activeKey, hiddenKeys));
+    }
+    return m;
+  }, [exposedPanes, projects, activeKey, hiddenKeys]);
 
   // grid is sized to the VISIBLE panes — hidden ones are display:none (out of
   // grid flow), so they leave no empty cell behind. Dormant background workers
@@ -2099,7 +2129,7 @@ function App() {
         </IconBtn>
       )}
       <VoiceButton onTranscript={handleTranscript} />
-      <IconBtn title="Appshot — attach to chat (⌘⌘)" onClick={fireAppshot}>
+      <IconBtn title="Appshot — attach to chat" onClick={fireAppshot}>
         <Camera size={15} />
       </IconBtn>
     </div>
@@ -2123,7 +2153,7 @@ function App() {
         <Layers size={15} />
       </IconBtn>
       <VoiceButton onTranscript={handleTranscript} />
-      <IconBtn title="Appshot — attach to chat (⌘⌘)" onClick={fireAppshot}>
+      <IconBtn title="Appshot — attach to chat" onClick={fireAppshot}>
         <Camera size={15} />
       </IconBtn>
     </div>
@@ -2247,53 +2277,28 @@ function App() {
                   hidden={hiddenKeys.includes(pane.key)}
                   style={paneStyle}
                   dropTarget={dropTargetKey === pane.key}
-                  onClose={() => requestClose(pane.key)}
-                  onToggleMax={() => toggleMax(pane.key)}
-                  onToggleHide={() => toggleHide(pane.key)}
-                  onMoveLeft={() => movePaneByKey(pane.key, -1)}
-                  onMoveRight={() => movePaneByKey(pane.key, 1)}
-                  onFocus={() => {
-                    setFocusedPane(pane.key);
-                  }}
+                  onClose={requestClose}
+                  onToggleMax={toggleMax}
+                  onToggleHide={toggleHide}
+                  onMovePane={movePaneByKey}
+                  onFocus={setFocusedPane}
                   onAnnotate={routeToChat}
-                  workspaceContext={buildWorkspaceContext(pane, exposedPanes, projects, activeKey, hiddenKeys)}
+                  workspaceContext={workspaceCtxByKey.get(pane.key)!}
                   onOpenFile={openFile}
                   onOpenEditorFile={openEditorFile}
                   onOpenViewerFile={openViewerFile}
                   onRevealFile={revealFile}
                   onRevealInFinder={revealPathInFinder}
-                  onDuplicate={() => spawn(pane.kind, pane.label)}
+                  onDuplicate={spawn}
                   onOpenHistoryItem={openHistoryItem}
                   openPanes={exposedPanes}
                   activeKey={activeKey}
                   onFocusPane={focusPane}
                   onOpenUrl={openUrl}
-                  onProfileChange={(profile) =>
-                    setPanes((ps) =>
-                      ps.map((p) =>
-                        p.key === pane.key && p.kind.type === "browser"
-                          ? { ...p, kind: { ...p.kind, profile } }
-                          : p,
-                      ),
-                    )
-                  }
-                  onUpdatePaneKind={(kind) =>
-                    setPanes((ps) => ps.map((p) => (p.key === pane.key ? { ...p, kind } : p)))
-                  }
-                  onChatSession={(info) => {
-                    // Stamp the live session into this pane's kind + re-record
-                    // pane history WITH a resume handle, so reopening this chat
-                    // from history CONTINUES it (and repaints prior turns).
-                    if (pane.kind.type !== "chat") return;
-                    if (pane.kind.resume?.id === info.id && pane.kind.resume?.title === info.title) return;
-                    const kind: PaneContent = {
-                      ...pane.kind,
-                      resume: { id: info.id, title: info.title, engine: info.engine, model: info.model },
-                    };
-                    setPanes((ps) => ps.map((p) => (p.key === pane.key ? { ...p, kind } : p)));
-                    recordPaneHistory(kind, pane.label);
-                  }}
-                  onVideoFullscreen={(on) => onVideoFullscreen(pane.key, on)}
+                  onProfileChange={handlePaneProfileChange}
+                  onUpdatePaneKind={handleUpdatePaneKind}
+                  onChatSession={handleChatSession}
+                  onVideoFullscreen={onVideoFullscreen}
                 />
                 );
               })}
@@ -3416,7 +3421,7 @@ function OpenPanesList({
   );
 }
 
-function PaneCard({
+const PaneCard = memo(function PaneCard({
   pane,
   defaultCwd,
   active,
@@ -3427,8 +3432,7 @@ function PaneCard({
   onClose,
   onToggleMax,
   onToggleHide,
-  onMoveLeft,
-  onMoveRight,
+  onMovePane,
   onFocus,
   onAnnotate,
   workspaceContext,
@@ -3455,12 +3459,15 @@ function PaneCard({
   hidden?: boolean;
   style?: CSSProperties;
   dropTarget?: boolean;
-  onClose: () => void;
-  onToggleMax?: () => void;
-  onToggleHide?: () => void;
-  onMoveLeft?: () => void;
-  onMoveRight?: () => void;
-  onFocus: () => void;
+  // Per-pane callbacks are KEY-THREADED: App passes ONE stable handler shared by
+  // every pane; PaneCard invokes it with its own pane.key (via the local
+  // useCallback wrappers below). This keeps each prop referentially stable across
+  // App renders so the memo() wrapper only re-renders the pane that changed.
+  onClose: (key: string) => void;
+  onToggleMax?: (key: string) => void;
+  onToggleHide?: (key: string) => void;
+  onMovePane?: (key: string, delta: -1 | 1) => void;
+  onFocus: (key: string) => void;
   onAnnotate: (text: string) => void;
   workspaceContext: ChatWorkspaceContext;
   onOpenFile: (path: string, name: string) => void;
@@ -3468,18 +3475,36 @@ function PaneCard({
   onOpenViewerFile: (path: string, name: string) => void;
   onRevealFile: (path: string, name: string) => void;
   onRevealInFinder: (path: string) => void;
-  onDuplicate: () => void;
+  onDuplicate: (kind: PaneContent, label: string) => void;
   onOpenHistoryItem: (kind: PaneContent, label: string) => void;
   onOpenUrl?: (url: string) => void;
-  onProfileChange: (profile: string) => void;
-  onUpdatePaneKind: (kind: PaneContent) => void;
-  onChatSession: (info: { id: string; title: string; engine?: string; model?: string }) => void;
-  onVideoFullscreen?: (on: boolean) => void;
+  onProfileChange: (key: string, profile: string) => void;
+  onUpdatePaneKind: (key: string, kind: PaneContent) => void;
+  onChatSession: (key: string, info: { id: string; title: string; engine?: string; model?: string }) => void;
+  onVideoFullscreen?: (key: string, on: boolean) => void;
   openPanes: Pane[];
   activeKey: string | null;
   onFocusPane: (key: string) => void;
 }) {
   const t = pane.kind.type;
+  // Stable per-pane wrappers binding the shared App handlers to THIS pane's key.
+  // pane.key is stable for a pane's lifetime, so these locals keep stable
+  // identities and the child components (TerminalPane/ChatPane/BrowserPane/…)
+  // don't re-render from new callback identities.
+  const handleClose = useCallback(() => onClose(pane.key), [onClose, pane.key]);
+  const handleToggleMax = useCallback(() => onToggleMax?.(pane.key), [onToggleMax, pane.key]);
+  const handleToggleHide = useCallback(() => onToggleHide?.(pane.key), [onToggleHide, pane.key]);
+  const handleMoveLeft = useCallback(() => onMovePane?.(pane.key, -1), [onMovePane, pane.key]);
+  const handleMoveRight = useCallback(() => onMovePane?.(pane.key, 1), [onMovePane, pane.key]);
+  const handleFocus = useCallback(() => onFocus(pane.key), [onFocus, pane.key]);
+  const handleDuplicate = useCallback(() => onDuplicate(pane.kind, pane.label), [onDuplicate, pane.kind, pane.label]);
+  const handleProfileChange = useCallback((profile: string) => onProfileChange(pane.key, profile), [onProfileChange, pane.key]);
+  const handleUpdatePaneKind = useCallback((kind: PaneContent) => onUpdatePaneKind(pane.key, kind), [onUpdatePaneKind, pane.key]);
+  const handleChatSession = useCallback(
+    (info: { id: string; title: string; engine?: string; model?: string }) => onChatSession(pane.key, info),
+    [onChatSession, pane.key],
+  );
+  const handleVideoFullscreen = useCallback((on: boolean) => onVideoFullscreen?.(pane.key, on), [onVideoFullscreen, pane.key]);
   const liveRoomKind = pane.kind.type === "live-room" ? pane.kind : null;
   // Register this pane in the canonical rect registry so the OS-drop hit-test can
   // target it without `elementFromPoint` (which fails over native webviews). The
@@ -3542,7 +3567,7 @@ function PaneCard({
     <div
       ref={wrapRef}
       data-pane-key={pane.key}
-      onMouseDownCapture={onFocus}
+      onMouseDownCapture={handleFocus}
       style={hidden ? { display: "none" } : style}
       className={`flex min-h-0 min-w-0 flex-col overflow-hidden bg-[var(--color-pane)] transition-colors ${
         maximized
@@ -3637,7 +3662,7 @@ function PaneCard({
                   icon={<AppSvgIcon name="panes" size={15} />}
                   label="duplicate pane"
                   onClick={() => {
-                    onDuplicate();
+                    handleDuplicate();
                     setOpenAsOpen(false);
                   }}
                 />
@@ -3680,27 +3705,27 @@ function PaneCard({
           {onToggleHide && (
             <button
               type="button"
-              onClick={(e) => (e.stopPropagation(), onToggleHide())}
+              onClick={(e) => (e.stopPropagation(), handleToggleHide())}
               className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
               title="Hide pane (keeps running)"
             >
               <EyeOff size={12} />
             </button>
           )}
-          {onMoveLeft && (
+          {onMovePane && (
             <button
               type="button"
-              onClick={(e) => (e.stopPropagation(), onMoveLeft())}
+              onClick={(e) => (e.stopPropagation(), handleMoveLeft())}
               className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
               title="Move pane left"
             >
               <MoveRight size={12} className="rotate-180" />
             </button>
           )}
-          {onMoveRight && (
+          {onMovePane && (
             <button
               type="button"
-              onClick={(e) => (e.stopPropagation(), onMoveRight())}
+              onClick={(e) => (e.stopPropagation(), handleMoveRight())}
               className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
               title="Move pane right"
             >
@@ -3710,7 +3735,7 @@ function PaneCard({
           {onToggleMax && (
             <button
               type="button"
-              onClick={(e) => (e.stopPropagation(), onToggleMax())}
+              onClick={(e) => (e.stopPropagation(), handleToggleMax())}
               className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
               title={maximized ? "Restore pane" : "Maximize pane"}
             >
@@ -3719,7 +3744,7 @@ function PaneCard({
           )}
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleClose}
             className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
             title="Close pane"
           >
@@ -3781,8 +3806,8 @@ function PaneCard({
               initialProfile={pane.kind.profile}
               memKey={pane.kind.memKey}
               onAnnotate={onAnnotate}
-              onProfileChange={onProfileChange}
-              onVideoFullscreen={onVideoFullscreen}
+              onProfileChange={handleProfileChange}
+              onVideoFullscreen={handleVideoFullscreen}
             />
           ) : liveRoomKind ? (
             <LiveRoomPane
@@ -3793,13 +3818,13 @@ function PaneCard({
               sessionId={liveRoomKind.sessionId}
               initialWindowId={liveRoomKind.windowId}
               onModeChange={(mode) =>
-                onUpdatePaneKind({ type: "live-room", mode, sessionId: liveRoomKind.sessionId, windowId: liveRoomKind.windowId })
+                handleUpdatePaneKind({ type: "live-room", mode, sessionId: liveRoomKind.sessionId, windowId: liveRoomKind.windowId })
               }
               onSessionChange={(sessionId) =>
-                onUpdatePaneKind({ type: "live-room", mode: liveRoomKind.mode, sessionId, windowId: liveRoomKind.windowId })
+                handleUpdatePaneKind({ type: "live-room", mode: liveRoomKind.mode, sessionId, windowId: liveRoomKind.windowId })
               }
               onWindowChange={(windowId) =>
-                onUpdatePaneKind({ type: "live-room", mode: liveRoomKind.mode, sessionId: liveRoomKind.sessionId, windowId })
+                handleUpdatePaneKind({ type: "live-room", mode: liveRoomKind.mode, sessionId: liveRoomKind.sessionId, windowId })
               }
             />
           ) : !chatCwd ? (
@@ -3817,7 +3842,7 @@ function PaneCard({
               reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}
               workspaceContext={workspaceContext}
               onOpenUrl={onOpenUrl}
-              onChatSession={onChatSession}
+              onChatSession={handleChatSession}
             />
           )}
           </Suspense>
@@ -3832,7 +3857,7 @@ function PaneCard({
       )}
     </div>
   );
-}
+});
 
 function Splash() {
   return (

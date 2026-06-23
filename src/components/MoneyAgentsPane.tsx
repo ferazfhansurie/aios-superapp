@@ -8,6 +8,7 @@ import {
   type MoneyAgentDetail,
 } from "../lib/moneyAgents";
 import { useVisible } from "../lib/useVisible";
+import { useSharedInterval } from "../lib/ticker";
 
 interface Props {
   onOpenAgentChat: (id: string, label: string, command?: string) => void;
@@ -45,15 +46,14 @@ export function MoneyAgentsPane({ onOpenAgentChat }: Props) {
   };
 
   useEffect(() => {
-    // One load on mount, then poll only while visible. Interval backed off
-    // 20s → 60s (an agent health check is heavier than a UI refresh).
+    // One load on mount / when becoming visible. The steady 60s poll rides the
+    // shared interval below (an agent health check is heavier than a UI refresh).
     refresh();
-    if (!visible) return;
-    const interval = setInterval(refresh, 60_000);
-    return () => clearInterval(interval);
-    // refresh is stable enough for this mount/visibility-gated poll.
+    // refresh is stable enough for this mount/visibility-gated load.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible]);
+  // Poll only while visible — hidden pane doesn't subscribe.
+  useSharedInterval(60_000, refresh, visible);
 
   const earning = agents.filter((agent) => agent.health === "running" || agent.health === "scheduled").length;
   const steer = agents.filter((agent) => agent.health === "needs-steer" || agent.health === "failed").length;

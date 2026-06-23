@@ -32,6 +32,7 @@ import {
 import type { Rect } from "../lib/browser";
 import { type NotificationLevel } from "../lib/notifications";
 import { reportDiag } from "../lib/diag";
+import { useSharedInterval } from "../lib/ticker";
 
 /** macOS deep-link straight to Privacy › Screen Recording. */
 const SCREEN_REC_SETTINGS_URL =
@@ -96,6 +97,9 @@ export function AppCastPane({
   // shownRef). Reset to false on close so a re-pick recreates it.
   const startedRef = useRef(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Latest steady-poll `sync` for the shared 1Hz ticker — set while the mirror
+  // effect is live, nulled on teardown so a stale closure never fires.
+  const syncRef = useRef<((force?: boolean) => void) | null>(null);
 
   const [windows, setWindows] = useState<WindowInfo[]>([]);
   const [picked, setPicked] = useState<number | null>(initialWindowId ?? null);
@@ -238,17 +242,22 @@ export function AppCastPane({
     document.addEventListener("fullscreenchange", syncSettled);
     // Backed off 250ms → 1s, and deduped: a steady mirror does no IPC on these
     // ticks. This is now only a safety net for layout shifts the observers miss
-    // (e.g. a sibling flexbox pane resizing without firing OUR slot's RO).
-    const poll = setInterval(() => sync(), 1000);
+    // (e.g. a sibling flexbox pane resizing without firing OUR slot's RO). The
+    // tick itself rides the shared 1Hz ticker (see useSharedInterval below).
+    syncRef.current = sync;
     return () => {
       cancelAnimationFrame(raf);
       settleTimers.forEach(clearTimeout);
       ro.disconnect();
       window.removeEventListener("resize", syncSettled);
       document.removeEventListener("fullscreenchange", syncSettled);
-      clearInterval(poll);
+      syncRef.current = null;
     };
   }, [active, picked, label, rect, pickerOpen]);
+
+  // Steady-state safety-net poll on the shared 1Hz interval — only while the
+  // mirror effect is live (active, picker closed, a window picked).
+  useSharedInterval(1000, () => syncRef.current?.(), active && !pickerOpen && picked != null);
 
   // Teardown on unmount: hide then close (stops capture + drops the view).
   useEffect(() => {

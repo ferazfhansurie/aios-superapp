@@ -79,7 +79,7 @@ export function applyFlashLevel(level: FlashLevel = loadSettings().flashLevel): 
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  userName: "faeez",
+  userName: "",
   reopenLastLayout: true,
   confirmCloseOraclePane: true,
   defaultPaneType: "terminal",

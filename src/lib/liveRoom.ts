@@ -19,6 +19,9 @@ export const LIVE_ROOM_MODES: LiveRoomModeDef[] = [
 const ENABLED_MODES = new Set(LIVE_ROOM_MODES.filter((m) => m.enabled).map((m) => m.id));
 const MODE_IDS = new Set(LIVE_ROOM_MODES.map((m) => m.id));
 
+export const LIVE_ROOM_RECORDING_AVAILABLE = false;
+export const LIVE_ROOM_RECORDING_UNAVAILABLE_REASON = "recording backend unavailable";
+
 export type LiveRoomStatus =
   | "idle"
   | "loading"
@@ -94,7 +97,7 @@ const ALLOWED_TRANSITIONS: Record<LiveRoomStatus, LiveRoomStatus[]> = {
   idle: ["loading", "permission-blocked", "preview", "failed"],
   loading: ["idle", "permission-blocked", "preview", "failed"],
   "permission-blocked": ["idle", "loading", "preview"],
-  preview: ["idle", "recording", "failed"],
+  preview: ["idle", "failed"],
   recording: ["paused", "saving", "partial", "failed"],
   paused: ["recording", "saving", "partial", "failed"],
   saving: ["saved", "partial", "failed"],
@@ -148,7 +151,7 @@ export function liveRoomPermissionSummary(permissions: LiveRoomPermissions): {
   const optionalMissing = [permissions.camera === "granted" ? null : "camera"].filter((v): v is string => Boolean(v));
   return {
     canPreview: permissions.screen === "granted",
-    canRecord: requiredMissing.length === 0,
+    canRecord: LIVE_ROOM_RECORDING_AVAILABLE && requiredMissing.length === 0,
     requiredMissing,
     optionalMissing,
   };
@@ -169,9 +172,9 @@ export function describeLiveRoomControls({
   const summary = liveRoomPermissionSummary(permissions);
   return {
     canStartPreview: status === "idle" || status === "permission-blocked" || status === "loading" || status === "preview",
-    canStartRecording: status === "preview" && summary.canRecord,
-    canStopRecording: status === "recording" || status === "paused",
-    canSave: status === "recording" || status === "paused" || status === "saving",
+    canStartRecording: LIVE_ROOM_RECORDING_AVAILABLE && status === "preview" && summary.canRecord,
+    canStopRecording: false,
+    canSave: false,
   };
 }
 

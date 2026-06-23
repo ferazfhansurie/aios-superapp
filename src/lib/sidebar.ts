@@ -70,7 +70,7 @@ export function seedDefault(): SidebarState {
     spaces: defaultSpaces(),
     items: SPAWN.map((a) => ({
       id: `app:${a.id}`,
-      label: a.id === "chat" ? "new chat" : a.label,
+      label: a.id === "chat" ? "gui" : a.label,
       iconName: a.id, // resolved back to the lucide icon via SPAWN_BY_ID at render
       kind: { type: "app", appId: a.id } as SidebarItemKind,
       group: a.group as SidebarGroup,

@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   LIVE_ROOM_MODES,
+  LIVE_ROOM_RECORDING_AVAILABLE,
   addLiveRoomMarker,
   canTransitionLiveRoomStatus,
   createLiveRoomDraft,
@@ -36,6 +37,7 @@ test("live room defaults to meeting and restores valid last-used modes", () => {
 
 test("live room status transitions protect saved partial output", () => {
   assert.equal(canTransitionLiveRoomStatus("idle", "preview"), true);
+  assert.equal(canTransitionLiveRoomStatus("preview", "recording"), false);
   assert.equal(canTransitionLiveRoomStatus("recording", "saving"), true);
   assert.equal(canTransitionLiveRoomStatus("recording", "partial"), true);
   assert.equal(canTransitionLiveRoomStatus("saved", "failed"), false);
@@ -60,14 +62,24 @@ test("permission summary separates required and optional sources", () => {
   );
 });
 
-test("control state follows permission and recording status", () => {
+test("recording controls stay unavailable until a durable backend exists", () => {
+  assert.equal(LIVE_ROOM_RECORDING_AVAILABLE, false);
+  assert.deepEqual(
+    liveRoomPermissionSummary({ screen: "granted", mic: "granted", camera: "missing" }),
+    {
+      canPreview: true,
+      canRecord: false,
+      requiredMissing: [],
+      optionalMissing: ["camera"],
+    },
+  );
   assert.deepEqual(
     describeLiveRoomControls({ status: "preview", permissions: { screen: "granted", mic: "granted", camera: "missing" } }),
-    { canStartPreview: true, canStartRecording: true, canStopRecording: false, canSave: false },
+    { canStartPreview: true, canStartRecording: false, canStopRecording: false, canSave: false },
   );
   assert.deepEqual(
     describeLiveRoomControls({ status: "recording", permissions: { screen: "granted", mic: "granted", camera: "missing" } }),
-    { canStartPreview: false, canStartRecording: false, canStopRecording: true, canSave: true },
+    { canStartPreview: false, canStartRecording: false, canStopRecording: false, canSave: false },
   );
 });
 
