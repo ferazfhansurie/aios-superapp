@@ -1706,6 +1706,7 @@ export function ChatPane({
     syncJumpVisibility(scrollRef.current, p);
   }, [syncJumpVisibility]);
   useLayoutEffect(() => {
+    if (hiddenRef.current) return;
     const el = scrollRef.current;
     if (
       el &&
@@ -1739,7 +1740,7 @@ export function ChatPane({
     // timer and re-ran this layout effect (thrashing layout) without new content.
     // Content/stream changes already re-fire this; the running clock must not.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [turns, streaming, liveStart, syncJumpVisibility]);
+  }, [turns, streaming, liveStart, hidden, syncJumpVisibility]);
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -2833,7 +2834,7 @@ export function ChatPane({
     [cwd, model, effort, permission, effectiveBudget, queued.length, images.length, planMode, goal],
   );
   const runPhase = runEventState.phase;
-  const runEventCount = runEventState.events.length;
+  const hasRunEvents = runEventState.events.length > 0;
 
   // ── composer props ─────────────────────────────────────────────────────────
   // Everything Composer needs. Each callback/ref/object is stable (useCallback /
@@ -2859,7 +2860,7 @@ export function ChatPane({
     cwd,
     goal,
     runPhase,
-    runEventCount,
+    hasRunEvents,
     contextChips,
     taRef,
     historyRef,

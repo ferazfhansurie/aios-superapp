@@ -1628,6 +1628,16 @@ function App() {
     () => panes.filter((pane) => !isDormantBackgroundAgent(pane, hiddenKeys)),
     [panes, hiddenKeys],
   );
+  const hiddenKeySet = useMemo(() => new Set(hiddenKeys), [hiddenKeys]);
+  const visiblePanes = useMemo(
+    () => exposedPanes.filter((pane) => !hiddenKeySet.has(pane.key)),
+    [exposedPanes, hiddenKeySet],
+  );
+  const visibleIndexByKey = useMemo(() => {
+    const m = new Map<string, number>();
+    visiblePanes.forEach((pane, index) => m.set(pane.key, index));
+    return m;
+  }, [visiblePanes]);
 
   // Pre-build each pane's ChatWorkspaceContext ONCE per layout change instead of
   // freshly per App render at the map call site (the old inline
@@ -1645,7 +1655,7 @@ function App() {
   // grid is sized to the VISIBLE panes — hidden ones are display:none (out of
   // grid flow), so they leave no empty cell behind. Dormant background workers
   // are not mounted until explicitly opened from the parent chat fleet.
-  const visibleCount = exposedPanes.filter((pane) => !hiddenKeys.includes(pane.key)).length;
+  const visibleCount = visiblePanes.length;
   const { cols, rows } = useMemo(() => {
     const n = visibleCount || 1;
     if (compactWebLayout) return { cols: 1, rows: n };
@@ -2256,9 +2266,8 @@ function App() {
                 {visibleCount === 0 && <div className="absolute inset-0 z-10">{idleDash}</div>}
             <ResizableGrid cols={cols} rows={rows} gap={8} storageKey={gridTrackStorageKey(GRID_TRACK_KEY, cols, rows)}>
               {exposedPanes.map((pane) => {
-                const visibleIndex = exposedPanes
-                  .filter((p) => !hiddenKeys.includes(p.key))
-                  .findIndex((p) => p.key === pane.key);
+                const paneHidden = hiddenKeySet.has(pane.key);
+                const visibleIndex = visibleIndexByKey.get(pane.key) ?? -1;
                 const paneStyle =
                   visibleCount === 3 && visibleIndex === 2
                     ? ({ gridColumn: "2", gridRow: "1 / span 2" } satisfies CSSProperties)
@@ -2270,11 +2279,11 @@ function App() {
                   defaultCwd={home}
                   active={
                     !overlayOpen &&
-                    !hiddenKeys.includes(pane.key) &&
+                    !paneHidden &&
                     (maximizedKey === null || maximizedKey === pane.key)
                   }
                   maximized={maximizedKey === pane.key}
-                  hidden={hiddenKeys.includes(pane.key)}
+                  hidden={paneHidden}
                   style={paneStyle}
                   dropTarget={dropTargetKey === pane.key}
                   onClose={requestClose}
@@ -3764,10 +3773,15 @@ const PaneCard = memo(function PaneCard({
         >
           <Suspense fallback={<PaneLoading />}>
             {isTerminal(pane.kind) ? (
-            <TerminalPane kind={pane.kind} paneKey={pane.key} />
-          ) : pane.kind.type === "file" ? (
-            <FileViewerPane path={pane.kind.path} paneKey={pane.key} />
-          ) : pane.kind.type === "editor" ? (
+              <TerminalPane
+                kind={pane.kind}
+                paneKey={pane.key}
+                active={active && activeKey === pane.key}
+                hidden={hidden}
+              />
+            ) : pane.kind.type === "file" ? (
+              <FileViewerPane path={pane.kind.path} paneKey={pane.key} />
+            ) : pane.kind.type === "editor" ? (
             <EditorPane
               active={active}
               path={pane.kind.path}

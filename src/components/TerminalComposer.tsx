@@ -135,6 +135,8 @@ interface SlashCommand {
 }
 
 export function TerminalComposer({
+  active = true,
+  hidden = false,
   onSend,
   onRaw,
   onInterrupt,
@@ -146,6 +148,8 @@ export function TerminalComposer({
   liveModel,
   liveCtxPct,
 }: {
+  active?: boolean;
+  hidden?: boolean;
   /** Write the composed text to the PTY (the pane appends the CR). */
   onSend: (text: string) => void;
   /**
@@ -278,6 +282,7 @@ export function TerminalComposer({
   // straight through to the terminal, so deliberate terminal interaction (incl.
   // ⌘-hotkeys, ^C, scrolling) is never hijacked.
   useEffect(() => {
+    if (!active || hidden) return;
     const onKeyCapture = (e: KeyboardEvent) => {
       // only bare printable characters (length-1 keys: letters/digits/punct/space)
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -328,7 +333,7 @@ export function TerminalComposer({
     // capture phase: beat xterm's own key handling to the keystroke.
     window.addEventListener("keydown", onKeyCapture, true);
     return () => window.removeEventListener("keydown", onKeyCapture, true);
-  }, []);
+  }, [active, hidden]);
 
   // ── bottom context bar (cwd / repo) ────────────────────────────────────────
   // Resolve a friendly label for this pane: prefer the git repo's basename,

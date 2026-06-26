@@ -3,12 +3,18 @@ import { lazy, Suspense } from "react";
 import type { PaneKind } from "./TerminalRuntime";
 
 export type { PaneKind };
+export type TerminalPaneProps = {
+  kind: PaneKind;
+  paneKey?: string;
+  active?: boolean;
+  hidden?: boolean;
+};
 
 const TerminalRuntime = lazy(() =>
   import("./TerminalRuntime").then((m) => ({ default: m.TerminalPane })),
 );
 
-export function TerminalPane(props: { kind: PaneKind; paneKey?: string }) {
+export function TerminalPane(props: TerminalPaneProps) {
   return (
     <Suspense fallback={<TerminalLoading />}>
       <TerminalRuntime {...props} />

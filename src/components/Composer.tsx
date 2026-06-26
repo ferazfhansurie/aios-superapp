@@ -708,7 +708,7 @@ export interface ComposerProps {
   cwd?: string;
   goal: string;
   runPhase: string;
-  runEventCount: number;
+  hasRunEvents: boolean;
 
   // ── computed-in-ChatPane (input-independent, memoized) ──
   contextChips: ReturnType<typeof composerContextChips>;
@@ -817,7 +817,7 @@ function ComposerInner(props: ComposerProps) {
     cwd,
     goal,
     runPhase,
-    runEventCount,
+    hasRunEvents,
     contextChips,
     taRef,
     historyRef,
@@ -1308,7 +1308,7 @@ function ComposerInner(props: ComposerProps) {
               )}
             </span>
           ))}
-          {runEventCount > 0 && (
+          {hasRunEvents && (
             <span
               className={`inline-flex max-w-full items-center gap-1.5 rounded-full border bg-white/[0.05] px-2.5 py-1 font-sans text-[11.5px] backdrop-blur-md ${
                 /fail|error|blocked/i.test(runPhase)
