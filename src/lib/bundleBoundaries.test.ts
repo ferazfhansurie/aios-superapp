@@ -1017,3 +1017,13 @@ test("chat cockpit uses semantic transcript, surface, and permission roles", () 
   assert.match(approvalCards.slice(approvalStart, approvalEnd), /--color-focus/);
   assert.doesNotMatch(approvalCards.slice(approvalStart, approvalEnd), /--color-accent/);
 });
+
+test("gui tmux resolution includes user-local aios installs", () => {
+  const monitor = read("src-tauri/src/monitor.rs");
+  const oracles = read("src-tauri/src/oracles.rs");
+
+  for (const source of [monitor, oracles]) {
+    assert.match(source, /\.local\/bin\/tmux/);
+    assert.match(source, /\.aios\/state\/bin\/tmux/);
+  }
+});

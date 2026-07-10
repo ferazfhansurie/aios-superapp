@@ -106,6 +106,14 @@ struct Instance {
 pub fn tmux_bin() -> String {
     #[cfg(unix)]
     {
+        if let Ok(home) = std::env::var("HOME") {
+            for rel in [".local/bin/tmux", ".aios/state/bin/tmux"] {
+                let path = format!("{home}/{rel}");
+                if std::path::Path::new(&path).exists() {
+                    return path;
+                }
+            }
+        }
         for candidate in [
             "/opt/homebrew/bin/tmux",
             "/usr/local/bin/tmux",
