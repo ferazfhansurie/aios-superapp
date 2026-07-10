@@ -19,7 +19,7 @@ use crate::adapt::{
     codex_item_is_error, codex_tool_input, codex_tool_name, codex_tool_result_text,
     codex_usage_event, codex_usage_to_claude,
 };
-use crate::session::ChatSession;
+use crate::session::{ChatSession, PendingCodexControl};
 use crate::wire::{
     assistant_text_line, assistant_thinking_line, assistant_tool_use_line, json_escape,
     text_delta_line, thinking_delta_line, user_tool_result_line,
@@ -83,6 +83,36 @@ pub fn codex_fire_turn(
     );
 }
 
+/// Sends a same-turn steer once the app-server's `turn/started` notification has
+/// supplied the required active turn id.
+pub fn codex_fire_steer(sess: &Arc<ChatSession>, thread_id: &str, turn_id: &str, text: &str) {
+    let id = codex_next_rpc(sess);
+    codex_rpc_write(
+        sess,
+        &json!({
+            "jsonrpc": "2.0", "id": id, "method": "turn/steer",
+            "params": {
+                "threadId": thread_id,
+                "expectedTurnId": turn_id,
+                "input": [{ "type": "text", "text": text }],
+            }
+        }),
+    );
+}
+
+/// Sends a turn-scoped interrupt. Codex app-server v2 requires BOTH ids; sending
+/// only `threadId` is rejected while the model keeps working.
+pub fn codex_fire_interrupt(sess: &Arc<ChatSession>, thread_id: &str, turn_id: &str) {
+    let id = codex_next_rpc(sess);
+    codex_rpc_write(
+        sess,
+        &json!({
+            "jsonrpc": "2.0", "id": id, "method": "turn/interrupt",
+            "params": { "threadId": thread_id, "turnId": turn_id }
+        }),
+    );
+}
+
 /// Adapts one codex app-server JSON-RPC frame to zero-or-more claude stream-json
 /// lines. Also talks back to the session (acks server requests, fires queued
 /// turns) via `codex_rpc_write` — so it is line→lines PLUS a stdin side-effect,
@@ -91,6 +121,11 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
+    // `turn/started` mutates active_turn then drains queued steer/interrupt
+    // controls. Keep that state transition in the same operation boundary as
+    // foreground send/steer/interrupt and result settlement, so a completed
+    // turn cannot cross over a just-drained steer.
+    let _operation = sess.operation_lock.lock();
     let method = v.get("method").and_then(|x| x.as_str());
     let has_id = v.get("id").is_some();
     let mut out = Vec::new();
@@ -161,6 +196,7 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
                 .unwrap_or("codex request failed");
             *sess.pending_turn.lock() = None;
             *sess.active_turn.lock() = None;
+            sess.pending_controls.lock().clear();
             *sess.answer_item.lock() = None;
             sess.answer_streamed.store(false, Ordering::SeqCst);
             sess.pending_approvals.lock().clear();
@@ -331,10 +367,28 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
                 .and_then(|x| x.as_str())
             {
                 *sess.active_turn.lock() = Some(id.to_string());
+                let thread_id = params
+                    .and_then(|p| p.get("threadId"))
+                    .and_then(|x| x.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| sess.thread_id.lock().clone())
+                    .unwrap_or_default();
+                let controls = sess.pending_controls.lock().drain(..).collect::<Vec<_>>();
+                for control in controls {
+                    match control {
+                        PendingCodexControl::Steer(text) => {
+                            codex_fire_steer(sess, &thread_id, id, &text)
+                        }
+                        PendingCodexControl::Interrupt => {
+                            codex_fire_interrupt(sess, &thread_id, id)
+                        }
+                    }
+                }
             }
         }
         "turn/completed" => {
             *sess.active_turn.lock() = None;
+            sess.pending_controls.lock().clear();
             *sess.answer_item.lock() = None;
             let tid = sess.thread_id.lock().clone().unwrap_or_default();
             // Map codex's usage envelope onto claude's field names so the ctx
@@ -352,6 +406,7 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
         }
         "turn/failed" => {
             *sess.active_turn.lock() = None;
+            sess.pending_controls.lock().clear();
             *sess.answer_item.lock() = None;
             let tid = sess.thread_id.lock().clone().unwrap_or_default();
             out.push(format!(
@@ -380,11 +435,13 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
             if !will_retry {
-                let tid = sess.thread_id.lock().clone().unwrap_or_default();
-                out.push(format!(
-                    "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
-                    json_escape(&tid)
-                ));
+                let message = params
+                    .and_then(|p| p.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .and_then(|x| x.as_str())
+                    .or_else(|| params.and_then(|p| p.get("message")).and_then(|x| x.as_str()))
+                    .unwrap_or("codex turn failed");
+                out.push(codex_error_result_line(sess, message));
             }
         }
         _ => {} // thread/started, item/started, deltas, mcp status — ignored in v1

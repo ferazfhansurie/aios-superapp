@@ -124,7 +124,7 @@ export function MissionBoard() {
         <button
           type="button"
           onClick={() => talkToOrchestrator()}
-          className="ml-auto flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--color-bg)] transition-transform hover:scale-[1.03]"
+          className="ml-auto flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--color-accent-fg)] transition-transform hover:scale-[1.03]"
           title="open the AIOS orchestrator — the one AI that knows your board, spawns agents, makes loops"
         >
           <MessageSquare size={12} />

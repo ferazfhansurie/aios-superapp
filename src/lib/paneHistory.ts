@@ -1,4 +1,5 @@
 import type { PaneContent } from "./apps";
+import { isTaskId } from "./taskWorkspace.ts";
 import { invoke, isTauriRuntime } from "./tauri.ts";
 
 const PANE_HISTORY_KEY = "aios.pane.history.v1";
@@ -64,6 +65,7 @@ function restorablePaneKind(kind: PaneContent): PaneContent {
       resume,
       modelId: kind.modelId,
       agentLabel: kind.agentLabel,
+      ...(isTaskId(kind.taskId) ? { taskId: kind.taskId } : {}),
     };
   }
   if (kind.type === "browser") {
@@ -73,6 +75,7 @@ function restorablePaneKind(kind: PaneContent): PaneContent {
       profile: kind.profile,
       memKey: kind.memKey,
       transient: kind.transient,
+      ...(isTaskId(kind.taskId) ? { taskId: kind.taskId } : {}),
     };
   }
   return kind;

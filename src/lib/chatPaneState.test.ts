@@ -4,8 +4,11 @@ import test from "node:test";
 
 import {
   buildChatContextCapsule,
+  chatStreamFlushDelay,
+  composeWireMessage,
   composerContextChips,
   contextLedger,
+  modePrefixFor,
   cycleQueueSelection,
   describeModelSwitch,
   moveQueuedMessage,
@@ -18,6 +21,12 @@ import {
   updateQueuedMessage,
   usageStack,
 } from "./chatPaneState.ts";
+
+test("hidden chat streams use a slower flush cadence", () => {
+  assert.equal(chatStreamFlushDelay(false), null);
+  assert.equal(chatStreamFlushDelay(true), 240);
+});
+import * as chatPaneState from "./chatPaneState.ts";
 import {
   isHttpPaneTarget,
   isPaneFileTarget,
@@ -102,6 +111,40 @@ test("usageStack never renders a negative session delta after a reset", () => {
     session: 0,
     total: 2,
   });
+});
+
+test("model-aware effort selection prefers saved, then current, then model default", () => {
+  assert.equal(typeof chatPaneState.resolveModelEffort, "function");
+  const sol = {
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    defaultEffort: "low",
+  };
+
+  assert.equal(
+    chatPaneState.resolveModelEffort(sol, "high", "max"),
+    "max",
+  );
+  assert.equal(
+    chatPaneState.resolveModelEffort(sol, "high", "unsupported"),
+    "high",
+  );
+  assert.equal(
+    chatPaneState.resolveModelEffort(sol, "unsupported", null),
+    "low",
+  );
+});
+
+test("effort slider snaps and moves across only the selected model's stops", () => {
+  assert.equal(typeof chatPaneState.nearestEffortIndex, "function");
+  assert.equal(typeof chatPaneState.moveEffortIndex, "function");
+
+  assert.equal(chatPaneState.nearestEffortIndex(0, 6), 0);
+  assert.equal(chatPaneState.nearestEffortIndex(0.51, 6), 3);
+  assert.equal(chatPaneState.nearestEffortIndex(1, 5), 4);
+  assert.equal(chatPaneState.moveEffortIndex(2, "ArrowRight", 6), 3);
+  assert.equal(chatPaneState.moveEffortIndex(0, "ArrowLeft", 6), 0);
+  assert.equal(chatPaneState.moveEffortIndex(2, "Home", 6), 0);
+  assert.equal(chatPaneState.moveEffortIndex(2, "End", 6), 5);
 });
 
 test("queueMessage trims text and selects the newly queued item", () => {
@@ -390,4 +433,54 @@ test("describeModelSwitch clears + announces on a real switch, no-ops on same mo
     shouldClear: true,
     notice: "switched to Codex — fresh chat",
   });
+});
+
+test("composeWireMessage sends codex the typed text VERBATIM (no AIOS framing)", () => {
+  // codex titles the shared ~/.codex thread from its first user message, so no
+  // agent/ultracode/plan/goal/memory prefix may leak into the wire text.
+  const typed = "add retry backoff to the fetch helper";
+  for (const budget of ["lean", "agent", "ultracode"] as const) {
+    assert.equal(
+      composeWireMessage({
+        display: typed,
+        engine: "codex",
+        effectiveBudget: budget,
+        goal: "ship the collector rewrite",
+        planMode: true,
+        wirePrefix: "Relevant AIOS memory context:\n1. foo\n\n",
+      }),
+      typed,
+      `codex wire must equal typed text for budget=${budget}`,
+    );
+  }
+});
+
+test("modePrefixFor returns no mode prefix for codex, banners for others", () => {
+  assert.equal(modePrefixFor("codex", "agent"), "");
+  assert.equal(modePrefixFor("codex", "ultracode"), "");
+  // claude (native subagents) gets the orchestrate banners
+  assert.match(modePrefixFor("claude", "agent"), /^Agent mode is ON\. For any task/);
+  assert.match(modePrefixFor("claude", "ultracode"), /^Ultracode mode is ON\./);
+  // opencode (direct tools, no fan-out) gets the DIRECT banners, never codex-empty
+  assert.match(modePrefixFor("opencode", "agent"), /direct file-edit and shell tools/);
+  assert.match(modePrefixFor("opencode", "ultracode"), /^Ultracode mode is ON\./);
+  // lean budget = no mode banner for anyone
+  assert.equal(modePrefixFor("claude", "lean"), "");
+});
+
+test("composeWireMessage keeps the full prefix stack for non-codex engines", () => {
+  const wire = composeWireMessage({
+    display: "do the thing",
+    engine: "claude",
+    effectiveBudget: "agent",
+    goal: "win the deal",
+    planMode: true,
+    wirePrefix: "MEM\n\n",
+  });
+  // outermost-first: agent banner → plan → goal → wirePrefix → typed text
+  assert.match(wire, /^Agent mode is ON\./);
+  assert.ok(wire.includes("Plan first:"));
+  assert.ok(wire.includes("Ongoing goal (keep pursuing this"));
+  assert.ok(wire.includes("win the deal"));
+  assert.ok(wire.endsWith("MEM\n\ndo the thing"));
 });

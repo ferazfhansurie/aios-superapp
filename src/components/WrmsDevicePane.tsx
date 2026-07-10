@@ -105,7 +105,7 @@ export function WrmsDevicePane() {
               }}
               className={`h-7 px-2 text-[10px] transition-colors ${
                 app === nextApp
-                  ? "bg-[var(--color-accent)] text-[var(--color-bg)]"
+                  ? "bg-[var(--color-accent)] text-[var(--color-accent-fg)]"
                   : "text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
               }`}
               title={`show ${nextApp} runs`}
@@ -127,7 +127,7 @@ export function WrmsDevicePane() {
           type="button"
           onClick={() => void runFlow(app === "vendor" ? "smoke" : "login")}
           disabled={running}
-          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-bg)] transition-opacity disabled:opacity-50"
+          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] transition-opacity disabled:opacity-50"
           title={app === "vendor" ? "run vendor smoke" : "run collector login"}
         >
           {running ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}

@@ -12,6 +12,7 @@ import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { createTerminalOutputPump, type TerminalOutputPump } from "../lib/terminalOutputPump";
 
 import {
   ptyKill,
@@ -23,8 +24,9 @@ import {
   spawnTmux,
 } from "../lib/pty";
 import { homeDir, saveImageTemp } from "../lib/fs";
-import { paneWriters, paneSubmitters, openUrlInPane, spawnPane } from "../lib/paneBus";
+import { paneWriters, paneSubmitters, openUrlInPane, spawnPane, taskSpawnContext } from "../lib/paneBus";
 import { isTauriRuntime } from "../lib/tauri";
+import type { TaskId } from "../lib/taskWorkspace";
 
 /** Wrap text in bracketed-paste markers so a TUI (claude code, vim, a shell with
  *  bracketed-paste mode on) treats it as ONE atomic paste — the trailing CR
@@ -106,6 +108,7 @@ type TerminalPaneProps = {
   paneKey?: string;
   active?: boolean;
   hidden?: boolean;
+  taskId?: TaskId;
 };
 
 type ClaudeStatus = {
@@ -173,7 +176,7 @@ function buttonOptions(clean: string, lastButton: string): { raw: string; option
   return options.length ? { raw: last[1], options } : null;
 }
 
-export function TerminalPane({ kind, paneKey, active = true, hidden = false }: TerminalPaneProps) {
+export function TerminalPane({ kind, paneKey, active = true, hidden = false, taskId }: TerminalPaneProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<number | null>(null);
   const hiddenRef = useRef(hidden);
@@ -224,9 +227,11 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
   // writing — the common "wrong spot" is a scrolled-up terminal (reading backlog
   // / tmux copy-mode) that would eat the sent line.
   const termRef = useRef<Xterm | null>(null);
+  const outputPumpRef = useRef<TerminalOutputPump | null>(null);
 
   useEffect(() => {
     hiddenRef.current = hidden;
+    outputPumpRef.current?.setHidden(hidden);
   }, [hidden]);
 
   useEffect(() => {
@@ -264,7 +269,7 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
     term.loadAddon(
       new WebLinksAddon((event, uri) => {
         if (event.button !== 0) return; // left-click only, like the default
-        if (!openUrlInPane(uri, "browser")) {
+        if (!openUrlInPane(uri, "browser", taskSpawnContext(taskId))) {
           try {
             window.open(uri, "_blank", "noopener,noreferrer");
           } catch {
@@ -397,10 +402,6 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
     let inputDisposer: { dispose: () => void } | null = null;
     // B3: unlisten handle for this pane's `pty-exit` subscription.
     let unlistenExit: (() => void) | null = null;
-    let pendingChunks: string[] = [];
-    let pendingBytes = 0;
-    let flushRaf: number | null = null;
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let lastMetadataParseAt = 0;
 
     const parseTerminalMetadata = (text: string) => {
@@ -434,36 +435,25 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
       }
     };
 
-    const flushPendingOutput = () => {
-      if (flushRaf != null) {
-        cancelAnimationFrame(flushRaf);
-        flushRaf = null;
-      }
-      if (flushTimer != null) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-      if (disposed || pendingChunks.length === 0) return;
-      const text = pendingChunks.join("");
-      pendingChunks = [];
-      pendingBytes = 0;
-      term.write(text);
-      parseTerminalMetadata(text);
-    };
-
-    const scheduleOutputFlush = () => {
-      if (flushRaf != null || flushTimer != null) return;
-      if (hiddenRef.current) {
-        flushTimer = setTimeout(flushPendingOutput, 120);
-      } else {
-        flushRaf = requestAnimationFrame(flushPendingOutput);
-      }
-    };
+    const outputPump = createTerminalOutputPump({
+      write: (text, done) => {
+        term.write(text, () => {
+          parseTerminalMetadata(text);
+          done();
+        });
+      },
+      schedule: (callback, delayMs) => window.setTimeout(callback, delayMs),
+      cancel: (handle) => window.clearTimeout(handle as number),
+    });
+    outputPump.setHidden(hiddenRef.current);
+    outputPumpRef.current = outputPump;
 
     if (!isTauriRuntime()) {
       term.write("\r\n\x1b[33m[aios] terminal panes run inside the desktop shell.\x1b[0m\r\n");
       return () => {
         disposed = true;
+        outputPump.dispose();
+        if (outputPumpRef.current === outputPump) outputPumpRef.current = null;
         host.removeEventListener("auxclick", onAuxClick);
         term.dispose();
       };
@@ -472,10 +462,7 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
     const onData = new Channel<string>();
     onData.onmessage = (chunk) => {
       if (disposed) return;
-      pendingChunks.push(chunk);
-      pendingBytes += chunk.length;
-      if (pendingBytes >= 64_000) flushPendingOutput();
-      else scheduleOutputFlush();
+      outputPump.push(chunk);
     };
 
     (async () => {
@@ -569,9 +556,13 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
     // round-trip + SIGWINCH to the child) per frame floods the PTY and flickers.
     // Coalesce to a single trailing fit+resize ~60ms after motion settles.
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastResize: { cols: number; rows: number } | null = null;
     const applyResize = () => {
+      if (hiddenRef.current) return;
       try {
         fit.fit();
+        if (lastResize?.cols === term.cols && lastResize.rows === term.rows) return;
+        lastResize = { cols: term.cols, rows: term.rows };
         if (sessionId != null) ptyResize(sessionId, term.cols, term.rows).catch((e) => reportDiag("terminal.resize", e, { action: "resize" }));
       } catch {
         /* ignore */
@@ -590,8 +581,8 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
       host.removeEventListener("auxclick", onAuxClick);
       ro.disconnect();
       if (resizeTimer != null) clearTimeout(resizeTimer);
-      if (flushRaf != null) cancelAnimationFrame(flushRaf);
-      if (flushTimer != null) clearTimeout(flushTimer);
+      outputPump.dispose();
+      if (outputPumpRef.current === outputPump) outputPumpRef.current = null;
       unlistenExit?.();
       inputDisposer?.dispose();
       if (sessionId != null) ptyKill(sessionId).catch((e) => reportDiag("terminal.kill", e, { action: "cleanup" }));
@@ -807,7 +798,7 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
               </span>
               <button
                 onClick={restartSession}
-                className="flex items-center gap-1.5 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)]"
+                className="flex items-center gap-1.5 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-fg)]"
               >
                 <RotateCw size={13} />
                 restart
@@ -817,7 +808,7 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
         )}
         {/* spawn a files pane rooted at this terminal's cwd ("open files here") */}
         <button
-          onClick={() => spawnPane("files", { path: paneCwd })}
+          onClick={() => spawnPane("files", { path: paneCwd, ...taskSpawnContext(taskId) })}
           title={`Open files here${paneCwd ? `\n${paneCwd}` : ""}`}
           className="absolute left-2 top-2 z-20 flex items-center gap-1 rounded-md border border-[var(--color-border-strong)] bg-[var(--color-panel)]/90 px-2 py-1 text-[11px] text-[var(--color-text-2)] opacity-40 backdrop-blur transition-all hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)] hover:opacity-100"
         >
@@ -846,7 +837,7 @@ export function TerminalPane({ kind, paneKey, active = true, hidden = false }: T
               <button
                 key={i}
                 onClick={() => sendChoice(b)}
-                className="rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)]"
+                className="rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-fg)]"
               >
                 {b}
               </button>

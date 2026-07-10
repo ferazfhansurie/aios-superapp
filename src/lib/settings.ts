@@ -50,6 +50,10 @@ export interface AppSettings {
   // picked model id (null = provider default).
   chatProvider: string;
   chatModel: string | null;
+  /** Last valid effort per model id. */
+  chatEffortByModel: Record<string, string>;
+  /** One-way defaults migration for newly opened blank chat panes. */
+  chatDefaultsVersion: number;
 
   // route claude chat turns through the local Headroom compression proxy
   // (ANTHROPIC_BASE_URL → http://127.0.0.1:8787). Compresses tool outputs / RAG
@@ -101,7 +105,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   graphPhysicsStrength: 50,
 
   chatProvider: "codex-cli",
-  chatModel: null,
+  chatModel: "gpt-5.6-terra",
+  chatEffortByModel: { "gpt-5.6-terra": "low" },
+  chatDefaultsVersion: 1,
 
   headroomCompression: false,
 
@@ -137,6 +143,18 @@ export function loadSettings(): AppSettings {
       // not keep users stuck on loud topbar modes after reinstall.
       if (parsed.topBarMode === "full" || parsed.topBarMode === "compact") {
         parsed.topBarMode = "hidden";
+      }
+      // Firaz's requested fresh-chat baseline: Terra is the daily driver and
+      // low effort is the fast default. This migrates existing installs once;
+      // a later explicit picker choice still remains the user's preference.
+      if ((parsed.chatDefaultsVersion ?? 0) < 1) {
+        parsed.chatModel = "gpt-5.6-terra";
+        parsed.chatProvider = "codex-cli";
+        parsed.chatEffortByModel = {
+          ...(parsed.chatEffortByModel ?? {}),
+          "gpt-5.6-terra": "low",
+        };
+        parsed.chatDefaultsVersion = 1;
       }
       cache = { ...DEFAULT_SETTINGS, ...parsed };
     } else {

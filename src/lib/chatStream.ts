@@ -52,6 +52,47 @@ export interface ChatStreamReduceResult {
   state: ChatStreamState;
 }
 
+/** Collapse consecutive token frames before reducers touch transcript history.
+ * Backends already batch opportunistically, but several frames can still land
+ * in one animation frame. Reducing each one separately clones the full turns
+ * array N times; this keeps ordering while paying that cost once per kind-run. */
+export function coalesceChatStreamDeltas(events: ChatEvent[]): ChatEvent[] {
+  const result: ChatEvent[] = [];
+  for (const event of events) {
+    const delta = event.type === "stream_event" ? event.event?.delta : undefined;
+    const kind = delta?.type;
+    const last = result[result.length - 1];
+    const lastDelta = last?.type === "stream_event" ? last.event?.delta : undefined;
+    if (kind === "text_delta" && lastDelta?.type === "text_delta") {
+      const fragment = delta?.text ?? "";
+      result[result.length - 1] = {
+        ...last,
+        event: {
+          ...last.event!,
+          delta: { ...lastDelta, text: `${lastDelta.text ?? ""}${fragment}` },
+        },
+      };
+      continue;
+    }
+    if (kind === "thinking_delta" && lastDelta?.type === "thinking_delta") {
+      const fragment = delta?.thinking ?? "";
+      result[result.length - 1] = {
+        ...last,
+        event: {
+          ...last.event!,
+          delta: {
+            ...lastDelta,
+            thinking: `${lastDelta.thinking ?? ""}${fragment}`,
+          },
+        },
+      };
+      continue;
+    }
+    result.push(event);
+  }
+  return result;
+}
+
 export function resultToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {

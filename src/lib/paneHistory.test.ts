@@ -77,6 +77,16 @@ test("pane history collapses repeated opens of the same resumed chat session", (
   }
 });
 
+test("pane history retains a chat task id for explicit resume/handoff continuity", () => {
+  recordPaneHistory({ ...resumeKind, taskId: "task:k-chat-handoff" }, "handoff");
+
+  const item = loadPaneHistory()[0];
+  assert.equal(item.kind.type, "chat");
+  if (item.kind.type === "chat") {
+    assert.equal(item.kind.taskId, "task:k-chat-handoff");
+  }
+});
+
 test("pane history replaces a fresh chat placeholder with its resume-capable session row", () => {
   recordPaneHistory({ type: "chat", cwd: "/Users/firazfhansurie/Repo/firaz/aios/shell" }, "chat");
   recordPaneHistory(

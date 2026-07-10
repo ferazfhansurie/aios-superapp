@@ -118,6 +118,15 @@ import type { AgentAuditEntry } from "./lib/agentActions";
 import { buildMirrorSnapshot, type MirrorSnapshot } from "./lib/mirror";
 import { gridTrackStorageKey, isCorePaneKind, migrateLayoutPanes, movePane, newPaneKey } from "./lib/paneLayout";
 import { pushNotification } from "./lib/notifications";
+import {
+  bindChatTaskId,
+  ensureTaskWorkspace,
+  getTaskWorkspace,
+  isTaskId,
+  linkTaskWorkspacePane,
+  taskPaneLinkFor,
+  unlinkTaskWorkspacePane,
+} from "./lib/taskWorkspace";
 
 import { SPAWN_BY_ID, type AppDef, type PaneContent } from "./lib/apps";
 import {
@@ -160,6 +169,7 @@ const TerminalPane = lazy(() =>
 const AnalyticsPane = lazy(() => import("./components/AnalyticsPane").then((m) => ({ default: m.AnalyticsPane })));
 const LoopPane = lazy(() => import("./components/LoopPane").then((m) => ({ default: m.LoopPane })));
 const TicketPane = lazy(() => import("./components/TicketPane").then((m) => ({ default: m.TicketPane })));
+const SystemPane = lazy(() => import("./components/SystemPane").then((m) => ({ default: m.SystemPane })));
 
 // Idle prefetch of the heavy lazy chunks. Opening a pane for the first time
 // used to pay its chunk fetch + parse ON CLICK — worst case the editor pulls
@@ -342,7 +352,13 @@ function recordAgentAudit(entry: AgentAuditEntry) {
 /** Strip a pane kind down to its restorable shape (drop one-shot fields). */
 function persistableKind(kind: PaneContent): PaneContent | null {
   if (!isCorePaneKind(kind.type)) return null;
-  if (kind.type === "chat") return { type: "chat", cwd: kind.cwd }; // fresh chat, no seed/resume/reattach
+  if (kind.type === "chat") {
+    return {
+      type: "chat",
+      cwd: kind.cwd,
+      ...(isTaskId(kind.taskId) ? { taskId: kind.taskId } : {}),
+    }; // fresh chat, no seed/resume/reattach
+  }
   // file/editor restore by path; everything else is self-describing.
   return kind;
 }
@@ -364,15 +380,25 @@ function loadLayout(): Pane[] {
     const saved = migrated.panes.filter(
       (p) => !isAgentPaneKey(p.key) || (p as { agentOpened?: unknown }).agentOpened === true,
     );
-    const changed = migrated.changed || saved.length !== migrated.panes.length;
+    // Pre-task layouts have stable pane keys but no task ids. Repair chats at
+    // restore time from that key so later save/history paths cannot merge them
+    // by a mutable engine session id.
+    const repaired = saved.map((pane) => {
+      const kind = bindChatTaskId(pane.kind as PaneContent, pane.key);
+      return kind === pane.kind ? pane : { ...pane, kind };
+    });
+    const changed =
+      migrated.changed ||
+      saved.length !== migrated.panes.length ||
+      repaired.some((pane, index) => pane !== saved[index]);
     if (changed) {
       try {
-        localStorage.setItem(LAYOUT_KEY, JSON.stringify(saved));
+        localStorage.setItem(LAYOUT_KEY, JSON.stringify(repaired));
       } catch {
         /* quota / unavailable — keys still stable for this session */
       }
     }
-    return saved.map((p) => {
+    return repaired.map((p) => {
       const key = p.key;
       const kind = p.kind as PaneContent;
       // Session restore (item 4): a browser pane reopens at the LAST url it was
@@ -396,14 +422,15 @@ function saveLayout(panes: Pane[]) {
     const out = panes
       .map((p) => {
         if (p.backgroundAgent) return null;
-        const kind = persistableKind(p.kind);
+        const kind = bindChatTaskId(p.kind, p.key);
+        const persistedKind = persistableKind(kind);
         // Persist the pane KEY (B1) — it's the seed for `termSessionName`, so a
         // restored terminal pane must keep the same key to reattach its session.
-        if (!kind) return null;
+        if (!persistedKind) return null;
         const record: { key: string; label: string; kind: PaneContent; agentOpened?: true } = {
           key: p.key,
           label: p.label,
-          kind,
+          kind: persistedKind,
         };
         if (isAgentPaneKey(p.key)) record.agentOpened = true;
         return record;
@@ -654,6 +681,34 @@ function App() {
     saveLayout(panes);
   }, [panes]);
 
+  // A task is more than its chat transcript. Reconcile every App-owned pane
+  // carrying a valid task id into the durable workspace so a restored chat
+  // keeps its terminal, files, browser, and review context. Panes with no
+  // task id remain deliberately independent. Existing `linkedAt` values are
+  // preserved, making this mount/restart-safe and idempotent.
+  useEffect(() => {
+    const ownerByTaskId = new Map<string, Pane>();
+    for (const pane of panes) {
+      if (pane.kind.type === "chat" && isTaskId(pane.kind.taskId)) {
+        ownerByTaskId.set(pane.kind.taskId, pane);
+      }
+    }
+    for (const pane of panes) {
+      const taskId = pane.kind.taskId;
+      if (!isTaskId(taskId)) continue;
+      const existing = getTaskWorkspace(taskId);
+      const owner = ownerByTaskId.get(taskId);
+      ensureTaskWorkspace({
+        id: taskId,
+        title: existing?.title ?? owner?.label ?? pane.label,
+        ownerPaneKey: existing?.ownerPaneKey ?? owner?.key ?? pane.key,
+      });
+      const priorLink = existing?.paneLinks.find((link) => link.paneKey === pane.key);
+      const link = taskPaneLinkFor({ key: pane.key, label: pane.label, kind: pane.kind }, priorLink?.linkedAt ?? Date.now());
+      if (link) linkTaskWorkspacePane(taskId, link);
+    }
+  }, [panes]);
+
   const restoredHistoryRecorded = useRef(false);
   useEffect(() => {
     if (restoredHistoryRecorded.current) return;
@@ -723,10 +778,14 @@ function App() {
     // agents runtime keys an agent's pane `agent:<id>` so reopen reattaches the
     // SAME pane instead of spawning a duplicate); minted otherwise.
     const key = explicitKey ?? newPaneKey(kind.type);
+    // Chat tasks are UI-owned rather than engine-session-owned. The key is
+    // stable across restart/layout restore, while an explicitly propagated
+    // taskId (handoff/history) remains authoritative.
+    const taskKind: PaneContent = bindChatTaskId(kind, key);
     // Light usage event (kind:"usage") — seeds the "what I use" prioritization.
     // Carries only the pane-type enum, never any argument/label content.
     reportUsage("pane.spawn", kind.type);
-    recordPaneHistory(kind, label);
+    recordPaneHistory(taskKind, label);
     // BACKGROUND SPAWN (loop/agent-originated): a pane spawned with background=true
     // must NOT disrupt firaz's current view — the dogfood/goal/maintainer loops
     // fire panes every few minutes, and stealing focus or dropping his fullscreen
@@ -763,7 +822,7 @@ function App() {
         while (taken.has(`${base} ${n}`)) n++;
         next = `${base} ${n}`;
       }
-      return [...p, { key, kind, label: next, backgroundAgent: background && isAgentPaneKey(key) }];
+      return [...p, { key, kind: taskKind, label: next, backgroundAgent: background && isAgentPaneKey(key) }];
     });
     // Background panes open hidden (display:none) so they run without taking grid
     // space or focus; firaz reveals them from the sidebar when he wants to peek.
@@ -772,8 +831,11 @@ function App() {
   }, []);
 
   const openUrl = useCallback(
-    (url: string, label = "browser") => {
-      spawn({ type: "browser", url }, label);
+    (url: string, label = "browser", ctx?: Pick<SpawnCtx, "taskId">) => {
+      // Pane-bus callers are cross-boundary input. Validate again at the App
+      // boundary before a task id reaches a persisted PaneContent record.
+      const taskId = isTaskId(ctx?.taskId) ? ctx.taskId : undefined;
+      spawn({ type: "browser", url, taskId }, label);
     },
     [spawn],
   );
@@ -992,26 +1054,29 @@ function App() {
   // a sensible label, then reuses `spawn` (so exit-fullscreen-on-spawn applies).
   const spawnPaneFromCtx = useCallback(
     (kind: SpawnPaneKind, ctx?: SpawnCtx) => {
+      // SpawnCtx is a public cross-pane boundary. Never persist a malformed id
+      // just because a caller forged the optional taskId field.
+      const taskId = isTaskId(ctx?.taskId) ? ctx.taskId : undefined;
       switch (kind) {
         case "terminal":
           // ctx.cmd (when present) seeds + runs a command in the new shell — the
           // shell pane's startup `cmd` fires once the PTY is ready, so a ChatPane
           // code-fence "run in terminal" lands its command without needing to look
           // the freshly-mounted pane up in the paneWriters registry.
-          spawn({ type: "shell", cwd: ctx?.cwd, cmd: ctx?.cmd }, ctx?.label ?? "terminal");
+          spawn({ type: "shell", cwd: ctx?.cwd, cmd: ctx?.cmd, taskId }, ctx?.label ?? "terminal");
           break;
         case "files": {
           const root = ctx?.path;
           const name = root ? root.split("/").filter(Boolean).pop() ?? root : "files";
-          spawn({ type: "files", root }, ctx?.label ?? `files · ${name}`);
+          spawn({ type: "files", root, taskId }, ctx?.label ?? `files · ${name}`);
           break;
         }
         case "browser":
-          spawn({ type: "browser", url: ctx?.url }, ctx?.label ?? "browser");
+          spawn({ type: "browser", url: ctx?.url, taskId }, ctx?.label ?? "browser");
           break;
         case "chat":
           spawn(
-            { type: "chat", cwd: ctx?.cwd, seed: ctx?.seed, modelId: ctx?.modelId },
+            { type: "chat", cwd: ctx?.cwd, seed: ctx?.seed, modelId: ctx?.modelId, taskId },
             ctx?.label ?? "chat",
           );
           break;
@@ -1100,6 +1165,12 @@ function App() {
     // also won't be in the next layout, so this just keeps the map from
     // accumulating dead entries). No-op for non-browser keys.
     forgetUrl(key);
+    const pane = panesRef.current.find((entry) => entry.key === key);
+    if (pane && isTaskId(pane.kind.taskId)) {
+      // Closing one child must never erase its task's durable run/artifact
+      // history or sibling links — it only marks this App pane as closed.
+      unlinkTaskWorkspacePane(pane.kind.taskId, key);
+    }
     setPanes((p) => p.filter((x) => x.key !== key));
     setHiddenKeys((h) => h.filter((k) => k !== key));
   }, [setFocusedPane]);
@@ -1312,7 +1383,18 @@ function App() {
     );
   }, []);
   const handleUpdatePaneKind = useCallback((key: string, kind: PaneContent) => {
-    setPanes((ps) => ps.map((p) => (p.key === key ? { ...p, kind } : p)));
+    setPanes((ps) =>
+      ps.map((p) =>
+        p.key === key
+          ? {
+              ...p,
+              // Pane implementations commonly update only their local shape.
+              // Preserve task ownership unless they deliberately replace it.
+              kind: kind.taskId || !p.kind.taskId ? kind : { ...kind, taskId: p.kind.taskId },
+            }
+          : p,
+      ),
+    );
   }, []);
   const handleChatSession = useCallback(
     (key: string, info: { id: string; title: string; engine?: string; model?: string }) => {
@@ -1943,7 +2025,12 @@ function App() {
           setPanes((p) =>
             p.map((x) =>
               x.key === DISCORD_PANE_KEY
-                ? { ...x, label: DISCORD_PANE_LABEL, kind, attention: hidden && version > 0 }
+                ? {
+                    ...x,
+                    label: DISCORD_PANE_LABEL,
+                    kind: kind.taskId || !x.kind.taskId ? kind : { ...kind, taskId: x.kind.taskId },
+                    attention: hidden && version > 0,
+                  }
                 : x,
             ),
           );
@@ -1979,7 +2066,7 @@ function App() {
     void listen<Record<string, unknown>>("control-command", (event) => {
       const payload = event.payload || {};
       const cmd = String(payload.cmd ?? "");
-      const dedupeKey = `${cmd}:${String(payload.paneType ?? "")}:${String(payload.key ?? "")}:${String(payload.seed ?? "")}:${String(payload.resume ?? "")}`;
+      const dedupeKey = `${cmd}:${String(payload.paneType ?? "")}:${String(payload.key ?? "")}:${String(payload.seed ?? "")}:${String(payload.resume ?? "")}:${String(payload.taskId ?? "")}`;
       const nowTs = Date.now();
       if (
         dedupeKey === lastControlCmdRef.current.key &&
@@ -1996,6 +2083,7 @@ function App() {
         const seed = payload.seed != null ? String(payload.seed) : undefined;
         const cwd = payload.cwd != null ? String(payload.cwd) : undefined;
         const label = payload.label != null ? String(payload.label) : undefined;
+        const taskId = isTaskId(payload.taskId) ? payload.taskId : undefined;
         const resume =
           payload.resume != null
             ? {
@@ -2030,6 +2118,7 @@ function App() {
                 cwd,
                 prompt: seed,
                 background,
+                taskId,
               },
             }),
           );
@@ -2039,14 +2128,18 @@ function App() {
         // firaz's view untouched (the pane keeps running where it is).
         if (explicitKey && panesRef.current.some((p) => p.key === explicitKey)) {
           emitAgentSpawned();
-          if (resume) {
+          if (resume || taskId) {
             setPanes((p) =>
               p.map((x) =>
                 x.key === explicitKey && x.kind.type === "chat"
                   ? {
                       ...x,
                       label: label ?? x.label,
-                      kind: { ...x.kind, cwd, resume },
+                      kind: {
+                        ...x.kind,
+                        ...(resume ? { cwd, resume } : {}),
+                        ...(taskId ? { taskId } : {}),
+                      },
                       attention: background,
                       backgroundAgent: background ? x.backgroundAgent : false,
                     }
@@ -2067,18 +2160,18 @@ function App() {
         }
         switch (paneType) {
           case "chat":
-            spawn({ type: "chat", seed: seed || undefined, cwd, resume }, label ?? "chat", explicitKey, background);
+            spawn({ type: "chat", seed: seed || undefined, cwd, resume, taskId }, label ?? "chat", explicitKey, background);
             emitAgentSpawned();
             break;
           case "terminal":
           case "shell":
-            spawn({ type: "shell", cwd, cmd: seed || undefined }, label ?? "terminal", explicitKey, background);
+            spawn({ type: "shell", cwd, cmd: seed || undefined, taskId }, label ?? "terminal", explicitKey, background);
             break;
           case "browser":
-            spawn({ type: "browser" }, "browser", explicitKey, background);
+            spawn({ type: "browser", taskId }, "browser", explicitKey, background);
             break;
           case "files":
-            spawn({ type: "files" }, "files", explicitKey, background);
+            spawn({ type: "files", taskId }, "files", explicitKey, background);
             break;
           case "wrms-device":
             spawn({ type: "wrms-device" }, label ?? "wrms device", explicitKey, background);
@@ -2471,7 +2564,7 @@ function MobileBottomNav({
             <AppSvgIcon name={item.icon} size={21} />
             <span className="w-full truncate text-center leading-none">{item.label}</span>
             {item.label === "panes" && panesCount > 0 && (
-              <span className="absolute right-3 top-1.5 grid h-4 min-w-4 place-items-center rounded-full bg-[var(--color-accent)] px-1 text-[9px] font-semibold leading-none text-black">
+              <span className="absolute right-3 top-1.5 grid h-4 min-w-4 place-items-center rounded-full bg-[var(--color-accent)] px-1 text-[9px] font-semibold leading-none text-[var(--color-accent-fg)]">
                 {panesCount > 9 ? "9+" : panesCount}
               </span>
             )}
@@ -2531,7 +2624,7 @@ function SpaceHeader({
             }
           }}
           spellCheck={false}
-          className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-0.5 text-[11px] uppercase tracking-wide text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+          className="shell-row shell-focus w-full bg-[var(--color-bg)] px-1.5 py-0.5 text-[11px] uppercase tracking-wide text-[var(--color-text)] outline-none"
         />
       </div>
     );
@@ -2561,7 +2654,7 @@ function SpaceHeader({
           <EllipsisVertical size={12} />
         </button>
         {menuOpen && (
-          <div className="absolute right-0 top-full z-50 mt-1 w-36 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
+          <div className="surface-pop absolute right-0 top-full z-50 mt-1 w-36 overflow-hidden py-1 text-[12px] text-[var(--color-text)]">
             <RowMenuItem
               icon={<Pencil size={13} />}
               label="rename"
@@ -2810,7 +2903,7 @@ function SidebarRow({
             }
           }}
           spellCheck={false}
-          className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-0.5 text-[13px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+          className="shell-row shell-focus min-w-0 flex-1 bg-[var(--color-bg)] px-1.5 py-0.5 text-[13px] text-[var(--color-text)] outline-none"
         />
       </div>
     );
@@ -2873,7 +2966,7 @@ function SidebarRow({
           <EllipsisVertical size={13} />
         </button>
         {menuOpen && (
-          <div className="absolute right-0 top-full z-50 mt-1 w-44 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)] py-1 text-[12px] text-[var(--color-text)] shadow-lg">
+          <div className="surface-pop absolute right-0 top-full z-50 mt-1 w-44 py-1 text-[12px] text-[var(--color-text)]">
             <RowMenuItem
               icon={<Pencil size={13} />}
               label="rename"
@@ -3005,7 +3098,7 @@ function RowMenuItem({
   return (
     <button
       onClick={onClick}
-      className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[var(--color-text)] transition-colors hover:bg-[var(--color-panel)]"
+      className="shell-row shell-hover shell-focus flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[var(--color-text)]"
     >
       <span className="text-[var(--color-muted)]">{icon}</span>
       {label}
@@ -3034,7 +3127,7 @@ function PinSiteModal({ spaceId, onClose }: { spaceId: string | null; onClose: (
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/45 p-6 backdrop-blur-sm" onMouseDown={onClose}>
       <div
-        className="modal-in glass w-[380px] rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel)]/95 p-4 shadow-2xl"
+        className="surface-pop modal-in glass w-[380px] bg-[var(--color-panel)]/95 p-4"
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-[var(--color-text)]">
@@ -3055,7 +3148,7 @@ function PinSiteModal({ spaceId, onClose }: { spaceId: string | null; onClose: (
             onKeyDown={(e) => e.key === "Escape" && onClose()}
             placeholder="youtube.com"
             spellCheck={false}
-            className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+            className="shell-row shell-focus w-full bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-[12px] text-[var(--color-text)] outline-none"
           />
           <input
             value={label}
@@ -3063,7 +3156,7 @@ function PinSiteModal({ spaceId, onClose }: { spaceId: string | null; onClose: (
             onKeyDown={(e) => e.key === "Escape" && onClose()}
             placeholder="label (optional)"
             spellCheck={false}
-            className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+            className="shell-row shell-focus w-full bg-[var(--color-bg)] px-2.5 py-1.5 text-[12px] text-[var(--color-text)] outline-none"
           />
           <div className="mt-1 flex justify-end gap-2">
             <button
@@ -3075,7 +3168,7 @@ function PinSiteModal({ spaceId, onClose }: { spaceId: string | null; onClose: (
             </button>
             <button
               type="submit"
-              className="rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+              className="rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)]"
             >
               pin
             </button>
@@ -3274,7 +3367,7 @@ function PaneActionItem({
     <button
       type="button"
       onClick={onClick}
-      className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+      className="shell-row shell-hover shell-focus flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[var(--color-text-2)] hover:text-[var(--color-text)]"
     >
       <span className="text-[var(--color-muted)]">{icon}</span>
       <span className="truncate">{label}</span>
@@ -3344,7 +3437,7 @@ function OpenPanesList({
                   else if (e.key === "Escape") setEditKey(null);
                 }}
                 spellCheck={false}
-                className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-0.5 text-[13px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60"
+                className="shell-row shell-focus min-w-0 flex-1 bg-[var(--color-bg)] px-1.5 py-0.5 text-[13px] text-[var(--color-text)] outline-none"
               />
             </div>
           );
@@ -3528,8 +3621,9 @@ const PaneCard = memo(function PaneCard({
       type: t,
       getRect: () => wrapRef.current?.getBoundingClientRect() ?? null,
       canAccept,
+      getContext: () => ({ taskId: pane.kind.taskId }),
     });
-  }, [pane.key, t]);
+  }, [pane.key, pane.kind.taskId, t]);
   const chatCwd = pane.kind.type === "chat" ? (pane.kind.cwd ?? defaultCwd) : undefined;
   const label =
     t === "oracle" ? `oracle: ${pane.label}` : t === "tmux" ? `tmux: ${pane.label}` : pane.label;
@@ -3578,18 +3672,18 @@ const PaneCard = memo(function PaneCard({
       data-pane-key={pane.key}
       onMouseDownCapture={handleFocus}
       style={hidden ? { display: "none" } : style}
-      className={`flex min-h-0 min-w-0 flex-col overflow-hidden bg-[var(--color-pane)] transition-colors ${
+      className={`flex min-h-0 min-w-0 flex-col overflow-hidden transition-colors ${
         maximized
           ? // truly fullscreen — edge-to-edge over the top bar + sidebar, no chrome
-            "fixed inset-0 z-40"
-          : `relative rounded-lg border ${
+            "shell-pane fixed inset-0 z-40"
+          : `shell-card shell-pane relative ${
               dropTarget
                 ? "border-[var(--color-accent)]"
                 : "border-[var(--color-border)] hover:border-[var(--color-border-strong)]"
             }`
       }`}
     >
-      <div className="flex h-7 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-white/[0.02] px-2.5">
+      <div className="pane-header !h-7 !px-2.5 justify-between">
         <div className="flex min-w-0 items-center gap-1.5">
           <span className="relative grid h-4 w-4 shrink-0 place-items-center">
             <AppSvgIcon name={iconKeyForPane(pane.kind, label)} size={16} />
@@ -3603,10 +3697,10 @@ const PaneCard = memo(function PaneCard({
               type="button"
               onClick={toggleMon}
               title={mon ? "monitoring → WhatsApp · click to stop" : "monitor this pane → WhatsApp"}
-              className={`rounded p-0.5 transition-colors ${
+              className={`shell-row shell-hover shell-focus p-0.5 ${
                 mon
                   ? "text-[var(--color-accent)]"
-                  : "text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+                  : "text-[var(--color-muted)] hover:text-[var(--color-text)]"
               }`}
             >
               <Radio size={12} className={mon ? "animate-pulse" : ""} />
@@ -3619,14 +3713,14 @@ const PaneCard = memo(function PaneCard({
                 e.stopPropagation();
                 setOpenAsOpen((v) => !v);
               }}
-              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              className="shell-row shell-hover shell-focus p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
               title="open as"
             >
               <EllipsisVertical size={12} />
             </button>
             {openAsOpen && (
               <div
-                className="absolute right-0 top-6 z-30 w-44 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)] py-1 text-[12px] shadow-2xl"
+                className="surface-pop absolute right-0 top-6 z-30 w-44 overflow-hidden py-1 text-[12px]"
                 onMouseDown={(e) => e.stopPropagation()}
               >
                 {fileTarget && (
@@ -3715,7 +3809,7 @@ const PaneCard = memo(function PaneCard({
             <button
               type="button"
               onClick={(e) => (e.stopPropagation(), handleToggleHide())}
-              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              className="shell-row shell-hover shell-focus p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
               title="Hide pane (keeps running)"
             >
               <EyeOff size={12} />
@@ -3725,7 +3819,7 @@ const PaneCard = memo(function PaneCard({
             <button
               type="button"
               onClick={(e) => (e.stopPropagation(), handleMoveLeft())}
-              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              className="shell-row shell-hover shell-focus p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
               title="Move pane left"
             >
               <MoveRight size={12} className="rotate-180" />
@@ -3735,7 +3829,7 @@ const PaneCard = memo(function PaneCard({
             <button
               type="button"
               onClick={(e) => (e.stopPropagation(), handleMoveRight())}
-              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              className="shell-row shell-hover shell-focus p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
               title="Move pane right"
             >
               <MoveRight size={12} />
@@ -3745,7 +3839,7 @@ const PaneCard = memo(function PaneCard({
             <button
               type="button"
               onClick={(e) => (e.stopPropagation(), handleToggleMax())}
-              className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+              className="shell-row shell-hover shell-focus p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
               title={maximized ? "Restore pane" : "Maximize pane"}
             >
               {maximized ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
@@ -3754,7 +3848,7 @@ const PaneCard = memo(function PaneCard({
           <button
             type="button"
             onClick={handleClose}
-            className="rounded p-0.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
+            className="shell-row shell-hover shell-focus p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
             title="Close pane"
           >
             <X size={12} />
@@ -3778,6 +3872,7 @@ const PaneCard = memo(function PaneCard({
                 paneKey={pane.key}
                 active={active && activeKey === pane.key}
                 hidden={hidden}
+                taskId={pane.kind.taskId}
               />
             ) : pane.kind.type === "file" ? (
               <FileViewerPane path={pane.kind.path} paneKey={pane.key} />
@@ -3796,6 +3891,7 @@ const PaneCard = memo(function PaneCard({
               onOpenFile={onOpenFile}
               onOpenEditorFile={onOpenEditorFile}
               onOpenViewerFile={onOpenViewerFile}
+              taskId={pane.kind.taskId}
             />
           ) : pane.kind.type === "history" ? (
             <HistoryPane
@@ -3810,6 +3906,8 @@ const PaneCard = memo(function PaneCard({
             <TicketPane />
           ) : pane.kind.type === "analytics" ? (
             <AnalyticsPane active={active && !hidden} />
+                    ) : pane.kind.type === "system" ? (
+                      <SystemPane active={active && !hidden} />
           ) : pane.kind.type === "wrms-device" ? (
             <WrmsDevicePane />
           ) : pane.kind.type === "browser" ? (
@@ -3822,6 +3920,7 @@ const PaneCard = memo(function PaneCard({
               onAnnotate={onAnnotate}
               onProfileChange={handleProfileChange}
               onVideoFullscreen={handleVideoFullscreen}
+              taskId={pane.kind.taskId}
             />
           ) : liveRoomKind ? (
             <LiveRoomPane
@@ -3852,6 +3951,7 @@ const PaneCard = memo(function PaneCard({
               seed={pane.kind.type === "chat" ? pane.kind.seed : undefined}
               modelId={pane.kind.type === "chat" ? pane.kind.modelId : undefined}
               agentLabel={pane.kind.type === "chat" ? pane.kind.agentLabel : undefined}
+              taskId={pane.kind.type === "chat" ? pane.kind.taskId : undefined}
               resume={pane.kind.type === "chat" ? pane.kind.resume : undefined}
               reattach={pane.kind.type === "chat" ? pane.kind.reattach : undefined}
               workspaceContext={workspaceContext}

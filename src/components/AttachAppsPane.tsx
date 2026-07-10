@@ -129,7 +129,7 @@ export function AttachAppsPane({
                       <button
                         type="button"
                         onClick={() => onAttachApp?.(app)}
-                        className="flex h-7 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)]"
+                        className="flex h-7 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)]"
                         title="attach as pane"
                       >
                         <PanelTopOpen size={12} />

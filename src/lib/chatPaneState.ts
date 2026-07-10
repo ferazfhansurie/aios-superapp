@@ -35,6 +35,139 @@ export type ComposerSendMode = "send" | "steer" | "queue" | "waiting";
 export type ChatStopStrategy = "interrupt" | "kill-and-restart";
 export type ContextBudgetMode = "lean" | "agent" | "ultracode";
 
+/** Keep background panes responsive without asking React to repaint every
+ * streamed token. Structural events still bypass this delay and flush at once. */
+export function chatStreamFlushDelay(hidden: boolean): number | null {
+  return hidden ? 240 : null;
+}
+
+// ── wire-message assembly ────────────────────────────────────────────────────
+// `display` is what the user typed (and what the transcript shows). `wire` is
+// what the engine actually receives — display plus any AIOS-only mode prefixes
+// (plan / goal / agent / ultracode). These prefixes are UX state, NOT part of
+// the user's message, so they must never leak into a place that treats the
+// first user turn as durable identity.
+//
+// CODEX titles each thread from its FIRST user message and shares ~/.codex with
+// the real Codex desktop app. If we staple a mode banner onto that turn, every
+// AIOS-originated codex thread shows up titled "Agent mode is ON…" and codex is
+// pushed into a fake "external orchestrator / execution bridge" mental model
+// (it has no subagent tooling to fan out to). So codex receives the typed text
+// VERBATIM — zero AIOS prefixes. See ChatPane dispatch.
+const PLAN_PREFIX =
+  "Plan first: lay out a concise step-by-step plan and wait for my go-ahead before writing any code or running mutating commands.\n\n";
+const GOAL_PREFIX = (goal: string) =>
+  `Ongoing goal (keep pursuing this across turns until I say it's done): ${goal}\n\n`;
+// Agent/ultra prefixes are CAPABILITY-aware, not engine-labelled. Only an engine
+// that actually exposes native fan-out tooling gets a "fan out to subagents"
+// directive — telling an engine to orchestrate subagents it doesn't have makes
+// it invent an external orchestrator / "execution bridge" and stall waiting on
+// infra that doesn't exist (the codex chat-pane hallucinated-bridge bug). In the
+// chat pane only claude ships the Task tool; opencode/spark have direct file +
+// shell tools but no subagent spawn, so they're told to DO THE WORK inline.
+const AGENT_PREFIX_ORCHESTRATE =
+  "Agent mode is ON. For any task with 2+ independent tracks, use your native subagent/Task tooling to fan out instead of doing everything serially. Keep each spawned agent's purpose specific so the chatpane can show what it's doing.\n\n";
+const AGENT_PREFIX_DIRECT =
+  "Agent mode is ON. You have direct file-edit and shell tools — use them to do the work yourself in THIS session. There is no external orchestrator, task queue, or execution bridge to hand work to; do not wait for one. For a task with independent parts, sequence them yourself. Only open a visible `aios-agent` worker pane if Firaz explicitly asks.\n\n";
+// ultracode = xhigh effort + workflows. Headless `claude -p` has no ultracode
+// flag, so we run xhigh and replicate the "workflows" half with this directive:
+// orchestrate, fan out, verify — be maximally thorough.
+const ULTRA_PREFIX_ORCHESTRATE =
+  "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel sub-agents via your native Task tooling, then adversarially verify findings before concluding. Prefer orchestrated multi-agent execution over a single pass; only handle trivially small tasks inline.\n\n";
+const ULTRA_PREFIX_DIRECT =
+  "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. You have direct file-edit and shell tools; do the work yourself in THIS session — there is no external orchestrator or execution bridge to fan out to. Sequence independent parts yourself, then re-check your work adversarially before concluding.\n\n";
+
+// True only for engines that expose native subagent/fan-out tooling in the chat
+// pane. Flip an engine here the day it gains a real subagent tool — the prefixes
+// key off this, so gating stays capability-driven, not a scattered engine check.
+export function engineHasNativeSubagents(engine: string): boolean {
+  return engine === "claude";
+}
+
+/** The per-turn "mode" prefix AIOS staples onto agent / ultracode budgets.
+ *  Returns "" when no mode prefix applies. CODEX always gets "" — its first
+ *  user turn becomes the thread title and it has no fan-out tooling, so it must
+ *  receive the typed text clean (no banner, no execution-bridge framing). */
+export function modePrefixFor(
+  engine: string,
+  effectiveBudget: ContextBudgetMode,
+): string {
+  if (engine === "codex") return "";
+  if (effectiveBudget === "ultracode") {
+    return engineHasNativeSubagents(engine) ? ULTRA_PREFIX_ORCHESTRATE : ULTRA_PREFIX_DIRECT;
+  }
+  if (effectiveBudget === "agent") {
+    return engineHasNativeSubagents(engine) ? AGENT_PREFIX_ORCHESTRATE : AGENT_PREFIX_DIRECT;
+  }
+  return "";
+}
+
+/** Assemble the exact string an engine receives for a turn. Order (outermost
+ *  first): mode prefix (agent/ultracode) → plan → goal → per-call wirePrefix →
+ *  the user's typed text. For CODEX every AIOS prefix is dropped, so the wire
+ *  equals the typed text verbatim (thread titles stay clean). */
+export function composeWireMessage(input: {
+  display: string;
+  engine: string;
+  effectiveBudget: ContextBudgetMode;
+  goal?: string;
+  planMode?: boolean;
+  wirePrefix?: string;
+}): string {
+  const { display, engine, effectiveBudget } = input;
+  // Codex must get the typed message untouched — no plan/goal/agent framing AND
+  // no injected AIOS preambles (e.g. the "Relevant AIOS memory context:" block
+  // that rides `wirePrefix`) in the thread text. Codex titles the thread from
+  // this exact string, so it is the DISPLAY text verbatim. Every other engine
+  // keeps the wirePrefix + full mode-prefix stack.
+  if (engine === "codex") return display;
+  let wire = (input.wirePrefix ?? "") + display;
+  const goal = input.goal?.trim();
+  if (goal) wire = GOAL_PREFIX(goal) + wire;
+  if (input.planMode) wire = PLAN_PREFIX + wire;
+  const mode = modePrefixFor(engine, effectiveBudget);
+  if (mode) wire = mode + wire;
+  return wire;
+}
+
+export interface ModelEffortProfile {
+  supportedEfforts?: readonly string[];
+  defaultEffort?: string;
+}
+
+/** Resolve a model switch deterministically: its saved tier wins, then the
+ *  current tier, then its advertised default, then the first supported tier. */
+export function resolveModelEffort(
+  model: ModelEffortProfile,
+  currentEffort?: string | null,
+  savedEffort?: string | null,
+): string {
+  const supported = model.supportedEfforts?.length
+    ? model.supportedEfforts
+    : ["low", "medium", "high", "xhigh", "max", "ultra"];
+  if (savedEffort && supported.includes(savedEffort)) return savedEffort;
+  if (currentEffort && supported.includes(currentEffort)) return currentEffort;
+  if (model.defaultEffort && supported.includes(model.defaultEffort)) return model.defaultEffort;
+  return supported[0] ?? "medium";
+}
+
+/** Nearest discrete stop for a normalized pointer position. */
+export function nearestEffortIndex(progress: number, count: number): number {
+  if (count <= 1) return 0;
+  const clamped = Math.min(Math.max(progress, 0), 1);
+  return Math.round(clamped * (count - 1));
+}
+
+/** Keyboard semantics shared by the slider component and unit tests. */
+export function moveEffortIndex(index: number, key: string, count: number): number {
+  const last = Math.max(0, count - 1);
+  if (key === "Home") return 0;
+  if (key === "End") return last;
+  if (key === "ArrowRight" || key === "ArrowUp") return Math.min(last, index + 1);
+  if (key === "ArrowLeft" || key === "ArrowDown") return Math.max(0, index - 1);
+  return Math.min(Math.max(index, 0), last);
+}
+
 export interface ComposerSendContractInput {
   streaming: boolean;
   hasDraft: boolean;
@@ -317,23 +450,15 @@ export function sendContract(input: ComposerSendContractInput): ComposerSendCont
 }
 
 /**
- * The effort label to SHOW for the given engine. Codex's `ReasoningEffort` enum
- * tops out at `xhigh` — the backend (chat.rs codex_effort) silently folds
- * `max`/`ultracode` → `xhigh`. Showing the raw picker label would lie ("max"
- * when codex actually runs xhigh), so for codex we surface the effective cap as
- * `xhigh (max)` / `xhigh (ultracode)`. Claude accepts these tiers natively, so
- * it keeps its real label unchanged. Keep the source-of-truth fold here in sync
- * with codex_effort in chat.rs.
+ * Display label for the selected tier. Current codex models advertise their
+ * exact effort strings, including max/ultra, so the UI must not down-label them.
  */
 export function effortChipLabel(
   effortId: string,
   effortLabel: string,
   engine: string,
 ): string {
-  if (engine !== "codex") return effortLabel;
-  if (effortId === "max" || effortId === "ultracode") {
-    return `xhigh (${effortLabel})`;
-  }
+  if (engine === "codex" && effortId === "ultracode") return "ultra";
   return effortLabel;
 }
 

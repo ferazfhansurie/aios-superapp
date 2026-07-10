@@ -8,8 +8,8 @@
  * raw newline-delimited claude JSON events over a per-session `Channel<string>`;
  * ALL parsing + rendering happens here.
  *
- * Lifecycle: one Channel + one chat session per mount. `chatStart` on mount with
- * the selected model/permission, `chatSend` on submit, `chatStop` on unmount.
+ * Lifecycle: a blank pane stays process-free until its first send. Resume,
+ * reattach, and seeded panes start eagerly; `chatStop` tears down on unmount.
  *
  * Best-in-class layer (Codex / Claude-Desktop grade) added on top of the working
  * stream-json core — without disturbing it:
@@ -22,7 +22,7 @@
  *   7. `/` slash menu (clear / plan / model / help)
  *   8. `@` file-mention picker sourced from cwd
  */
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
@@ -58,9 +58,9 @@ import {
   chatDetach,
   chatReattach,
   chatSend,
+  chatSteer,
   chatSendRaw,
   chatSetTitle,
-  chatPrewarmCodex,
   chatStart,
   chatStop,
   webChatSend,
@@ -79,14 +79,22 @@ import {
 } from "../lib/chat";
 import { fileSrc, saveImageTemp } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
-import { idleRate, codexRate, resetIn } from "../lib/dashboard";
 import {
+  claudeRate,
+  idleRate,
+  codexRate,
+  resetIn,
+} from "../lib/dashboard";
+import {
+  composeWireMessage,
+  chatStreamFlushDelay,
   composerContextChips,
   describeModelSwitch,
   effortChipLabel,
   moveQueuedMessage,
   queueMessage,
   removeQueuedMessage,
+  resolveModelEffort,
   resumeTitle,
   shouldApplyResumeProp,
   stopStrategy,
@@ -97,6 +105,7 @@ import {
   type QueuedMessage,
 } from "../lib/chatPaneState";
 import { usagePaceRisk } from "../lib/usagePace";
+import { clearChatQueue, hydrateChatQueue, saveChatQueue } from "../lib/chatQueue";
 import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
 import {
   chatHandles,
@@ -116,9 +125,11 @@ import {
   parseRunEventState,
   reduceRunEvents,
   serializeRunEventState,
+  taskSnapshotRevision,
   type RunEventState,
 } from "../lib/runEvents";
 import {
+  coalesceChatStreamDeltas,
   finalizeStreamingTurns,
   reduceChatStreamEvent,
   type ChatTurn,
@@ -145,9 +156,16 @@ import {
 import {
   ChatCwdContext,
   ChatFileOpenContext,
+  ChatTaskIdContext,
   useChatFileOpener,
   type ChatFileOpener,
 } from "./chat/chatContext";
+import {
+  bindTaskSession,
+  ensureTaskWorkspace,
+  publishTaskSnapshot,
+  type TaskId,
+} from "../lib/taskWorkspace";
 import {
   artifactFromTool,
   tokensFromUsage,
@@ -161,8 +179,18 @@ import {
 import { CopyButton, Markdown, parseButtons } from "./chat/ChatMarkdown";
 import { ApprovalCard, QuestionCard } from "./chat/ApprovalCards";
 import { ModelIcon } from "./chat/modelIcons";
-import { FleetView } from "./chat/FleetView";
+import { TaskActivity } from "./chat/TaskActivity";
+import { ConversationRail } from "./chat/ConversationRail";
+import { TaskSummary, type TaskSource } from "./chat/TaskSummary";
 import { emptyFleetState, reduceFleet, type FleetState } from "../lib/subagentFleet";
+import {
+  canStartNormalSend,
+  canSteer,
+  initialChatRunLifecycle,
+  reduceChatRunLifecycle,
+  type ChatRunLifecycle,
+  type ChatRunLifecycleEvent,
+} from "../lib/chatRunLifecycle";
 import { PaneDropZone } from "./PaneDropZone";
 import { reportDiag } from "../lib/diag";
 import { pushNotification } from "../lib/notifications";
@@ -186,11 +214,11 @@ import {
  * stdin — verified against claude 2.1.170, the line is folded into the SAME
  * running turn; codex fires `turn/steer` (text-only). Rejects (no live turn /
  * unsupported engine / codex+images) → caller falls back to the queue.
- * lib/chat.ts's `chatSteer` wrapper is owned by another track and still
- * text-only, so the command is invoked directly here for the image arg.
+ * The wrapper carries the renderer run id so stale steers cannot target a newer
+ * backend turn after stop/retry races.
  */
-const steerTurn = (id: number, text: string, imagePaths?: string[]) =>
-  invoke<void>("chat_steer", { sessionId: id, text, imagePaths: imagePaths ?? null });
+const steerTurn = (id: number, text: string, runId: string, imagePaths?: string[]) =>
+  chatSteer(id, text, runId, imagePaths);
 
 type Turn = ChatTurn;
 
@@ -282,6 +310,15 @@ function useDebouncedPersist<T>(
     [],
   );
 }
+
+/** Keep derived rail/task projections referentially stable when a stream token
+ * changes only the live assistant text. This lets memoized side surfaces skip
+ * the transcript's 20fps update cadence. */
+function useStableProjection<T>(value: T, signature: string): T {
+  const ref = useRef({ signature, value });
+  if (ref.current.signature !== signature) ref.current = { signature, value };
+  return ref.current.value;
+}
 type ChatUsageRate = Awaited<ReturnType<typeof codexRate>>;
 type UsageWin = { pct: number | null; resetsAt: number | null };
 type UsageSnapshot = { fiveHour: UsageWin; sevenDay: UsageWin };
@@ -321,7 +358,10 @@ function hasUsageData(snapshot: UsageSnapshot | null): snapshot is UsageSnapshot
 }
 
 function normalizeUsage(
-  raw: Awaited<ReturnType<typeof idleRate>> | ChatUsageRate,
+  raw:
+    | Awaited<ReturnType<typeof idleRate>>
+    | Awaited<ReturnType<typeof claudeRate>>
+    | ChatUsageRate,
   provider: string,
   model: ChatModel,
 ): UsageSnapshot {
@@ -347,18 +387,10 @@ interface ImageChip {
 let _imgSeq = 0;
 // (WAVEFORM_BARS / WAVE_KEYFRAMES moved into Composer.)
 
-// instruction prefixes for the composer modes
-const PLAN_PREFIX =
-  "Plan first: lay out a concise step-by-step plan and wait for my go-ahead before writing any code or running mutating commands.\n\n";
-const GOAL_PREFIX = (goal: string) =>
-  `Ongoing goal (keep pursuing this across turns until I say it's done): ${goal}\n\n`;
-const AGENT_PREFIX =
-  "Agent mode is ON. For any task with 2+ independent tracks, use available multi-agent/subagent tooling instead of doing all work serially in the main thread. In Codex, do not spawn AIOS shell worker panes by default; use native subagent/multi-agent tools when available, and only create a visible `aios-agent` worker pane when Firaz explicitly asks to open one. Keep each spawned agent's purpose specific so the chatpane can show what it is doing.\n\n";
-// ultracode = xhigh effort + workflows. Headless `claude -p` has no ultracode
-// flag, so we run xhigh and replicate the "workflows" half with this directive:
-// orchestrate, fan out, verify — be maximally thorough.
-const ULTRA_PREFIX =
-  "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel sub-agents. Claude should use the Task tool; Codex should use native subagent/multi-agent tools when available, not AIOS shell worker panes unless Firaz explicitly asks to open visible workers. Then adversarially verify findings before concluding. Prefer orchestrated multi-agent execution over a single pass; only handle trivially small tasks inline.\n\n";
+// Composer-mode wire prefixes (plan / goal / agent / ultracode) + the
+// codex-verbatim rule now live in chatPaneState.composeWireMessage — a pure,
+// tested function. dispatch() calls it so codex threads never inherit AIOS UX
+// framing in their (title-defining) first user message.
 
 // (CONTEXT_BUDGETS moved into Composer.)
 
@@ -435,6 +467,7 @@ export function ChatPane({
   reattach,
   modelId,
   agentLabel,
+  taskId,
   onOpenUrl,
   onChatSession,
 }: {
@@ -450,6 +483,8 @@ export function ChatPane({
   seed?: string;
   modelId?: string;
   agentLabel?: string;
+  /** Durable UI task ownership from the App pane model. */
+  taskId?: TaskId;
   workspaceContext?: ChatWorkspaceContext;
   /** Resume a prior chat session on mount (from the idle "continue" rail).
    *  engine/model carry the saved session's backend so a resumed codex thread
@@ -460,7 +495,7 @@ export function ChatPane({
    *  "running" tray) — replays its buffer and continues live instead of spawning. */
   reattach?: number;
   /** Open an http(s) link from rendered markdown in an in-app browser pane. */
-  onOpenUrl?: (url: string) => void;
+  onOpenUrl?: (url: string, ctx?: { taskId?: TaskId }) => void;
   /** Reports the LIVE chat session id (+ title/engine/model) up to the owning
    *  pane so it can be recorded into pane history WITH a resume handle. Without
    *  this, reopening a chat from history spawns a FRESH pane instead of
@@ -469,6 +504,10 @@ export function ChatPane({
 }) {
   const nativeRuntime = useMemo(() => isTauriRuntime(), []);
   const webChatRuntime = !nativeRuntime;
+  const onTaskOpenUrl = useCallback(
+    (url: string) => onOpenUrl?.(url, taskId ? { taskId } : {}),
+    [onOpenUrl, taskId],
+  );
   const [turns, setTurns] = useState<Turn[]>([]);
   const turnsRef = useRef<Turn[]>([]);
   turnsRef.current = turns;
@@ -532,6 +571,57 @@ export function ChatPane({
 
   const [streaming, setStreaming] = useState(false);
   const [backendBusy, setBackendBusy] = useState(false);
+  // Visual streaming is kept for transcript rendering; lifecycle is the source
+  // of truth for whether sends, steers, and stops are legal.
+  const [runLifecycle, setRunLifecycle] = useState<ChatRunLifecycle>(() =>
+    initialChatRunLifecycle(),
+  );
+  const runLifecycleRef = useRef<ChatRunLifecycle>(initialChatRunLifecycle());
+  const transitionRunLifecycle = useCallback((event: ChatRunLifecycleEvent): ChatRunLifecycle => {
+    const next = reduceChatRunLifecycle(runLifecycleRef.current, event);
+    if (next === runLifecycleRef.current) return next;
+    runLifecycleRef.current = next;
+    setRunLifecycle(next);
+    if (next.phase === "starting" || next.phase === "running") {
+      setStreaming(true);
+      setBackendBusy(true);
+    } else if (
+      next.phase === "completed" ||
+      next.phase === "failed" ||
+      next.phase === "interrupted" ||
+      next.phase === "exited"
+    ) {
+      setStreaming(false);
+      setBackendBusy(false);
+    }
+    return next;
+  }, []);
+  const beginRun = useCallback((): string => {
+    const next = transitionRunLifecycle({ type: "starting" });
+    if (next.phase !== "starting") {
+      throw new Error("chat run could not start from its current lifecycle state");
+    }
+    return next.runId;
+  }, [transitionRunLifecycle]);
+  const adoptBackendRun = useCallback((runId: string) => {
+    const current = runLifecycleRef.current;
+    // Normal sends mint their own id before chat_send, so their echoed starting
+    // frame is a duplicate. This branch exists for a reattached busy session,
+    // whose buffered backend lifecycle arrives before this pane has local state.
+    if (!canStartNormalSend(current)) return;
+    const next: ChatRunLifecycle = { phase: "starting", runId };
+    runLifecycleRef.current = next;
+    setRunLifecycle(next);
+    setStreaming(true);
+    setBackendBusy(true);
+  }, []);
+  const resetRunLifecycle = useCallback(() => {
+    const next = initialChatRunLifecycle();
+    runLifecycleRef.current = next;
+    setRunLifecycle(next);
+    setStreaming(false);
+    setBackendBusy(false);
+  }, []);
   const [started, setStarted] = useState(false);
   // claude's init event arrived (session_id known) — gates the seed auto-send
   // claudeReady is still tracked (init-event signal) but no longer gates the
@@ -556,10 +646,35 @@ export function ChatPane({
     return CHAT_MODELS.find((m) => m.id === preferred) ?? CHAT_MODELS[0];
   });
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
-  const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(EFFORTS[1]);
+  const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(() => {
+    const settings = loadSettings();
+    const id = resolveModelEffort(
+      model,
+      null,
+      settings.chatEffortByModel?.[model.id] ?? null,
+    );
+    return EFFORTS.find((option) => option.id === id) ?? EFFORTS[1];
+  });
   const [contextBudget, setContextBudget] = useState<ContextBudgetMode>("agent");
   const effectiveBudget: ContextBudgetMode =
     contextBudget === "ultracode" || effort.ultra ? "ultracode" : contextBudget;
+  // "ultracode" is an AIOS workflow preset, while "ultra" is a real Codex
+  // reasoning value. Claude keeps the legacy xhigh wire mapping; Codex gets the
+  // exact effort advertised by the selected model.
+  const runtimeEffort =
+    effectiveBudget === "ultracode" && (model.engine ?? "claude") !== "codex"
+      ? "xhigh"
+      : effort.id;
+  useEffect(() => {
+    const settings = loadSettings();
+    if (settings.chatEffortByModel?.[model.id] === effort.id) return;
+    saveSettings({
+      chatEffortByModel: {
+        ...settings.chatEffortByModel,
+        [model.id]: effort.id,
+      },
+    });
+  }, [model.id, effort.id]);
   // running context size (prompt tokens of the latest turn) → composer indicator
   const [ctxTokens, setCtxTokens] = useState<number | null>(null);
   const activeModelRef = useRef(model);
@@ -574,6 +689,7 @@ export function ChatPane({
   type UsageWindow = keyof UsageSnapshot;
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
   const [usageWindow, setUsageWindow] = useState<UsageWindow>("fiveHour");
+  const [claudeIdentityLabel, setClaudeIdentityLabel] = useState<string | null>(null);
   // Snapshot each provider the first time it appears in this chat. The strip
   // paints that baseline separately from usage added while this pane is alive.
   const usageBaselineRef = useRef<Record<string, UsageSnapshot>>({});
@@ -583,18 +699,80 @@ export function ChatPane({
     }
     setUsage(next);
   }, []);
+
   // cumulative $ spent this chat session (summed across result events).
 
   // ── message queue / steering (Phase 2) ─────────────────────────────────────
   // Type-ahead while a turn is in flight: submitting queues the message instead
   // of dropping it; queued messages fire one-by-one as each turn completes
   // (codex-style). Held in a ref too so the flush effect reads the latest list.
+  const queueStorageKey = paneKey ?? null;
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [queuedIdx, setQueuedIdx] = useState(0);
+  const [taskSummaryOpen, setTaskSummaryOpen] = useState(true);
+  // `undefined` means the current pane has not finished loading yet; `null`
+  // means an intentionally unkeyed, memory-only composer.
+  const [hydratedQueuePaneKey, setHydratedQueuePaneKey] = useState<string | null | undefined>(undefined);
   const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
   const [editingQueuedText, setEditingQueuedText] = useState("");
   const queuedRef = useRef<QueuedMessage[]>([]);
+  const queuedIdxRef = useRef(0);
+  const queueHydrationIdRef = useRef(0);
   queuedRef.current = queued;
+  queuedIdxRef.current = queuedIdx;
+  const setQueuedSelection = useCallback((next: SetStateAction<number>) => {
+    setQueuedIdx((current) => {
+      const resolved = typeof next === "function" ? next(current) : next;
+      queuedIdxRef.current = resolved;
+      return resolved;
+    });
+  }, []);
+
+  // Queue work belongs to this pane's durable task surface, rather than an
+  // ephemeral backend process. A restart or reattach therefore keeps the next
+  // instructions in order; `/clear` intentionally removes them below.
+  useLayoutEffect(() => {
+    const queueHydrationId = ++queueHydrationIdRef.current;
+    setHydratedQueuePaneKey(undefined);
+    // Pins contain base64 in renderer memory. They belong only to the pane that
+    // created them; never retain them across a pane switch or fresh hydration.
+    pinnedImagesRef.current.clear();
+    const hydrated =
+      queueStorageKey && typeof localStorage !== "undefined"
+        ? hydrateChatQueue(localStorage, queueStorageKey)
+        : { queue: null, droppedMessages: 0, droppedImages: 0 };
+    // A pane switch may win while this component is reconciling. Never apply
+    // that older pane's snapshot after its key has changed.
+    if (queueHydrationIdRef.current !== queueHydrationId) return;
+    const items = hydrated.queue?.items ?? [];
+    const selected = hydrated.queue?.selected ?? 0;
+    queuedRef.current = items;
+    queuedIdxRef.current = selected;
+    setQueued(items);
+    setQueuedIdx(selected);
+    setEditingQueuedId(null);
+    setEditingQueuedText("");
+    if (hydrated.droppedMessages > 0) {
+      const messageWord = hydrated.droppedMessages === 1 ? "message" : "messages";
+      const imageWord = hydrated.droppedImages === 1 ? "image" : "images";
+      setTurns((prev) => [
+        ...prev,
+        {
+          kind: "result",
+          id: uid(),
+          text: `${hydrated.droppedMessages} queued ${messageWord} were not sent because ${hydrated.droppedImages} temporary pasted ${imageWord} could not be recovered after restart. reattach the image and send again.`,
+        },
+      ]);
+    }
+    setHydratedQueuePaneKey(queueStorageKey);
+  }, [queueStorageKey]);
+
+  useEffect(() => {
+    if (hydratedQueuePaneKey !== queueStorageKey) return;
+    if (!queueStorageKey) return;
+    if (typeof localStorage === "undefined") return;
+    saveChatQueue(localStorage, queueStorageKey, { items: queued, selected: queuedIdx });
+  }, [hydratedQueuePaneKey, queueStorageKey, queued, queuedIdx]);
 
   // mode chips
   const [planMode, setPlanMode] = useState(false);
@@ -617,7 +795,7 @@ export function ChatPane({
   // (auto-memory search effect moved into Composer — it's driven by `input`.)
 
   // open-dropdown tracking (single source so only one is open)
-  const [openMenu, setOpenMenu] = useState<null | "model" | "perm" | "effort" | "advanced">(
+  const [openMenu, setOpenMenu] = useState<null | "add" | "model" | "perm" | "effort" | "advanced">(
     null,
   );
 
@@ -690,6 +868,22 @@ export function ChatPane({
   }, [openSessionId, resumedTitle, reportChatSession]);
 
   const sessionIdRef = useRef<number | null>(null);
+  // Blank panes are intentionally cheap: opening a chat surface must not spawn a
+  // claude/codex process until the user actually sends something. The ref makes
+  // repeated submits in the same render frame idempotent; the state wakes the
+  // lifecycle effect exactly once. Resume/reattach/seed paths remain eager.
+  const [sessionStartRequested, setSessionStartRequested] = useState(false);
+  const sessionStartRequestedRef = useRef(false);
+  const requestSessionStart = useCallback(() => {
+    if (sessionIdRef.current != null || sessionStartRequestedRef.current) return;
+    sessionStartRequestedRef.current = true;
+    setSessionStartRequested(true);
+  }, []);
+  const eagerSessionStart = Boolean(seed) || resumeId != null || reattach != null || webChatRuntime;
+  // Composer's `started` contract means "submit is allowed", not strictly "a
+  // process exists". A dormant blank pane is ready to submit; once first send
+  // requests startup, the composer switches to its existing starting state.
+  const composerSessionReady = started || (!sessionStartRequested && !eagerSessionStart);
   useEffect(() => {
     const onAgentSpawned = (event: Event) => {
       const detail = (event as CustomEvent<Record<string, unknown>>).detail ?? {};
@@ -717,9 +911,10 @@ export function ChatPane({
     return () => window.removeEventListener("chat-agent-spawned", onAgentSpawned);
   }, []);
   const webAbortRef = useRef<AbortController | null>(null);
-  // live mirror of `streaming` for the close-handle closure (a turn in flight).
+  // Lifecycle, not visual streaming, is the live authority for close/send/steer.
   const activeRunRef = useRef(false);
-  activeRunRef.current = streaming || backendBusy;
+  const lifecycle = runLifecycleRef.current;
+  activeRunRef.current = !canStartNormalSend(lifecycle);
   // set true when the pane is intentionally detached (kept running) — tells the
   // unmount cleanup NOT to kill the claude process.
   const detachedRef = useRef(false);
@@ -750,6 +945,7 @@ export function ChatPane({
   // markdown re-parses, and layout reads regardless of how fast the model emits.
   const pendingDeltasRef = useRef<ChatEvent[]>([]);
   const rafRef = useRef<number | null>(null);
+  const hiddenFlushTimerRef = useRef<number | null>(null);
   // last user prompt text actually sent to claude (for regenerate)
   const lastSentRef = useRef<string | null>(null);
   const stopChatRef = useRef<() => void>(() => {});
@@ -814,7 +1010,10 @@ export function ChatPane({
 
   const empty = turns.length === 0;
   const usageProvider = usageProviderKey(model);
-  const usageLabel = usageProviderLabel(model);
+  const usageLabel =
+    usageProvider === "claude" && claudeIdentityLabel
+      ? `claude · ${claudeIdentityLabel}`
+      : usageProviderLabel(model);
 
   // ── voice dictation bridge (P0) ────────────────────────────────────────────
   // App registers each pane's writer here; ⌘J dictation pushes text to the
@@ -1114,6 +1313,34 @@ export function ChatPane({
   // below wraps this to coalesce high-frequency deltas; everything else flushes
   // the buffer first (to preserve order) then applies synchronously here.
   const applyEvent = useCallback((ev: ChatEvent) => {
+    if (ev.type === "aios_run") {
+      const state = ev.state;
+      const runId = ev.runId;
+      if (state === "starting" && runId) {
+        adoptBackendRun(runId);
+      } else if (
+        runId &&
+        (state === "running" ||
+          state === "interrupting" ||
+          state === "completed" ||
+          state === "failed" ||
+          state === "interrupted" ||
+          state === "exited")
+      ) {
+        const next = transitionRunLifecycle({ type: state, runId });
+        if (
+          next.runId === runId &&
+          (state === "completed" ||
+            state === "failed" ||
+            state === "interrupted" ||
+            state === "exited")
+        ) {
+          turnStartRef.current = null;
+          setLiveStart(null);
+        }
+      }
+      return;
+    }
     setRunEventState((state) => reduceRunEvents(state, ev));
     setFleetState((state) => reduceFleet(state, ev));
     // ---- control protocol: tool approval requests + acks --------------------
@@ -1206,8 +1433,10 @@ export function ChatPane({
         });
         streamingTurnId.current = null;
         thinkingTurnId.current = null;
-        setStreaming(false);
-        setBackendBusy(false);
+        // Keep the run live until its tagged `aios_run` terminal frame arrives.
+        // A result is transcript content, not authority to unlock the composer:
+        // the adjacent lifecycle frame protects us from late-result stop/steer
+        // races and from a previous run settling a newer one.
         // prefer claude's reported duration; fall back to our wall-clock measure
         const wall =
           turnStartRef.current != null ? Date.now() - turnStartRef.current : undefined;
@@ -1259,8 +1488,7 @@ export function ChatPane({
           claudeSessionIdRef.current = null;
           setOpenSessionId(null);
           setResumedTitle(null);
-          setStreaming(false);
-          setBackendBusy(false);
+          resetRunLifecycle();
           setStarted(false);
           setClaudeReady(false);
           streamingTurnId.current = null;
@@ -1277,6 +1505,8 @@ export function ChatPane({
           // re-runs the session effect. If another recovery path already nulled
           // it, bump restartKey so the pane cannot stay in "started but no
           // sessionId" limbo where sends only enqueue and clear the composer.
+          sessionStartRequestedRef.current = true;
+          setSessionStartRequested(true);
           if (resumeIdRef.current == null) setRestartKey((k) => k + 1);
           setResumeId(null);
         }
@@ -1294,8 +1524,6 @@ export function ChatPane({
         }
         turnStartRef.current = null;
         setLiveStart(null);
-        setStreaming(false);
-        setBackendBusy(false);
         return;
       }
 
@@ -1352,18 +1580,22 @@ export function ChatPane({
       default:
         return;
     }
-  }, [rememberUsage]);
+  }, [rememberUsage, transitionRunLifecycle, adoptBackendRun, resetRunLifecycle]);
 
   // Apply all buffered stream deltas in ONE pass: a single setRunEventState fold
   // and a single setTurns fold (threading the streaming/thinking ids through),
   // so N tokens cost one render instead of N. Safe to call anytime; no-op when
-  // the buffer is empty. Cancels any pending rAF.
+  // the buffer is empty. Cancels any pending visible/background scheduler.
   const flushPending = useCallback(() => {
     if (rafRef.current != null) {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     }
-    const evs = pendingDeltasRef.current;
+    if (hiddenFlushTimerRef.current != null) {
+      window.clearTimeout(hiddenFlushTimerRef.current);
+      hiddenFlushTimerRef.current = null;
+    }
+    const evs = coalesceChatStreamDeltas(pendingDeltasRef.current);
     if (evs.length === 0) return;
     pendingDeltasRef.current = [];
     setRunEventState((state) => evs.reduce((s, e) => reduceRunEvents(s, e), state));
@@ -1398,11 +1630,19 @@ export function ChatPane({
       // IN ORDER, so flush the buffer first then handle it synchronously.
       if (isCoalescableDelta(ev)) {
         pendingDeltasRef.current.push(ev);
-        if (rafRef.current == null) {
-          rafRef.current = requestAnimationFrame(() => {
-            rafRef.current = null;
-            flushPending();
-          });
+        if (rafRef.current == null && hiddenFlushTimerRef.current == null) {
+          const backgroundDelay = chatStreamFlushDelay(hiddenRef.current);
+          if (backgroundDelay != null) {
+            hiddenFlushTimerRef.current = window.setTimeout(() => {
+              hiddenFlushTimerRef.current = null;
+              flushPending();
+            }, backgroundDelay);
+          } else {
+            rafRef.current = requestAnimationFrame(() => {
+              rafRef.current = null;
+              flushPending();
+            });
+          }
         }
         return;
       }
@@ -1412,13 +1652,23 @@ export function ChatPane({
     [applyEvent, flushPending],
   );
 
-  // cancel any in-flight rAF on unmount so a buffered flush never fires a
-  // setState into an unmounted component.
+  // A pane brought back to the foreground should reveal everything it buffered
+  // immediately instead of waiting for the background cadence to elapse.
+  useEffect(() => {
+    if (!(hidden ?? false)) flushPending();
+  }, [flushPending, hidden]);
+
+  // cancel either scheduler on unmount so a buffered flush never fires a state
+  // update into an unmounted component.
   useEffect(
     () => () => {
       if (rafRef.current != null) {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
+      }
+      if (hiddenFlushTimerRef.current != null) {
+        window.clearTimeout(hiddenFlushTimerRef.current);
+        hiddenFlushTimerRef.current = null;
       }
     },
     [],
@@ -1453,6 +1703,10 @@ export function ChatPane({
 
   useEffect(() => {
     let disposed = false;
+    // A genuinely blank pane owns no backend process. First send flips
+    // sessionStartRequested; resume, reattach, seed, and web-runtime paths keep
+    // their existing eager behavior.
+    if (!sessionStartRequested && !eagerSessionStart) return;
     // The resync's setModel re-fired this effect. The previous cleanup already
     // skipped teardown (skipResyncTeardownRef), the session is live + bound — so
     // this run must NOT re-reattach (double buffer replay) nor spawn. No-op.
@@ -1501,15 +1755,15 @@ export function ChatPane({
             busy: info.busy,
             engine: info.engine,
             model: info.model,
+            runId: info.run_id,
+            runState: info.run_state,
           }))
         : chatStart(chan, {
             engine: model.engine ?? "claude",
             cwd: cwd ?? null,
             model: model.disabled ? null : model.id,
             permissionMode: permission.id,
-            // ultracode isn't a real --effort value; run it as xhigh (the
-            // "+ workflows" half is applied per-message via ULTRA_PREFIX).
-            effort: effectiveBudget === "ultracode" ? "xhigh" : effort.id,
+            effort: runtimeEffort,
             fast: false,
             resume: resumeId,
             // route claude turns through the Headroom compression proxy when
@@ -1525,10 +1779,12 @@ export function ChatPane({
             busy: false,
             engine: null as string | null,
             model: null as string | null,
+            runId: null as string | null,
+            runState: null as string | null,
           }));
 
     startup
-      .then(({ id, busy, engine: liveEngine, model: liveModel }) => {
+      .then(({ id, busy, engine: liveEngine, model: liveModel, runId, runState }) => {
         if (disposed) {
           // only kill a freshly-spawned session we're abandoning; never a reattach.
           if (reattach == null) chatStop(id).catch((e) => reportDiag("chat.stop", e, { action: "stop" }));
@@ -1557,6 +1813,18 @@ export function ChatPane({
         // and focus it, or reattach it if its pane was closed.
         if (paneKey && id != null) chatSessions.set(paneKey, id);
         setBackendBusy(busy);
+        if (busy && runId) {
+          // A detached run's opening lifecycle frame may have been evicted from
+          // replay. Seed from the atomic backend snapshot before enabling any
+          // composer action, then advance it to its captured live phase.
+          adoptBackendRun(runId);
+          if (runState === "running" || runState === "interrupting") {
+            transitionRunLifecycle({ type: "running", runId });
+          }
+          if (runState === "interrupting") {
+            transitionRunLifecycle({ type: "interrupting", runId });
+          }
+        }
         if (busy && turnStartRef.current == null) {
           const t0 = Date.now();
           turnStartRef.current = t0;
@@ -1566,6 +1834,8 @@ export function ChatPane({
       })
       .catch((err) => {
         if (!disposed) {
+          sessionStartRequestedRef.current = false;
+          setSessionStartRequested(false);
           setTurns((prev) => [
             ...prev,
             { kind: "result", id: uid(), text: `failed to start: ${err}` },
@@ -1594,22 +1864,7 @@ export function ChatPane({
     };
     // model/permission/effort/resumeId are captured at start; changing them restarts the session
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model.id, permission.id, effort.id, effectiveBudget, cwd, restartKey, resumeId, reattach, webChatRuntime, paneKey]);
-
-  // Keep one spare full-tool codex app-server warm for the same profile. The
-  // current pane still owns its live session; this prepares the next matching
-  // gpt pane so first send does not pay app-server/tool initialization.
-  useEffect(() => {
-    if (!started || webChatRuntime || reattach != null) return;
-    if ((model.engine ?? "claude") !== "codex" || model.disabled) return;
-    chatPrewarmCodex({
-      cwd: cwd ?? null,
-      model: model.id,
-      permissionMode: permission.id,
-      effort: effectiveBudget === "ultracode" ? "xhigh" : effort.id,
-      fast: false,
-    }).catch((e) => reportDiag("chat.prewarm", e, { action: "codex-prewarm", model: model.id }));
-  }, [started, webChatRuntime, reattach, model.engine, model.disabled, model.id, cwd, permission.id, effectiveBudget, effort.id, reportDiag]);
+  }, [model.id, permission.id, effort.id, effectiveBudget, runtimeEffort, cwd, restartKey, resumeId, reattach, webChatRuntime, paneKey, sessionStartRequested, eagerSessionStart, adoptBackendRun, transitionRunLifecycle]);
 
   // Publish a close-handle so App can detach (keep running) vs kill a busy chat.
   useEffect(() => {
@@ -1638,9 +1893,12 @@ export function ChatPane({
     let alive = true;
     const provider = usageProviderKey(model);
     const label = model.engine ?? "claude";
-    const fn = label === "codex" ? codexRate : idleRate;
+    const fn = label === "codex" ? codexRate : label === "claude" ? claudeRate : idleRate;
     fn()
       .then((r) => {
+        if (label === "claude" && "label" in r) {
+          setClaudeIdentityLabel(r.label ?? null);
+        }
         const next = normalizeUsage(r, provider, model);
         if (alive && hasUsageData(next)) {
           rememberUsage(provider, next);
@@ -1652,7 +1910,9 @@ export function ChatPane({
     };
   }, [model.engine, model.id, rememberUsage]);
 
-  // Queue flush: when a turn finishes (streaming → false) and messages are
+
+  // Queue flush: only an authoritative terminal lifecycle state drains queued
+  // work. A stop request remains interrupting until the engine confirms it.
   // queued, fire the next one. Routed through refs so this effect isn't a dep of
   // the (changing) dispatch/sendText closures. One per turn → the queue drains
   // in order — ChatGPT-style "stack the next message while one streams".
@@ -1664,15 +1924,18 @@ export function ChatPane({
   // the follow-up landed without any of that context.
   const flushSendRef = useRef<(text: string, images?: string[]) => void>(() => {});
   useEffect(() => {
-    if (streaming) return;
+    // On a pane switch, the old queue must never flush before the new pane's
+    // keyed snapshot has replaced it.
+    if (hydratedQueuePaneKey !== queueStorageKey) return;
+    if (!canStartNormalSend(runLifecycle)) return;
     if (!started) return;
     if (queuedRef.current.length === 0) return;
     if (sessionIdRef.current == null) return;
     const [next, ...rest] = queuedRef.current;
     setQueued(rest);
-    setQueuedIdx((idx) => (rest.length === 0 ? 0 : Math.min(idx, rest.length - 1)));
+    setQueuedSelection((idx) => (rest.length === 0 ? 0 : Math.min(idx, rest.length - 1)));
     flushSendRef.current(next.text, next.images);
-  }, [streaming, started]);
+  }, [hydratedQueuePaneKey, queueStorageKey, runLifecycle, started, setQueuedSelection]);
 
   // autoscroll on new content — but with a STICKY pause. The moment you scroll
   // up (wheel, scrollbar, touch) we stop yanking you down and hold there until
@@ -1852,11 +2115,19 @@ export function ChatPane({
       // it. Repeating any preamble every turn is context bloat (and re-inflates
       // resumed codex threads). Session identity belongs in CLAUDE.md / AGENTS.md,
       // read once via cwd by each engine — not stapled to every user message.
-      let wire = (opts?.wirePrefix ?? "") + display;
-      if (goal.trim()) wire = GOAL_PREFIX(goal.trim()) + wire;
-      if (planMode) wire = PLAN_PREFIX + wire;
-      if (effectiveBudget === "ultracode") wire = ULTRA_PREFIX + wire;
-      else if (effectiveBudget === "agent") wire = AGENT_PREFIX + wire;
+      const engine = model.engine ?? "claude";
+      // codex gets the typed text verbatim (see composeWireMessage) — its first
+      // user turn defines the shared ~/.codex thread title, so no plan/goal/
+      // agent/ultracode/memory framing may leak into it. every other engine
+      // keeps the full prefix stack.
+      const wire = composeWireMessage({
+        display,
+        engine,
+        effectiveBudget,
+        goal,
+        planMode,
+        wirePrefix: opts?.wirePrefix,
+      });
       lastSentRef.current = display;
       // feed the autocomplete history (dedup, newest first, capped).
       if (display.trim()) {
@@ -1874,8 +2145,7 @@ export function ChatPane({
           { kind: "user", id: uid(), text: display, images: opts?.imagePaths },
         ]);
       }
-      setStreaming(true);
-      setBackendBusy(true);
+      const runId = beginRun();
       // a fresh turn starts with no sub-agents — clear any fleet left over from
       // the previous turn so completed chips don't linger into a new ask.
       setFleetState(emptyFleetState());
@@ -1888,6 +2158,7 @@ export function ChatPane({
       // plan-mode is a per-message instruction; clear it after firing
       if (planMode) setPlanMode(false);
       if (webChatRuntime) {
+        transitionRunLifecycle({ type: "running", runId });
         webAbortRef.current?.abort();
         const controller = new AbortController();
         webAbortRef.current = controller;
@@ -1917,6 +2188,7 @@ export function ChatPane({
               duration_ms: Date.now() - t0,
               usage: reply.usage,
             });
+            transitionRunLifecycle({ type: "completed", runId });
           })
           .catch((err) => {
             if (controller.signal.aborted) return;
@@ -1924,21 +2196,19 @@ export function ChatPane({
               ...prev,
               { kind: "result", id: uid(), text: `send failed: ${err}` },
             ]);
-            setStreaming(false);
-            setBackendBusy(false);
+            transitionRunLifecycle({ type: "failed", runId });
           })
           .finally(() => {
             if (webAbortRef.current === controller) webAbortRef.current = null;
           });
         return;
       }
-      chatSend(id, wire, opts?.imagePaths).catch((err) => {
+      chatSend(id, wire, runId, opts?.imagePaths).catch((err) => {
         setTurns((prev) => [
           ...prev,
           { kind: "result", id: uid(), text: `send failed: ${err}` },
         ]);
-        setStreaming(false);
-        setBackendBusy(false);
+        transitionRunLifecycle({ type: "failed", runId });
       });
     },
     [
@@ -1952,6 +2222,8 @@ export function ChatPane({
       model.id,
       model.disabled,
       handleEvent,
+      beginRun,
+      transitionRunLifecycle,
     ],
   );
   // keep the flush effect calling the latest dispatch closure
@@ -2010,7 +2282,7 @@ export function ChatPane({
     if (images?.length) pinQueuedImages(images);
     setQueued((items) => {
       const next = queueMessage(items, raw, images);
-      setQueuedIdx(next.selected);
+      setQueuedSelection(next.selected);
       return next.items;
     });
     setInput("");
@@ -2021,15 +2293,15 @@ export function ChatPane({
     const gone = queuedRef.current.find((q) => q.id === id);
     gone?.images?.forEach((path) => pinnedImagesRef.current.delete(path));
     setQueued((items) => {
-      const next = removeQueuedMessage({ items, selected: queuedIdx }, id);
-      setQueuedIdx(next.selected);
+      const next = removeQueuedMessage({ items, selected: queuedIdxRef.current }, id);
+      setQueuedSelection(next.selected);
       return next.items;
     });
     if (editingQueuedId === id) {
       setEditingQueuedId(null);
       setEditingQueuedText("");
     }
-  }, [queuedIdx, editingQueuedId]);
+  }, [editingQueuedId, setQueuedSelection]);
 
   const editQueued = useCallback((item: QueuedMessage) => {
     setEditingQueuedId(item.id);
@@ -2041,24 +2313,24 @@ export function ChatPane({
     if (!id) return;
     setQueued((items) => {
       const next = updateQueuedMessage(
-        { items, selected: queuedIdx },
+        { items, selected: queuedIdxRef.current },
         id,
         editingQueuedText,
       );
-      setQueuedIdx(next.selected);
+      setQueuedSelection(next.selected);
       return next.items;
     });
     setEditingQueuedId(null);
     setEditingQueuedText("");
-  }, [editingQueuedId, editingQueuedText, queuedIdx]);
+  }, [editingQueuedId, editingQueuedText, setQueuedSelection]);
 
   const moveQueued = useCallback((id: string, delta: number) => {
     setQueued((items) => {
-      const next = moveQueuedMessage({ items, selected: queuedIdx }, id, delta);
-      setQueuedIdx(next.selected);
+      const next = moveQueuedMessage({ items, selected: queuedIdxRef.current }, id, delta);
+      setQueuedSelection(next.selected);
       return next.items;
     });
-  }, [queuedIdx]);
+  }, [setQueuedSelection]);
 
   // Explicitly inject one highlighted pending message into the live turn.
   // claude steers over stdin (images ride as real content blocks); codex steers
@@ -2071,11 +2343,12 @@ export function ChatPane({
       if (!item || (engine !== "codex" && engine !== "claude")) return;
       if (engine === "codex" && item.images?.length) return;
       const id = sessionIdRef.current;
-      if (id == null) return;
+      const lifecycle = runLifecycleRef.current;
+      if (id == null || !canSteer(lifecycle) || lifecycle.phase !== "running") return;
       void (async () => {
         try {
           if (item.images?.length) await restorePinnedImages(item.images);
-          await steerTurn(id, item.text, item.images);
+          await steerTurn(id, item.text, lifecycle.runId, item.images);
           removeQueued(queuedId);
           const bubble =
             item.text ||
@@ -2154,13 +2427,16 @@ export function ChatPane({
       if (activeRunRef.current) {
         const engine = model.engine ?? "claude";
         const sid = sessionIdRef.current;
+        const lifecycle = runLifecycleRef.current;
         const steerable =
           sid != null &&
           !webChatRuntime &&
+          canSteer(lifecycle) &&
+          lifecycle.phase === "running" &&
           (engine === "claude" || (engine === "codex" && imgPaths.length === 0));
         if (steerable) {
           try {
-            await steerTurn(sid, text, imgPaths.length ? imgPaths : undefined);
+            await steerTurn(sid, text, lifecycle.runId, imgPaths.length ? imgPaths : undefined);
             const bubble =
               text || `[${imgPaths.length} image${imgPaths.length > 1 ? "s" : ""}]`;
             setTurns((prev) => [
@@ -2188,18 +2464,11 @@ export function ChatPane({
         return;
       }
       if (sessionIdRef.current == null) {
+        requestSessionStart();
         enqueue(text, imgPaths.length ? imgPaths : undefined);
         consumeComposerImages();
         setInput("");
         setOverlay(null);
-        setTurns((prev) => [
-          ...prev,
-          {
-            kind: "result",
-            id: uid(),
-            text: "chat is still starting — queued message will send automatically.",
-          },
-        ]);
         return;
       }
       // Claude keeps its original first-message labels. Codex starts with a
@@ -2246,7 +2515,7 @@ export function ChatPane({
     // imagesRef.current (fresh after the pending-save await), so depending on the
     // images STATE would only re-create this closure on every attach for nothing.
     // `streaming` is read through activeRunRef (always-fresh), not as a dep.
-    [dispatch, attachedMemories, setImagesSync, enqueue, restorePinnedImages, webChatRuntime, reportChatSession],
+    [dispatch, attachedMemories, setImagesSync, enqueue, restorePinnedImages, webChatRuntime, reportChatSession, requestSessionStart],
   );
 
   // (the composer's `send` now lives in Composer — it reads the live store
@@ -2353,86 +2622,66 @@ export function ChatPane({
   }, [streaming, dispatch]);
 
   const finalizeStreaming = useCallback(
-    (note: string, mode: "interrupt" | "kill-and-restart" = "interrupt") => {
+    (note: string) => {
       const id = sessionIdRef.current;
-      // apply any buffered deltas before finalizing, else a pending rAF flush
-      // could re-open the bubble we just closed.
-      flushPending();
-      setTurns((prev) =>
-        finalizeStreamingTurns(
-          {
-            turns: prev,
-            streamingTurnId: streamingTurnId.current,
-            thinkingTurnId: thinkingTurnId.current,
-          },
-          Date.now(),
-        ).turns,
-      );
-      streamingTurnId.current = null;
-      thinkingTurnId.current = null;
-      turnStartRef.current = null;
-      setLiveStart(null);
-      setStreaming(false);
-      setBackendBusy(false);
-      setTurns((prev) => [...prev, { kind: "result", id: uid(), text: note }]);
+      const lifecycle = runLifecycleRef.current;
+      const runId = lifecycle.runId;
+      if (canStartNormalSend(lifecycle) || !runId) return;
       if (webChatRuntime) {
+        // Web has no backend channel, so mirror the same ordered lifecycle
+        // locally around AbortController. Desktop waits for Rust's frames.
+        transitionRunLifecycle({ type: "interrupting", runId });
         webAbortRef.current?.abort();
         webAbortRef.current = null;
+        transitionRunLifecycle({ type: "interrupted", runId });
         return;
       }
       if (id != null) {
-        if (mode === "kill-and-restart") {
-          sessionIdRef.current = null;
-          chatStop(id)
-            .catch((e) => reportDiag("chat.stop", e, { action: "killRestart" }))
-            .finally(() => {
-              setRunEventState(emptyRunEventState());
-              setFleetState(emptyFleetState());
-              setRunEventsKey(null);
-              setRestartKey((k) => k + 1);
-            });
-        } else {
-          chatInterrupt(id).catch((e) => reportDiag("chat.interrupt", e, { action: "interrupt" }));
+        // Starting has no backend `running` acknowledgement yet; expose the
+        // stop request immediately while Rust validates the same run id. This
+        // is deliberately non-terminal, and a late running frame cannot undo it.
+        if (lifecycle.phase === "starting") {
+          transitionRunLifecycle({ type: "interrupting", runId });
         }
+        // Do not settle locally. Rust atomically validates `runId`, emits
+        // interrupting, and then delivers the engine's terminal lifecycle frame.
+        const strategy = stopStrategy(model.engine);
+        const request = strategy === "kill-and-restart"
+          ? chatStop(id, runId)
+          : chatInterrupt(id, runId);
+        request.catch((e) => {
+          reportDiag("chat.interrupt", e, { action: "interrupt" });
+          setTurns((prev) => [...prev, { kind: "result", id: uid(), text: `${note} request failed: ${e}` }]);
+        });
       }
     },
-    [webChatRuntime, flushPending],
+    [model.engine, webChatRuntime, transitionRunLifecycle],
   );
 
   // true interrupt of the in-flight turn (process survives)
   const stop = useCallback(() => {
-    // Always let stop clear a wedged UI — even if the backend session id was lost
-    // (a hung turn whose process died without a `result`). Previously this
-    // early-returned when sessionIdRef was null, leaving the pane permanently stuck
-    // on "Working…" with a dead stop button. finalizeStreaming already guards the
-    // backend interrupt on a non-null id, so resetting local stream state here is
-    // safe and guarantees stop is never a no-op while a turn appears in flight.
-    const strategy = stopStrategy(model.engine);
-    finalizeStreaming(
-      strategy === "kill-and-restart"
-        ? "stopped by user — backend restarted"
-        : "stopped by user",
-      strategy,
-    );
-  }, [finalizeStreaming, model.engine]);
+    // Do not settle locally. The backend channel must deliver a
+    // tagged result/exit before the composer becomes runnable again.
+    finalizeStreaming("stopped by user");
+  }, [finalizeStreaming]);
   stopChatRef.current = stop;
 
-  // stall watchdog "retry": stop the wedged turn, then replay the last prompt on
-  // a clean slate. `stop()` finalizes the in-flight turn (interrupt or, for
-  // kill-and-restart engines, a backend respin) and flips `streaming` false. We
-  // defer the replay a beat so the finalize settles + the restart effect (for
-  // kill-and-restart) has minted a fresh session before we re-dispatch.
+  // Retry never races an interrupt acknowledgement. If the terminal lifecycle
+  // has not landed by the next tick, leave the prompt available for a deliberate
+  // retry instead of starting a second overlapping turn.
   const retryStalledTurn = useCallback(() => {
     const last = lastSentRef.current;
     stop();
     if (!last) return;
     window.setTimeout(() => {
-      if (sessionIdRef.current != null) dispatch(last, { skipUserBubble: true });
+      if (sessionIdRef.current != null && canStartNormalSend(runLifecycleRef.current)) {
+        dispatch(last, { skipUserBubble: true });
+      }
     }, 400);
   }, [stop, dispatch]);
 
   const restartStalledTurn = useCallback(() => {
-    finalizeStreaming("turn stalled — backend restarted", "kill-and-restart");
+    finalizeStreaming("turn stalled — interrupt requested");
   }, [finalizeStreaming]);
 
   // hard reset: clear transcript + re-spin a FRESH claude session (drops any
@@ -2446,10 +2695,14 @@ export function ChatPane({
       }
     }
     setTurns([]);
+    setQueued([]);
+    setQueuedSelection(0);
+    pinnedImagesRef.current.clear();
+    if (typeof localStorage !== "undefined") clearChatQueue(localStorage, queueStorageKey ?? undefined);
     setRunEventState(emptyRunEventState());
     setFleetState(emptyFleetState());
     setRunEventsKey(null);
-    setStreaming(false);
+    resetRunLifecycle();
     webAbortRef.current?.abort();
     webAbortRef.current = null;
     streamingTurnId.current = null;
@@ -2459,8 +2712,6 @@ export function ChatPane({
     setLiveStart(null);
     setInput("");
     setOverlay(null);
-    setQueued([]);
-    setQueuedIdx(0);
     usageBaselineRef.current = {};
     setResumeId(null);
     setResumedTitle(null);
@@ -2470,8 +2721,10 @@ export function ChatPane({
     setOpenSessionId(null);
     recordedRef.current = false;
     codexTitleLockedRef.current = false;
+    sessionStartRequestedRef.current = false;
+    setSessionStartRequested(false);
     setRestartKey((k) => k + 1);
-  }, [runEventsKey]);
+  }, [runEventsKey, resetRunLifecycle, queueStorageKey, setQueuedSelection]);
 
   // ── model switch: clear-on-switch (engine-split Phase 2) ────────────────────
   // Picking a different model tears down the transcript + run-events and spins a
@@ -2484,14 +2737,30 @@ export function ChatPane({
     (m: ChatModel) => {
       const { shouldClear, notice } = describeModelSwitch(model.id, m);
       if (!shouldClear) return;
+      const settings = loadSettings();
+      const nextEffortId = resolveModelEffort(
+        m,
+        effort.id,
+        settings.chatEffortByModel?.[m.id] ?? null,
+      );
+      const nextEffort =
+        EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1];
       clearSession();
+      setEffort(nextEffort);
       setModel(m);
       // picking a model sets it as the global default (sticks across panes +
       // restarts). engine omitted = claude.
-      saveSettings({ chatModel: m.id, chatProvider: `${m.engine ?? "claude"}-cli` });
+      saveSettings({
+        chatModel: m.id,
+        chatProvider: `${m.engine ?? "claude"}-cli`,
+        chatEffortByModel: {
+          ...settings.chatEffortByModel,
+          [m.id]: nextEffort.id,
+        },
+      });
       if (notice) setTurns([{ kind: "result", id: uid(), text: notice }]);
     },
-    [model.id, clearSession],
+    [model.id, effort.id, clearSession],
   );
 
   // ── /resume: reopen a past chat session ────────────────────────────────────
@@ -2780,7 +3049,7 @@ export function ChatPane({
   }, [setOverlay]);
 
   // ── keyboard ─────────────────────────────────────────────────────────────────
-  const activeRun = streaming || backendBusy;
+  const activeRun = !canStartNormalSend(runLifecycle);
 
   // (onKeyDown moved into Composer — it reads input/overlay reactively.)
 
@@ -2852,7 +3121,7 @@ export function ChatPane({
     streaming,
     backendBusy,
     activeRun,
-    started,
+    started: composerSessionReady,
     model,
     permission,
     effort,
@@ -2899,7 +3168,7 @@ export function ChatPane({
     jumpToLatest,
     queued,
     queuedIdx,
-    setQueuedIdx,
+    setQueuedIdx: setQueuedSelection,
     editingQueuedId,
     editingQueuedText,
     setEditingQueuedId,
@@ -3027,10 +3296,118 @@ export function ChatPane({
     return -1;
   }, [blocks]);
 
+  // The pinned task summary is derived from the same normalized transcript that
+  // renders below it. It is intentionally a compact projection: no extra event
+  // parsing and no per-token store, so it stays instant in long conversations.
+  const projectedTaskArtifacts = useMemo(() => {
+    const byPath = new Map<string, Artifact>();
+    for (const block of blocks) {
+      if (block.kind !== "activity") continue;
+      for (const tool of block.tools) {
+        const artifact = artifactFromTool(tool);
+        if (artifact) byPath.set(artifact.path, artifact);
+      }
+    }
+    return [...byPath.values()];
+  }, [blocks]);
+  const taskArtifacts = useStableProjection(
+    projectedTaskArtifacts,
+    JSON.stringify(projectedTaskArtifacts.map(({ path, name, kind }) => [path, name, kind])),
+  );
+  const projectedTaskSources = useMemo<TaskSource[]>(() => {
+    const seen = new Set<string>();
+    const sources: TaskSource[] = [];
+    for (const turn of turns) {
+      if (turn.kind !== "user") continue;
+      for (const path of turn.images ?? []) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        sources.push({ path, label: baseName(path) });
+      }
+    }
+    return sources;
+  }, [turns]);
+  const taskSources = useStableProjection(
+    projectedTaskSources,
+    JSON.stringify(projectedTaskSources.map(({ path, label }) => [path, label])),
+  );
+  // The task workspace receives only renderer-normalized state. Raw ChatEvent
+  // frames never cross this boundary, so remounts and rails replay one compact,
+  // bounded vocabulary no matter which backend produced the turn.
+  const taskTitle = resumedTitle ?? resume?.title ?? "chat";
+  const taskRevision = taskSnapshotRevision(runEventState);
+  const taskSnapshotStateRef = useRef(runEventState);
+  taskSnapshotStateRef.current = runEventState;
+  useEffect(() => {
+    if (!taskId || !paneKey) return;
+    ensureTaskWorkspace({ id: taskId, title: taskTitle, cwd, ownerPaneKey: paneKey });
+  }, [cwd, paneKey, taskId, taskTitle]);
+  useEffect(() => {
+    if (!taskId || !openSessionId) return;
+    bindTaskSession(taskId, openSessionId);
+  }, [openSessionId, taskId]);
+  useEffect(() => {
+    if (!taskId) return;
+    const snapshotState = taskSnapshotStateRef.current;
+    publishTaskSnapshot(taskId, {
+      phase: snapshotState.phase,
+      events: snapshotState.events,
+      artifacts: taskArtifacts,
+      fleet: fleetState,
+      title: taskTitle,
+      cwd,
+      ...(openSessionId ? { sessionId: openSessionId } : {}),
+    });
+  }, [cwd, fleetState, openSessionId, taskArtifacts, taskId, taskRevision, taskTitle]);
+  const projectedConversationMarks = useMemo(
+    () =>
+      blocks
+        .filter((block) => block.kind === "user" || block.kind === "activity")
+        .slice(-18)
+        .map((block) => ({
+          id: block.id,
+          label:
+            block.kind === "user"
+              ? block.turn.text.replace(/\s+/g, " ").trim() || "attached source"
+              : `${block.tools.length} step${block.tools.length === 1 ? "" : "s"}`,
+        })),
+    [blocks],
+  );
+  const conversationMarks = useStableProjection(
+    projectedConversationMarks,
+    JSON.stringify(projectedConversationMarks.map(({ id, label }) => [id, label])),
+  );
+  const navigateConversationMark = useCallback(
+    (id: string) => {
+      document.getElementById(`chat-block-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    },
+    [],
+  );
+  const draftOutput = useCallback(() => {
+    setInput("create a file or site");
+    requestAnimationFrame(() => taRef.current?.focus());
+  }, [setInput]);
+  const openTaskArtifact = useCallback((artifact: Artifact) => {
+    if (openFileInPane(artifact.path, artifact.name)) return;
+    openPath(artifact.path).catch((e) => reportDiag("chat.open-output", e, { path: artifact.path }));
+  }, []);
+  const openTaskSource = useCallback((source: TaskSource) => {
+    if (openViewerFileInPane(source.path, source.label)) return;
+    openPath(source.path).catch((e) => reportDiag("chat.open-source", e, { path: source.path }));
+  }, []);
+  const showTaskAgents = useCallback(() => {
+    setTaskSummaryOpen(false);
+    requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    });
+  }, []);
+
   // ── render ──────────────────────────────────────────────────────────────────
 
   if (empty) {
     return (
+      <ChatTaskIdContext.Provider value={taskId}>
       <ChatFileOpenContext.Provider value={openChatFile}>
       <PaneDropZone onPath={insertPath} onFiles={onDropFiles} label="drop image or path">
       <div className="flex h-full min-h-0 w-full flex-col items-center justify-start bg-[var(--color-bg)] px-6 pt-[13vh] pb-8">
@@ -3050,7 +3427,7 @@ export function ChatPane({
           {composer}
           {!resumedTitle && <RecentSessions onResume={resumeSession} currentId={openSessionId} />}
           <div className="mt-3 flex items-center justify-center gap-3 font-mono text-[11px] text-[var(--color-faint)]">
-            <span>{started ? "ready" : `starting ${model.engine ?? "claude"}…`}</span>
+            <span>{composerSessionReady ? "ready" : `starting ${model.engine ?? "claude"}…`}</span>
             <span className="text-[var(--color-border-strong)]">·</span>
             <span className="inline-flex items-center gap-1">
               <Slash size={10} /> commands
@@ -3063,10 +3440,12 @@ export function ChatPane({
       </div>
       </PaneDropZone>
       </ChatFileOpenContext.Provider>
+      </ChatTaskIdContext.Provider>
     );
   }
 
   return (
+    <ChatTaskIdContext.Provider value={taskId}>
     <ChatCwdContext.Provider value={cwd ?? null}>
     <ChatFileOpenContext.Provider value={openChatFile}>
     <PaneDropZone onPath={insertPath} label="drop to add to message">
@@ -3085,9 +3464,23 @@ export function ChatPane({
             {model.label}
           </span>
         </div>
-        <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">
-          {model.engine ?? "claude"}
-        </span>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setTaskSummaryOpen((open) => !open)}
+            title="toggle pinned task summary"
+            className={`grid h-6 w-6 place-items-center rounded-md transition-colors ${
+              taskSummaryOpen
+                ? "bg-[var(--color-panel-2)] text-[var(--color-text)]"
+                : "text-[var(--color-faint)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+            }`}
+          >
+            <ListChecks size={14} />
+          </button>
+          <span className="font-mono text-[10px] text-[var(--color-faint)]">
+            {model.engine ?? "claude"}
+          </span>
+        </div>
       </div>
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-none flex-col gap-5 px-6 py-8">
@@ -3096,24 +3489,41 @@ export function ChatPane({
               <ResumedNote title={resumedTitle} onClear={() => setResumedTitle(null)} />
             </div>
           )}
-          <TranscriptBlocks
-            blocks={blocks}
-            model={model}
-            streaming={streaming}
-            lastActivityIdx={lastActivityIdx}
-            liveStart={liveStart}
-            onRegenerate={regenerate}
-            onAssistantButton={handleAssistantButton}
-            onOpenUrl={onOpenUrl}
-            onResolveApproval={resolveApproval}
-            answeredQuestions={answeredQuestions}
-            onQuestionAnswer={handleQuestionAnswer}
-          />
-          {/* live sub-agent fleet — only mounts when the model spawned ≥1 Task
-              sub-agent this turn (claude only; codex emits none). Additive:
-              empty fleet renders nothing. */}
+          {taskSummaryOpen && (
+            <div className="flex justify-end">
+              <TaskSummary
+                taskId={taskId}
+                artifacts={taskArtifacts}
+                agents={fleetState.agents}
+                workflows={fleetState.workflows}
+                sources={taskSources}
+                onCreateOutput={draftOutput}
+                onOpenArtifact={openTaskArtifact}
+                onOpenSource={openTaskSource}
+                onShowAgents={showTaskAgents}
+              />
+            </div>
+          )}
+          <div className="relative">
+            <ConversationRail items={conversationMarks} onNavigate={navigateConversationMark} />
+            <TranscriptBlocks
+              blocks={blocks}
+              model={model}
+              streaming={streaming}
+              lastActivityIdx={lastActivityIdx}
+              liveStart={liveStart}
+              onRegenerate={regenerate}
+              onAssistantButton={handleAssistantButton}
+              onOpenUrl={onTaskOpenUrl}
+              onResolveApproval={resolveApproval}
+              answeredQuestions={answeredQuestions}
+              onQuestionAnswer={handleQuestionAnswer}
+            />
+          </div>
+          {/* Compact Codex-style task narrative. It consumes only fleet state
+              already normalized by the renderer and retains settled workers. */}
           {(fleetState.agents.length > 0 || fleetState.workflows.length > 0) && (
-            <FleetView
+            <TaskActivity
               agents={fleetState.agents}
               workflows={fleetState.workflows}
             />
@@ -3133,8 +3543,8 @@ export function ChatPane({
               Not an error — neutral glass + a warning-toned line, so it reads as
               "heads up" not "it broke". */}
           {streaming && stalled && (
-            <div className="mt-1 flex flex-wrap items-center gap-2 rounded-xl border border-[color-mix(in_srgb,var(--color-warning)_30%,transparent)] bg-white/[0.04] px-3 py-2 backdrop-blur-md">
-              <span className="font-sans text-[12px] text-[var(--color-warning)]">
+            <div className="mt-1 flex flex-wrap items-center gap-2 rounded-[var(--aios-radius-card)] border border-[var(--color-warning-accent)] bg-[var(--color-warning-soft)] px-3 py-2">
+              <span className="font-sans text-[12px] text-[var(--color-warning-accent)]">
                 turn stalled — restart?
               </span>
               <div className="flex items-center gap-1.5">
@@ -3142,7 +3552,7 @@ export function ChatPane({
                   <button
                     type="button"
                     onClick={restartStalledTurn}
-                    className="flex h-7 items-center gap-1.5 rounded-full border border-white/15 bg-white/[0.07] px-3 text-[11.5px] font-medium text-[var(--color-text)] backdrop-blur-md transition-colors hover:bg-white/[0.12]"
+                    className="flex h-7 items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3 text-[11.5px] font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-hover)]"
                   >
                     <RotateCcw size={12} />
                     restart
@@ -3151,7 +3561,7 @@ export function ChatPane({
                 <button
                   type="button"
                   onClick={retryStalledTurn}
-                  className="flex h-7 items-center gap-1.5 rounded-full border border-white/15 bg-white/[0.07] px-3 text-[11.5px] font-medium text-[var(--color-text)] backdrop-blur-md transition-colors hover:bg-white/[0.12]"
+                  className="flex h-7 items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3 text-[11.5px] font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-hover)]"
                 >
                   <RefreshCw size={12} />
                   retry
@@ -3159,7 +3569,7 @@ export function ChatPane({
                 <button
                   type="button"
                   onClick={stop}
-                  className="flex h-7 items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.04] px-3 text-[11.5px] font-medium text-[var(--color-text-2)] transition-colors hover:bg-white/[0.08] hover:text-[var(--color-text)]"
+                  className="flex h-7 items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border)] bg-[var(--color-panel)] px-3 text-[11.5px] font-medium text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-hover)] hover:text-[var(--color-text)]"
                 >
                   <Square size={11} className="fill-current" />
                   stop
@@ -3183,15 +3593,17 @@ export function ChatPane({
       <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg)]/80 px-6 pb-5 pt-3 backdrop-blur">
         <div className="mx-auto max-w-none">
           {/* context readout — out of the cramped composer, model-aware window
-              (opus 4.8 = 1M, sonnet/haiku = 200K, codex = 272K) */}
+              (fable 5 / opus 4.8 = 1M, sonnet/haiku = 200K, codex = 272K) */}
           {ctxTokens != null && (
             <div
               title={`${ctxTokens.toLocaleString()} tokens of context`}
               className="mb-1.5 flex justify-end px-1 font-mono text-[10.5px] tabular-nums text-[var(--color-faint)]"
             >
               {(() => {
-                const win = model.id.startsWith("claude-opus")
-                  ? 1_000_000
+                const win =
+                  model.id.startsWith("claude-opus") ||
+                  model.id.startsWith("claude-fable")
+                    ? 1_000_000
                   : model.engine === "codex"
                     ? 272_000
                     : model.engine === "opencode"
@@ -3235,6 +3647,7 @@ export function ChatPane({
     </PaneDropZone>
     </ChatFileOpenContext.Provider>
     </ChatCwdContext.Provider>
+    </ChatTaskIdContext.Provider>
   );
 }
 
@@ -3274,7 +3687,9 @@ function UsageStrip({
       : null;
   return (
     <div className="mb-2 flex items-center gap-2.5 px-1 font-mono text-[10px] tabular-nums text-[var(--color-faint)]">
-      <span className="shrink-0 lowercase tracking-wide text-[var(--color-muted)]">{engine}</span>
+      <span className="shrink-0 lowercase tracking-wide text-[var(--color-muted)]">
+        {engine}
+      </span>
       <span className="flex shrink-0 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]">
         {(["fiveHour", "sevenDay"] as const).map((id) => (
           <button
@@ -3868,46 +4283,45 @@ const TranscriptBlocks = memo(function TranscriptBlocks({
 }) {
   return (
     <>
-      {blocks.map((b, i) =>
-        b.kind === "activity" ? (
-          <ActivityGroup
-            key={b.id}
-            tools={b.tools}
-            durationMs={b.durationMs}
-            // live only on the final activity group, while a turn is in
-            // flight and it hasn't been closed by a result yet
-            live={streaming && b.durationMs == null && i === lastActivityIdx}
-            // pass the START timestamp (stable per-turn), not a per-second
-            // elapsed value — the leaf owns its own 1Hz tick so this prop
-            // change doesn't re-render the whole list every second.
-            liveStart={liveStart}
-          />
-        ) : b.kind === "user" ? (
-          <UserBubble key={b.id} turn={b.turn} streaming={streaming} onRegenerate={onRegenerate} />
-        ) : b.kind === "assistant" ? (
-          <AssistantBubble
-            key={b.id}
-            turn={b.turn}
-            model={model}
-            onButton={onAssistantButton}
-            disabled={streaming}
-            onOpenUrl={onOpenUrl}
-          />
-        ) : b.kind === "thinking" ? (
-          <ThinkingBlock key={b.id} turn={b.turn} />
-        ) : b.kind === "approval" ? (
-          <ApprovalCard key={b.id} turn={b.turn} onResolve={onResolveApproval} />
-        ) : b.kind === "question" ? (
-          <QuestionCard
-            key={b.id}
-            turn={b.turn}
-            answered={answeredQuestions[b.turn.id]}
-            onAnswer={onQuestionAnswer}
-          />
-        ) : (
-          <ResultFooter key={b.id} turn={b.turn} />
-        ),
-      )}
+      {blocks.map((b, i) => (
+        <div key={b.id} id={`chat-block-${b.id}`}>
+          {b.kind === "activity" ? (
+            <ActivityGroup
+              tools={b.tools}
+              durationMs={b.durationMs}
+              // live only on the final activity group, while a turn is in
+              // flight and it hasn't been closed by a result yet
+              live={streaming && b.durationMs == null && i === lastActivityIdx}
+              // pass the START timestamp (stable per-turn), not a per-second
+              // elapsed value — the leaf owns its own 1Hz tick so this prop
+              // change doesn't re-render the whole list every second.
+              liveStart={liveStart}
+            />
+          ) : b.kind === "user" ? (
+            <UserBubble turn={b.turn} streaming={streaming} onRegenerate={onRegenerate} />
+          ) : b.kind === "assistant" ? (
+            <AssistantBubble
+              turn={b.turn}
+              model={model}
+              onButton={onAssistantButton}
+              disabled={streaming}
+              onOpenUrl={onOpenUrl}
+            />
+          ) : b.kind === "thinking" ? (
+            <ThinkingBlock turn={b.turn} />
+          ) : b.kind === "approval" ? (
+            <ApprovalCard turn={b.turn} onResolve={onResolveApproval} />
+          ) : b.kind === "question" ? (
+            <QuestionCard
+              turn={b.turn}
+              answered={answeredQuestions[b.turn.id]}
+              onAnswer={onQuestionAnswer}
+            />
+          ) : (
+            <ResultFooter turn={b.turn} />
+          )}
+        </div>
+      ))}
     </>
   );
 });
@@ -3941,7 +4355,7 @@ const UserBubble = memo(function UserBubble({
         </div>
       )}
       {turn.text && !(turn.images?.length && /^\[\d+ images?\]$/.test(turn.text)) && (
-        <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-4 py-2.5 font-sans text-[14px] leading-relaxed text-[var(--color-text)]">
+        <div className="shell-elevated max-w-[80%] whitespace-pre-wrap break-words rounded-[var(--aios-radius-bubble)] rounded-br-[var(--aios-radius-row)] bg-[var(--color-panel-2)] px-4 py-2.5 font-sans text-[14px] leading-relaxed text-[var(--color-text)]">
           {turn.text}
         </div>
       )}
@@ -4058,7 +4472,7 @@ const AssistantBubble = memo(function AssistantBubble({
   return (
     <div className="group flex flex-col items-start gap-1">
       <div className="flex max-w-[92%] items-start gap-2">
-        <span className="mt-[3px] grid h-5 w-5 shrink-0 place-items-center rounded-full border border-white/10 bg-white/[0.04]">
+        <span className="assistant-avatar mt-[3px] grid h-5 w-5 shrink-0 place-items-center">
           <ModelIcon model={model} size={13} />
         </span>
         <div className="min-w-0 font-sans text-[14.5px] leading-relaxed text-[var(--color-text-2)]">
@@ -4076,7 +4490,7 @@ const AssistantBubble = memo(function AssistantBubble({
               type="button"
               disabled={disabled}
               onClick={() => onButton(label)}
-              className="rounded-[var(--aios-radius-pill)] border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3.5 py-1.5 text-[13px] font-medium text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] hover:text-[var(--color-accent)] disabled:cursor-not-allowed disabled:opacity-40"
+              className="assistant-choice px-3.5 py-1.5 text-[13px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
             >
               {label}
             </button>

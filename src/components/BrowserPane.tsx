@@ -87,7 +87,8 @@ import { addLink } from "../lib/sidebar";
 import { DEFAULT_PROFILE, addProfile, loadProfiles } from "../lib/profiles";
 import { rememberUrl } from "../lib/browser-mem";
 import { type NotificationLevel } from "../lib/notifications";
-import { onAiosDrag, openViewerFileInPane, registerPaneDropSink, spawnPane } from "../lib/paneBus";
+import { onAiosDrag, openViewerFileInPane, registerPaneDropSink, spawnPane, taskSpawnContext } from "../lib/paneBus";
+import type { TaskId } from "../lib/taskWorkspace";
 import { homeDir } from "../lib/fs";
 import { PaneDropZone } from "./PaneDropZone";
 import { reportDiag, reportError } from "../lib/diag";
@@ -170,6 +171,7 @@ export function BrowserPane({
   onAnnotate,
   onProfileChange,
   onVideoFullscreen,
+  taskId,
 }: {
   label: string;
   active?: boolean;
@@ -190,6 +192,8 @@ export function BrowserPane({
   /** Fired when the user switches this pane's profile, so App persists it on the
    *  pane model (the login sticks if the pane is reopened). */
   onProfileChange?: (profile: string) => void;
+  /** Optional owner carried into panes explicitly opened from this browser. */
+  taskId?: TaskId;
 }) {
   const slotRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -861,8 +865,8 @@ export function BrowserPane({
   const openDownloadInFiles = useCallback((d: DownloadRecord) => {
     setDownloadsOpen(false);
     const dir = d.path.replace(/\/[^/]*$/, "");
-    spawnPane("files", { path: dir || d.path });
-  }, []);
+    spawnPane("files", { path: dir || d.path, ...taskSpawnContext(taskId) });
+  }, [taskId]);
 
   // Close the downloads panel on outside click.
   useEffect(() => {
@@ -916,7 +920,7 @@ export function BrowserPane({
   const openCurrentInNewPane = useCallback(() => {
     const url = current || normalizeUrl(input);
     if (!url || url === "about:blank") return;
-    spawnPane("browser", { url, label: "browser" });
+    spawnPane("browser", { url, label: "browser", ...taskSpawnContext(taskId) });
     showToast("opened page in new browser", "success");
   }, [current, input, showToast]);
 
@@ -926,18 +930,19 @@ export function BrowserPane({
     spawnPane("terminal", {
       cmd: `curl -L ${escapeShellSingleQuote(url)} | sed -n '1,160p'`,
       label: "terminal · web inspect",
+      ...taskSpawnContext(taskId),
     });
     showToast("opened terminal inspector", "success");
-  }, [current, input, showToast]);
+  }, [current, input, showToast, taskId]);
 
   const openUrlInNewPane = useCallback(
     (url: string) => {
       if (!url || url === "about:blank") return;
-      spawnPane("browser", { url, label: "browser" });
+      spawnPane("browser", { url, label: "browser", ...taskSpawnContext(taskId) });
       setContextMenu(null);
       showToast("opened link in new browser", "success");
     },
-    [showToast],
+    [showToast, taskId],
   );
 
   const sendContextToChat = useCallback(
@@ -957,11 +962,12 @@ export function BrowserPane({
       spawnPane("terminal", {
         cmd: `curl -L ${escapeShellSingleQuote(url)} | sed -n '1,160p'`,
         label: "terminal · web inspect",
+        ...taskSpawnContext(taskId),
       });
       setContextMenu(null);
       showToast("opened terminal inspector", "success");
     },
-    [showToast],
+    [showToast, taskId],
   );
 
   const copyContextTarget = useCallback(
@@ -1047,12 +1053,12 @@ export function BrowserPane({
   const openDownloadsInFiles = useCallback(() => {
     setMenuOpen(false);
     homeDir()
-      .then((h) => spawnPane("files", { path: `${h}/Downloads` }))
+      .then((h) => spawnPane("files", { path: `${h}/Downloads`, ...taskSpawnContext(taskId) }))
       .catch((e) => {
         reportError("browser.reveal", e, { action: "openDownloadsInFiles" });
-        spawnPane("files", {}); // still open SOMETHING (just not ~/Downloads)
+        spawnPane("files", taskSpawnContext(taskId)); // still open SOMETHING (just not ~/Downloads)
       });
-  }, []);
+  }, [taskId]);
 
   const runOmniboxRow = useCallback(
     (row: OmniboxRow) => {
@@ -1842,7 +1848,7 @@ export function BrowserPane({
               <button
                 type="button"
                 onClick={retryLoad}
-                className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)]"
               >
                 retry
               </button>

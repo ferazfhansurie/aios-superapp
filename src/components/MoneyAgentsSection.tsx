@@ -167,7 +167,7 @@ export function MoneyAgentsSection({
             </button>
             <button
               type="submit"
-              className="rounded bg-[var(--color-accent)] px-2 py-1 text-[10px] font-medium text-[var(--color-bg)] disabled:opacity-50"
+              className="rounded bg-[var(--color-accent)] px-2 py-1 text-[10px] font-medium text-[var(--color-accent-fg)] disabled:opacity-50"
               disabled={!draftName.trim()}
             >
               create

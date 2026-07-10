@@ -30,6 +30,16 @@ pub const REPLAY_CAP: usize = 6000;
 /// 12 MB is generous for a long agentic transcript while still capping a runaway.
 pub const REPLAY_BYTE_CAP: usize = 12 * 1024 * 1024;
 
+/// A turn-scoped Codex control request that arrived after `turn/start` was sent
+/// but before the app-server published `turn/started` (the first point at which
+/// its required turn id is known). The adapter drains these in order as soon as
+/// that notification lands. An interrupt supersedes any queued steers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingCodexControl {
+    Steer(String),
+    Interrupt,
+}
+
 /// One live chat session. For `claude` this is a persistent child + its stdin
 /// (turns are pushed as stream-json lines). For `codex`/`opencode` there is no
 /// persistent process: `child` holds the CURRENT turn's subprocess (so an
@@ -53,9 +63,10 @@ pub struct ChatSession {
     pub cwd: Mutex<Option<String>>,
     /// Model id, captured for per-turn re-spawns (e.g. `gpt-5.5`, `opencode/...`).
     pub model: Mutex<Option<String>>,
-    /// Reasoning effort the composer picked (`low|medium|high|xhigh|max|ultracode`),
-    /// kept so codex `turn/start` can carry it every turn. Claude passes effort as
-    /// a CLI flag at spawn; codex needs it re-sent per turn. `None` = engine default.
+    /// Reasoning effort the composer picked (`low|medium|high|xhigh|max|ultra`),
+    /// kept so codex `turn/start` can carry it every turn. The AIOS-only
+    /// `ultracode` workflow preset is resolved before this boundary. Claude
+    /// passes effort at spawn; `None` = engine default.
     pub effort: Mutex<Option<String>>,
     /// Current output sink; `None` while detached (output only buffers). Boxed
     /// behind [`OutputSink`] so the same session runtime can forward to a Tauri
@@ -79,6 +90,10 @@ pub struct ChatSession {
     pub title: Mutex<String>,
     /// True while a turn is in flight (set on send, cleared on `result`).
     pub busy: AtomicBool,
+    /// Serializes turn-changing operations (send / steer / interrupt) for this
+    /// session. Without it, an old steer can validate then inject after a result
+    /// freed the session and a newer run started.
+    pub operation_lock: Mutex<()>,
     /// True once the pane closed but we kept the process alive.
     pub detached: AtomicBool,
     /// Fire an OS notification when the current/next turn completes.
@@ -91,6 +106,9 @@ pub struct ChatSession {
     /// codex app-server: the in-flight turn's id (from `turn/started`), needed as
     /// `expectedTurnId` to steer it. `None` between turns. Cleared on turn end.
     pub active_turn: Mutex<Option<String>>,
+    /// Codex controls received during the narrow `turn/start` → `turn/started`
+    /// window, when the session is busy but the required turn id is not known.
+    pub pending_controls: Mutex<VecDeque<PendingCodexControl>>,
     /// codex app-server: the item id of the turn's REAL answer (the agentMessage
     /// whose `phase` is `final_answer`). Codex also emits preamble/status agent
     /// messages mid-turn; we route THOSE to the thinking block so only the final
@@ -143,11 +161,13 @@ impl ChatSession {
             claude_id: Mutex::new(None),
             title: Mutex::new(String::new()),
             busy: AtomicBool::new(false),
+            operation_lock: Mutex::new(()),
             detached: AtomicBool::new(false),
             notify_on_done: AtomicBool::new(false),
             rpc_id: AtomicU64::new(1),
             pending_turn: Mutex::new(None),
             active_turn: Mutex::new(None),
+            pending_controls: Mutex::new(VecDeque::new()),
             answer_item: Mutex::new(None),
             answer_streamed: AtomicBool::new(false),
             pending_approvals: Mutex::new(HashMap::new()),

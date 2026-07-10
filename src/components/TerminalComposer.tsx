@@ -868,7 +868,7 @@ export function TerminalComposer({
           <button
             type="button"
             onClick={finishHandoff}
-            className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:brightness-110 active:scale-95"
+            className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)] transition-all hover:brightness-110 active:scale-95"
           >
             <Rocket size={13} />
             clear + start fresh
@@ -1004,7 +1004,7 @@ export function TerminalComposer({
               type="button"
               onClick={() => void micStop()}
               title="stop dictation (esc to cancel)"
-              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
+              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-accent-fg)] transition-colors hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)]"
             >
               <Square size={14} className="fill-current" />
             </button>

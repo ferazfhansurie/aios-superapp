@@ -121,7 +121,7 @@ export function AppAttachPane({
             type="button"
             onClick={() => void capture()}
             disabled={capturing}
-            className="flex h-7 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)] disabled:opacity-60"
+            className="flex h-7 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)] disabled:opacity-60"
             title="capture preview"
           >
             {capturing ? <Loader2 size={12} className="animate-spin" /> : <Camera size={12} />}

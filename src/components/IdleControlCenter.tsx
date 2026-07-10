@@ -196,7 +196,7 @@ function CommandLine({
           <button
             type="submit"
             title="start a chat with this"
-            className="group/send grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-accent-fg)] transition-colors duration-200 hover:bg-[var(--color-accent-hover)] active:scale-95"
+            className="group/send grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-accent-fg)] transition-colors duration-200 hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)] active:scale-95"
           >
             <ArrowUp size={16} className="transition-transform duration-200 group-hover/send:-translate-y-0.5" />
           </button>

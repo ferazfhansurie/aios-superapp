@@ -56,6 +56,9 @@ export interface ChatStartOpts {
    *  → spawn locally; `"bisnesgpt"` → run on the box via aios-noded over the
    *  tailnet and stream it into this pane (claude only in v1). */
   node?: string | null;
+  /** claude account id from ~/.aios/state/claude-accounts.json — runs the
+   *  session AS that login (CLAUDE_CONFIG_DIR). null/unknown → default login. */
+  account?: string | null;
 }
 
 /** A past chat session for the /resume picker. */
@@ -70,6 +73,14 @@ export interface ChatSessionInfo {
    *  left off" preview line. Empty when no transcript is found. `title` stays
    *  the FIRST user message (a stable label). */
   last_user?: string;
+  /** Provenance of a Codex thread — the catalog `source` / rollout `originator`
+   *  (`aios-shell`, `Codex Desktop`, `cli`, `vscode`, …). Present for codex
+   *  threads merged from Codex's shared catalog; empty otherwise. */
+  source?: string;
+  /** Whether a Codex thread is archived in Codex's catalog. Archived threads are
+   *  filtered out of the picker backend-side, so this is effectively always
+   *  false in listChatSessions output — surfaced for completeness. */
+  archived?: boolean;
 }
 
 /** Lists the chats started in the chat pane (from the chat store) for /resume. */
@@ -111,12 +122,12 @@ export async function readChatTranscript(id: string): Promise<ChatTurnInfo[]> {
   return invoke<ChatTurnInfo[]>("read_chat_transcript", { id });
 }
 
-/** Reasoning effort levels claude exposes via `--effort` (all models accept
- *  these; xhigh/max are the deepest tiers — the "ultracode" end). */
+/** Reasoning effort levels exposed by the current chat engines. Model metadata
+ *  narrows this list so the composer never offers an unsupported tier. */
 export interface EffortOption {
   id: string;
   label: string;
-  /** Secondary line shown in the menu (e.g. ultracode's "xhigh + workflows"). */
+  /** Secondary explanation surfaced by the effort control. */
   sub?: string;
   /** The flashy top tier — rendered with the animated purple gradient. */
   ultra?: boolean;
@@ -127,7 +138,7 @@ export const EFFORTS: EffortOption[] = [
   { id: "high", label: "high" },
   { id: "xhigh", label: "xhigh" },
   { id: "max", label: "max" },
-  { id: "ultracode", label: "ultracode", sub: "xhigh + workflows", ultra: true },
+  { id: "ultra", label: "ultra", sub: "maximum reasoning + automatic delegation", ultra: true },
 ];
 
 /**
@@ -185,6 +196,10 @@ export interface ChatEvent {
   seven_day?: { pct?: number | null; resets_at?: number | null };
   // synthetic stderr
   text?: string;
+  // ordered backend lifecycle frame. `starting` is echoed after the renderer
+  // mints a run; every later state is tagged with that same run id.
+  state?: "starting" | "running" | "interrupting" | "completed" | "failed" | "interrupted" | "exited";
+  runId?: string;
   // control protocol (interrupts + permission/approval requests in non-bypass
   // modes). claude → us: `control_request` (subtype `can_use_tool`) and
   // `control_response` (ack of our interrupt). We reply via `chatSendRaw`.
@@ -214,6 +229,8 @@ export interface ChatModel {
   id: string;
   /** Display label. */
   label: string;
+  /** Compact label used by the composer trigger. */
+  shortLabel?: string;
   /** Which backend runs it. Omitted = claude. */
   engine?: "claude" | "codex" | "opencode";
   /** If true, shown greyed and not selectable yet. */
@@ -222,6 +239,10 @@ export interface ChatModel {
   note?: string;
   /** The flashy new flagship — sparkle icon + "new" badge in the picker. */
   hot?: boolean;
+  /** Ordered effort ids advertised by this exact model. */
+  supportedEfforts?: readonly string[];
+  /** Fallback when a saved/current effort is not supported. */
+  defaultEffort?: string;
   /** Run this session on a remote node (the bisnesgpt box via aios-noded over
    *  the tailnet) instead of locally. Omitted = local. claude only in v1. */
   node?: "bisnesgpt";
@@ -236,11 +257,46 @@ export interface ChatModel {
  */
 export const CHAT_MODELS: ChatModel[] = [
   // ChatGPT-subscription models via Codex — no API key, no per-token billing.
-  // Trimmed to the two that matter: spark (gpt-5.3-codex-spark, the fast
-  // codex-tuned default) and gpt 5.5 (the flagship). Both verified over
-  // `codex exec -m <id>`.
-  { id: "gpt-5.3-codex-spark", label: "spark", engine: "codex" },
-  { id: "gpt-5.5", label: "gpt 5.5", engine: "codex" },
+  {
+    id: "gpt-5.6-sol",
+    label: "gpt 5.6 sol",
+    shortLabel: "5.6 sol",
+    engine: "codex",
+    hot: true,
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    defaultEffort: "low",
+  },
+  {
+    id: "gpt-5.6-terra",
+    label: "gpt 5.6 terra",
+    shortLabel: "5.6 terra",
+    engine: "codex",
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    defaultEffort: "medium",
+  },
+  {
+    id: "gpt-5.6-luna",
+    label: "gpt 5.6 luna",
+    shortLabel: "5.6 luna",
+    engine: "codex",
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    defaultEffort: "medium",
+  },
+  {
+    id: "gpt-5.3-codex-spark",
+    label: "spark",
+    engine: "codex",
+    supportedEfforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "high",
+  },
+  {
+    id: "gpt-5.5",
+    label: "gpt 5.5",
+    engine: "codex",
+    supportedEfforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "medium",
+  },
+  { id: "claude-fable-5", label: "fable 5", engine: "claude" },
   { id: "claude-opus-4-8", label: "opus 4.8", engine: "claude" },
   { id: "claude-sonnet-4-6", label: "sonnet 4.6", engine: "claude" },
   { id: "claude-haiku-4-5", label: "haiku 4.5", engine: "claude" },
@@ -310,6 +366,7 @@ export async function chatStart(
     resume: opts.resume ?? null,
     headroom: opts.headroom ?? null,
     node: opts.node ?? null,
+    account: opts.account ?? null,
   });
 }
 
@@ -333,11 +390,13 @@ export async function chatPrewarmCodex(opts: ChatStartOpts = {}): Promise<number
 export async function chatSend(
   id: number,
   text: string,
+  runId: string,
   imagePaths?: string[],
 ): Promise<void> {
   return invoke("chat_send", {
     sessionId: id,
     text,
+    runId,
     imagePaths: imagePaths && imagePaths.length ? imagePaths : null,
   });
 }
@@ -348,13 +407,23 @@ export async function chatSend(
  * next step). Only codex supports true mid-turn steering; for other engines this
  * REJECTS (caller should queue the message instead). Verified live vs codex 0.135.
  */
-export async function chatSteer(id: number, text: string): Promise<void> {
-  return invoke("chat_steer", { sessionId: id, text });
+export async function chatSteer(
+  id: number,
+  text: string,
+  runId: string,
+  imagePaths?: string[],
+): Promise<void> {
+  return invoke("chat_steer", {
+    sessionId: id,
+    text,
+    runId,
+    imagePaths: imagePaths && imagePaths.length ? imagePaths : null,
+  });
 }
 
 /** Kills a chat session and frees its claude process. */
-export async function chatStop(id: number): Promise<void> {
-  return invoke("chat_stop", { sessionId: id });
+export async function chatStop(id: number, runId?: string): Promise<void> {
+  return invoke("chat_stop", { sessionId: id, runId: runId ?? null });
 }
 
 /** Detaches a session from its pane WITHOUT killing it — the claude process
@@ -365,6 +434,10 @@ export async function chatDetach(id: number, notify: boolean): Promise<void> {
 
 export interface ChatReattachInfo {
   busy: boolean;
+  /** Renderer-owned lifecycle snapshot for a busy reattached session. This
+   * closes the replay-gap where an old buffer no longer contains `aios_run`. */
+  run_id: string | null;
+  run_state: string | null;
   /** Which engine drives the reattached session (`claude` | `codex` | `opencode`).
    *  The frontend re-syncs its `model` state from this so a reattached codex run
    *  isn't driven by the default claude state (wrong stop-strategy / steer / usage). */
@@ -408,8 +481,8 @@ export async function listChatLive(): Promise<LiveChat[]> {
  * acks with a `control_response` then ends the turn with a `result` of subtype
  * `error_during_execution`.
  */
-export async function chatInterrupt(id: number): Promise<void> {
-  return invoke("chat_interrupt", { sessionId: id });
+export async function chatInterrupt(id: number, runId: string): Promise<void> {
+  return invoke("chat_interrupt", { sessionId: id, runId });
 }
 
 /**

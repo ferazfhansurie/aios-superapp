@@ -202,7 +202,7 @@ export function BoxCockpit({
     <div className="relative flex h-full flex-col overflow-y-auto">
       {/* ── header strip ── */}
       <header className="sticky top-0 z-10 flex items-center gap-3.5 border-b border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-bg)_82%,transparent)] px-7 py-3.5 backdrop-blur-md">
-        <div className="grid size-6 place-items-center rounded-md bg-[var(--color-accent)] font-mono text-[12px] font-bold text-[var(--color-bg)]">
+        <div className="grid size-6 place-items-center rounded-md bg-[var(--color-accent)] font-mono text-[12px] font-bold text-[var(--color-accent-fg)]">
           A
         </div>
         <div className="flex items-center gap-2 text-[14px] font-medium text-[var(--color-text)]">

@@ -33,11 +33,9 @@ pub fn codex_input_items(text: &str, image_paths: &[String]) -> serde_json::Valu
     json!(items)
 }
 
-/// Maps the composer's effort id onto codex's `ReasoningEffort` enum
-/// (`none|minimal|low|medium|high|xhigh`). The composer also offers `max` and
-/// `ultracode` which codex has no equivalent for — both fold to `xhigh` (its
-/// deepest tier). Returns `None` for anything codex wouldn't accept so we never
-/// send an invalid effort that closes the turn.
+/// Validates the composer's effort id against current Codex model tiers.
+/// `max` and `ultra` are real app-server values for the 5.6 model family;
+/// `ultracode` remains an AIOS workflow preset and must never cross the wire.
 pub fn codex_effort(raw: &str) -> Option<&'static str> {
     match raw {
         "none" => Some("none"),
@@ -45,7 +43,9 @@ pub fn codex_effort(raw: &str) -> Option<&'static str> {
         "low" => Some("low"),
         "medium" => Some("medium"),
         "high" => Some("high"),
-        "xhigh" | "max" | "ultracode" => Some("xhigh"),
+        "xhigh" => Some("xhigh"),
+        "max" => Some("max"),
+        "ultra" => Some("ultra"),
         _ => None,
     }
 }
@@ -120,7 +120,12 @@ pub fn codex_item_type(item: &Value) -> &str {
 pub fn codex_is_action_item(item: &Value) -> bool {
     !matches!(
         codex_item_type(item),
-        "" | "agentMessage" | "agent_message" | "reasoning"
+        ""
+            | "userMessage"
+            | "user_message"
+            | "agentMessage"
+            | "agent_message"
+            | "reasoning"
     )
 }
 
@@ -380,4 +385,17 @@ pub fn codex_usage_to_claude(usage: Option<&serde_json::Value>) -> String {
         "output_tokens": output,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::codex_effort;
+
+    #[test]
+    fn codex_effort_preserves_current_model_tiers() {
+        assert_eq!(codex_effort("max"), Some("max"));
+        assert_eq!(codex_effort("ultra"), Some("ultra"));
+        assert_eq!(codex_effort("ultracode"), None);
+        assert_eq!(codex_effort("bogus"), None);
+    }
 }

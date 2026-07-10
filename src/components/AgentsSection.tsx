@@ -106,27 +106,27 @@ export function AgentsSection({
         event.preventDefault();
         submit();
       }}
-      className="mb-1 flex flex-col gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-pane)] p-2"
+      className="shell-card mb-1 flex flex-col gap-1 p-2"
     >
       <input
         autoFocus
         value={draftLabel}
         onChange={(e) => setDraftLabel(e.target.value)}
         placeholder="agent name (e.g. research-daily)"
-        className="rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-[11px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+        className="shell-row shell-focus bg-[var(--color-bg)] px-2 py-1 text-[11px] text-[var(--color-text)] outline-none"
       />
       <textarea
         value={draftPrompt}
         onChange={(e) => setDraftPrompt(e.target.value)}
         placeholder="prompt / mission (e.g. /last30days AI agents)"
         rows={2}
-        className="resize-none rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-[11px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+        className="shell-row shell-focus resize-none bg-[var(--color-bg)] px-2 py-1 text-[11px] text-[var(--color-text)] outline-none"
       />
       <div className="flex gap-1">
         <select
           value={draftModel}
           onChange={(e) => setDraftModel(e.target.value)}
-          className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-1 text-[10.5px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+          className="shell-row shell-focus min-w-0 flex-1 bg-[var(--color-bg)] px-1.5 py-1 text-[10.5px] text-[var(--color-text)] outline-none"
         >
           {CHAT_MODELS.filter((m) => !m.disabled).map((m) => (
             <option key={m.id} value={m.id}>
@@ -137,7 +137,7 @@ export function AgentsSection({
         <select
           value={draftPerm}
           onChange={(e) => setDraftPerm(e.target.value)}
-          className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-1 text-[10.5px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+          className="shell-row shell-focus min-w-0 flex-1 bg-[var(--color-bg)] px-1.5 py-1 text-[10.5px] text-[var(--color-text)] outline-none"
         >
           {PERMISSION_MODES.map((p) => (
             <option key={p.id} value={p.id}>
@@ -150,13 +150,13 @@ export function AgentsSection({
         <button
           type="button"
           onClick={resetDraft}
-          className="rounded px-2 py-1 text-[10px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
+          className="shell-row shell-hover shell-focus px-2 py-1 text-[10px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
         >
           cancel
         </button>
         <button
           type="submit"
-          className="rounded bg-[var(--color-accent)] px-2 py-1 text-[10px] font-medium text-[var(--color-bg)] disabled:opacity-50"
+          className="shell-row shell-focus bg-[var(--color-accent)] px-2 py-1 text-[10px] font-medium text-[var(--color-accent-fg)] disabled:opacity-50"
           disabled={!draftLabel.trim() || !draftPrompt.trim()}
         >
           create + run

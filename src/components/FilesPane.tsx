@@ -31,7 +31,8 @@ import {
   type DirEntry,
 } from "../lib/fs";
 import { detectProject, listProjects, type ProjectInfo } from "../lib/run";
-import { AIOS_DIR_MIME, AIOS_PATH_MIME, beginPathDrag, consumeDragClick, spawnPane } from "../lib/paneBus";
+import { AIOS_DIR_MIME, AIOS_PATH_MIME, beginPathDrag, consumeDragClick, spawnPane, taskSpawnContext } from "../lib/paneBus";
+import type { TaskId } from "../lib/taskWorkspace";
 import { fileIcon } from "../lib/fileIcons";
 import { AppSvgIcon } from "./AppSvgIcon";
 import { PaneDropZone } from "./PaneDropZone";
@@ -67,11 +68,14 @@ export function FilesPane({
   onOpenFile,
   onOpenEditorFile,
   onOpenViewerFile,
+  taskId,
 }: {
   initialRoot?: string;
   onOpenFile?: (path: string, name: string) => void;
   onOpenEditorFile?: (path: string, name: string) => void;
   onOpenViewerFile?: (path: string, name: string) => void;
+  /** Optional owner inherited by panes explicitly opened from this explorer. */
+  taskId?: TaskId;
 }) {
   const [root, setRoot] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -202,8 +206,8 @@ export function FilesPane({
   }, [selected, children, root]);
 
   const openTerminalHere = useCallback(() => {
-    spawnPane("terminal", { cwd: focusDir });
-  }, [focusDir]);
+    spawnPane("terminal", { cwd: focusDir, ...taskSpawnContext(taskId) });
+  }, [focusDir, taskId]);
 
   const selectedEntry = useMemo(() => {
     if (!selected) return null;
@@ -240,9 +244,9 @@ export function FilesPane({
   const openContextTerminal = useCallback(() => {
     const entry = contextMenu?.entry;
     if (!entry) return;
-    spawnPane("terminal", { cwd: entryDir(entry), label: "terminal · project" });
+    spawnPane("terminal", { cwd: entryDir(entry), label: "terminal · project", ...taskSpawnContext(taskId) });
     closeContextMenu();
-  }, [closeContextMenu, contextMenu]);
+  }, [closeContextMenu, contextMenu, taskId]);
 
   const openContextDefault = useCallback(() => {
     const entry = contextMenu?.entry;
@@ -268,16 +272,16 @@ export function FilesPane({
   const openContextChat = useCallback(() => {
     const entry = contextMenu?.entry;
     if (!entry) return;
-    spawnPane("chat", { cwd: entryDir(entry), label: `chat · ${entry.name}` });
+    spawnPane("chat", { cwd: entryDir(entry), label: `chat · ${entry.name}`, ...taskSpawnContext(taskId) });
     closeContextMenu();
-  }, [closeContextMenu, contextMenu]);
+  }, [closeContextMenu, contextMenu, taskId]);
 
   const openContainingFilesPane = useCallback(() => {
     const entry = contextMenu?.entry;
     if (!entry) return;
-    spawnPane("files", { path: entryDir(entry), label: `files · ${entry.name}` });
+    spawnPane("files", { path: entryDir(entry), label: `files · ${entry.name}`, ...taskSpawnContext(taskId) });
     closeContextMenu();
-  }, [closeContextMenu, contextMenu]);
+  }, [closeContextMenu, contextMenu, taskId]);
 
   const runContextProject = useCallback(async () => {
     const entry = contextMenu?.entry;
@@ -286,15 +290,16 @@ export function FilesPane({
     const project = await detectProject(entry.path).catch(() => null);
     const command = project?.commands[0];
     if (!project?.root || !command) {
-      spawnPane("terminal", { cwd: entryDir(entry), label: "terminal · project" });
+      spawnPane("terminal", { cwd: entryDir(entry), label: "terminal · project", ...taskSpawnContext(taskId) });
       return;
     }
     spawnPane("terminal", {
       cwd: project.root,
       cmd: command.cmd,
       label: `run · ${command.label}`,
+      ...taskSpawnContext(taskId),
     });
-  }, [closeContextMenu, contextMenu]);
+  }, [closeContextMenu, contextMenu, taskId]);
 
   const rootName = root.split("/").filter(Boolean).pop() ?? root;
   const f = filter.trim().toLowerCase();

@@ -469,7 +469,7 @@ export function CdpChromePane({ onClose }: { onClose?: () => void }) {
               <button
                 type="button"
                 onClick={retry}
-                className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)]"
               >
                 retry
               </button>
@@ -489,7 +489,7 @@ export function CdpChromePane({ onClose }: { onClose?: () => void }) {
               <button
                 type="button"
                 onClick={retry}
-                className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)]"
               >
                 retry
               </button>

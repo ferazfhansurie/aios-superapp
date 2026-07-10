@@ -111,7 +111,8 @@ export function ProviderBlock({
   sevenDay: { pct: number | null; resetsAt: number | null };
 }) {
   if (fiveHour.pct == null && sevenDay.pct == null) return null;
-  const accent = PROVIDER_COLOR[name] ?? "var(--color-accent)";
+  // account-suffixed names ("claude · gmail") share the provider's color
+  const accent = PROVIDER_COLOR[name.split(" · ")[0]] ?? "var(--color-accent)";
   const fiveHourRisk = usagePaceRisk({
     pct: fiveHour.pct,
     resetsAt: fiveHour.resetsAt,
@@ -137,9 +138,9 @@ export function ProviderBlock({
 }
 
 /**
- * Hook that polls claude + codex usage every 30s. Shared by both the sidebar and
- * the idle home so they draw from one source. Returns the raw rate shapes plus
- * `hasClaude` / `hasCodex` flags so the caller can hide empty providers.
+ * Poll the one Claude identity used by the terminal/default ~/.claude login,
+ * plus Codex usage. The shell deliberately does not surface stale alternate
+ * account configs in the sidebar or chat pane.
  */
 export function useUsageRates() {
   const [claude, setClaude] = useState<ClaudeRate | null>(null);
@@ -168,16 +169,17 @@ export function useUsageRates() {
   return { claude, codex, hasClaude, hasCodex };
 }
 
-/** Sidebar usage section — the narrow stacked claude+codex blocks. */
+/** Sidebar usage section — one terminal-active Claude block + Codex. */
 export function UsageGlance() {
   const { claude, codex, hasClaude, hasCodex } = useUsageRates();
   if (!hasClaude && !hasCodex) return null;
+  const claudeName = claude?.label ? `claude · ${claude.label}` : "claude";
 
   return (
     <div className="flex flex-col gap-3 border-t border-[var(--color-border)] pt-3">
       <span className="text-[10px] font-medium uppercase tracking-widest text-[var(--color-muted)]">usage</span>
       {hasClaude && (
-        <ProviderBlock name="claude" fiveHour={claude!.fiveHour} sevenDay={claude!.sevenDay} />
+        <ProviderBlock name={claudeName} fiveHour={claude!.fiveHour} sevenDay={claude!.sevenDay} />
       )}
       {hasCodex && (
         <ProviderBlock name="codex" fiveHour={codex!.fiveHour} sevenDay={codex!.sevenDay} />

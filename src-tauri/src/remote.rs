@@ -33,6 +33,13 @@ use futures_util::{SinkExt, StreamExt};
 struct RemoteHandle {
     box_id: u32,
     input_tx: mpsc::UnboundedSender<String>,
+    on_event: Channel<String>,
+    run: Mutex<Option<RemoteRun>>,
+}
+
+struct RemoteRun {
+    id: String,
+    interrupting: bool,
 }
 
 fn remote_table() -> &'static Mutex<HashMap<u32, RemoteHandle>> {
@@ -191,9 +198,15 @@ pub fn start(
     })?;
 
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
-    remote_table()
-        .lock()
-        .insert(local_id, RemoteHandle { box_id, input_tx });
+    remote_table().lock().insert(
+        local_id,
+        RemoteHandle {
+            box_id,
+            input_tx,
+            on_event: on_event.clone(),
+            run: Mutex::new(None),
+        },
+    );
 
     // Attach WS: forward box lines → frontend channel; drain input_rx → box.
     tauri::async_runtime::spawn(async move {
@@ -233,8 +246,12 @@ pub fn start(
         while let Some(msg) = stream.next().await {
             match msg {
                 Ok(Message::Text(line)) => {
+                    let terminal = remote_result_terminal(&line);
                     if on_event.send(line).is_err() {
                         break; // pane closed
+                    }
+                    if let Some(state) = terminal {
+                        finish_run(local_id, state);
                     }
                 }
                 Ok(Message::Close(_)) | Err(_) => break,
@@ -253,19 +270,75 @@ pub fn is_remote(local_id: u32) -> bool {
     remote_table().lock().contains_key(&local_id)
 }
 
-/// Sends a user turn to the box session.
-pub fn send(local_id: u32, text: &str) -> Result<(), String> {
-    push_frame(local_id, json!({ "type": "send", "text": text }))
+/// Sends a user turn to the box session, carrying the same renderer-owned run
+/// identity used by local chat sessions. Remote output is plain stream-json, so
+/// this bridge adds the ordered lifecycle frames around it.
+pub fn send(local_id: u32, text: &str, run_id: &str) -> Result<(), String> {
+    let mut table = remote_table().lock();
+    let handle = table.get_mut(&local_id).ok_or("no such remote session")?;
+    if handle.run.lock().is_some() {
+        return Err("remote session busy — a turn is already in flight".into());
+    }
+    *handle.run.lock() = Some(RemoteRun {
+        id: run_id.to_string(),
+        interrupting: false,
+    });
+    emit_run(handle, "starting", run_id);
+    if let Err(error) = handle
+        .input_tx
+        .send(json!({ "type": "send", "text": text }).to_string())
+    {
+        finish_handle_run(handle, "failed");
+        return Err(format!("remote session input channel closed: {error}"));
+    }
+    // The turn is now accepted by the local websocket writer queue. This is the
+    // remote equivalent of a local child being launched: it is safe to unlock
+    // steer while terminal state still comes from the eventual box result/EOF.
+    emit_run(handle, "running", run_id);
+    Ok(())
 }
 
 /// Steers the in-flight box turn (claude: another injected user line).
-pub fn steer(local_id: u32, text: &str) -> Result<(), String> {
-    push_frame(local_id, json!({ "type": "steer", "text": text }))
+pub fn steer(local_id: u32, text: &str, run_id: &str) -> Result<(), String> {
+    let table = remote_table().lock();
+    let handle = table.get(&local_id).ok_or("no such remote session")?;
+    let active = handle.run.lock();
+    let Some(active) = active.as_ref() else {
+        return Err("stale or missing remote chat run".into());
+    };
+    if active.id != run_id || active.interrupting {
+        return Err("stale or missing remote chat run".into());
+    }
+    handle
+        .input_tx
+        .send(json!({ "type": "steer", "text": text }).to_string())
+        .map_err(|_| "remote session input channel closed".to_string())
 }
 
 /// Interrupts the in-flight box turn.
-pub fn interrupt(local_id: u32) -> Result<(), String> {
-    push_frame(local_id, json!({ "type": "interrupt" }))
+pub fn interrupt(local_id: u32, run_id: &str) -> Result<(), String> {
+    let table = remote_table().lock();
+    let handle = table.get(&local_id).ok_or("no such remote session")?;
+    {
+        let mut active = handle.run.lock();
+        let Some(active) = active.as_mut() else {
+            return Err("stale or missing remote chat run".into());
+        };
+        if active.id != run_id || active.interrupting {
+            return Err("stale or missing remote chat run".into());
+        }
+        active.interrupting = true;
+    }
+    emit_run(handle, "interrupting", run_id);
+    if handle
+        .input_tx
+        .send(json!({ "type": "interrupt" }).to_string())
+        .is_err()
+    {
+        finish_handle_run(handle, "failed");
+        return Err("remote session input channel closed".into());
+    }
+    Ok(())
 }
 
 /// Stops the box session and drops the local handle.
@@ -289,16 +362,47 @@ pub fn stop(local_id: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn push_frame(local_id: u32, frame: Value) -> Result<(), String> {
-    let t = remote_table().lock();
-    let h = t.get(&local_id).ok_or("no such remote session")?;
-    h.input_tx
-        .send(frame.to_string())
-        .map_err(|_| "remote session input channel closed".to_string())
+fn cleanup(local_id: u32) {
+    if let Some(handle) = remote_table().lock().remove(&local_id) {
+        finish_handle_run(&handle, "exited");
+    }
 }
 
-fn cleanup(local_id: u32) {
-    remote_table().lock().remove(&local_id);
+fn emit_run(handle: &RemoteHandle, state: &str, run_id: &str) {
+    let _ = handle.on_event.send(
+        json!({ "type": "aios_run", "state": state, "runId": run_id }).to_string(),
+    );
+}
+
+fn finish_handle_run(handle: &RemoteHandle, fallback: &str) {
+    let active = handle.run.lock().take();
+    let Some(active) = active else { return };
+    let state = if active.interrupting { "interrupted" } else { fallback };
+    emit_run(handle, state, &active.id);
+}
+
+fn finish_run(local_id: u32, fallback: &str) {
+    if let Some(handle) = remote_table().lock().get(&local_id) {
+        finish_handle_run(handle, fallback);
+    }
+}
+
+fn remote_result_terminal(line: &str) -> Option<&'static str> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("type").and_then(Value::as_str) != Some("result") {
+        return None;
+    }
+    Some(
+        if parsed
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "failed"
+        } else {
+            "completed"
+        },
+    )
 }
 
 fn synthetic_error(msg: &str) -> String {

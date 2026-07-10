@@ -1,6 +1,7 @@
 import { lazy, Suspense } from "react";
 
 import type { PaneKind } from "./TerminalRuntime";
+import type { TaskId } from "../lib/taskWorkspace";
 
 export type { PaneKind };
 export type TerminalPaneProps = {
@@ -8,6 +9,7 @@ export type TerminalPaneProps = {
   paneKey?: string;
   active?: boolean;
   hidden?: boolean;
+  taskId?: TaskId;
 };
 
 const TerminalRuntime = lazy(() =>

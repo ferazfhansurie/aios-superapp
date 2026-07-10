@@ -55,6 +55,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util"
 # we don't pull a whole HTTP client (reqwest) for one localhost request.
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+# Read-only reader for Codex's shared thread catalog (~/.codex/state_5.sqlite).
+# `bundled` compiles our own libsqlite3 (no system-lib dependency). We ONLY ever
+# open Codex's live db in immutable/read-only URI mode — never lock or mutate it,
+# since Codex Desktop may hold it open. No other sqlite dep existed in the tree.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # macOS-only: flip the WKWebView element-fullscreen preference (off by default)
 # so YouTube/video fullscreen works inside browser panes. Pinned to the same

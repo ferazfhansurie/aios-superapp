@@ -355,6 +355,7 @@ pub fn run() {
             usage::usage_stats,
             usage::codex_usage,
             usage::claude_usage,
+            usage::claude_usage_accounts,
             memory::memory_graph,
             memory::memory_file,
             memory::memory_search,

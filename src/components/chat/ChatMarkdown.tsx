@@ -3,9 +3,9 @@
  *  (not ChatTranscript) because CodeBlock uses it — keeps the modules acyclic. */
 import { memo, useMemo, useState } from "react";
 import { Check, Copy, Globe, Terminal } from "lucide-react";
-import { openUrlInPane, spawnPane } from "../../lib/paneBus";
+import { openUrlInPane, spawnPane, taskSpawnContext } from "../../lib/paneBus";
 import { isHttpPaneTarget, isPaneFileTarget } from "../../lib/paneRouting";
-import { useChatCwd, useChatFileOpener } from "./chatContext";
+import { useChatCwd, useChatFileOpener, useChatTaskId } from "./chatContext";
 
 /** Copy-to-clipboard button with a brief check confirmation. */
 export function CopyButton({
@@ -144,6 +144,7 @@ export const CodeBlock = memo(function CodeBlock({ lang, body }: { lang: string;
   // strip a single trailing newline so the block isn't bottom-heavy
   const code = body.replace(/\n$/, "");
   const cwd = useChatCwd();
+  const taskId = useChatTaskId();
   const isShell = SHELL_LANGS.has(lang.trim().toLowerCase());
   // Single-line shell snippet → safe to seed + auto-run. Multi-line scripts →
   // seed the whole block but don't auto-fire (avoid running half a heredoc).
@@ -158,7 +159,7 @@ export const CodeBlock = memo(function CodeBlock({ lang, body }: { lang: string;
           {isShell && code.trim() && (
             <button
               type="button"
-              onClick={() => spawnPane("terminal", { cwd: cwd ?? undefined, cmd: seedCmd })}
+              onClick={() => spawnPane("terminal", { cwd: cwd ?? undefined, cmd: seedCmd, ...taskSpawnContext(taskId) })}
               title={seedCmd ? "run in a new terminal pane" : "open a terminal here (multi-line — run it yourself)"}
               className="flex items-center gap-1 rounded px-1 py-0.5 text-[10.5px] text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-accent)]"
             >
@@ -305,6 +306,7 @@ const Inline = memo(function Inline({
   // `foo.ts` mention resolves against the session cwd + existence-checks before
   // opening — never a blind name search.
   const openFile = useChatFileOpener();
+  const taskId = useChatTaskId();
   const nodes: React.ReactNode[] = [];
   let i = 0;
   let k = 0;
@@ -387,7 +389,7 @@ const Inline = memo(function Inline({
                 if (http) {
                   e.preventDefault();
                   if (onOpenUrl) onOpenUrl(url);
-                  else openUrlInPane(url);
+                  else openUrlInPane(url, undefined, taskSpawnContext(taskId));
                   return;
                 }
                 if (fileish) {
@@ -407,7 +409,7 @@ const Inline = memo(function Inline({
               <button
                 key={`au${k++}`}
                 type="button"
-                onClick={() => spawnPane("browser", { url })}
+                onClick={() => spawnPane("browser", { url, ...taskSpawnContext(taskId) })}
                 title="open in a browser pane"
                 className="ml-0.5 inline-flex translate-y-[1px] items-center rounded p-0.5 align-baseline text-[var(--color-faint)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-accent)]"
               >

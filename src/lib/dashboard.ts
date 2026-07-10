@@ -205,24 +205,30 @@ export async function codexRate(): Promise<CodexRate> {
 }
 
 /**
- * Live Claude rate-limit usage, fetched from the logged-in claude.ai web pane
- * first, then Anthropic OAuth API, then the old statusline file. 5h / 7d windows
- * mirror codexRate's shape so the sidebar renders both with the same component.
+ * Live Claude rate-limit usage for the terminal-active Claude Code identity,
+ * fetched from its OAuth login with local CLI/statusline fallbacks. 5h / 7d
+ * windows mirror codexRate's shape so both use the same component.
  * Returns the empty shape when no source is available.
  */
 export interface ClaudeRate {
   fiveHour: RateWindow;
   sevenDay: RateWindow;
+  label: string | null;
+  email: string | null;
 }
 export async function claudeRate(): Promise<ClaudeRate> {
   const empty: ClaudeRate = {
     fiveHour: { pct: null, resetsAt: null },
     sevenDay: { pct: null, resetsAt: null },
+    label: null,
+    email: null,
   };
   try {
     const u = await invoke<{
       fiveHour?: { pct?: number | null; resetsAt?: number | null };
       sevenDay?: { pct?: number | null; resetsAt?: number | null };
+      label?: string | null;
+      email?: string | null;
     } | null>("claude_usage");
     if (!u) return empty;
     return {
@@ -234,9 +240,59 @@ export async function claudeRate(): Promise<ClaudeRate> {
         pct: u.sevenDay?.pct ?? null,
         resetsAt: u.sevenDay?.resetsAt ?? null,
       },
+      label: u.label ?? null,
+      email: u.email ?? null,
     };
   } catch {
     return empty;
+  }
+}
+
+/**
+ * Live usage for every configured Claude account (multi-sub: firaz runs two Max
+ * subscriptions). Backed by the `claude_usage_accounts` Rust command, which
+ * reads ~/.aios/state/claude-accounts.json — accounts[0] is the one the CLI is
+ * logged into (full fallback chain); extras are OAuth-only from their own token
+ * source. `needsLogin` = no token / fetch failed, so the UI can hint instead of
+ * silently hiding the block.
+ */
+export interface ClaudeAccountRate {
+  id: string;
+  label: string;
+  email: string | null;
+  fiveHour: RateWindow;
+  sevenDay: RateWindow;
+  needsLogin: boolean;
+}
+export async function claudeAccountsRate(): Promise<ClaudeAccountRate[]> {
+  try {
+    const raw = await invoke<
+      Array<{
+        id?: string;
+        label?: string;
+        email?: string | null;
+        fiveHour?: { pct?: number | null; resetsAt?: number | null };
+        sevenDay?: { pct?: number | null; resetsAt?: number | null };
+        needsLogin?: boolean;
+      }> | null
+    >("claude_usage_accounts");
+    if (!Array.isArray(raw)) return [];
+    return raw.map((a, i) => ({
+      id: a.id ?? `account-${i}`,
+      label: a.label ?? a.id ?? "claude",
+      email: a.email ?? null,
+      fiveHour: {
+        pct: a.fiveHour?.pct ?? null,
+        resetsAt: a.fiveHour?.resetsAt ?? null,
+      },
+      sevenDay: {
+        pct: a.sevenDay?.pct ?? null,
+        resetsAt: a.sevenDay?.resetsAt ?? null,
+      },
+      needsLogin: a.needsLogin ?? false,
+    }));
+  } catch {
+    return [];
   }
 }
 

@@ -1,3 +1,5 @@
+import { isTaskId, type TaskId } from "./taskWorkspace.ts";
+
 /** Lightweight registry so cross-cutting features (voice dictation, drops) can
  *  inject text into a specific terminal pane's PTY. Each TerminalPane registers
  *  a writer keyed by its pane key; App tracks which pane is focused. */
@@ -77,6 +79,8 @@ export interface PaneContext {
   cwd?: string;
   url?: string;
   file?: string;
+  /** Task ownership is optional: standalone panes intentionally expose none. */
+  taskId?: TaskId;
 }
 
 export interface PaneHandle {
@@ -248,6 +252,15 @@ export interface SpawnCtx {
   cmd?: string;
   /** Optional human label override for the new pane. */
   label?: string;
+  /** Optional owning chat task. App propagates it only for explicitly linked
+   * child panes; independent spawns remain taskless. */
+  taskId?: TaskId;
+}
+
+/** Explicit child actions inherit a validated task id. Standalone actions pass
+ * an empty context so the task rail never accidentally absorbs unrelated panes. */
+export function taskSpawnContext(taskId: unknown): Pick<SpawnCtx, "taskId"> {
+  return isTaskId(taskId) ? { taskId } : {};
 }
 
 let spawnPaneImpl: ((kind: SpawnPaneKind, ctx?: SpawnCtx) => void) | null = null;
@@ -386,10 +399,10 @@ export function getActivePaneKey(): string | null {
 // ── open-url-in-pane channel ─────────────────────────────────────────────────
 // Same shape as file opening: App owns pane creation, deep markdown renderers can
 // ask for an in-app browser pane without knowing the layout machinery.
-let openUrlImpl: ((url: string, label?: string) => void) | null = null;
+let openUrlImpl: ((url: string, label?: string, ctx?: Pick<SpawnCtx, "taskId">) => void) | null = null;
 
 export function registerOpenUrl(
-  fn: (url: string, label?: string) => void,
+  fn: (url: string, label?: string, ctx?: Pick<SpawnCtx, "taskId">) => void,
 ): () => void {
   openUrlImpl = fn;
   return () => {
@@ -397,9 +410,9 @@ export function registerOpenUrl(
   };
 }
 
-export function openUrlInPane(url: string, label?: string): boolean {
+export function openUrlInPane(url: string, label?: string, ctx?: Pick<SpawnCtx, "taskId">): boolean {
   if (!openUrlImpl) return false;
-  openUrlImpl(url, label);
+  openUrlImpl(url, label, ctx);
   return true;
 }
 

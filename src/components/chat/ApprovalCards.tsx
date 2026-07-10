@@ -51,9 +51,9 @@ export const ApprovalCard = memo(function ApprovalCard({
   }
 
   return (
-    <div className="overflow-hidden rounded-xl border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)]">
+    <div className="overflow-hidden rounded-[var(--aios-radius-card)] border border-[var(--color-warning-accent)] bg-[var(--color-warning-soft)]">
       <div className="flex items-center gap-2.5 px-3.5 pt-3 pb-2">
-        <span className="grid h-6 w-6 shrink-0 place-items-center rounded-md bg-[var(--color-bg)]/40 text-[var(--color-accent)]">
+        <span className="grid h-6 w-6 shrink-0 place-items-center rounded-[var(--aios-radius-row)] bg-[var(--color-warning-accent)] text-[var(--color-warning-fg)]">
           <ShieldQuestion size={14} />
         </span>
         <span className="font-sans text-[12.5px] text-[var(--color-text)]">
@@ -62,7 +62,7 @@ export const ApprovalCard = memo(function ApprovalCard({
         </span>
       </div>
       {args && (
-        <div className="mx-3.5 mb-2 truncate rounded-md bg-[var(--color-bg)]/40 px-2.5 py-1.5 font-mono text-[11px] text-[var(--color-muted)]">
+        <div className="mx-3.5 mb-2 truncate rounded-[var(--aios-radius-row)] bg-[var(--color-panel)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--color-muted)]">
           {args}
         </div>
       )}
@@ -70,7 +70,7 @@ export const ApprovalCard = memo(function ApprovalCard({
         <button
           type="button"
           onClick={() => onResolve(turn.requestId, turn.toolName, "allow")}
-          className="flex items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 font-sans text-[12px] font-medium text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
+          className="flex items-center gap-1.5 rounded-[var(--aios-radius-row)] bg-[var(--color-warning-accent)] px-3 py-1.5 font-sans text-[12px] font-medium text-[var(--color-warning-fg)] transition-colors focus-visible:outline-2 focus-visible:outline-[var(--color-focus)]"
         >
           <Check size={13} /> allow once
         </button>
@@ -79,14 +79,14 @@ export const ApprovalCard = memo(function ApprovalCard({
           onClick={() =>
             onResolve(turn.requestId, turn.toolName, "allow_always")
           }
-          className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3 py-1.5 font-sans text-[12px] text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)]/50"
+          className="flex items-center gap-1.5 rounded-[var(--aios-radius-row)] border border-[var(--color-warning-accent)] bg-[var(--color-warning-soft)] px-3 py-1.5 font-sans text-[12px] text-[var(--color-text)] transition-colors focus-visible:outline-2 focus-visible:outline-[var(--color-focus)]"
         >
           <CheckCheck size={13} /> allow always
         </button>
         <button
           type="button"
           onClick={() => onResolve(turn.requestId, turn.toolName, "deny")}
-          className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] px-3 py-1.5 font-sans text-[12px] text-[var(--color-muted)] transition-colors hover:border-[var(--color-danger)]/40 hover:text-[var(--color-danger)]"
+          className="flex items-center gap-1.5 rounded-[var(--aios-radius-row)] border border-[var(--color-border)] px-3 py-1.5 font-sans text-[12px] text-[var(--color-muted)] transition-colors hover:border-[var(--color-danger)]/40 hover:text-[var(--color-danger)] focus-visible:outline-2 focus-visible:outline-[var(--color-focus)]"
         >
           <X size={13} /> deny
         </button>
@@ -229,7 +229,7 @@ export const QuestionCard = memo(function QuestionCard({
                     onClick={() => toggle(qi, o.label, q.multiSelect)}
                     className={`flex items-center gap-1.5 rounded-[var(--aios-radius-pill)] border px-3.5 py-1.5 text-[13px] font-medium transition-colors ${
                       active
-                        ? "border-[var(--color-accent)] bg-[var(--color-accent)] text-[var(--color-bg)]"
+                        ? "border-[var(--color-accent)] bg-[var(--color-accent)] text-[var(--color-accent-fg)]"
                         : "border-[var(--color-border-strong)] bg-[var(--color-panel-2)] text-[var(--color-text)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]"
                     }`}
                   >
@@ -271,7 +271,7 @@ export const QuestionCard = memo(function QuestionCard({
             <button
               type="button"
               onClick={submit}
-              className="flex items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 font-sans text-[12px] font-medium text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
+              className="flex items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 font-sans text-[12px] font-medium text-[var(--color-accent-fg)] transition-colors hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)]"
             >
               <Check size={13} /> send answer
             </button>

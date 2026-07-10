@@ -3,6 +3,7 @@
 import { createContext, useContext } from "react";
 import { openFileInPane } from "../../lib/paneBus";
 import { resolvePaneFileTarget, targetLabel } from "../../lib/paneRouting";
+import type { TaskId } from "../../lib/taskWorkspace";
 
 // ── deterministic in-chat file open ──────────────────────────────────────────
 //
@@ -26,8 +27,16 @@ export const ChatFileOpenContext = createContext<ChatFileOpener | null>(null);
  *  without threading cwd through every layer. */
 export const ChatCwdContext = createContext<string | null>(null);
 
+/** The owning chat task is threaded once from PaneCard so all explicit child
+ * actions (markdown, code blocks) stay in the same durable workspace. */
+export const ChatTaskIdContext = createContext<TaskId | undefined>(undefined);
+
 export function useChatCwd(): string | null {
   return useContext(ChatCwdContext);
+}
+
+export function useChatTaskId(): TaskId | undefined {
+  return useContext(ChatTaskIdContext);
 }
 
 export function useChatFileOpener(): ChatFileOpener {

@@ -21,8 +21,8 @@ test("gridTrackStorageKey scopes persisted sizes by grid shape", () => {
 });
 
 test("core pane policy keeps the lean shell surfaces plus terminal-backed restores", () => {
-  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "loop", "ticket", "analytics", "wrms-device", "live-room"]);
-  for (const type of ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "loop", "ticket", "analytics", "wrms-device", "live-room"]) {
+  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "loop", "ticket", "analytics", "system", "wrms-device", "live-room"]);
+  for (const type of ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "loop", "ticket", "analytics", "system", "wrms-device", "live-room"]) {
     assert.equal(isCorePaneKind(type), true, `${type} should be core`);
   }
   for (const type of ["app", "appcast", "apps", "bridges", "chrome", "git", "memory", "mission", "money-agents", "notes", "notifications", "plugins", "pulse", "agents", "oracle-roster"]) {
@@ -67,6 +67,20 @@ test("migrateLayoutPanes passes through existing keys untouched (changed=false)"
     panes.map((p) => p.key),
     ["k12-ab3f", "k-chat-x7q2p1"],
   );
+});
+
+test("migrateLayoutPanes preserves a persisted chat task id", () => {
+  const taskId = "task:k-chat-owned";
+  const { panes, changed } = migrateLayoutPanes([
+    {
+      key: "k-chat-owned",
+      label: "chat",
+      kind: { type: "chat", cwd: "/repo", taskId },
+    },
+  ]);
+
+  assert.equal(changed, false);
+  assert.equal(panes[0].kind.taskId, taskId);
 });
 
 test("migrateLayoutPanes drops non-core panes and persists the cleanup", () => {

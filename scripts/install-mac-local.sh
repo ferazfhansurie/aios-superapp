@@ -18,7 +18,9 @@ fi
 codesign --force --deep --sign - --requirements "$stable_requirement" "$bundle_app"
 codesign --verify --deep --strict "$bundle_app"
 
-pkill -x aios-shell 2>/dev/null || true
+# -f: macOS registers GUI apps under their full executable path, so a bare
+# `pkill -x aios-shell` never matches and the old instance survives the install.
+pkill -f "$installed_app/Contents/MacOS/aios-shell" 2>/dev/null || true
 
 if [[ -d "$installed_app" ]]; then
   backup="/Applications/AIOS.previous-install-$(date +%Y%m%d-%H%M%S).app"

@@ -1,8 +1,8 @@
 //! Usage stats for the account menu.
 //!
-//! Claude usage now prefers the logged-in claude.ai web session from the live
-//! browser pane — the same source Claude's own usage screen uses — then falls
-//! back to Anthropic OAuth and finally the older local statusline cache.
+//! Claude usage follows the terminal-active Claude Code login: OAuth/keychain
+//! first, then CLI helper/statusline fallbacks. Browser-pane accounts are kept
+//! separate so a stale claude.ai tab cannot make the shell show the wrong user.
 
 use chrono::DateTime;
 use serde_json::{json, Value};
@@ -14,6 +14,7 @@ use tauri::{AppHandle, Manager};
 
 const CLAUDE_USAGE_CACHE_TTL_SECS: u64 = 30;
 static CLAUDE_USAGE_CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+static CLAUDE_ACCOUNTS_CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
 
 /// Returns the raw usage payload as JSON, or `null` if not yet written.
 /// Frontend renders 5h/7d %, reset countdowns, cost, context — or a graceful
@@ -28,10 +29,10 @@ pub fn usage_stats() -> Value {
     }
 }
 
-/// Live Claude rate-limit usage from the active claude.ai web session, falling
-/// back to Anthropic OAuth and then the local statusline cache. Returns a shape
+/// Live Claude rate-limit usage from the terminal-active Claude Code login,
+/// falling back to its helper/statusline cache. Returns a shape
 /// that mirrors `codex_usage` so the sidebar renders both identically:
-///   { "fiveHour": {pct, resetsAt}, "sevenDay": {pct, resetsAt} }
+///   { "fiveHour": {pct, resetsAt}, "sevenDay": {pct, resetsAt}, label, email }
 /// Returns `null` when no source is available so the sidebar block hides
 /// gracefully. Reads + parses in Rust — no shelling out to node/ccusage.
 #[tauri::command]
@@ -39,16 +40,7 @@ pub fn claude_usage(app: AppHandle) -> Value {
     claude_usage_value(Some(&app))
 }
 
-pub fn claude_usage_value(app: Option<&AppHandle>) -> Value {
-    if let Some(app) = app {
-        if let Some(data) = claude_usage_from_webview(app) {
-            if claude_usage_has_signal(&data) {
-                write_claude_usage_cache(&data);
-                return data;
-            }
-        }
-    }
-
+pub fn claude_usage_value(_app: Option<&AppHandle>) -> Value {
     if let Ok(guard) = CLAUDE_USAGE_CACHE.lock() {
         if let Some((fetched_at, ref data)) = *guard {
             if fetched_at.elapsed().as_secs() < CLAUDE_USAGE_CACHE_TTL_SECS
@@ -61,6 +53,7 @@ pub fn claude_usage_value(app: Option<&AppHandle>) -> Value {
 
     if let Some(data) = claude_usage_from_oauth() {
         if claude_usage_has_signal(&data) {
+            let data = attach_terminal_claude_identity(data);
             write_claude_usage_cache(&data);
             return data;
         }
@@ -68,15 +61,53 @@ pub fn claude_usage_value(app: Option<&AppHandle>) -> Value {
 
     if let Some(data) = claude_usage_from_helper() {
         if claude_usage_has_signal(&data) {
+            let data = attach_terminal_claude_identity(data);
             write_claude_usage_cache(&data);
             return data;
         }
     }
 
-    let data = claude_usage_from_statusline().unwrap_or(Value::Null);
+    let data = attach_terminal_claude_identity(
+        claude_usage_from_statusline().unwrap_or(Value::Null),
+    );
     if claude_usage_has_signal(&data) {
         write_claude_usage_cache(&data);
     }
+    data
+}
+
+/// Resolve the identity Claude Code itself is using from ~/.claude.json, then
+/// reuse any matching human label in the legacy accounts file (e.g. "fhe").
+/// This is metadata only; credentials stay in Claude's keychain.
+fn terminal_claude_identity() -> (Option<String>, Option<String>) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let profile = std::fs::read_to_string(format!("{home}/.claude.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let email = profile
+        .as_ref()
+        .and_then(|value| value.pointer("/oauthAccount/emailAddress"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let label = email.as_deref().and_then(|active_email| {
+        claude_accounts_config()
+            .into_iter()
+            .find(|account| account.email.as_deref() == Some(active_email))
+            .map(|account| account.label)
+            .or_else(|| active_email.split('@').next().map(ToOwned::to_owned))
+    });
+    (label, email)
+}
+
+fn attach_terminal_claude_identity(mut data: Value) -> Value {
+    let Some(object) = data.as_object_mut() else {
+        return data;
+    };
+    let (label, email) = terminal_claude_identity();
+    object.insert("label".into(), json!(label));
+    object.insert("email".into(), json!(email));
     data
 }
 
@@ -84,6 +115,334 @@ fn write_claude_usage_cache(data: &Value) {
     if let Ok(mut guard) = CLAUDE_USAGE_CACHE.lock() {
         *guard = Some((Instant::now(), data.clone()));
     }
+}
+
+/// One configured Claude account from `~/.aios/state/claude-accounts.json`.
+/// `token` describes where its OAuth token lives:
+///   {"kind":"default"}                          → the normal claude-code chain
+///   {"kind":"keychain","service":..,"account":..}
+///   {"kind":"credentials_file","path":..}
+///   {"kind":"env_file","path":..,"var":..}      → var defaults to CLAUDE_CODE_OAUTH_TOKEN
+/// `config_dir` (json: configDir) is the CLAUDE_CONFIG_DIR the CLI must run
+/// under to BE this account — None for the default login (~/.claude).
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeAccount {
+    pub(crate) id: String,
+    label: String,
+    email: Option<String>,
+    token: Value,
+    pub(crate) config_dir: Option<String>,
+}
+
+/// CLAUDE_CONFIG_DIR (expanded) for a configured account id, or None when the
+/// id is unknown / the account is the default login. chat.rs uses this to spawn
+/// chat sessions AS a specific account.
+pub(crate) fn claude_account_config_dir(id: &str) -> Option<String> {
+    claude_accounts_config()
+        .into_iter()
+        .find(|a| a.id == id)?
+        .config_dir
+        .map(|d| expand_home(&d))
+}
+
+pub(crate) fn claude_accounts_config() -> Vec<ClaudeAccount> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = format!("{home}/.aios/state/claude-accounts.json");
+    let fallback = vec![ClaudeAccount {
+        id: "default".into(),
+        label: "claude".into(),
+        email: None,
+        token: json!({ "kind": "default" }),
+        config_dir: None,
+    }];
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return fallback;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return fallback;
+    };
+    let Some(list) = v.get("accounts").and_then(|a| a.as_array()) else {
+        return fallback;
+    };
+    let accounts: Vec<ClaudeAccount> = list
+        .iter()
+        .filter_map(|a| {
+            let id = a.get("id")?.as_str()?.to_string();
+            Some(ClaudeAccount {
+                label: a
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&id)
+                    .to_string(),
+                email: a
+                    .get("email")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+                token: a.get("token").cloned().unwrap_or(json!({"kind":"default"})),
+                config_dir: a
+                    .get("configDir")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+                id,
+            })
+        })
+        .collect();
+    if accounts.is_empty() {
+        fallback
+    } else {
+        accounts
+    }
+}
+
+fn resolve_account_token(source: &Value) -> Option<String> {
+    match source.get("kind").and_then(|k| k.as_str()).unwrap_or("default") {
+        "default" => claude_oauth_token(),
+        "keychain" => {
+            let service = source.get("service")?.as_str()?.to_string();
+            let account = source
+                .get("account")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned);
+            let text = keychain_credentials_text(&service, account.as_deref())?;
+            // secondary accounts never run claude themselves, so THIS is the only
+            // refresher their token has. Rotated credentials are written back to
+            // the same keychain item so the refresh token never goes stale.
+            token_with_refresh(&text, |updated| {
+                write_keychain_credentials(&service, account.as_deref(), updated);
+            })
+        }
+        "credentials_file" => {
+            let path = expand_home(source.get("path")?.as_str()?);
+            let text = std::fs::read_to_string(&path).ok()?;
+            token_with_refresh(&text, |updated| {
+                let _ = std::fs::write(&path, updated);
+            })
+        }
+        "env_file" => {
+            let path = expand_home(source.get("path")?.as_str()?);
+            let var = source
+                .get("var")
+                .and_then(|v| v.as_str())
+                .unwrap_or("CLAUDE_CODE_OAUTH_TOKEN");
+            token_from_env_file(&path, var)
+        }
+        "token" => source
+            .get("value")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn expand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Claude Code's public OAuth client id — same one the CLI itself uses for its
+/// refresh grant. Needed to refresh tokens for accounts the CLI never runs on.
+const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// Access token from a credentials JSON, refreshing when expired. `write_back`
+/// receives the updated credentials JSON (rotated refresh token included) so
+/// the caller can persist it to wherever the credentials live.
+fn token_with_refresh(text: &str, write_back: impl FnOnce(&str)) -> Option<String> {
+    if let Some(token) = parse_claude_credentials_token(text) {
+        return Some(token);
+    }
+    let (updated, access) = refresh_claude_credentials(text)?;
+    write_back(&updated);
+    Some(access)
+}
+
+/// Refresh an expired claudeAiOauth credential set against Anthropic's token
+/// endpoint. Returns (updated credentials JSON, fresh access token). The
+/// refresh token travels via stdin (curl --config data), never argv.
+fn refresh_claude_credentials(text: &str) -> Option<(String, String)> {
+    let mut creds: Value = serde_json::from_str(text).ok()?;
+    let oauth_ref = creds
+        .get("claudeAiOauth")
+        .or_else(|| creds.get("claude_ai_oauth"))?;
+    let refresh = oauth_ref
+        .get("refreshToken")
+        .or_else(|| oauth_ref.get("refresh_token"))?
+        .as_str()?
+        .to_string();
+
+    let body = json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+    });
+    let mut child = std::process::Command::new("/usr/bin/curl")
+        .args([
+            "-fsS",
+            "--max-time",
+            "6",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            "https://console.anthropic.com/v1/oauth/token",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .as_mut()?
+        .write_all(body.to_string().as_bytes())
+        .ok()?;
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let resp: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let access = resp.get("access_token")?.as_str()?.to_string();
+    let new_refresh = resp
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&refresh)
+        .to_string();
+    let expires_in = resp
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(28_800);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+
+    let oauth_key = if creds.get("claudeAiOauth").is_some() {
+        "claudeAiOauth"
+    } else {
+        "claude_ai_oauth"
+    };
+    let oauth = creds.get_mut(oauth_key)?.as_object_mut()?;
+    oauth.insert("accessToken".into(), json!(access));
+    oauth.insert("refreshToken".into(), json!(new_refresh));
+    oauth.insert("expiresAt".into(), json!(now_ms + expires_in * 1000));
+    Some((creds.to_string(), access))
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_credentials_text(service: &str, account: Option<&str>) -> Option<String> {
+    let user = std::env::var("USER").ok()?;
+    let account = account.unwrap_or(&user);
+    let out = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_credentials_text(_service: &str, _account: Option<&str>) -> Option<String> {
+    None
+}
+
+/// Upsert a keychain generic password via `security -i` (commands over stdin so
+/// the secret never appears in argv/ps).
+#[cfg(target_os = "macos")]
+fn write_keychain_credentials(service: &str, account: Option<&str>, secret: &str) {
+    let Ok(user) = std::env::var("USER") else {
+        return;
+    };
+    let account = account.unwrap_or(&user);
+    let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let cmd = format!(
+        "add-generic-password -U -s {} -a {} -w {}\n",
+        quote(service),
+        quote(account),
+        quote(secret)
+    );
+    if let Ok(mut child) = std::process::Command::new("security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(cmd.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_keychain_credentials(_service: &str, _account: Option<&str>, _secret: &str) {}
+
+/// Live usage for EVERY configured Claude account (multi-sub support). Returns
+///   [{ id, label, email, fiveHour, sevenDay, opus?, source, needsLogin }]
+/// The first account gets the full fallback chain (webview → oauth → helper →
+/// statusline) — it's the one the CLI/chat pane actually runs on. Extra accounts
+/// are OAuth-only from their configured token source. 30s cache.
+#[tauri::command]
+pub fn claude_usage_accounts(app: AppHandle) -> Value {
+    if let Ok(guard) = CLAUDE_ACCOUNTS_CACHE.lock() {
+        if let Some((fetched_at, ref data)) = *guard {
+            if fetched_at.elapsed().as_secs() < CLAUDE_USAGE_CACHE_TTL_SECS {
+                return data.clone();
+            }
+        }
+    }
+
+    let accounts = claude_accounts_config();
+    let mut out = Vec::with_capacity(accounts.len());
+    for (idx, account) in accounts.iter().enumerate() {
+        let usage = if idx == 0 {
+            // primary account = whatever the CLI is logged into; reuse the full chain.
+            let v = claude_usage_value(Some(&app));
+            if v.is_null() {
+                None
+            } else {
+                Some(v)
+            }
+        } else {
+            resolve_account_token(&account.token)
+                .and_then(|token| claude_usage_from_oauth_token(&token))
+        };
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".into(), json!(account.id));
+        entry.insert("label".into(), json!(account.label));
+        entry.insert("email".into(), json!(account.email));
+        match usage {
+            Some(u) if claude_usage_has_signal(&u) => {
+                for key in ["fiveHour", "sevenDay", "opus", "source"] {
+                    if let Some(v) = u.get(key) {
+                        entry.insert(key.into(), v.clone());
+                    }
+                }
+                entry.insert("needsLogin".into(), json!(false));
+            }
+            _ => {
+                entry.insert("fiveHour".into(), json!({ "pct": null, "resetsAt": null }));
+                entry.insert("sevenDay".into(), json!({ "pct": null, "resetsAt": null }));
+                entry.insert("needsLogin".into(), json!(true));
+            }
+        }
+        out.push(Value::Object(entry));
+    }
+
+    let data = Value::Array(out);
+    if let Ok(mut guard) = CLAUDE_ACCOUNTS_CACHE.lock() {
+        *guard = Some((Instant::now(), data.clone()));
+    }
+    data
 }
 
 fn claude_usage_has_signal(data: &Value) -> bool {
@@ -319,6 +678,10 @@ fn curl_config_escape(s: &str) -> String {
 
 fn claude_usage_from_oauth() -> Option<Value> {
     let token = claude_oauth_token()?;
+    claude_usage_from_oauth_token(&token)
+}
+
+fn claude_usage_from_oauth_token(token: &str) -> Option<Value> {
     let mut child = std::process::Command::new("/usr/bin/curl")
         .args([
             "-fsS",
@@ -356,6 +719,10 @@ fn claude_oauth_token() -> Option<String> {
 fn claude_oauth_token_from_env_file() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path = format!("{home}/.aios/state/claude-oauth.env");
+    token_from_env_file(&path, "CLAUDE_CODE_OAUTH_TOKEN")
+}
+
+fn token_from_env_file(path: &str, var: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     for line in text.lines() {
         let line = line.trim();
@@ -365,7 +732,7 @@ fn claude_oauth_token_from_env_file() -> Option<String> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() != "CLAUDE_CODE_OAUTH_TOKEN" {
+        if key.trim() != var {
             continue;
         }
         let token = value
@@ -387,30 +754,11 @@ fn claude_oauth_token_from_credentials_file() -> Option<String> {
     parse_claude_credentials_token(&text)
 }
 
-#[cfg(target_os = "macos")]
 fn claude_oauth_token_from_keychain() -> Option<String> {
-    let user = std::env::var("USER").ok()?;
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-a",
-            &user,
-            "-w",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    parse_claude_credentials_token(text.trim())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn claude_oauth_token_from_keychain() -> Option<String> {
-    None
+    // the CLI's own login — read-only here (claude code manages its refresh;
+    // racing it on rotation would risk the daily driver's session).
+    let text = keychain_credentials_text("Claude Code-credentials", None)?;
+    parse_claude_credentials_token(&text)
 }
 
 fn parse_claude_credentials_token(text: &str) -> Option<String> {
@@ -926,6 +1274,30 @@ mod tests {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0)
                 > 0
+        );
+    }
+
+    #[test]
+    fn resolves_inline_and_env_file_account_tokens() {
+        assert_eq!(
+            resolve_account_token(&json!({ "kind": "token", "value": " sk-ant-oat01-x " })),
+            Some("sk-ant-oat01-x".to_string())
+        );
+        assert_eq!(resolve_account_token(&json!({ "kind": "token", "value": "" })), None);
+
+        let dir = std::env::temp_dir().join("aios-usage-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fhe-oauth.env");
+        std::fs::write(
+            &path,
+            "# fhe max sub\nCLAUDE_CODE_OAUTH_TOKEN=\"sk-ant-oat01-fhe\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_account_token(
+                &json!({ "kind": "env_file", "path": path.to_string_lossy() })
+            ),
+            Some("sk-ant-oat01-fhe".to_string())
         );
     }
 

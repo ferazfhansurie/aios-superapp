@@ -270,7 +270,7 @@ export function GitPane({ initialRoot }: { initialRoot?: string }) {
               type="button"
               onClick={commitAll}
               disabled={!message.trim() || dirtyCount === 0 || busy === "commit"}
-              className="mt-2 flex h-9 w-full items-center justify-center gap-2 rounded-md border border-[var(--color-accent)]/50 bg-[var(--color-accent)]/70 text-[13px] font-semibold text-black disabled:cursor-not-allowed disabled:border-[var(--color-border)] disabled:bg-[var(--color-panel-2)] disabled:text-[var(--color-muted)]"
+              className="mt-2 flex h-9 w-full items-center justify-center gap-2 rounded-md border border-[var(--color-accent)]/50 bg-[var(--color-accent)]/70 text-[13px] font-semibold text-[var(--color-accent-fg)] disabled:cursor-not-allowed disabled:border-[var(--color-border)] disabled:bg-[var(--color-panel-2)] disabled:text-[var(--color-muted)]"
             >
               <Check size={15} /> commit all
             </button>

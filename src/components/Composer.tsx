@@ -30,6 +30,7 @@ import {
   Brain,
   Check,
   ChevronDown,
+  ChevronRight,
   Clock,
   CornerDownLeft,
   FileText,
@@ -40,6 +41,7 @@ import {
   ListChecks,
   Loader2,
   Mic,
+  Plus,
   Pencil,
   RotateCcw,
   Search,
@@ -58,6 +60,7 @@ import {
   PERMISSION_MODES,
   type ChatModel,
   type ChatSessionInfo,
+  type EffortOption,
 } from "../lib/chat";
 import { readDir, type DirEntry } from "../lib/fs";
 import {
@@ -65,6 +68,8 @@ import {
   contextLedger,
   cycleQueueSelection,
   effortChipLabel,
+  moveEffortIndex,
+  nearestEffortIndex,
   sendContract,
   type ContextBudgetMode,
   type QueuedMessage,
@@ -188,6 +193,8 @@ function Dropdown({
   children,
   align = "left",
   triggerClassName,
+  maxWidth = "min(92vw, 360px)",
+  panelClassName,
 }: {
   open: boolean;
   onToggle: () => void;
@@ -196,6 +203,8 @@ function Dropdown({
   align?: "left" | "right";
   /** Override the trigger pill styling (e.g. the ultracode gradient). */
   triggerClassName?: string;
+  maxWidth?: string;
+  panelClassName?: string;
 }) {
   // The panel renders through a PORTAL to document.body, fixed-positioned above
   // the trigger. An absolutely-positioned menu inside a pane card got clipped at
@@ -268,15 +277,112 @@ function Dropdown({
               left: pos.left,
               right: pos.right,
               zIndex: 70,
-              maxWidth: "min(92vw, 360px)",
+              maxWidth,
               maxHeight: pos.maxHeight,
             }}
-            className="min-w-[140px] overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50"
+            className={`min-w-[140px] overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] shadow-2xl shadow-black/50 ${panelClassName ?? "py-1"}`}
           >
             {children}
           </div>,
           document.body,
         )}
+    </div>
+  );
+}
+
+function EffortSlider({
+  options,
+  value,
+  onSelect,
+}: {
+  options: EffortOption[];
+  value: EffortOption;
+  onSelect: (effort: EffortOption) => void;
+}) {
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const rawIndex = options.findIndex((option) => option.id === value.id);
+  const index = rawIndex >= 0 ? rawIndex : 0;
+  const last = Math.max(0, options.length - 1);
+  const stopPosition = (stop: number) => {
+    const pct = last > 0 ? (stop / last) * 100 : 50;
+    // Codex keeps the 28px thumb inside the 24px track: its endpoint centers
+    // are inset 13px, then that correction tapers linearly across the rail.
+    const offset = 13 - (pct / 100) * 26;
+    return `calc(${pct}% + ${offset}px)`;
+  };
+
+  const selectIndex = useCallback(
+    (next: number) => {
+      const option = options[Math.min(Math.max(next, 0), last)];
+      if (option) onSelect(option);
+    },
+    [last, onSelect, options],
+  );
+  const selectPointer = useCallback(
+    (clientX: number) => {
+      const rect = trackRef.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0) return;
+      selectIndex(nearestEffortIndex((clientX - rect.left) / rect.width, options.length));
+    },
+    [options.length, selectIndex],
+  );
+
+  return (
+    <div className="w-56 max-w-[calc(100vw-16px)] pb-2">
+      <div className="flex h-9 items-center justify-between px-3">
+        <div className="flex items-center gap-1 font-sans text-[14px] font-medium text-[var(--color-muted)]">
+          <span>advanced</span>
+          <ChevronRight size={12} />
+        </div>
+        <Zap size={16} strokeWidth={1.8} className="text-[var(--color-muted)]" />
+      </div>
+      <div className="mx-3 flex h-9 items-start pt-1">
+        <div
+          ref={trackRef}
+          role="slider"
+          tabIndex={0}
+          aria-label="reasoning effort"
+          aria-valuemin={0}
+          aria-valuemax={last}
+          aria-valuenow={index}
+          aria-valuetext={value.label}
+          onKeyDown={(event) => {
+            const next = moveEffortIndex(index, event.key, options.length);
+            if (next === index && !["Home", "End", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+            event.preventDefault();
+            selectIndex(next);
+          }}
+          onPointerDown={(event) => {
+            event.currentTarget.setPointerCapture(event.pointerId);
+            selectPointer(event.clientX);
+          }}
+          onPointerMove={(event) => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) selectPointer(event.clientX);
+          }}
+          onPointerUp={(event) => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+              event.currentTarget.releasePointerCapture(event.pointerId);
+            }
+          }}
+          className="relative h-6 w-full cursor-pointer touch-none overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.10] outline-none ring-offset-2 ring-offset-[var(--color-panel-2)] focus-visible:ring-2 focus-visible:ring-white/70"
+        >
+          <div
+            className="absolute inset-y-0 left-0 rounded-l-xl bg-[#ffb889] transition-[width] duration-300 [transition-timing-function:cubic-bezier(.23,1,.32,1)]"
+            style={{ width: stopPosition(index) }}
+          />
+          {options.map((option, stop) => (
+            <span
+              key={option.id}
+              className={`pointer-events-none absolute top-1/2 h-1 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full ${stop <= index ? "bg-white/30" : "bg-white/20"}`}
+              style={{ left: stopPosition(stop) }}
+            />
+          ))}
+          <span
+            className="pointer-events-none absolute top-1/2 h-7 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full border border-black/10 bg-white shadow-[0_0_2px_rgba(0,0,0,0.10)] transition-[left] duration-300 [transition-timing-function:cubic-bezier(.23,1,.32,1)]"
+            style={{ left: stopPosition(index) }}
+          />
+        </div>
+      </div>
     </div>
   );
 }
@@ -787,9 +893,9 @@ export interface ComposerProps {
   setGoal: React.Dispatch<React.SetStateAction<string>>;
   setComposerCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
   setOpenMenu: React.Dispatch<
-    React.SetStateAction<null | "model" | "perm" | "effort" | "advanced">
+    React.SetStateAction<null | "add" | "model" | "perm" | "effort" | "advanced">
   >;
-  openMenu: null | "model" | "perm" | "effort" | "advanced";
+  openMenu: null | "add" | "model" | "perm" | "effort" | "advanced";
   setContextBudget: React.Dispatch<React.SetStateAction<ContextBudgetMode>>;
   setEffort: React.Dispatch<React.SetStateAction<(typeof EFFORTS)[number]>>;
   setPermission: React.Dispatch<
@@ -892,6 +998,14 @@ function ComposerInner(props: ComposerProps) {
   const setInput = store.set;
   const setOverlay = overlayStore.set;
   const setOverlayIdx = overlayIdxStore.set;
+  const effortOptions = useMemo(
+    () =>
+      EFFORTS.filter(
+        (option) =>
+          !model.supportedEfforts || model.supportedEfforts.includes(option.id),
+      ),
+    [model.supportedEfforts],
+  );
 
   // @-mention picker state — driven by typing, so it lives here.
   const [mentionItems, setMentionItems] = useState<DirEntry[]>([]);
@@ -1754,7 +1868,7 @@ function ComposerInner(props: ComposerProps) {
               type="button"
               onClick={() => void micStop()}
               title="stop dictation (esc to cancel)"
-              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
+              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-accent-fg)] transition-colors hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)]"
             >
               <Square size={14} className="fill-current" />
             </button>
@@ -1796,6 +1910,74 @@ function ComposerInner(props: ComposerProps) {
           </div>
         )}
         <div className="flex flex-wrap items-center justify-end gap-1.5 px-3 pb-3 pt-1">
+          {/* Codex-style add sheet. These are real AIOS actions: file/finder
+              attach, persistent goal, plan mode, memory sources, and agent
+              budget. Keeping them in one left-hand control makes the composer
+              scan like Codex without hiding the underlying capabilities. */}
+          <Dropdown
+            open={openMenu === "add"}
+            onToggle={() => setOpenMenu(openMenu === "add" ? null : "add")}
+            align="left"
+            maxWidth="min(94vw, 420px)"
+            panelClassName="py-1"
+            triggerClassName="grid h-8 w-8 place-items-center rounded-full border border-white/10 bg-white/[0.05] text-[var(--color-text-2)] transition-colors hover:border-white/20 hover:bg-white/[0.1] hover:text-[var(--color-text)]"
+            trigger={<Plus size={17} />}
+          >
+            <div className="px-3 pb-1 pt-2 font-sans text-[12px] font-medium text-[var(--color-muted)]">
+              add
+            </div>
+            <MenuItem
+              onClick={() => {
+                fileInputRef.current?.click();
+                setOpenMenu(null);
+              }}
+            >
+              <span className="flex items-center gap-2.5"><FileText size={15} /> files and folders</span>
+            </MenuItem>
+            <MenuItem
+              onClick={() => {
+                fileInputRef.current?.click();
+                setOpenMenu(null);
+              }}
+            >
+              <span className="flex items-center gap-2.5"><Folder size={15} /> attach finder</span>
+            </MenuItem>
+            <MenuItem
+              onClick={() => {
+                const next = window.prompt("pursue goal — keep this context until cleared:", goal);
+                if (next != null) setGoal(next.trim());
+                setOpenMenu(null);
+              }}
+            >
+              <span className="flex items-center gap-2.5"><Target size={15} /> goal <span className="text-[var(--color-faint)]">set a goal to keep pursuing</span></span>
+            </MenuItem>
+            <MenuItem
+              active={planMode}
+              onClick={() => {
+                setPlanMode((enabled) => !enabled);
+                setOpenMenu(null);
+              }}
+            >
+              <span className="flex items-center gap-2.5"><ListChecks size={15} /> plan mode <span className="text-[var(--color-faint)]">turn plan mode on</span></span>
+            </MenuItem>
+            <div className="my-1 border-t border-[var(--color-border)]" />
+            <MenuItem
+              onClick={() => {
+                setContextBudget("agent");
+                setOpenMenu(null);
+              }}
+            >
+              <span className="flex items-center gap-2.5"><Sparkles size={15} /> agents <span className="text-[var(--color-faint)]">use agent task tools when available</span></span>
+            </MenuItem>
+            <MenuItem
+              onClick={() => {
+                openMemoryPanel();
+                setOpenMenu(null);
+              }}
+            >
+              <span className="flex items-center gap-2.5"><PackageOpen size={15} /> sources <span className="text-[var(--color-faint)]">attach memory and project context</span></span>
+            </MenuItem>
+          </Dropdown>
           {/* advanced controls stay available, but the composer stays clean.
               min-w-0 + wrap (NOT shrink-0): on a narrow pane the pills wrap to
               a second row instead of bleeding out the left edge of the card. */}
@@ -1878,10 +2060,13 @@ function ComposerInner(props: ComposerProps) {
                 onClick={() => {
                   setContextBudget(b.id);
                   if (b.id === "ultracode") {
-                    const ultra = EFFORTS.find((ef) => ef.ultra);
-                    if (ultra) setEffort(ultra);
+                    const deepest = effortOptions[effortOptions.length - 1];
+                    if (deepest) setEffort(deepest);
                   } else if (effort.ultra) {
-                    setEffort(EFFORTS[1]);
+                    const fallback =
+                      effortOptions.find((option) => option.id === model.defaultEffort) ??
+                      effortOptions[0];
+                    if (fallback) setEffort(fallback);
                   }
                   setOpenMenu(null);
                 }}
@@ -1960,6 +2145,8 @@ function ComposerInner(props: ComposerProps) {
             open={openMenu === "effort"}
             onToggle={() => setOpenMenu(openMenu === "effort" ? null : "effort")}
             align="right"
+            maxWidth="min(94vw, 224px)"
+            panelClassName="overflow-hidden py-0"
             triggerClassName={
               effort.ultra
                 ? "flex items-center gap-1.5 rounded-full border border-transparent bg-[linear-gradient(110deg,#7c3aed,#a855f7,#ec4899,#a855f7,#7c3aed)] bg-[length:220%_100%] px-3 py-1 font-sans text-[12px] font-semibold text-white shadow-[0_0_16px_-3px_#a855f7] [animation:aios-ultra-sweep_4s_ease_infinite] transition-shadow hover:shadow-[0_0_20px_-2px_#a855f7]"
@@ -1988,30 +2175,7 @@ function ComposerInner(props: ComposerProps) {
               </>
             }
           >
-            <div className="px-3 pb-1 pt-1.5 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
-              effort
-            </div>
-            {EFFORTS.map((ef) => (
-              <MenuItem
-                key={ef.id}
-                active={ef.id === effort.id}
-                title={ef.sub}
-                onClick={() => {
-                  setEffort(ef);
-                  setOpenMenu(null);
-                }}
-              >
-                <span className="flex min-w-0 flex-col">
-                  <span className="flex items-center gap-2">
-                    {ef.ultra && <Sparkles size={13} className="text-[#a855f7]" />}
-                    {ef.label}
-                  </span>
-                  {ef.sub && (
-                    <span className="truncate text-[10.5px] text-[var(--color-faint)]">{ef.sub}</span>
-                  )}
-                </span>
-              </MenuItem>
-            ))}
+            <EffortSlider options={effortOptions} value={effort} onSelect={setEffort} />
           </Dropdown>
           {/* model selector (right) — the headline pill: accent glow, hot
               models get the sparkle. */}
@@ -2025,7 +2189,7 @@ function ComposerInner(props: ComposerProps) {
                 <span className="shrink-0">
                   <ModelIcon model={model} size={13} />
                 </span>
-                <span className="whitespace-nowrap">{model.label}</span>
+                <span className="whitespace-nowrap">{model.shortLabel ?? model.label}</span>
                 {model.hot && (
                   <Sparkles size={11} className="shrink-0 text-[#a78bfa]" />
                 )}

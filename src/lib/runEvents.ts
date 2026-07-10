@@ -148,6 +148,39 @@ function append(state: RunEventState, events: RunEvent[], phase: RunPhase): RunE
   };
 }
 
+function appendStreamingEvent(
+  state: RunEventState,
+  event: Extract<RunEvent, { type: "reasoning" | "message.delta" }>,
+  phase: RunPhase,
+): RunEventState {
+  const last = state.events[state.events.length - 1];
+  if (last?.type === event.type) {
+    const merged = {
+      ...last,
+      text: last.text + event.text,
+      at: event.at,
+      ...(event.type === "reasoning" ? { streaming: event.streaming } : {}),
+    } as RunEvent;
+    return {
+      ...state,
+      events: [...state.events.slice(0, -1), merged],
+      phase,
+    };
+  }
+  return append(state, [event], phase);
+}
+
+/** Revision used by the durable task cockpit. Word-by-word token changes do
+ * not need a deep-cloned workspace publish; phase/tool/result boundaries do. */
+export function taskSnapshotRevision(state: RunEventState): string {
+  for (let index = state.events.length - 1; index >= 0; index--) {
+    const event = state.events[index];
+    if (event.type === "reasoning" || event.type === "message.delta") continue;
+    return `${state.phase}:${event.type}:${event.id}:${event.at}`;
+  }
+  return `${state.phase}:none`;
+}
+
 /** Normalizes raw chat stream frames into a durable run timeline. */
 export function reduceRunEvents(
   state: RunEventState,
@@ -179,24 +212,22 @@ export function reduceRunEvents(
     const delta = ev.event?.delta;
     if (ev.event?.type !== "content_block_delta" || !delta) return state;
     if (delta.type === "thinking_delta" && delta.thinking) {
-      return append(
+      return appendStreamingEvent(
         state,
-        [
-          {
-            type: "reasoning",
-            id: nextId("reasoning"),
-            text: delta.thinking,
-            streaming: true,
-            at,
-          },
-        ],
+        {
+          type: "reasoning",
+          id: nextId("reasoning"),
+          text: delta.thinking,
+          streaming: true,
+          at,
+        },
         "thinking",
       );
     }
     if (delta.type === "text_delta" && delta.text) {
-      return append(
+      return appendStreamingEvent(
         state,
-        [{ type: "message.delta", id: nextId("msg"), text: delta.text, at }],
+        { type: "message.delta", id: nextId("msg"), text: delta.text, at },
         "writing",
       );
     }

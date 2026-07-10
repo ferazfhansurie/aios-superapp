@@ -3,12 +3,37 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  coalesceChatStreamDeltas,
   finalizeStreamingTurns,
   reduceChatStreamEvent,
 } from "./chatStream.ts";
 
 let n = 0;
 const uid = () => `t${++n}`;
+
+test("coalesceChatStreamDeltas folds same-kind bursts before transcript reduction", () => {
+  const text = (value) => ({
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: value } },
+  });
+  const thinking = (value) => ({
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: value } },
+  });
+
+  const result = coalesceChatStreamDeltas([
+    text("one "),
+    text("two"),
+    thinking("check "),
+    thinking("done"),
+    text(" three"),
+  ]);
+
+  assert.equal(result.length, 3);
+  assert.equal(result[0].event.delta.text, "one two");
+  assert.equal(result[1].event.delta.thinking, "check done");
+  assert.equal(result[2].event.delta.text, " three");
+});
 
 test("reduceChatStreamEvent appends text deltas into one streaming assistant turn", () => {
   n = 0;

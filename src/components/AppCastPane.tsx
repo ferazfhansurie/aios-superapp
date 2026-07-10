@@ -432,7 +432,7 @@ export function AppCastPane({
                             reportDiag("appcast.openSettings", err, { action: "openSettings" }),
                           );
                         }}
-                        className="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[11px] font-medium text-white"
+                        className="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[11px] font-medium text-[var(--color-accent-fg)]"
                       >
                         open settings
                       </button>
@@ -525,7 +525,7 @@ export function AppCastPane({
                           reportDiag("appcast.openSettings", err, { action: "openSettings" }),
                         )
                       }
-                      className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                      className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)]"
                     >
                       open settings
                     </button>
@@ -559,7 +559,7 @@ export function AppCastPane({
                           reportDiag("appcast.openSettings", err, { action: "openAccessibility" }),
                         )
                       }
-                      className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                      className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)]"
                     >
                       open settings
                     </button>
@@ -585,7 +585,7 @@ export function AppCastPane({
                       setError(null);
                       refreshWindows();
                     }}
-                    className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white"
+                    className="mt-3 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)]"
                   >
                     retry
                   </button>

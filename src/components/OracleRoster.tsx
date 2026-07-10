@@ -660,7 +660,7 @@ function CreateOracleForm({
       <button
         type="submit"
         disabled={!name.trim()}
-        className="rounded-md bg-[var(--color-accent)] px-2 py-1 text-[11px] font-semibold text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)] disabled:opacity-40"
+        className="rounded-md bg-[var(--color-accent)] px-2 py-1 text-[11px] font-semibold text-[var(--color-accent-fg)] transition-colors hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)] disabled:opacity-40"
       >
         create
       </button>

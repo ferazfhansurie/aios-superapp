@@ -7,6 +7,7 @@ import {
   parseRunEventState,
   reduceRunEvents,
   serializeRunEventState,
+  taskSnapshotRevision,
 } from "./runEvents.ts";
 
 test("reduceRunEvents captures thinking and text deltas as structured events", () => {
@@ -46,6 +47,40 @@ test("reduceRunEvents captures thinking and text deltas as structured events", (
       { type: "message.delta", text: "done", at: 11 },
     ],
   );
+});
+
+test("reduceRunEvents coalesces contiguous token deltas into one timeline event", () => {
+  let state = emptyRunEventState();
+  for (const text of ["one ", "two ", "three"]) {
+    state = reduceRunEvents(state, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+    });
+  }
+
+  assert.equal(state.events.length, 1);
+  assert.equal(state.events[0].type, "message.delta");
+  assert.equal(state.events[0].text, "one two three");
+});
+
+test("taskSnapshotRevision ignores word-by-word deltas but advances on structural events", () => {
+  let state = emptyRunEventState();
+  state = reduceRunEvents(state, {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: "one" } },
+  });
+  const writingRevision = taskSnapshotRevision(state);
+  state = reduceRunEvents(state, {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: " two" } },
+  });
+  assert.equal(taskSnapshotRevision(state), writingRevision);
+
+  state = reduceRunEvents(state, {
+    type: "assistant",
+    message: { content: [{ type: "tool_use", id: "tool-1", name: "Read", input: {} }] },
+  });
+  assert.notEqual(taskSnapshotRevision(state), writingRevision);
 });
 
 test("reduceRunEvents captures tool lifecycle", () => {

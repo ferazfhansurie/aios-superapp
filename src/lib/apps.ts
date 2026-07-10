@@ -5,6 +5,7 @@
 
 import {
   BarChart3,
+  Swords,
   Clapperboard,
   Folder,
   Globe,
@@ -18,14 +19,16 @@ import {
 
 import type { PaneKind } from "../components/TerminalPane";
 import type { LiveRoomMode } from "./liveRoom";
+import type { TaskId } from "./taskWorkspace";
 
 /** A pane's content — terminal-backed (shell/oracle/tmux) or a view. */
-export type PaneContent =
+export type PaneContent = (
   | PaneKind
   | { type: "files"; root?: string }
   | { type: "loop" }
   | { type: "ticket" }
   | { type: "analytics" }
+  | { type: "system" }
   | { type: "live-room"; mode?: LiveRoomMode; sessionId?: string; windowId?: number }
   | { type: "history" }
   | { type: "browser"; url?: string; profile?: string; memKey?: string; transient?: boolean }
@@ -49,7 +52,8 @@ export type PaneContent =
       agentLabel?: string;
     }
   | { type: "file"; path: string; name: string }
-  | { type: "editor"; path: string; name: string; line?: number; col?: number };
+  | { type: "editor"; path: string; name: string; line?: number; col?: number }
+) & { taskId?: TaskId };
 
 /** A built-in app — `id` is the stable key persisted by the sidebar store
  *  (labels are user-editable, ids are not). */
@@ -72,6 +76,7 @@ export const SPAWN: AppDef[] = [
   { id: "loop", kind: { type: "loop" }, icon: Repeat, label: "loops", group: "tools" },
   { id: "ticket", kind: { type: "ticket" }, icon: Ticket, label: "tickets", group: "tools" },
   { id: "analytics", kind: { type: "analytics" }, icon: BarChart3, label: "analytics", group: "tools" },
+  { id: "system", kind: { type: "system" }, icon: Swords, label: "system", group: "tools" },
   { id: "wrms-device", kind: { type: "wrms-device" }, icon: Smartphone, label: "wrms device", group: "tools" },
 ];
 
