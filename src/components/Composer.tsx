@@ -76,7 +76,8 @@ import {
 } from "../lib/chatPaneState";
 import { memorySearch, type MemoryHit } from "../lib/memory";
 import { baseName, fmtElapsed, fmtRelativeTime } from "./chat/chatFormat";
-import { ModelIcon } from "./chat/modelIcons";
+import { AiosMark, ModelIcon } from "./chat/modelIcons";
+import { AIOS_MODEL_ID } from "../lib/aiosRouter";
 
 // ── external stores (input + overlay) ────────────────────────────────────────
 
@@ -808,6 +809,9 @@ export interface ComposerProps {
   activeRun: boolean;
   started: boolean;
   model: ChatModel;
+  /** non-null when the session was routed via the aios virtual model — the
+   *  router's human-readable reason. Drives the "aios → model" pill. */
+  aiosRouted?: string | null;
   permission: (typeof PERMISSION_MODES)[number];
   effort: (typeof EFFORTS)[number];
   effectiveBudget: ContextBudgetMode;
@@ -862,6 +866,11 @@ export interface ComposerProps {
   sendText: (text: string) => void;
   stop: () => void;
   steerQueued: (id: string) => void;
+  /** True only when the run lifecycle is `running` — the sole state steerQueued
+   *  acts on. The queued-steer button disables outside it so a click can never
+   *  silently no-op (it used to show on `streaming`, which includes starting/
+   *  interrupting, where clicks were dropped). */
+  canSteerNow: boolean;
   jumpToLatest: () => void;
 
   // ── queue ──
@@ -917,6 +926,7 @@ function ComposerInner(props: ComposerProps) {
     activeRun,
     started,
     model,
+    aiosRouted = null,
     permission,
     effort,
     effectiveBudget,
@@ -959,6 +969,7 @@ function ComposerInner(props: ComposerProps) {
     sendText,
     stop,
     steerQueued,
+    canSteerNow,
     jumpToLatest,
     queued,
     queuedIdx,
@@ -1295,8 +1306,10 @@ function ComposerInner(props: ComposerProps) {
       }
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
+        // Only while the run can actually take a steer — otherwise the Enter
+        // would be silently dropped by steerQueued's lifecycle guard.
         const item = queued[queuedIdx] ?? queued[0];
-        if (item) steerQueued(item.id);
+        if (item && canSteerNow) steerQueued(item.id);
         return;
       }
     }
@@ -1776,9 +1789,10 @@ function ComposerInner(props: ComposerProps) {
                   (model.engine === "codex" && !q.images?.length)) && (
                 <button
                   type="button"
+                  disabled={!canSteerNow}
                   onClick={() => steerQueued(q.id)}
-                  className="shrink-0 rounded-md px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-panel)]"
-                  title="inject into current turn"
+                  className="shrink-0 rounded-md px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-panel)] disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+                  title={canSteerNow ? "inject into current turn" : "waiting for the turn to accept input"}
                 >
                   steer
                 </button>
@@ -2185,34 +2199,64 @@ function ComposerInner(props: ComposerProps) {
             align="right"
             triggerClassName="flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.06] px-3 py-1 font-sans text-[12px] font-semibold text-[var(--color-text)] backdrop-blur-md transition-colors hover:border-white/20 hover:bg-white/[0.1]"
             trigger={
-              <>
-                <span className="shrink-0">
-                  <ModelIcon model={model} size={13} />
+              aiosRouted ? (
+                // routed via aios — always show WHICH concrete model is live:
+                // house mark, then "aios → <model>" with the reason on hover.
+                <span
+                  className="flex items-center gap-1.5"
+                  title={`routed by aios · ${aiosRouted}`}
+                >
+                  <span className="shrink-0">
+                    <AiosMark size={13} />
+                  </span>
+                  <span className="whitespace-nowrap">aios</span>
+                  <span className="text-[var(--color-faint)]">→</span>
+                  <span className="shrink-0">
+                    <ModelIcon model={model} size={12} />
+                  </span>
+                  <span className="whitespace-nowrap">{model.shortLabel ?? model.label}</span>
+                  <ChevronDown size={12} className="text-[var(--color-faint)]" />
                 </span>
-                <span className="whitespace-nowrap">{model.shortLabel ?? model.label}</span>
-                {model.hot && (
-                  <Sparkles size={11} className="shrink-0 text-[#a78bfa]" />
-                )}
-                <ChevronDown size={12} className="text-[var(--color-faint)]" />
-              </>
+              ) : (
+                <>
+                  <span className="shrink-0">
+                    <ModelIcon model={model} size={13} />
+                  </span>
+                  <span className="whitespace-nowrap">{model.shortLabel ?? model.label}</span>
+                  {model.hot && (
+                    <Sparkles size={11} className="shrink-0 text-[#a78bfa]" />
+                  )}
+                  <ChevronDown size={12} className="text-[var(--color-faint)]" />
+                </>
+              )
             }
           >
             {CHAT_MODELS.map((m, i) => {
-              const eng = m.engine ?? "claude";
-              const prevEng = i > 0 ? (CHAT_MODELS[i - 1].engine ?? "claude") : null;
+              // the virtual aios entry gets its own group; concrete models
+              // group by engine as before.
+              const groupOf = (cm: ChatModel) =>
+                cm.id === AIOS_MODEL_ID ? "aios" : (cm.engine ?? "claude");
+              const eng = groupOf(m);
+              const prevEng = i > 0 ? groupOf(CHAT_MODELS[i - 1]) : null;
               return (
-                <Fragment key={m.id}>
+                <Fragment key={`${m.id}-${i}`}>
                   {eng !== prevEng && (
                     <div
                       className={`px-3 pb-1 pt-1.5 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)] ${
                         i > 0 ? "mt-1 border-t border-[var(--color-border)] pt-2" : ""
                       }`}
                     >
-                      {eng === "codex" ? "codex · chatgpt sub" : eng === "opencode" ? "opencode · free" : "claude"}
+                      {eng === "aios"
+                        ? "aios · auto-router"
+                        : eng === "codex"
+                          ? "codex · chatgpt sub"
+                          : eng === "opencode"
+                            ? "opencode · free"
+                            : "claude"}
                     </div>
                   )}
                   <MenuItem
-                    active={m.id === model.id}
+                    active={aiosRouted ? m.id === AIOS_MODEL_ID : m.id === model.id}
                     disabled={m.disabled}
                     title={m.note}
                     onClick={() => {

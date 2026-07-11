@@ -66,6 +66,8 @@ import {
   resetSidebar,
   subscribe as subscribeSidebar,
 } from "../lib/sidebar";
+import { CHAT_MODELS } from "../lib/chat";
+import { AIOS_MODEL_ID } from "../lib/aiosRouter";
 import { AppSvgIcon, iconKeyForSidebarItem } from "./AppSvgIcon";
 
 import {
@@ -1289,6 +1291,64 @@ export function Settings({
                         ? `last used model · ${s.chatModel}`
                         : "using the engine's default model"}
                     </div>
+                  </div>
+
+                  {/* aios router — the model architecture behind the virtual
+                      "aios" picker entry (lib/aiosRouter.ts). adjustable so a
+                      new model drop is a settings change, not a code change. */}
+                  <div className="py-3">
+                    <div className="text-[13px] text-[var(--color-text)]">aios router</div>
+                    <p className="mb-1 mt-0.5 text-[11px] leading-snug text-[var(--color-muted)]">
+                      the "aios" picker entry routes through this architecture:
+                      main wins by default; deep is summon-only ("use deep" in
+                      chat); bulk does heavy lifting and drains the prepaid
+                      claude sub when main's 7-day budget runs ahead of pace.
+                      every route shows its reason in the chat pane.
+                    </p>
+                    {(
+                      [
+                        ["main", "daily driver — everything by default"],
+                        ["deep", "judgment tier — summon with \"use deep\", never auto"],
+                        ["bulk", "heavy lifting + burn tier when main runs hot"],
+                      ] as const
+                    ).map(([role, sub]) => (
+                      <Row key={role} label={role} sub={sub}>
+                        <select
+                          value={s.aiosRouterRoles[role]}
+                          onChange={(e) =>
+                            patch({
+                              aiosRouterRoles: { ...s.aiosRouterRoles, [role]: e.target.value },
+                            })
+                          }
+                          className="rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2 py-1 text-[11px] text-[var(--color-text)]"
+                        >
+                          {CHAT_MODELS.filter(
+                            (m) => m.id !== AIOS_MODEL_ID && !m.disabled && !m.node,
+                          ).map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.label}
+                            </option>
+                          ))}
+                        </select>
+                      </Row>
+                    ))}
+                    <Row
+                      label="pace margin"
+                      sub="pct-points the target's 7d meter may run ahead of the week clock before diverting to the burn tier"
+                    >
+                      <input
+                        type="number"
+                        min={5}
+                        max={50}
+                        value={s.aiosRouterPaceMargin}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          if (Number.isFinite(v))
+                            patch({ aiosRouterPaceMargin: Math.min(50, Math.max(5, v)) });
+                        }}
+                        className="w-16 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2 py-1 text-right text-[11px] text-[var(--color-text)]"
+                      />
+                    </Row>
                   </div>
 
                   {/* headroom — real, wired control. */}

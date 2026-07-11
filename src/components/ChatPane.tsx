@@ -80,6 +80,15 @@ import {
 import { fileSrc, saveImageTemp } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
 import {
+  AIOS_MODEL_ID,
+  buildHandoffSeed,
+  parseModelDirective,
+  resolveAios,
+  resolveAiosSync,
+  type AiosDecision,
+  type ModelDirective,
+} from "../lib/aiosRouter";
+import {
   claudeRate,
   idleRate,
   codexRate,
@@ -630,21 +639,39 @@ export function ChatPane({
 
   // composer settings — boot from the saved default (settings.chatModel).
   // The model the user last picked in the composer IS their default; persisted
-  // so codex / opus / whatever sticks across panes + restarts.
+  // so codex / opus / whatever sticks across panes + restarts. The virtual
+  // "aios" entry resolves to a concrete model HERE — the pane always holds a
+  // concrete model; `aiosRouted` carries the route reason for display.
+  const bootRouteRef = useRef<AiosDecision | null>(null);
   const [model, setModel] = useState<ChatModel>(() => {
     // Resuming a prior chat: honor its saved model/engine FIRST so a codex thread
     // doesn't boot on claude (which would mis-route --resume to the wrong binary).
     if (resume?.model) {
-      const byId = CHAT_MODELS.find((m) => m.id === resume.model);
+      const byId = CHAT_MODELS.find((m) => m.id === resume.model && m.id !== AIOS_MODEL_ID);
       if (byId) return byId;
     }
     if (resume?.engine) {
-      const byEngine = CHAT_MODELS.find((m) => (m.engine ?? "claude") === resume.engine);
+      const byEngine = CHAT_MODELS.find(
+        (m) => m.id !== AIOS_MODEL_ID && (m.engine ?? "claude") === resume.engine,
+      );
       if (byEngine) return byEngine;
     }
     const preferred = modelId ?? loadSettings().chatModel;
-    return CHAT_MODELS.find((m) => m.id === preferred) ?? CHAT_MODELS[0];
+    if (preferred && preferred !== AIOS_MODEL_ID) {
+      const byId = CHAT_MODELS.find((m) => m.id === preferred);
+      if (byId) return byId;
+    }
+    // aios default (or a stale saved id): route from the cached decision now;
+    // a mount effect re-checks live meters and corrects the pristine pane.
+    bootRouteRef.current = resolveAiosSync();
+    return bootRouteRef.current.model;
   });
+  // non-null ⇒ the live session was picked by the aios router (value = reason).
+  const [aiosRouted, setAiosRouted] = useState<string | null>(
+    () => bootRouteRef.current?.reason ?? null,
+  );
+  const aiosRoutedRef = useRef(aiosRouted);
+  aiosRoutedRef.current = aiosRouted;
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(() => {
     const settings = loadSettings();
@@ -1309,6 +1336,11 @@ export function ChatPane({
 
   // ── event ingestion ───────────────────────────────────────────────────────
 
+  // Backend handed an undeliverable codex steer back (its one retry against the
+  // server-reported turn id also failed, or the turn ended first). Routed
+  // through a ref because the queue helpers are defined below applyEvent.
+  const steerRequeueRef = useRef<(text: string) => void>(() => {});
+
   // applies ONE event synchronously (the full ingestion logic). handleEvent
   // below wraps this to coalesce high-frequency deltas; everything else flushes
   // the buffer first (to preserve order) then applies synchronously here.
@@ -1554,6 +1586,10 @@ export function ChatPane({
       // system init: not rendered, but carries claude's session_id — capture it
       // so the first user send can recordChatSession() into the /resume list.
       case "system": {
+        if (ev.subtype === "codex_steer_requeued") {
+          if (ev.text) steerRequeueRef.current(ev.text);
+          return;
+        }
         if (ev.session_id) {
           const prev = claudeSessionIdRef.current;
           // claude's `--resume` emits a FRESH session_id and writes continued
@@ -1799,11 +1835,14 @@ export function ChatPane({
           if (liveEngine) {
             const restored =
               (liveModel ? CHAT_MODELS.find((m) => m.id === liveModel) : undefined) ??
-              CHAT_MODELS.find((m) => (m.engine ?? "claude") === liveEngine);
+              CHAT_MODELS.find(
+                (m) => m.id !== AIOS_MODEL_ID && (m.engine ?? "claude") === liveEngine,
+              );
             if (restored && restored.id !== model.id) {
               // arm: the cleanup fired by this setModel must skip teardown.
               skipResyncTeardownRef.current = true;
               setModel(restored);
+              setAiosRouted(null);
             }
           }
         }
@@ -2303,6 +2342,28 @@ export function ChatPane({
     }
   }, [editingQueuedId, setQueuedSelection]);
 
+  // An undeliverable codex steer handed back by the backend: drop the
+  // optimistic "steered" bubble (the model never saw that message) and put the
+  // text back in the queue so the end-of-turn flush sends it as a fresh turn.
+  // Unlike enqueue() this must not touch whatever is being typed right now.
+  steerRequeueRef.current = (text: string) => {
+    setTurns((prev) => {
+      for (let i = prev.length - 1; i >= 0; i--) {
+        const t = prev[i];
+        if (t.kind === "user" && t.steered && t.text === text) {
+          return [...prev.slice(0, i), ...prev.slice(i + 1)];
+        }
+      }
+      return prev;
+    });
+    setQueued((items) => {
+      const next = queueMessage(items, text);
+      setQueuedSelection(next.selected);
+      return next.items;
+    });
+    reportDiag("chat.steer", "requeued by backend", { action: "requeue" });
+  };
+
   const editQueued = useCallback((item: QueuedMessage) => {
     setEditingQueuedId(item.id);
     setEditingQueuedText(item.text);
@@ -2371,9 +2432,28 @@ export function ChatPane({
   // Send an explicit string (used by send() with the composer text, and by the
   // external "send to AI" submitter which passes the note body directly so it
   // doesn't race the input state).
+  // in-chat model directives ("use fable 5 to check this") — the real handler
+  // is defined AFTER clearSession/switchModel (which it needs); sendText only
+  // ever calls through the ref. pendingAutoSend carries the directive's task
+  // into the freshly-switched session once it's ready.
+  const applyModelDirectiveRef = useRef<(d: ModelDirective) => Promise<void>>(
+    async () => {},
+  );
+  const pendingAutoSendRef = useRef<string | null>(null);
+
   const sendText = useCallback(
     async (raw: string, queuedImages?: string[]) => {
       const text = raw.trim();
+      // model directive — re-route the pane (with a transcript-tail handoff)
+      // instead of sending as chat. Only between turns: mid-run text should
+      // steer the running turn, not kill the session under it.
+      if (!queuedImages && !activeRunRef.current && imagesRef.current.length === 0) {
+        const directive = parseModelDirective(text);
+        if (directive) {
+          void applyModelDirectiveRef.current(directive);
+          return;
+        }
+      }
       // Always drain in-flight disk saves before collecting paths. The old guard
       // (`some(path==null) && pendingSavesRef.size`) had a race: a save could
       // resolve (clearing pendingSavesRef) a beat before its path landed in
@@ -2726,6 +2806,48 @@ export function ChatPane({
     setRestartKey((k) => k + 1);
   }, [runEventsKey, resetRunLifecycle, queueStorageKey, setQueuedSelection]);
 
+  // ── aios: the virtual router entry ──────────────────────────────────────────
+  // Resolves to a concrete model from live usage meters (lib/aiosRouter.ts) and
+  // applies it like a manual switch, flagged with the route reason (shown in the
+  // composer pill + header). Sticky per session: re-routing only ever happens
+  // when a fresh session starts, never mid-thread.
+  const switchToAios = useCallback(async (): Promise<AiosDecision> => {
+    const d = await resolveAios();
+    // aios becomes the saved default; provider mirrors the RESOLVED engine so
+    // everything downstream of chatProvider keeps working.
+    saveSettings({
+      chatModel: AIOS_MODEL_ID,
+      chatProvider: `${d.model.engine ?? "claude"}-cli`,
+    });
+    if (d.model.id === activeModelRef.current.id) {
+      // router landed on the model already live — keep the session, flag it.
+      setAiosRouted(d.reason);
+      setTurns((prev) => [
+        ...prev,
+        { kind: "result", id: uid(), text: `aios → ${d.model.label} · ${d.reason}` },
+      ]);
+      return d;
+    }
+    const settings = loadSettings();
+    const nextEffortId = resolveModelEffort(
+      d.model,
+      effort.id,
+      settings.chatEffortByModel?.[d.model.id] ?? null,
+    );
+    clearSession();
+    setEffort(EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1]);
+    setModel(d.model);
+    setAiosRouted(d.reason);
+    setTurns([
+      {
+        kind: "result",
+        id: uid(),
+        text: `aios → ${d.model.label} — fresh chat · ${d.reason}`,
+      },
+    ]);
+    return d;
+  }, [effort.id, clearSession]);
+
   // ── model switch: clear-on-switch (engine-split Phase 2) ────────────────────
   // Picking a different model tears down the transcript + run-events and spins a
   // fresh session (the session-effect restarts on model.id), instead of
@@ -2735,8 +2857,20 @@ export function ChatPane({
   // keep their rehydrated transcript.
   const switchModel = useCallback(
     (m: ChatModel) => {
+      if (m.id === AIOS_MODEL_ID) {
+        void switchToAios();
+        return;
+      }
       const { shouldClear, notice } = describeModelSwitch(model.id, m);
-      if (!shouldClear) return;
+      if (!shouldClear) {
+        // re-picking the live model while aios-routed = making the choice
+        // manual: keep the session, drop the router flag.
+        if (aiosRoutedRef.current != null) {
+          setAiosRouted(null);
+          saveSettings({ chatModel: m.id });
+        }
+        return;
+      }
       const settings = loadSettings();
       const nextEffortId = resolveModelEffort(
         m,
@@ -2748,6 +2882,7 @@ export function ChatPane({
       clearSession();
       setEffort(nextEffort);
       setModel(m);
+      setAiosRouted(null);
       // picking a model sets it as the global default (sticks across panes +
       // restarts). engine omitted = claude.
       saveSettings({
@@ -2760,8 +2895,169 @@ export function ChatPane({
       });
       if (notice) setTurns([{ kind: "result", id: uid(), text: notice }]);
     },
-    [model.id, effort.id, clearSession],
+    [model.id, effort.id, clearSession, switchToAios],
   );
+
+  // "use fable 5 to check X" — the in-chat switch. Carries a compact transcript
+  // tail into the target model so the thread continues instead of restarting.
+  const applyModelDirective = useCallback(
+    async (directive: ModelDirective) => {
+      const { modelId: targetId, rest } = directive;
+      if (targetId === AIOS_MODEL_ID) {
+        const before = activeModelRef.current.id;
+        const d = await switchToAios();
+        if (rest) {
+          // same model kept = session still live, send now; otherwise wait for
+          // the fresh session (pendingAutoSend flushes on ready).
+          if (d.model.id === before) {
+            void sendTextRef.current(rest);
+          } else {
+            pendingAutoSendRef.current = rest;
+            // clearSession left the pane dormant — force the fresh session to
+            // spawn NOW so composerSessionReady actually dips and the flush
+            // effect fires on connect (it never toggles on a dormant pane).
+            sessionStartRequestedRef.current = true;
+            setSessionStartRequested(true);
+          }
+        }
+        return;
+      }
+      const target = CHAT_MODELS.find(
+        (m) => m.id === targetId && !m.disabled && !m.node,
+      );
+      if (!target) return;
+      if (target.id === activeModelRef.current.id) {
+        if (rest) {
+          void sendTextRef.current(rest);
+        } else {
+          setTurns((prev) => [
+            ...prev,
+            { kind: "result", id: uid(), text: `already on ${target.label}` },
+          ]);
+        }
+        return;
+      }
+      const seed = rest
+        ? buildHandoffSeed(
+            turnsRef.current.map((t) => ({
+              kind: t.kind,
+              text: (t as { text?: string }).text ?? "",
+            })),
+            activeModelRef.current.label,
+            rest,
+          )
+        : "";
+      const settings = loadSettings();
+      const nextEffortId = resolveModelEffort(
+        target,
+        effort.id,
+        settings.chatEffortByModel?.[target.id] ?? null,
+      );
+      const nextEffort =
+        EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1];
+      clearSession();
+      setEffort(nextEffort);
+      setModel(target);
+      setAiosRouted(null);
+      saveSettings({
+        chatModel: target.id,
+        chatProvider: `${target.engine ?? "claude"}-cli`,
+        chatEffortByModel: {
+          ...settings.chatEffortByModel,
+          [target.id]: nextEffort.id,
+        },
+      });
+      setTurns([
+        {
+          kind: "result",
+          id: uid(),
+          text: `switched to ${target.label}${rest ? " — carrying context" : " — fresh chat"}`,
+        },
+      ]);
+      if (seed) {
+        pendingAutoSendRef.current = seed;
+        // see the aios branch above — without this the fresh session never
+        // spawns until the next manual send and the seed is stranded.
+        sessionStartRequestedRef.current = true;
+        setSessionStartRequested(true);
+      }
+    },
+    [effort.id, clearSession, switchToAios],
+  );
+  applyModelDirectiveRef.current = applyModelDirective;
+
+  // flush a directive's task into the freshly-switched session once it's ready.
+  useEffect(() => {
+    if (!composerSessionReady) return;
+    const pending = pendingAutoSendRef.current;
+    if (!pending) return;
+    pendingAutoSendRef.current = null;
+    void sendTextRef.current(pending);
+  }, [composerSessionReady]);
+
+  // aios boot re-check: the sync boot seed used the LAST cached route; confirm
+  // against live meters and correct the pane while it's still pristine.
+  const aiosRecheckedRef = useRef(false);
+  useEffect(() => {
+    if (aiosRecheckedRef.current || bootRouteRef.current == null) return;
+    aiosRecheckedRef.current = true;
+    void resolveAios().then((d) => {
+      if (aiosRoutedRef.current == null) return; // manually switched since boot
+      if (lastSentRef.current != null) return; // already talking — sticky
+      // a send may be mid-flight before lastSentRef lands: the start request
+      // flips synchronously at send time, and any turn means non-pristine.
+      // eager panes (seed/resume/reattach) spawn immediately — never swap the
+      // model under them; they ride the cached boot route.
+      if (sessionStartRequestedRef.current || turnsRef.current.length > 0) return;
+      if (eagerSessionStart) return;
+      setAiosRouted(d.reason);
+      if (activeModelRef.current.id === d.model.id) return;
+      const settings = loadSettings();
+      const nextEffortId = resolveModelEffort(
+        d.model,
+        null,
+        settings.chatEffortByModel?.[d.model.id] ?? null,
+      );
+      setEffort(EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1]);
+      setModel(d.model);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // aios failover: a ROUTED session that slams into the engine's usage wall
+  // ("You've hit your usage limit…") re-resolves — the meters now see the cap,
+  // so the router lands on the bulk lane — and resends the last user message
+  // with a transcript handoff. No dead pane waiting for a human to notice.
+  // Manual sessions are left alone: the user picked that model on purpose.
+  const limitRerouteRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!aiosRouted || turns.length === 0) return;
+    const last = turns[turns.length - 1];
+    if (last.kind !== "assistant" && last.kind !== "result") return;
+    if ((last as { streaming?: boolean }).streaming) return;
+    const text = (last as { text?: string }).text ?? "";
+    if (!/(?:hit|reached) your usage limit/i.test(text)) return;
+    if (limitRerouteRef.current === last.id) return;
+    limitRerouteRef.current = last.id;
+    const lastUser = [...turns].reverse().find((t) => t.kind === "user") as
+      | { text?: string }
+      | undefined;
+    const prior = turnsRef.current.map((t) => ({
+      kind: t.kind,
+      text: (t as { text?: string }).text ?? "",
+    }));
+    const fromLabel = activeModelRef.current.label;
+    void switchToAios().then((d) => {
+      // router landed back on the same (capped) model → both lanes are walls;
+      // leave the error visible instead of looping.
+      if (d.model.id === activeModelRef.current.id) return;
+      if (lastUser?.text) {
+        pendingAutoSendRef.current = buildHandoffSeed(prior, fromLabel, lastUser.text);
+        sessionStartRequestedRef.current = true;
+        setSessionStartRequested(true);
+      }
+    });
+  }, [turns, aiosRouted, switchToAios]);
 
   // ── /resume: reopen a past chat session ────────────────────────────────────
   // Loads the chat-only session list (lazy, on picker open). On selection we
@@ -2804,8 +3100,13 @@ export function ChatPane({
     setResumedTitle(incomingResume.title);
     const resumeModel =
       CHAT_MODELS.find((m) => incomingResume.model && m.id === incomingResume.model) ??
-      CHAT_MODELS.find((m) => (m.engine ?? "claude") === (incomingResume.engine || "claude"));
+      CHAT_MODELS.find(
+        (m) =>
+          m.id !== AIOS_MODEL_ID &&
+          (m.engine ?? "claude") === (incomingResume.engine || "claude"),
+      );
     if (resumeModel && resumeModel.id !== activeModelRef.current.id) setModel(resumeModel);
+    setAiosRouted(null); // a resumed thread is its own concrete model, not a route
     setRunEventState(emptyRunEventState());
     setFleetState(emptyFleetState());
     setTurns([]);
@@ -2848,8 +3149,13 @@ export function ChatPane({
       codexTitleLockedRef.current = true;
       const resumeModel =
         CHAT_MODELS.find((m) => session.model && m.id === session.model) ??
-        CHAT_MODELS.find((m) => (m.engine ?? "claude") === (session.engine || "claude"));
+        CHAT_MODELS.find(
+          (m) =>
+            m.id !== AIOS_MODEL_ID &&
+            (m.engine ?? "claude") === (session.engine || "claude"),
+        );
       if (resumeModel) setModel(resumeModel);
+      setAiosRouted(null);
       setResumeId(session.id);
       setResumedTitle(session.title);
       // show the past conversation immediately while claude re-spins. Paint a
@@ -3123,6 +3429,7 @@ export function ChatPane({
     activeRun,
     started: composerSessionReady,
     model,
+    aiosRouted,
     permission,
     effort,
     effectiveBudget,
@@ -3165,6 +3472,10 @@ export function ChatPane({
     sendText,
     stop,
     steerQueued,
+    // The queued-steer button must share the exact gate steerQueued acts on —
+    // gating the button on `streaming` alone made it clickable during the
+    // starting/interrupting phases where the handler silently no-ops.
+    canSteerNow: canSteer(runLifecycle),
     jumpToLatest,
     queued,
     queuedIdx,
@@ -3477,8 +3788,13 @@ export function ChatPane({
           >
             <ListChecks size={14} />
           </button>
-          <span className="font-mono text-[10px] text-[var(--color-faint)]">
-            {model.engine ?? "claude"}
+          <span
+            className="font-mono text-[10px] text-[var(--color-faint)]"
+            title={aiosRouted ?? undefined}
+          >
+            {aiosRouted
+              ? `aios → ${model.engine ?? "claude"} · ${model.shortLabel ?? model.label}`
+              : (model.engine ?? "claude")}
           </span>
         </div>
       </div>
@@ -3493,6 +3809,8 @@ export function ChatPane({
             <div className="flex justify-end">
               <TaskSummary
                 taskId={taskId}
+                model={model}
+                aiosRouted={aiosRouted}
                 artifacts={taskArtifacts}
                 agents={fleetState.agents}
                 workflows={fleetState.workflows}

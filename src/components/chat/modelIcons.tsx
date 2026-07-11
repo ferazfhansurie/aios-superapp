@@ -86,21 +86,54 @@ function OpencodeMark({ size = 14, color }: { size?: number; color: string }) {
   );
 }
 
+/** aios — the house mark for the virtual router entry: firaz's logo (neon
+ *  orange terminal-folder with a smiley) redrawn as a vector so it stays crisp
+ *  at pill size. Brand orange, fixed like the other engines' brand colors. */
+export const AIOS_COLOR = "#FF9500";
+
+export function AiosMark({ size = 14, color = AIOS_COLOR }: { size?: number; color?: string }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke={color}
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {/* folder body with top tab */}
+      <path d="M3.5 18V7.2a1.7 1.7 0 0 1 1.7-1.7h4l1.9 2h7.2a1.7 1.7 0 0 1 1.7 1.7V18a1.7 1.7 0 0 1-1.7 1.7H5.2A1.7 1.7 0 0 1 3.5 18Z" />
+      {/* terminal prompt >_ */}
+      <path d="m7 10.6 2.1 2-2.1 2" />
+      <path d="M10.4 15.9h2.4" />
+      {/* smiley */}
+      <path d="M15.2 10.8v.9" />
+      <path d="M18.6 10.8v.9" />
+      <path d="M15.1 14.1c.5.6 1.2.9 1.8.9s1.3-.3 1.8-.9" />
+    </svg>
+  );
+}
+
 const MARKS: Record<Engine, (p: { size?: number; color: string }) => ReactElement> = {
   claude: ClaudeMark,
   codex: CodexMark,
   opencode: OpencodeMark,
 };
 
-/** Icon for a model's engine (omitted engine ⇒ claude). Returns null only for an
- *  unknown engine string, so callers can `{icon}` unconditionally. */
+/** Icon for a model's engine (omitted engine ⇒ claude). The virtual "aios"
+ *  entry is keyed by id, not engine. Returns null only for an unknown engine
+ *  string, so callers can `{icon}` unconditionally. */
 export function ModelIcon({
   model,
   size = 14,
 }: {
-  model: Pick<ChatModel, "engine">;
+  model: Pick<ChatModel, "engine"> & { id?: string };
   size?: number;
 }): ReactElement | null {
+  if (model.id === "aios") return <AiosMark size={size} />;
   const engine = (model.engine ?? "claude") as Engine;
   const Mark = MARKS[engine];
   return Mark ? <Mark size={size} color={ENGINE_COLOR[engine]} /> : null;

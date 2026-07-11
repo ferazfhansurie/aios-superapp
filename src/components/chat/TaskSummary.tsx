@@ -1,9 +1,14 @@
-import { memo, useCallback, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Bot, FilePlus2, Image, Link2, PackageOpen, Plus } from "lucide-react";
 
 import type { Artifact } from "./toolPresentation";
 import type { FleetAgent, FleetWorkflow } from "../../lib/subagentFleet";
 import { getTaskWorkspace, subscribeTaskWorkspace, type TaskId } from "../../lib/taskWorkspace";
+import type { ChatModel } from "../../lib/chat";
+import { claudeRate, codexRate, type ClaudeRate, type CodexRate } from "../../lib/dashboard";
+import { loadSettings } from "../../lib/settings";
+import { aiosRoles, windowElapsedPct } from "../../lib/aiosRouter";
+import { AiosMark, ModelIcon } from "./modelIcons";
 
 export interface TaskSource {
   path: string;
@@ -17,6 +22,8 @@ export interface TaskSource {
  */
 export const TaskSummary = memo(function TaskSummary({
   taskId,
+  model,
+  aiosRouted,
   artifacts,
   agents,
   workflows,
@@ -27,6 +34,10 @@ export const TaskSummary = memo(function TaskSummary({
   onShowAgents,
 }: {
   taskId?: TaskId;
+  /** the pane's live (concrete) model — drives the router section. */
+  model: ChatModel;
+  /** route reason when the session was picked by aios, null = manual pick. */
+  aiosRouted: string | null;
   artifacts: Artifact[];
   agents: FleetAgent[];
   workflows: FleetWorkflow[];
@@ -53,6 +64,8 @@ export const TaskSummary = memo(function TaskSummary({
 
   return (
     <aside className="shell-card shell-elevated w-full max-w-[360px] p-5">
+      <RouterSection model={model} aiosRouted={aiosRouted} />
+
       <SummarySection title="outputs" icon={<PackageOpen size={15} />} onAdd={onCreateOutput}>
         {artifactRows.length === 0 ? (
           <button
@@ -138,6 +151,117 @@ export const TaskSummary = memo(function TaskSummary({
     </aside>
   );
 });
+
+/** The model-architecture view: who runs this session, what routes where, and
+ *  the live meters the router decides on. Self-contained polling (60s, only
+ *  while the panel is open) so the streaming path stays untouched. */
+function RouterSection({ model, aiosRouted }: { model: ChatModel; aiosRouted: string | null }) {
+  const [codex, setCodex] = useState<CodexRate | null>(null);
+  const [claude, setClaude] = useState<ClaudeRate | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const pull = () => {
+      void codexRate().then((r) => alive && setCodex(r)).catch(() => {});
+      void claudeRate().then((r) => alive && setClaude(r)).catch(() => {});
+    };
+    pull();
+    const timer = window.setInterval(pull, 60_000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const s = loadSettings();
+  const roles = aiosRoles();
+  const codex7d = codex?.sevenDay.pct ?? null;
+  const clock = windowElapsedPct(codex?.sevenDay.resetsAt ?? null);
+  const paceDelta = codex7d != null && clock != null ? codex7d - clock : null;
+  const paceHot = paceDelta != null && paceDelta >= s.aiosRouterPaceMargin;
+
+  const meter = (label: string, pct: number | null, extra?: ReactNode) => (
+    <div className="flex items-center gap-2 font-mono text-[11px] text-[var(--color-muted)]">
+      <span className="w-16 shrink-0">{label}</span>
+      <span className="relative h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-[var(--color-panel-2)]">
+        <span
+          className="absolute inset-y-0 left-0 rounded-full bg-[var(--color-accent)]/70"
+          style={{ width: `${Math.min(100, Math.max(0, pct ?? 0))}%` }}
+        />
+      </span>
+      <span className="w-9 shrink-0 text-right">{pct != null ? `${Math.round(pct)}%` : "—"}</span>
+      {extra}
+    </div>
+  );
+
+  return (
+    <SummarySection title="aios router" icon={<AiosMark size={15} />}>
+      <div className="flex flex-col gap-2 px-1 py-1">
+        {/* who is running THIS session */}
+        <div
+          className="flex items-center gap-2 text-[14px] text-[var(--color-text-2)]"
+          title={aiosRouted ?? undefined}
+        >
+          {aiosRouted ? <AiosMark size={14} /> : <ModelIcon model={model} size={14} />}
+          <span className="truncate">
+            {aiosRouted ? (
+              <>
+                aios <span className="text-[var(--color-faint)]">→</span> {model.label}
+              </>
+            ) : (
+              <>{model.label} · manual pick</>
+            )}
+          </span>
+        </div>
+        {aiosRouted && (
+          <p className="text-[11.5px] leading-snug text-[var(--color-muted)]">{aiosRouted}</p>
+        )}
+
+        {/* the architecture — which model does what */}
+        <div className="mt-1 flex flex-col gap-1 text-[12.5px] text-[var(--color-muted)]">
+          {(
+            [
+              [roles.main, "main", "everything, default", false],
+              [roles.deep, "deep", "judgment · \"use deep\"", false],
+              [roles.bulk, "bulk", `heavy + burn · pace +${s.aiosRouterPaceMargin}`, paceHot],
+            ] as const
+          ).map(([m, role, what, hot]) => (
+            <div key={role} className="flex items-center gap-2">
+              <ModelIcon model={m} size={13} />
+              <span className="text-[var(--color-text-2)]">{m.label}</span>
+              <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-[var(--color-faint)]">
+                {role}
+              </span>
+              <span
+                className={`ml-auto text-[11px] ${hot ? "text-[var(--color-accent)]" : "text-[var(--color-faint)]"}`}
+              >
+                {what}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* live meters the router decides on */}
+        <div className="mt-1 flex flex-col gap-1">
+          {meter(
+            "codex 7d",
+            codex7d,
+            paceDelta != null ? (
+              <span
+                className={`shrink-0 font-mono text-[10px] ${paceHot ? "text-[var(--color-accent)]" : "text-[var(--color-faint)]"}`}
+                title={clock != null ? `${clock}% through the week` : undefined}
+              >
+                {paceDelta >= 0 ? `+${Math.round(paceDelta)}` : Math.round(paceDelta)} pace
+              </span>
+            ) : undefined,
+          )}
+          {meter("codex 5h", codex?.fiveHour.pct ?? null)}
+          {meter("claude 7d", claude?.sevenDay.pct ?? null)}
+          {meter("claude 5h", claude?.fiveHour.pct ?? null)}
+        </div>
+      </div>
+    </SummarySection>
+  );
+}
 
 function SummarySection({
   title,

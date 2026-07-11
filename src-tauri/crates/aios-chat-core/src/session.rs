@@ -109,6 +109,13 @@ pub struct ChatSession {
     /// Codex controls received during the narrow `turn/start` → `turn/started`
     /// window, when the session is busy but the required turn id is not known.
     pub pending_controls: Mutex<VecDeque<PendingCodexControl>>,
+    /// codex app-server: in-flight `turn/steer` requests, JSON-RPC id → (text,
+    /// already-retried). Codex rejects a steer whose `expectedTurnId` went stale
+    /// ("expected active turn id `X` but found `Y`") and reports the ACTUAL id
+    /// so the client can resync — its own TUI retries exactly once. The adapter
+    /// does the same here; a steer that still fails is handed back to the
+    /// frontend queue instead of tearing down the (still running) turn.
+    pub pending_steers: Mutex<HashMap<u64, (String, bool)>>,
     /// codex app-server: the item id of the turn's REAL answer (the agentMessage
     /// whose `phase` is `final_answer`). Codex also emits preamble/status agent
     /// messages mid-turn; we route THOSE to the thinking block so only the final
@@ -168,6 +175,7 @@ impl ChatSession {
             pending_turn: Mutex::new(None),
             active_turn: Mutex::new(None),
             pending_controls: Mutex::new(VecDeque::new()),
+            pending_steers: Mutex::new(HashMap::new()),
             answer_item: Mutex::new(None),
             answer_streamed: AtomicBool::new(false),
             pending_approvals: Mutex::new(HashMap::new()),

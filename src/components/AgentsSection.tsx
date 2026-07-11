@@ -58,7 +58,10 @@ export function AgentsSection({
 
   const [draftLabel, setDraftLabel] = useState("");
   const [draftPrompt, setDraftPrompt] = useState("");
-  const [draftModel, setDraftModel] = useState(CHAT_MODELS[0]?.id ?? "claude-opus-4-8");
+  // agents spawn a REAL backend — the virtual "aios" router entry is chat-only.
+  const [draftModel, setDraftModel] = useState(
+    CHAT_MODELS.find((m) => m.id !== "aios" && !m.disabled)?.id ?? "claude-opus-4-8",
+  );
   const [draftPerm, setDraftPerm] = useState(PERMISSION_MODES[0]?.id ?? "bypassPermissions");
 
   const toggleCollapsed = () => {
@@ -128,7 +131,7 @@ export function AgentsSection({
           onChange={(e) => setDraftModel(e.target.value)}
           className="shell-row shell-focus min-w-0 flex-1 bg-[var(--color-bg)] px-1.5 py-1 text-[10.5px] text-[var(--color-text)] outline-none"
         >
-          {CHAT_MODELS.filter((m) => !m.disabled).map((m) => (
+          {CHAT_MODELS.filter((m) => !m.disabled && m.id !== "aios").map((m) => (
             <option key={m.id} value={m.id}>
               {m.label}
             </option>

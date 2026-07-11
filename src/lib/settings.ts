@@ -55,6 +55,18 @@ export interface AppSettings {
   /** One-way defaults migration for newly opened blank chat panes. */
   chatDefaultsVersion: number;
 
+  // aios router — the virtual "aios" picker entry resolves through this role
+  // architecture (lib/aiosRouter.ts):
+  //   main — daily driver, wins by default (smart + cheap)
+  //   deep — judgment tier, summoned ("use deep" / "use fable"), never auto
+  //   bulk — heavy lifting AND the burn tier: drains the prepaid claude sub
+  //          when main's 7d budget runs ahead of pace
+  // paceMargin = pct-points main's 7d meter may run ahead of the week clock
+  // before diverting to bulk. last = cached route for sync pane boot.
+  aiosRouterRoles: { main: string; deep: string; bulk: string };
+  aiosRouterPaceMargin: number;
+  aiosRouterLast: string | null;
+
   // route claude chat turns through the local Headroom compression proxy
   // (ANTHROPIC_BASE_URL → http://127.0.0.1:8787). Compresses tool outputs / RAG
   // before they hit the LLM (60-95% fewer tokens); never touches your prompt.
@@ -105,9 +117,17 @@ export const DEFAULT_SETTINGS: AppSettings = {
   graphPhysicsStrength: 50,
 
   chatProvider: "codex-cli",
-  chatModel: "gpt-5.6-terra",
+  chatModel: "aios",
   chatEffortByModel: { "gpt-5.6-terra": "low" },
-  chatDefaultsVersion: 1,
+  chatDefaultsVersion: 2,
+
+  aiosRouterRoles: {
+    main: "gpt-5.6-sol",
+    deep: "claude-fable-5",
+    bulk: "claude-opus-4-8",
+  },
+  aiosRouterPaceMargin: 15,
+  aiosRouterLast: null,
 
   headroomCompression: false,
 
@@ -155,6 +175,12 @@ export function loadSettings(): AppSettings {
           "gpt-5.6-terra": "low",
         };
         parsed.chatDefaultsVersion = 1;
+      }
+      // v2: aios (the usage-pace router) becomes the fresh-chat default. A
+      // later explicit picker choice still overrides, like any default.
+      if ((parsed.chatDefaultsVersion ?? 0) < 2) {
+        parsed.chatModel = "aios";
+        parsed.chatDefaultsVersion = 2;
       }
       cache = { ...DEFAULT_SETTINGS, ...parsed };
     } else {

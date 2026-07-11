@@ -960,6 +960,7 @@ pub fn chat_start(
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
         pending_controls: Mutex::new(VecDeque::new()),
+        pending_steers: Mutex::new(HashMap::new()),
         answer_item: Mutex::new(None),
         answer_streamed: AtomicBool::new(false),
         pending_approvals: Mutex::new(HashMap::new()),
@@ -1120,6 +1121,7 @@ fn start_per_turn(
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
         pending_controls: Mutex::new(VecDeque::new()),
+        pending_steers: Mutex::new(HashMap::new()),
         answer_item: Mutex::new(None),
         answer_streamed: AtomicBool::new(false),
         pending_approvals: Mutex::new(HashMap::new()),
@@ -1554,6 +1556,7 @@ fn start_codex_appserver(
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
         pending_controls: Mutex::new(VecDeque::new()),
+        pending_steers: Mutex::new(HashMap::new()),
         answer_item: Mutex::new(None),
         answer_streamed: AtomicBool::new(false),
         pending_approvals: Mutex::new(HashMap::new()),
@@ -3346,6 +3349,7 @@ mod tests {
             pending_turn: Mutex::new(None),
             active_turn: Mutex::new(None),
             pending_controls: Mutex::new(VecDeque::new()),
+            pending_steers: Mutex::new(HashMap::new()),
             answer_item: Mutex::new(None),
             answer_streamed: AtomicBool::new(false),
             pending_approvals: Mutex::new(HashMap::new()),
@@ -3447,6 +3451,82 @@ mod tests {
                 runs.remove(&id);
             }
         });
+    }
+
+    #[test]
+    fn codex_steer_mismatch_resyncs_from_the_error_and_retries_once() {
+        let (sess, child, stdout) = test_codex_session_with_rpc_capture();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        *sess.active_turn.lock() = Some("turn-old".into());
+        super::codex_steer(&sess, "new instruction").expect("steer accepted");
+        // codex rejects the stale expectedTurnId and reports the ACTUAL id —
+        // the adapter must resync + retry, not tear the running turn down.
+        let out = super::adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"expected active turn id `turn-old` but found `turn-new`"}}"#,
+        );
+        assert!(out.is_empty(), "mismatch must recover silently: {out:?}");
+        assert_eq!(sess.active_turn.lock().as_deref(), Some("turn-new"));
+        let captured = finish_rpc_capture(&sess, child, stdout);
+        let steers: Vec<&str> = captured
+            .lines()
+            .filter(|l| l.contains("turn/steer"))
+            .collect();
+        assert_eq!(steers.len(), 2, "original + exactly one retry: {captured}");
+        assert!(steers[1].contains(r#""expectedTurnId":"turn-new""#), "retry must use the server-reported id: {captured}");
+        // A SECOND rejection of the (marked) retry re-queues to the frontend
+        // instead of looping — and still leaves the live turn's state intact.
+        let out = super::adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"expected active turn id `turn-new` but found `turn-newer`"}}"#,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(
+            out[0].contains("codex_steer_requeued") && out[0].contains("new instruction"),
+            "got: {out:?}"
+        );
+        assert!(out[0].contains(r#""type":"system""#), "must not be a fatal result line: {out:?}");
+        assert!(sess.active_turn.lock().is_some(), "steer failure must not clear the running turn");
+    }
+
+    #[test]
+    fn codex_steer_success_response_resyncs_active_turn() {
+        let (sess, child, stdout) = test_codex_session_with_rpc_capture();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        *sess.active_turn.lock() = Some("turn-a".into());
+        super::codex_steer(&sess, "go").expect("steer accepted");
+        // the response names the turn actually steered into — adopt it.
+        let out = super::adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"turnId":"turn-b"}}"#,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(sess.active_turn.lock().as_deref(), Some("turn-b"));
+        finish_rpc_capture(&sess, child, stdout);
+    }
+
+    #[test]
+    fn codex_turn_end_requeues_undelivered_pending_steers() {
+        let sess = test_codex_session();
+        sess.busy.store(true, Ordering::SeqCst);
+        // steer lands in the turn/start → turn/started window (no id yet) …
+        super::codex_steer(&sess, "queued steer").expect("queued");
+        // … and the turn ends before `turn/started` ever supplied one. The
+        // text goes back to the frontend queue, BEFORE the result line so the
+        // pane re-queues it by the time the end-of-turn flush runs.
+        let out = super::adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"t1","usage":{}}}}"#,
+        );
+        let requeue_idx = out
+            .iter()
+            .position(|l| l.contains("codex_steer_requeued") && l.contains("queued steer"))
+            .unwrap_or_else(|| panic!("missing requeue frame: {out:?}"));
+        let result_idx = out
+            .iter()
+            .position(|l| l.contains(r#""type":"result""#))
+            .unwrap_or_else(|| panic!("missing result frame: {out:?}"));
+        assert!(requeue_idx < result_idx, "requeue must precede the result: {out:?}");
     }
 
     #[test]

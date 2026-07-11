@@ -147,6 +147,13 @@ import {
   type SidebarSpace,
   type SidebarState,
 } from "./lib/sidebar";
+import {
+  loadSidebarWidth,
+  saveSidebarWidth,
+  SIDEBAR_MAX,
+  SIDEBAR_COLLAPSE_AT,
+  SIDEBAR_EXPAND_AT,
+} from "./lib/sidebarWidth";
 
 // re-export the catalog types so existing consumers (IdleDashboard) keep their
 // `import { AppDef } from "../App"` path working without churn.
@@ -624,6 +631,61 @@ function App() {
     }),
   []);
   const iconsOnly = sidebarMode === "icons";
+  // drag-to-resize width for the full rail (own localStorage key — see
+  // lib/sidebarWidth). Live width follows the drag; ⌘B / icons-only ignore it.
+  const [sidebarWidth, setSidebarWidth] = useState<number>(loadSidebarWidth);
+  const [sidebarDragging, setSidebarDragging] = useState(false);
+  const sidebarWidthRef = useRef(sidebarWidth);
+  sidebarWidthRef.current = sidebarWidth;
+  // Drag the inner edge of an OPEN rail: width follows live; release below the
+  // collapse threshold hides it exactly like ⌘B (keeping the last saved width).
+  const startSidebarResize = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidthRef.current;
+    let raw = startW;
+    setSidebarDragging(true);
+    const onMove = (ev: PointerEvent) => {
+      raw = startW + (ev.clientX - startX);
+      // let it visually shrink past the min while dragging so the collapse
+      // intent reads; the persisted value is re-clamped on release.
+      setSidebarWidth(Math.max(SIDEBAR_COLLAPSE_AT - 40, Math.min(SIDEBAR_MAX, raw)));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setSidebarDragging(false);
+      if (raw < SIDEBAR_COLLAPSE_AT) {
+        setSidebarWidth(loadSidebarWidth()); // restore for the next open
+        setSidebarOpen(false);
+      } else {
+        setSidebarWidth(saveSidebarWidth(raw));
+      }
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, []);
+  // Drag out from the COLLAPSED edge past the threshold → re-expand to last width.
+  const startSidebarExpand = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    setSidebarDragging(true);
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setSidebarDragging(false);
+    };
+    const onMove = (ev: PointerEvent) => {
+      if (ev.clientX - startX > SIDEBAR_EXPAND_AT) {
+        setSidebarWidth(loadSidebarWidth());
+        setSidebarOpen(true);
+        cleanup();
+      }
+    };
+    const onUp = () => cleanup();
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, []);
   // "pin a site" inline prompt.
   // which space the pin-a-site modal targets (null = closed).
   const [pinSiteSpace, setPinSiteSpace] = useState<string | null>(null);
@@ -2287,13 +2349,52 @@ function App() {
       )}
 
       {/* body: sidebar + pane grid */}
-      <div className="flex min-h-0 flex-1">
-        {sidebarOpen && !compactWebLayout && (
-          <aside
-            className={`flex shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)] transition-[width] ${
-              iconsOnly ? "w-16" : "w-60"
+      <div className="relative flex min-h-0 flex-1">
+        {/* collapsed-edge grip — thin invisible strip at the far-left; drag it
+            out past the threshold to re-expand the rail to its last width (⌘B
+            still toggles as before). */}
+        {!sidebarOpen && !compactWebLayout && (
+          <div
+            onPointerDown={startSidebarExpand}
+            title="drag to reveal sidebar"
+            className={`group absolute inset-y-0 left-0 z-20 w-1.5 cursor-col-resize ${
+              sidebarDragging ? "select-none" : ""
             }`}
           >
+            <div
+              className={`ml-0 h-full w-px transition-colors ${
+                sidebarDragging
+                  ? "bg-[var(--color-accent)]"
+                  : "bg-transparent group-hover:bg-[var(--color-border-strong)]"
+              }`}
+            />
+          </div>
+        )}
+        {sidebarOpen && !compactWebLayout && (
+          <aside
+            className={`relative flex shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-panel)] ${
+              sidebarDragging ? "select-none" : "transition-[width]"
+            } ${iconsOnly ? "w-16" : ""}`}
+            style={iconsOnly ? undefined : { width: sidebarWidth }}
+          >
+            {/* inner-edge drag handle (full rail only) — invisible ~6px strip
+                centred on the border; a 1px line lights on hover / while
+                dragging. Release below the collapse threshold hides the rail. */}
+            {!iconsOnly && (
+              <div
+                onPointerDown={startSidebarResize}
+                title="drag to resize · release small to collapse"
+                className="group absolute inset-y-0 right-0 z-20 w-1.5 translate-x-1/2 cursor-col-resize"
+              >
+                <div
+                  className={`mx-auto h-full w-px transition-colors ${
+                    sidebarDragging
+                      ? "bg-[var(--color-accent)]"
+                      : "bg-transparent group-hover:bg-[var(--color-border-strong)]"
+                  }`}
+                />
+              </div>
+            )}
             <div
               className={`flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-2 ${
                 topBarHidden ? "pt-8" : ""

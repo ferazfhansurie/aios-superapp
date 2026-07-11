@@ -256,6 +256,11 @@ export interface ChatModel {
  * opencode/openrouter catalog on top of these.
  */
 export const CHAT_MODELS: ChatModel[] = [
+  // aios — the virtual router (lib/aiosRouter.ts). Never spawned directly:
+  // picking it resolves to a concrete model below (usage-pace routing between
+  // the codex daily driver and the prepaid claude burn tier) and the pane
+  // keeps the RESOLVED model in state, flagged as aios-routed for display.
+  { id: "aios", label: "aios", shortLabel: "aios", hot: true },
   // ChatGPT-subscription models via Codex — no API key, no per-token billing.
   {
     id: "gpt-5.6-sol",

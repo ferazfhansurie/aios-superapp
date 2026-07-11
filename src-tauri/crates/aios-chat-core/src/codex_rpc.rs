@@ -86,7 +86,24 @@ pub fn codex_fire_turn(
 /// Sends a same-turn steer once the app-server's `turn/started` notification has
 /// supplied the required active turn id.
 pub fn codex_fire_steer(sess: &Arc<ChatSession>, thread_id: &str, turn_id: &str, text: &str) {
+    codex_fire_steer_attempt(sess, thread_id, turn_id, text, false);
+}
+
+/// The raw steer write. Registers the request id in `pending_steers` first so
+/// the adapter can recognize the (async) response: on a stale-turn-id rejection
+/// it resyncs from the error and retries once — `retried` marks that retry so a
+/// second rejection re-queues instead of looping.
+fn codex_fire_steer_attempt(
+    sess: &Arc<ChatSession>,
+    thread_id: &str,
+    turn_id: &str,
+    text: &str,
+    retried: bool,
+) {
     let id = codex_next_rpc(sess);
+    sess.pending_steers
+        .lock()
+        .insert(id, (text.to_string(), retried));
     codex_rpc_write(
         sess,
         &json!({
@@ -98,6 +115,26 @@ pub fn codex_fire_steer(sess: &Arc<ChatSession>, thread_id: &str, turn_id: &str,
             }
         }),
     );
+}
+
+/// Parses the server's ACTUAL active turn id out of codex's steer rejection —
+/// "expected active turn id `X` but found `Y`". Codex formats the error so the
+/// client can resync and retry; its own TUI parses it exactly the same way.
+fn steer_mismatch_actual(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once("but found `")?;
+    let (actual, _) = rest.split_once('`')?;
+    (!actual.is_empty()).then(|| actual.to_string())
+}
+
+/// Tells the frontend a steer could not be delivered into the live turn: the
+/// pane drops its optimistic "steered" bubble, re-queues the text, and the
+/// normal end-of-turn flush sends it as a fresh turn. Never a fatal `result`
+/// line — the turn the steer bounced off is still running.
+fn codex_steer_requeue_line(text: &str) -> String {
+    format!(
+        "{{\"type\":\"system\",\"subtype\":\"codex_steer_requeued\",\"text\":\"{}\"}}",
+        json_escape(text)
+    )
 }
 
 /// Sends a turn-scoped interrupt. Codex app-server v2 requires BOTH ids; sending
@@ -194,6 +231,32 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
                 .get("message")
                 .and_then(|x| x.as_str())
                 .unwrap_or("codex request failed");
+            // A rejected `turn/steer` must NOT tear down the still-running turn
+            // (the old blanket cleanup below did exactly that: it cleared
+            // active_turn and emitted a fatal result line, freeing the composer
+            // while codex kept streaming — and every later steer then failed
+            // with "no active turn"). Codex's own recovery protocol instead:
+            // resync to the actual id it reports and retry the steer once.
+            let steer = v
+                .get("id")
+                .and_then(|x| x.as_u64())
+                .and_then(|id| sess.pending_steers.lock().remove(&id));
+            if let Some((text, retried)) = steer {
+                if !retried {
+                    if let Some(actual) = steer_mismatch_actual(message) {
+                        let tid = sess.thread_id.lock().clone().unwrap_or_default();
+                        if !tid.is_empty() {
+                            *sess.active_turn.lock() = Some(actual.clone());
+                            codex_fire_steer_attempt(sess, &tid, &actual, &text, true);
+                            return out;
+                        }
+                    }
+                }
+                // Retry exhausted / turn not steerable (review, compact) / turn
+                // already over → hand the text back to the frontend queue.
+                out.push(codex_steer_requeue_line(&text));
+                return out;
+            }
             *sess.pending_turn.lock() = None;
             *sess.active_turn.lock() = None;
             sess.pending_controls.lock().clear();
@@ -202,6 +265,21 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
             sess.pending_approvals.lock().clear();
             out.push(codex_error_result_line(sess, message));
             return out;
+        }
+        // A successful `turn/steer` response confirms the live turn id (codex
+        // returns the turn it actually steered into) — resync so the NEXT steer
+        // starts from the server's truth rather than a possibly stale cache.
+        if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
+            if sess.pending_steers.lock().remove(&id).is_some() {
+                if let Some(turn_id) = v
+                    .get("result")
+                    .and_then(|r| r.get("turnId"))
+                    .and_then(|x| x.as_str())
+                {
+                    *sess.active_turn.lock() = Some(turn_id.to_string());
+                }
+                return out;
+            }
         }
         if let Some(tid) = v
             .get("result")
@@ -388,7 +466,20 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
         }
         "turn/completed" => {
             *sess.active_turn.lock() = None;
-            sess.pending_controls.lock().clear();
+            // Steers still waiting on a turn id when the turn ended can never
+            // fire — hand them back to the frontend queue (before the result
+            // line, so they're re-queued by the time the flush effect runs)
+            // instead of dropping them silently. `pending_steers` is
+            // deliberately NOT drained here: codex answers every `turn/steer`
+            // request, so an in-flight steer outliving its turn gets a late
+            // "no active turn" error response, which the error path above
+            // re-queues — draining it here too would double-deliver and send
+            // that late response down the fatal cleanup path.
+            for control in sess.pending_controls.lock().drain(..) {
+                if let PendingCodexControl::Steer(text) = control {
+                    out.push(codex_steer_requeue_line(&text));
+                }
+            }
             *sess.answer_item.lock() = None;
             let tid = sess.thread_id.lock().clone().unwrap_or_default();
             // Map codex's usage envelope onto claude's field names so the ctx
@@ -406,7 +497,11 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
         }
         "turn/failed" => {
             *sess.active_turn.lock() = None;
-            sess.pending_controls.lock().clear();
+            for control in sess.pending_controls.lock().drain(..) {
+                if let PendingCodexControl::Steer(text) = control {
+                    out.push(codex_steer_requeue_line(&text));
+                }
+            }
             *sess.answer_item.lock() = None;
             let tid = sess.thread_id.lock().clone().unwrap_or_default();
             out.push(format!(
