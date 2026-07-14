@@ -89,11 +89,13 @@ This first version intentionally has no editing UI. Conversation is the write su
 Implement `scripts/cfo-state.mjs` as the only supported write path. The Oracle/CFO invokes it after interpreting Firaz's message. Its first-version commands are:
 
 - `init-month`: create a new current month with explicit baseline, budget, cash, floor, debt, and target values
-- `add-adjustment`: append an expense, refund, or correction
+- `add-adjustment`: append an expense, refund, or correction, with an optional cash delta applied in the same transaction
 - `set-balance`: explicitly replace cash, debt, income, budget, floor, or target after account reconciliation
 - `show`: return the normalized snapshot and derived totals as JSON
 
 `add-adjustment` requires a stable `--event-id`. Discord/bridge callers use the transport message ID. A manual administrative adjustment uses an explicitly generated UUID recorded by the caller. The writer never derives identity from amount, note, or timestamp.
+
+When Firaz confirms that an adjustment was paid from tracked cash, the caller passes `--cash-delta` in the same `add-adjustment` command (normally the negative expense amount). Adjustment append and cash change occur under one lock and one revision. Replaying the same event ID is an idempotent no-op for both the adjustment and cash delta, so cash cannot be decremented twice. `set-balance` remains for independent account reconciliations, not for completing an expense write.
 
 The writer acquires an exclusive same-directory lock using atomic lock-directory creation before the read–validate–deduplicate–append–write transaction. It retries for up to two seconds with bounded jitter, then fails without changing state. While holding the lock it:
 
@@ -120,7 +122,12 @@ Any write that would make derived `spent` negative is rejected.
 
 ### Month lifecycle
 
-`init-month` is the only operation that establishes `opening_spent`. It refuses to overwrite an existing current month. On rollover, the writer moves the validated current document to `~/.aios/state/finance/history/YYYY-MM.json` under the same lock, then creates the next month only from explicit CFO-confirmed opening values. No amount is automatically carried into `opening_spent`.
+`init-month` is the only operation that establishes `opening_spent`. It refuses to overwrite an existing current month. On rollover, the writer keeps the old canonical snapshot in place while it creates and validates both an archive temporary file and the next-month temporary file. Under the same lock it commits in this order:
+
+1. rename the archive temporary file to `~/.aios/state/finance/history/YYYY-MM.json` without removing the current file;
+2. rename the validated next-month temporary file over the canonical current file.
+
+If archive creation or commit fails, the old current file remains untouched. If the process stops after the archive commit but before current replacement, the old current file still remains and the next rollover invocation verifies the identical archive then retries current replacement. If it stops after current replacement, the archive and new current are already complete. An existing archive with different content is a hard conflict requiring manual review. No amount is automatically carried into `opening_spent`.
 
 Every adjustment timestamp must fall within the document's `month` in Asia/Kuala_Lumpur. Late corrections use `add-adjustment --month YYYY-MM` against the archived month and never change the current meter unless Firaz separately approves a current-month correction. This prevents late entries from leaking into the wrong month or double-counting an imported baseline.
 
@@ -214,9 +221,11 @@ Unit tests cover:
 - adjustment summation and negative refund/correction entries
 - writer replay is an idempotent no-op while duplicate IDs already persisted fail closed
 - concurrent writers cannot lose an adjustment; lock timeout leaves state unchanged
+- a cash-paid expense updates the adjustment and cash in one revision; replay changes neither twice
 - revision increments and read-back verification
 - expense/refund/correction sign rules and rejection when derived spend would become negative
 - explicit month initialization, rollover archival, month-bound timestamps, and late archived corrections
+- rollover failure injection before archive commit, between archive and current commits, and after current commit proves deterministic retry without a missing current snapshot
 - spend percentages above 100% retain their true label while visual width caps at 100%
 
 Component tests verify:
