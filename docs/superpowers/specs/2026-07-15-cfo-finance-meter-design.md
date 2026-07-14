@@ -84,6 +84,8 @@ Duplicate message/event IDs must not create duplicate adjustments. Refunds use n
 
 This first version intentionally has no editing UI. Conversation is the write surface; supershell is the read surface.
 
+Budget and month are conversational controls too. `set july budget rm6,700` calls the writer's explicit budget update for the current month. `start august with budget rm3,700` calls `init-month` after archiving July and requires the opening cash, cash floor, debt, and target to be confirmed or carried only with explicit CFO approval. Changing a budget never changes recorded spend, and changing months never silently carries spending adjustments forward.
+
 ### Writer command and concurrency
 
 Implement `scripts/cfo-state.mjs` as the only supported write path. The Oracle/CFO invokes it after interpreting Firaz's message. Its first-version commands are:
@@ -91,6 +93,7 @@ Implement `scripts/cfo-state.mjs` as the only supported write path. The Oracle/C
 - `init-month`: create a new current month with explicit baseline, budget, cash, floor, debt, and target values
 - `add-adjustment`: append an expense, refund, or correction, with an optional cash delta applied in the same transaction
 - `set-balance`: explicitly replace cash, debt, income, budget, floor, or target after account reconciliation
+- `set-budget`: explicitly change the current month's spending budget without changing spend history
 - `show`: return the normalized snapshot and derived totals as JSON
 
 `add-adjustment` requires a stable `--event-id`. Discord/bridge callers use the transport message ID. A manual administrative adjustment uses an explicitly generated UUID recorded by the caller. The writer never derives identity from amount, note, or timestamp.
