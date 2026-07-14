@@ -78,8 +78,10 @@ The bar is capped visually at 100%, while the label may show more than 100%. The
 Finance colors are pace-aware rather than copied literally from rate limits:
 
 - safe: spending percentage is no more than five percentage points ahead of month elapsed
-- warning: spending is 5–15 points ahead, or remaining allowance is below 10%
+- warning: spending is more than 5 and no more than 15 points ahead, or remaining allowance is below 10%
 - danger: spending is more than 15 points ahead or the budget is exceeded
+
+Status precedence is `danger`, then `warning`, then `safe`. Exceeding the budget therefore always renders danger even if another condition would otherwise be warning or safe.
 
 For the confirmed July snapshot, 94% spent around 48% through the month is danger.
 
@@ -156,4 +158,3 @@ Verification includes the focused frontend/Rust tests, the existing bundle-bound
 - Editing budgets in the UI
 - Treating expected sales as received income
 - Hiding debt from the headline financial position
-
