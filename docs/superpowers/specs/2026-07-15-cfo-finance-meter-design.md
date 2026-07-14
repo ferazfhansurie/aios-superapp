@@ -32,6 +32,8 @@ Create a small canonical runtime snapshot at `~/.aios/state/finance/cfo.json`. T
 
 ```json
 {
+  "schema_version": 1,
+  "revision": 1,
   "updated_at": "2026-07-15T02:55:00+08:00",
   "currency": "MYR",
   "month": "2026-07",
@@ -46,6 +48,7 @@ Create a small canonical runtime snapshot at `~/.aios/state/finance/cfo.json`. T
     {
       "id": "2026-07-16T13:10:00+08:00-rm20-food",
       "at": "2026-07-16T13:10:00+08:00",
+      "kind": "expense",
       "amount": 20,
       "category": "food",
       "note": "lunch",
@@ -55,13 +58,15 @@ Create a small canonical runtime snapshot at `~/.aios/state/finance/cfo.json`. T
 }
 ```
 
-All amounts are numeric MYR values. `spent`, `net_cash`, and `remaining_budget` are derived in code, not stored:
+All amounts are numeric MYR values rounded to two decimal places on write. Derived money values are also rounded to two decimals before display or comparison. `spent`, `net_cash`, and `remaining_budget` are derived in code, not stored:
 
 - `spent = opening_spent + sum(adjustments.amount)`
 - `net_cash = cash - card_debt`
 - `remaining_budget = spend_budget - spent`
 - `spent_pct = spent / spend_budget * 100`
 - `month_elapsed_pct` uses calendar days in the snapshot month and the local Malaysia date
+
+For deterministic pacing, Asia/Kuala_Lumpur is authoritative. `month_elapsed_pct = current_day_number / days_in_month * 100`, so the current day is included. `days_remaining = days_in_month - current_day_number`, excluding today.
 
 New sales do not automatically increase `spend_budget`. A budget change requires an explicit CFO decision.
 
@@ -75,13 +80,53 @@ Firaz can update the meter by telling the CFO channel an expense in plain langua
 4. writes the state atomically through a temporary file and rename;
 5. reads it back and reports the new spent total and remaining allowance.
 
-Duplicate message/event IDs must not create duplicate adjustments. Refunds and corrections use explicit negative adjustments so the audit history remains intact. The workflow never silently rewrites `opening_spent` after the month is established.
+Duplicate message/event IDs must not create duplicate adjustments. Refunds use negative adjustments, while corrections may move the total in either direction, so the audit history remains intact. The workflow never silently rewrites `opening_spent` after the month is established.
 
 This first version intentionally has no editing UI. Conversation is the write surface; supershell is the read surface.
 
+### Writer command and concurrency
+
+Implement `scripts/cfo-state.mjs` as the only supported write path. The Oracle/CFO invokes it after interpreting Firaz's message. Its first-version commands are:
+
+- `init-month`: create a new current month with explicit baseline, budget, cash, floor, debt, and target values
+- `add-adjustment`: append an expense, refund, or correction
+- `set-balance`: explicitly replace cash, debt, income, budget, floor, or target after account reconciliation
+- `show`: return the normalized snapshot and derived totals as JSON
+
+`add-adjustment` requires a stable `--event-id`. Discord/bridge callers use the transport message ID. A manual administrative adjustment uses an explicitly generated UUID recorded by the caller. The writer never derives identity from amount, note, or timestamp.
+
+The writer acquires an exclusive same-directory lock using atomic lock-directory creation before the read–validate–deduplicate–append–write transaction. It retries for up to two seconds with bounded jitter, then fails without changing state. While holding the lock it:
+
+1. reads revision N;
+2. validates the full document;
+3. checks the incoming event ID;
+4. treats an already-present event ID as an idempotent success and returns the existing totals without writing;
+5. applies a new event, increments the revision to N+1, and writes a mode-0600 temporary file in the same directory;
+6. renames the temporary file over the canonical file;
+7. reads back revision N+1 and verifies the event ID and totals before reporting success;
+8. removes the lock in a `finally` path.
+
+Validation or write failures leave the previous canonical file intact. A stale lock older than five minutes is reported for manual recovery, not silently stolen.
+
+If the reader finds duplicate persisted adjustment IDs, it rejects the snapshot and logs a diagnostic. This differs intentionally from an incoming replay, which the writer handles as an idempotent no-op.
+
+Adjustment sign rules are enforced by `kind`:
+
+- `expense`: amount must be greater than zero
+- `refund`: amount must be less than zero
+- `correction`: amount may be positive or negative but not zero
+
+Any write that would make derived `spent` negative is rejected.
+
+### Month lifecycle
+
+`init-month` is the only operation that establishes `opening_spent`. It refuses to overwrite an existing current month. On rollover, the writer moves the validated current document to `~/.aios/state/finance/history/YYYY-MM.json` under the same lock, then creates the next month only from explicit CFO-confirmed opening values. No amount is automatically carried into `opening_spent`.
+
+Every adjustment timestamp must fall within the document's `month` in Asia/Kuala_Lumpur. Late corrections use `add-adjustment --month YYYY-MM` against the archived month and never change the current meter unless Firaz separately approves a current-month correction. This prevents late entries from leaking into the wrong month or double-counting an imported baseline.
+
 ## Data boundary
 
-Add one defensive Tauri command, `finance_snapshot`, that resolves and reads the state file and returns a typed nullable payload. Frontend components do not read arbitrary paths. Missing, malformed, non-finite, or mismatched-month values are rejected or normalized at this boundary. Negative adjustment amounts are allowed only for explicit refunds or corrections; core balances, budgets, and `opening_spent` cannot be negative.
+Add one defensive Tauri command, `finance_snapshot`, that resolves and reads the state file and returns a typed nullable payload. Frontend components do not read arbitrary paths. Missing, malformed, non-finite, or mismatched-month values are rejected or normalized at this boundary. Negative adjustment amounts follow the typed sign rules above; core balances, budgets, and `opening_spent` cannot be negative.
 
 The command never infers spend from bank balances. Reconciliation happens in the CFO workflow before the snapshot is written.
 
@@ -147,6 +192,8 @@ When the state file changes after a CFO screenshot update, both surfaces refresh
 
 - `src-tauri/src/finance.rs`: typed state-file reader and validation
 - `src-tauri/src/lib.rs`: register `finance_snapshot`
+- `scripts/cfo-state.mjs`: locked, idempotent state writer and month rollover
+- `scripts/cfo-state.test.mjs`: writer, concurrency, replay, validation, and rollover tests
 - `src/lib/finance.ts`: types, invoke wrapper, derived calculations, formatting, pace status
 - `src/components/dashboard/FinanceGlance.tsx`: shared sidebar block and hook
 - `src/components/dashboard/CfoFinanceCard.tsx`: expanded idle-dashboard card
@@ -164,7 +211,12 @@ Unit tests cover:
 - leap years, month length, day boundaries, and Malaysia-local elapsed percentage
 - safe, warning, danger, exceeded, zero-budget, stale, and month-mismatch states
 - malformed JSON, non-finite inputs, and negative core values fail closed
-- adjustment summation, duplicate-ID rejection, and negative refund/correction entries
+- adjustment summation and negative refund/correction entries
+- writer replay is an idempotent no-op while duplicate IDs already persisted fail closed
+- concurrent writers cannot lose an adjustment; lock timeout leaves state unchanged
+- revision increments and read-back verification
+- expense/refund/correction sign rules and rejection when derived spend would become negative
+- explicit month initialization, rollover archival, month-bound timestamps, and late archived corrections
 - spend percentages above 100% retain their true label while visual width caps at 100%
 
 Component tests verify:
