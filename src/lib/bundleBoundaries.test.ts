@@ -112,7 +112,8 @@ test("sidebar usage renders a real claude meter (not the spark proxy)", () => {
   assert.doesNotMatch(source, /showRemaining/);
   assert.equal(source.includes("gpt-5.3-codex-spark"), false);
   assert.equal(source.includes("idleRate()"), false);
-  assert.match(sidebar, /UsageGlance as SidebarUsage/);
+  assert.match(sidebar, /<UsageGlance \/>/);
+  assert.match(sidebar, /<FinanceGlance \/>/);
 });
 
 test("browser video fullscreen avoids macos native space transition", () => {
@@ -264,7 +265,8 @@ test("sidebar keeps usage visible outside the idle dashboard", () => {
   const sidebarUsage = read("src/components/SidebarUsage.tsx");
   const controlCenter = read("src/components/IdleControlCenter.tsx");
 
-  assert.match(sidebarUsage, /UsageGlance as SidebarUsage/);
+  assert.match(sidebarUsage, /<UsageGlance \/>/);
+  assert.match(sidebarUsage, /<FinanceGlance \/>/);
   assert.match(app, /<SidebarUsage \/>/);
   assert.doesNotMatch(controlCenter, /SidebarUsage|UsageGlance|useUsageRates/);
 });
@@ -330,7 +332,8 @@ test("idle dashboard is a minimal home: clock + command line + usage glance, not
   // so the sidebar + home draw the bars from one source.
   assert.match(usageGlance, /export function ProviderBlock/);
   assert.match(usageGlance, /export function useUsageRates/);
-  assert.match(sidebarUsage, /UsageGlance as SidebarUsage/);
+  assert.match(sidebarUsage, /<UsageGlance \/>/);
+  assert.match(sidebarUsage, /<FinanceGlance \/>/);
   assert.doesNotMatch(app, /notifications=\{notifications\}/);
 });
 
