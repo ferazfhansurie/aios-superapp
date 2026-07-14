@@ -30,6 +30,7 @@ import { listBridges, type Channel } from "../lib/bridges";
 import { formatRelativeRunAge } from "../lib/controlCenter";
 import { useSharedTicker, useSharedInterval } from "../lib/ticker";
 import { loadSettings, subscribe as subscribeSettings } from "../lib/settings";
+import { CfoFinanceCard } from "./dashboard/CfoFinanceCard";
 
 const CORE_LAUNCHERS: Array<{
   label: string;
@@ -76,6 +77,8 @@ export function IdleControlCenter({
             <CommandLine onSeedChat={onTalkToJarvis} onOpenPalette={onOpenPalette} />
           </div>
         </div>
+
+        <CfoFinanceCard />
 
         <RecentPanes onSpawn={onSpawn} />
 

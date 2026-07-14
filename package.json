@@ -12,7 +12,7 @@
     "install:mac-local": "bash scripts/install-mac-local.sh",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:cfo": "node --test scripts/cfo-state.test.mjs"
+    "test:cfo": "node --test scripts/cfo-state.test.mjs scripts/cfo-conversation.test.mjs src/lib/finance.test.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

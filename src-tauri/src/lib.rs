@@ -11,6 +11,7 @@ mod control;
 mod device;
 mod diag;
 mod files;
+mod finance;
 mod lsp;
 mod mac_apps;
 mod memory;
@@ -293,6 +294,7 @@ pub fn run() {
         .on_menu_event(|app, event| handle_menu_event(app, event.id().0.as_str()))
         .invoke_handler(tauri::generate_handler![
             read_telemetry,
+            finance::finance_snapshot,
             diag::diag_report,
             diag::diag_recent,
             diag::diag_clear,

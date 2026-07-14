@@ -7,4 +7,9 @@
  * the sidebar and the idle home draw the bars from ONE source — no duplicated
  * markup, no drift. See UsageGlance for the data paths + color thresholds.
  */
-export { UsageGlance as SidebarUsage } from "./dashboard/UsageGlance";
+import { UsageGlance } from "./dashboard/UsageGlance";
+import { FinanceGlance } from "./dashboard/FinanceGlance";
+
+export function SidebarUsage() {
+  return <><UsageGlance /><FinanceGlance /></>;
+}
