@@ -36,17 +36,28 @@ Create a small canonical runtime snapshot at `~/.aios/state/finance/cfo.json`. T
   "currency": "MYR",
   "month": "2026-07",
   "income_received": 11700,
-  "spent": 6300,
+  "opening_spent": 6300,
   "spend_budget": 6700,
   "cash": 5400,
   "cash_floor": 5000,
   "card_debt": 4578.91,
-  "next_month_cash_target": 7000
+  "next_month_cash_target": 7000,
+  "adjustments": [
+    {
+      "id": "2026-07-16T13:10:00+08:00-rm20-food",
+      "at": "2026-07-16T13:10:00+08:00",
+      "amount": 20,
+      "category": "food",
+      "note": "lunch",
+      "source": "discord-cfo"
+    }
+  ]
 }
 ```
 
-All amounts are numeric MYR values. `net_cash` and `remaining_budget` are derived in code, not stored:
+All amounts are numeric MYR values. `spent`, `net_cash`, and `remaining_budget` are derived in code, not stored:
 
+- `spent = opening_spent + sum(adjustments.amount)`
 - `net_cash = cash - card_debt`
 - `remaining_budget = spend_budget - spent`
 - `spent_pct = spent / spend_budget * 100`
@@ -54,9 +65,23 @@ All amounts are numeric MYR values. `net_cash` and `remaining_budget` are derive
 
 New sales do not automatically increase `spend_budget`. A budget change requires an explicit CFO decision.
 
+### Conversational adjustment protocol
+
+Firaz can update the meter by telling the CFO channel an expense in plain language, for example `spent rm20 lunch`, `rm45 petrol`, or by sending a transaction screenshot. The Oracle/CFO workflow:
+
+1. reads the latest state;
+2. appends one uniquely identified adjustment with amount, time, optional category/note, and source;
+3. updates cash only when Firaz also confirms the payment came from a tracked cash account;
+4. writes the state atomically through a temporary file and rename;
+5. reads it back and reports the new spent total and remaining allowance.
+
+Duplicate message/event IDs must not create duplicate adjustments. Refunds and corrections use explicit negative adjustments so the audit history remains intact. The workflow never silently rewrites `opening_spent` after the month is established.
+
+This first version intentionally has no editing UI. Conversation is the write surface; supershell is the read surface.
+
 ## Data boundary
 
-Add one defensive Tauri command, `finance_snapshot`, that resolves and reads the state file and returns a typed nullable payload. Frontend components do not read arbitrary paths. Missing, malformed, negative, non-finite, or mismatched-month values are rejected or normalized at this boundary.
+Add one defensive Tauri command, `finance_snapshot`, that resolves and reads the state file and returns a typed nullable payload. Frontend components do not read arbitrary paths. Missing, malformed, non-finite, or mismatched-month values are rejected or normalized at this boundary. Negative adjustment amounts are allowed only for explicit refunds or corrections; core balances, budgets, and `opening_spent` cannot be negative.
 
 The command never infers spend from bank balances. Reconciliation happens in the CFO workflow before the snapshot is written.
 
@@ -138,7 +163,8 @@ Unit tests cover:
 - net cash = RM821.09 from RM5,400 cash and RM4,578.91 debt
 - leap years, month length, day boundaries, and Malaysia-local elapsed percentage
 - safe, warning, danger, exceeded, zero-budget, stale, and month-mismatch states
-- malformed JSON and non-finite or negative inputs fail closed
+- malformed JSON, non-finite inputs, and negative core values fail closed
+- adjustment summation, duplicate-ID rejection, and negative refund/correction entries
 - spend percentages above 100% retain their true label while visual width caps at 100%
 
 Component tests verify:
