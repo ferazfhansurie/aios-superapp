@@ -1,6 +1,6 @@
 # Implementation Plan — Customizable, Pinnable, Reorderable Sidebar
 
-**Repo:** `/Users/firazfhansurie/Repo/firaz/aios/shell` (the AIOS cockpit shell)
+**Repo:** `aios/shell` (the AIOS cockpit shell)
 **Stack:** Tauri 2 + React 19 + Vite 7 + Tailwind 4 + TypeScript. pnpm.
 **Audience:** an AI engineer implementing this end-to-end. Read this whole doc before writing code.
 

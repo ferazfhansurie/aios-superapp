@@ -1,7 +1,7 @@
 # Idle Dashboard Redesign — minimal-but-useful
 
 **Status:** PLAN ONLY. No source touched. firaz picks an option (A or B) before any code is written.
-**Repo:** `/Users/firazfhansurie/Repo/firaz/aios/shell`
+**Repo:** `aios/shell`
 **Goal:** the home screen shown when no panes are open should be MORE MINIMAL but STILL USEFUL. Lots of negative space, one clear focal point, glance + launch.
 
 ---

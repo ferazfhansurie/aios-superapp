@@ -4076,7 +4076,7 @@ enabled = true
 command = "node"
 
 [mcp_servers.memory.env]
-CODEX_HOME = "/Users/firazfhansurie/.codex"
+CODEX_HOME = "/Users/example/.codex"
 
 [features]
 js_repl = false
@@ -4477,7 +4477,7 @@ js_repl = false
         let selected = super::select_codex_appserver_bin(
             None,
             Some("/opt/homebrew/bin/codex".into()),
-            Some("/Users/firazfhansurie/.codex-chat/packages/standalone/current/codex".into()),
+            Some("/Users/example/.codex-chat/packages/standalone/current/codex".into()),
         );
 
         assert_eq!(selected.as_deref(), Some("/opt/homebrew/bin/codex"));

@@ -36,11 +36,11 @@ Object.defineProperty(globalThis, "window", {
 });
 
 const badInstructionsTitle =
-  "# AGENTS.md instructions for /Users/firazfhansurie <INSTRUCTIONS> <critical_persona> you are AIOS";
+  "# AGENTS.md instructions for /Users/example <INSTRUCTIONS> <critical_persona> you are AIOS";
 
 const resumeKind = {
   type: "chat" as const,
-  cwd: "/Users/firazfhansurie",
+  cwd: "/Users/example",
   resume: {
     id: "019ec098-83a8-7c32-9509-6866c3f5db19",
     title: badInstructionsTitle,
@@ -56,7 +56,7 @@ test.beforeEach(() => {
 test("pane history gives resumed chats short useful labels instead of instruction dumps", () => {
   const item = describePaneHistoryItem(resumeKind, badInstructionsTitle);
 
-  assert.equal(item.label, "resumed chat · firazfhansurie");
+  assert.equal(item.label, "resumed chat · example");
   assert.equal(item.indicator, "resume");
   assert.match(item.detail, /codex session · 019ec098/);
   assert.doesNotMatch(item.label, /agents\.md|instructions|critical_persona/i);
@@ -70,10 +70,10 @@ test("pane history collapses repeated opens of the same resumed chat session", (
 
   const items = loadPaneHistory();
   assert.equal(items.length, 1);
-  assert.equal(items[0].label, "resumed chat · firazfhansurie");
+  assert.equal(items[0].label, "resumed chat · example");
   assert.equal(items[0].kind.type, "chat");
   if (items[0].kind.type === "chat") {
-    assert.equal(items[0].kind.resume?.title, "resumed chat · firazfhansurie");
+    assert.equal(items[0].kind.resume?.title, "resumed chat · example");
   }
 });
 
@@ -88,11 +88,11 @@ test("pane history retains a chat task id for explicit resume/handoff continuity
 });
 
 test("pane history replaces a fresh chat placeholder with its resume-capable session row", () => {
-  recordPaneHistory({ type: "chat", cwd: "/Users/firazfhansurie/Repo/firaz/aios/shell" }, "chat");
+  recordPaneHistory({ type: "chat", cwd: "/Users/example/Projects/aios/shell" }, "chat");
   recordPaneHistory(
     {
       type: "chat",
-      cwd: "/Users/firazfhansurie/Repo/firaz/aios/shell",
+      cwd: "/Users/example/Projects/aios/shell",
       resume: {
         id: "019ee07c-391b-79f0-b177-4b37e5bbd3a5",
         title: "fix history resume",
@@ -155,7 +155,7 @@ test("pane history cleans and dedupes existing stored bad resume rows on load", 
   const items = loadPaneHistory();
   assert.equal(items.length, 1);
   assert.equal(items[0].id, "h-old-0");
-  assert.equal(items[0].label, "resumed chat · firazfhansurie");
+  assert.equal(items[0].label, "resumed chat · example");
   assert.match(items[0].detail, /codex session · 019ec098/);
 });
 

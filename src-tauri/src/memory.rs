@@ -957,7 +957,7 @@ metadata:
   type: project
 ---
 
-repo: /Users/firazfhansurie/Repo/firaz/aios/shell
+repo: /Users/example/Projects/aios/shell
 the shell uses panes, command registry, and memory context.
 "#,
         )
@@ -979,7 +979,7 @@ browser note that mentions shell once.
         let hits = search_memory_dir(
             &root,
             "aios shell".to_string(),
-            Some("/Users/firazfhansurie/Repo/firaz/aios/shell".to_string()),
+            Some("/Users/example/Projects/aios/shell".to_string()),
             Some(5),
         );
 

@@ -21,10 +21,8 @@ Install these once (per machine):
 > We use **npm** on Windows (not pnpm) — pnpm 11's build-approval gate blocks
 > esbuild's install. This is the only deliberate divergence from Firaz's setup.
 
-### Optional (only if you want these panes live)
+### Optional
 - **LibreOffice** → office-file previews in the Files pane
-- **MotionBoards key** → write it to `%USERPROFILE%\.aios\state\motion.key`
-  (one line, `mb_...`). Never commit it. The Studio/Motion pane reads it from there.
 
 ---
 
@@ -91,7 +89,7 @@ git pull origin <this-branch>
 ## What works on Windows vs. what's inert
 
 **Working:** terminals (PowerShell), chat (`claude.exe`), files + office preview,
-browser, memory graph, database, settings, the homescreen dashboard (your real
+browser, memory graph, settings, the homescreen dashboard (your real
 usage stats), screenshots, clipboard "send to chat", and the device/battery panel.
 
 **Inert** (Unix-only integrations — they show empty, never crash): the oracle

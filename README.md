@@ -152,29 +152,6 @@ An Obsidian-style view of your local markdown "memory" vault, with two modes:
 - **Table** — sortable, searchable, with inline create/edit/delete of memory
   files (name · type · description · body).
 
-### 🗄 Database
-
-A query workbench for **Postgres** (including Neon) and **MySQL**, over an async
-`sqlx` driver. Add a connection (tested before it's saved, stored locally at
-`0600`), browse tables, page through rows, run arbitrary SQL, and edit / insert /
-delete rows inline. Postgres results are serialized server-side via `to_jsonb`
-for clean rendering.
-
-### 👥 Contacts & customer inbox
-
-A customer-comms surface that merges your **WhatsApp logs** (inbound + outbound)
-with a **local CRM** (contacts + deals at `~/.aios/state/crm.json`), deduped by
-handle and sorted newest-first. Open a thread to see the full history; quick-reply
-sends straight through the bridge's `push.js`.
-
-### 🎨 Studio (MotionBoards)
-
-Generate **images and video** from a canvas pane via the
-[MotionBoards](https://motionboards.vercel.app) API — browse the model catalog,
-check your credit balance, fire sync/async jobs with live status polling, and
-read/write shared board state. A thin server-side bridge keeps your Bearer key
-off the frontend (set `AIOS_MOTION_KEY`).
-
 ### 📊 Pulse & usage
 
 The idle dashboard and account menu surface a GitHub-style **activity heatmap**,
@@ -182,26 +159,8 @@ The idle dashboard and account menu surface a GitHub-style **activity heatmap**,
 rate-limit %**, and **device stats** (CPU, RAM, disk, battery, uptime) — all read
 locally from your Claude usage data, degrading to quiet zeros when absent.
 
-### ⚙️ Automations · 🔌 Bridges · 🧩 Plugins
+### 📸 Appshot · 🎨 Theming
 
-- **Automations** — a dense status board for always-on daemons and scheduled
-  jobs: it reads `launchd` jobs, your proactive plan, and live background tmux
-  sessions, with per-row state dots, schedule chips, "last fired" times, failure
-  pills, and expandable rows (command, log tail, run-now, enable/disable).
-- **Bridges** — connection status for every channel AIOS can speak through
-  (WhatsApp live; Instagram / Threads / Google Chat / X / Telegram / Gmail /
-  iMessage on the way), detected via process, `launchd`, and activity logs.
-- **Plugins / skills** — a catalog of your AIOS skills (parsed from the skill
-  index) plus the MCP servers wired into your `~/.claude.json`.
-- **Task monitor** — point it at an oracle's tmux session and it pings you on
-  **WhatsApp** when the task goes idle (done) or throws an error, with anti-spam
-  guards so you get a signal, not noise.
-
-### 🎙 Voice · 📸 Appshot · 🎨 Theming
-
-- **Push-to-talk voice** — hold to record, transcribe via a local **whisper.cpp**
-  server, and drop the text into the focused chat composer, terminal compose box,
-  or PTY (clipboard fallback).
 - **Appshot** (`⌘⌘`) — grabs a screenshot and pipes its path into the master
   oracle for instant visual context.
 - **Theming** — system / light / dark, a live **accent color** picker, density
@@ -210,7 +169,7 @@ locally from your Claude usage data, degrading to quiet zeros when absent.
 ### ⌘ Command palette
 
 `⌘K` opens a Raycast-style fuzzy palette grouped into **open** (new panes),
-**resume** (recent chats), **fleet** (oracles), **customers**, **run** (auto-
+**resume** (recent chats), **fleet** (oracles), **run** (auto-
 discovered `~/Repo` projects), **view**, **actions**, and **app**.
 
 <details>
@@ -229,7 +188,6 @@ discovered `~/Repo` projects), **view**, **actions**, and **app**.
 | `⌘R` | Reload the app |
 | `⌘,` | Settings |
 | `⌘⌘` | Appshot (screenshot → oracle) |
-| `⌘J` | Voice dictation |
 | `F5` | Run the detected project |
 | `Esc` | Exit a maximized pane |
 | **Chat** | `Enter` send · `Shift+Enter` newline · `⌘↑/↓` history · `@` files |
@@ -288,8 +246,7 @@ App state — settings, sidebar layout, and per-pane chat drafts — persists in
 ```
 src/            React + TypeScript frontend (Vite)
   components/     one file per pane (Chat, Terminal, Editor, Browser, Files,
-                  Notes, Memory, Database, Contacts, Studio, Pulse,
-                  Automations, Bridges, Plugins, Viewer, …)
+                  Notes, Memory, Pulse, Viewer, …)
   lib/            thin Tauri-invoke wrappers + the pane event bus
   App.tsx         the superapp shell — pane grid, layout, keybinds, dispatch
   App.css         the design system (color tokens, type scale, radii, spacing)
@@ -328,7 +285,7 @@ make it quieter. All of it lives as theme-aware CSS custom properties in
 
 ## 🗺 Roadmap
 
-Shipped and stable today: everything in **What's inside** above. On deck:
+The core panes described above are shipped today. On deck:
 
 - **Customizable sidebar** — pin/reorder/rename/hide anything (drag-and-drop).
 - **Control plane** — expose every UI action over localhost HTTP + MCP so an

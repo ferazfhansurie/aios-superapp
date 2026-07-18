@@ -3,7 +3,7 @@
 date: 2026-06-01
 source inspected: `/Applications/Codex.app`
 bundle version observed: `26.519.81530`
-method: local `app.asar` asset inventory, selected asset extraction into `/tmp/codex-assets`, string/feature scan, and comparison against the real AIOS tauri superapp in `/Users/firazfhansurie/Repo/firaz/aios/shell`.
+method: local `app.asar` asset inventory, selected asset extraction into `/tmp/codex-assets`, string/feature scan, and comparison against the AIOS Tauri superapp in this repository.
 
 note: this is a product/interaction audit. do not copy codex source. copy the product patterns, then implement them in aios-native code and language.
 

@@ -506,8 +506,8 @@ import { liveRoomSessionFolder, validateLiveRoomManifest } from "./liveRoom.ts";
 
 test("live room session folders are scoped under state live-room sessions", () => {
   assert.equal(
-    liveRoomSessionFolder("/Users/firazfhansurie/.aios/state", "lr-abc"),
-    "/Users/firazfhansurie/.aios/state/live-room/sessions/lr-abc",
+    liveRoomSessionFolder("/Users/example/.aios/state", "lr-abc"),
+    "/Users/example/.aios/state/live-room/sessions/lr-abc",
   );
 });
 

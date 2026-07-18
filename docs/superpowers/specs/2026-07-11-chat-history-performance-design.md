@@ -2,7 +2,7 @@
 
 date: 2026-07-11
 status: approved design, pending implementation plan
-scope: aios supershell at `/Users/firazfhansurie/Repo/firaz/aios/shell`
+scope: aios supershell repository
 
 ## objective
 

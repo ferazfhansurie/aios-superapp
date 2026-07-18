@@ -44,11 +44,11 @@ async fn main() {
         }
     };
 
-    // Bind the tailscale IP only. Default to the box's known tailnet address;
-    // override with AIOS_NODE_BIND. Refuse 0.0.0.0 / :: — binding all interfaces
-    // would expose an RCE daemon to every network the box is on.
+    // Default to loopback. Remote use must explicitly set AIOS_NODE_BIND to a
+    // private overlay-network address. Refuse 0.0.0.0 / :: — binding all
+    // interfaces would expose an RCE daemon to every network the box is on.
     let bind = std::env::var("AIOS_NODE_BIND")
-        .unwrap_or_else(|_| "100.113.3.98:8765".to_string());
+        .unwrap_or_else(|_| "127.0.0.1:8765".to_string());
     let addr: SocketAddr = match bind.parse() {
         Ok(a) => a,
         Err(e) => {

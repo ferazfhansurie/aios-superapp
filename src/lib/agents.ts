@@ -212,9 +212,8 @@ export function setMission(value: string): void {
   localStorage.setItem(MISSION_KEY, value.trim() || DEFAULT_MISSION);
 }
 
-/** Firaz's box. The agents launch chat panes here, scoped to the right repo so
- *  tools hit the correct codebase. Absolute because spawn() needs a real cwd. */
-const WRMS_ROOT = "/Users/firazfhansurie/Repo/wrms";
+/** Default relative workspace for the optional WRMS agent fleet. */
+const WRMS_ROOT = "wrms";
 
 export interface WrmsAgentSeed {
   id: string;

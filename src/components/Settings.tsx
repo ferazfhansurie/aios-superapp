@@ -977,7 +977,7 @@ function ProjectsSection() {
       {addOpen && (
         <div className="mb-3 flex flex-col gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-pane)]/50 p-3">
           <input className={inputCls} placeholder="name (e.g. my-app)" value={nName} onChange={(e) => setNName(e.target.value)} />
-          <input className={inputCls} placeholder="absolute path (e.g. /Users/firazfhansurie/Repo/...)" value={nPath} onChange={(e) => setNPath(e.target.value)} />
+          <input className={inputCls} placeholder="absolute path (e.g. /path/to/project)" value={nPath} onChange={(e) => setNPath(e.target.value)} />
           <input className={inputCls} placeholder="run command (optional, e.g. npm run dev)" value={nCmd} onChange={(e) => setNCmd(e.target.value)} />
           <div className="flex justify-end gap-2">
             <button onClick={() => setAddOpen(false)} className="rounded-md px-2.5 py-1 text-[12px] text-[var(--color-muted)] hover:text-[var(--color-text)]">cancel</button>

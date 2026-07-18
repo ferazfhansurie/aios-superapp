@@ -5,11 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const WRMS_QA_ROOT: &str = "/Users/firazfhansurie/Repo/firaz/aios/wrms-qa";
-const DEFAULT_COLLECTOR_APP: &str =
-    "/Users/firazfhansurie/Repo/wrms/core/wrms-collector-flutter/build/ios/iphonesimulator/Runner.app";
-const DEFAULT_VENDOR_APP: &str =
-    "/Users/firazfhansurie/Repo/wrms/core/wrms-vendor-app-flutter/build/ios/iphonesimulator/Runner.app";
+const DEFAULT_WRMS_QA_ROOT: &str = "wrms-qa";
+const DEFAULT_COLLECTOR_APP: &str = "";
+const DEFAULT_VENDOR_APP: &str = "";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,17 +94,27 @@ fn default_app_path(app: &str, is_real: bool) -> Option<String> {
     if is_real {
         return None;
     }
-    let path = match app {
-        "vendor" => DEFAULT_VENDOR_APP,
-        _ => DEFAULT_COLLECTOR_APP,
+    let (env_key, fallback) = match app {
+        "vendor" => ("AIOS_WRMS_VENDOR_APP", DEFAULT_VENDOR_APP),
+        _ => ("AIOS_WRMS_COLLECTOR_APP", DEFAULT_COLLECTOR_APP),
     };
+    let configured = std::env::var(env_key).unwrap_or_else(|_| fallback.to_string());
+    let path = configured.trim();
     Path::new(path).exists().then(|| path.to_string())
+}
+
+fn wrms_qa_root() -> PathBuf {
+    std::env::var("AIOS_WRMS_QA_ROOT")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_WRMS_QA_ROOT))
 }
 
 fn latest_app_shot(app: Option<String>) -> Option<WrmsQaShot> {
     let app = normalize_app(app);
     let prefix = format!("{app}-");
-    let root = PathBuf::from(WRMS_QA_ROOT);
+    let root = wrms_qa_root();
     let shots_root = root.join("shots");
     let dirs = fs::read_dir(&shots_root).ok()?;
     let mut best: Option<(PathBuf, String, u64)> = None;
@@ -194,7 +202,7 @@ pub fn wrms_qa_run(
     real: Option<bool>,
     udid: Option<String>,
 ) -> Result<WrmsQaRunResult, String> {
-    let root = PathBuf::from(WRMS_QA_ROOT);
+    let root = wrms_qa_root();
     let script = root.join("flutter").join("vision-driver.mjs");
     if !script.exists() {
         return Err(format!(

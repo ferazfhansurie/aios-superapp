@@ -1121,7 +1121,7 @@ function NewLoopForm({ onCreated }: { onCreated: () => void }) {
             <input className="w-24 shrink-0 rounded-lg border border-white/10 bg-white/[0.03] px-2 py-1.5 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]/60" placeholder="30m" value={cadence} onChange={(e) => setCadence(e.target.value)} />
           </div>
           <input className={inputCls} placeholder="prompt — what the loop should do each fire" value={prompt} onChange={(e) => setPrompt(e.target.value)} />
-          <input className={inputCls} placeholder="cwd (optional, e.g. /Users/firazfhansurie/Repo/wrms)" value={cwd} onChange={(e) => setCwd(e.target.value)} />
+          <input className={inputCls} placeholder="cwd (optional, e.g. /path/to/project)" value={cwd} onChange={(e) => setCwd(e.target.value)} />
           {err && <div className="text-[10px] text-[var(--color-danger)]">⚠ {err}</div>}
           <button
             type="submit"

@@ -53,7 +53,7 @@ fn node_target() -> Result<(String, String), String> {
     let addr = std::env::var("AIOS_NODE_ADDR")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "100.113.3.98:8765".to_string());
+        .ok_or("no remote node configured (set AIOS_NODE_ADDR)")?;
     // Secret precedence: AIOS_NODE_SECRET env → dedicated `box-node-secret`
     // (the BOX's token, paired once — distinct from this Mac's own control-plane
     // `node-secret`, a different trust domain) → fall back to `node-secret` for

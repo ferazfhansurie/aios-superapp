@@ -11,7 +11,7 @@ the shell chatpane currently exposes only `gpt-5.3-codex-spark` and `gpt-5.5`, r
 - `gpt-5.6-terra`: low, medium, high, xhigh, max, ultra; default medium
 - `gpt-5.6-luna`: low, medium, high, xhigh, max; default medium
 
-the shell also renders every configured claude account in the sidebar and chatpane. the terminal's actual claude login is `firaz@fathopesenergy.com` (`internettoo`, fhe), while the configured multi-account list contains a stale gmail-labelled default entry. firaz wants the shell to behave like codex: show and run only the account currently logged into the terminal.
+the shell also renders every configured claude account in the sidebar and chatpane. the terminal's active claude login can differ from stale configured multi-account entries. the shell should behave like codex: show and run only the account currently logged into the terminal.
 
 ## approved product decisions
 

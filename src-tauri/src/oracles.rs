@@ -546,7 +546,7 @@ pub fn appshot(identity: Option<String>) -> Result<String, String> {
 /// ssh call so the connection returns immediately.
 ///
 /// Node target is env-overridable so this isn't hardwired to one box:
-///   - `AIOS_BOX_SSH`     — ssh destination (default `firaz@100.113.3.98`, tailnet)
+///   - `AIOS_BOX_SSH`     — ssh destination (required, e.g. `user@private-host`)
 ///   - `AIOS_BOX_DISPLAY` — X display the GUI lands on (default `:0`)
 ///
 /// `BatchMode=yes` keeps it from hanging on a password prompt inside the GUI
@@ -557,7 +557,10 @@ pub fn launch_box_app(node: Option<String>) -> Result<String, String> {
     // `node` is reserved for the Part F registry (per-node ssh targets); for now
     // any value resolves to the single bisnesgpt box via env.
     let _ = node;
-    let dest = env_or("AIOS_BOX_SSH", "firaz@100.113.3.98");
+    let dest = std::env::var("AIOS_BOX_SSH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("no remote GUI node configured (set AIOS_BOX_SSH)")?;
     let display = env_or("AIOS_BOX_DISPLAY", ":0");
     // Detach aios-shell from the ssh session so ssh returns the instant it's
     // spawned (setsid + full redirect), otherwise ssh blocks on the GUI process.

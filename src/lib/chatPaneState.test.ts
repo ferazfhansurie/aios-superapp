@@ -36,7 +36,7 @@ import {
 
 test("buildChatContextCapsule keeps live context compact and factual", () => {
   const capsule = buildChatContextCapsule({
-    cwd: "/Users/firazfhansurie/Repo/firaz/aios-shell",
+    cwd: "/Users/example/Projects/aios-shell",
     engine: "codex",
     modelLabel: "gpt-5.5",
     contextBudget: "agent",
@@ -46,10 +46,10 @@ test("buildChatContextCapsule keeps live context compact and factual", () => {
       openPanes: [
         { key: "p1", label: "chat", type: "chat", detail: "aios-shell" },
         { key: "p2", label: "browser", type: "browser", detail: "https://claude.ai" },
-        { key: "p3", label: "files", type: "files", detail: "/Users/firazfhansurie/Repo/firaz/aios-shell" },
+        { key: "p3", label: "files", type: "files", detail: "/Users/example/Projects/aios-shell" },
       ],
       projects: [
-        { name: "aios-shell", root: "/Users/firazfhansurie/Repo/firaz/aios-shell", kind: "tauri" },
+        { name: "aios-shell", root: "/Users/example/Projects/aios-shell", kind: "tauri" },
       ],
     },
     memories: [
