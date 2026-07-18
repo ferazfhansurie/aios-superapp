@@ -1,16 +1,15 @@
 <div align="center">
 
-<img src="docs/cover/cover.png" alt="AIOS — one native window to drive your AI coding agents" width="100%" />
+<img src="docs/cover/hero-v2.png" alt="AIOS — a visual multi-model workspace for building with AI" width="100%" />
 
 <br /><br />
 
 # AIOS
 
-**the superapp for driving AI coding agents — one native window.**
+**build with the best AI models without living in a terminal.**
 
-terminals, oracles, a multi-engine chat, an embedded browser, a file explorer,
-automations, bridges, and a 3D memory graph you can fly through. native, fast,
-and it runs on your own AI subscriptions with no keys baked in.
+pick a model. describe what you want. watch the work happen. preview the result.
+then rearrange, extend, and brand the workspace until it feels like yours.
 
 <br />
 
@@ -22,35 +21,46 @@ and it runs on your own AI subscriptions with no keys baked in.
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![changelog](https://img.shields.io/badge/changelog-active-success)](./CHANGELOG.md)
 
-<sub>actively developed — it's the author's daily driver, updated most days. see the **[changelog](./CHANGELOG.md)**.</sub>
+<sub>open source, local-first, and built to be forked. bring your existing AI subscriptions.</sub>
 
 <br /><br />
 
-<a href="https://aios.adleticagency.com"><strong>website</strong></a>
-· <a href="https://aios.adleticagency.com/use-cases">use cases</a>
-· <a href="https://aios.adleticagency.com/demo">interactive demo</a>
-· <a href="https://aios.adleticagency.com/agency-os-lite">early access</a>
+<a href="#-start-building"><strong>start building</strong></a>
+· <a href="#-make-it-yours">customize it</a>
+· <a href="./CONTRIBUTING.md">contribute</a>
+· <a href="./CHANGELOG.md">changelog</a>
 
 <br /><br />
-
-<sub>early access installers are distributed through the paid discord build room:
-7-day trial, then rm99/month.</sub>
 
 </div>
 
 ---
 
-AIOS is a desktop **superapp** for driving AI coding agents. It wraps a Rust
-(Tauri v2) backend and a React + xterm.js frontend into a single native window
-where **every pane is a tool**: terminals, an agent roster, a
-multi-engine chat, an embedded browser, a file explorer, a 3D memory graph,
-automations, bridges, and a plugin/skill catalog.
+AIOS is a native visual workspace for vibe coders who want **multi-model power
+without command-line ceremony**. Use Claude, Codex, or OpenCode from the same
+chat surface. Change model, reasoning effort, and permissions from simple
+controls. Attach context, follow every tool call, inspect changed files, and
+preview what your agent built without bouncing between terminal windows.
 
-It's the control surface for the [AIOS](https://github.com/ferazfhansurie/aios)
-stack — but it **degrades gracefully** and runs fine on a plain machine with
-nothing but a terminal. No tmux? The oracle roster is just empty. No `claude`
-CLI? The chat pane sits quiet. No memory vault? The graph is empty. Nothing
-errors; missing pieces simply go quiet.
+This is not another locked AI editor. AIOS is a **customizable superapp shell**.
+Its resizable panes, commands, themes, agents, and integrations are ordinary
+React and Rust modules you can fork and reshape for your own workflow.
+
+### Why vibe coders choose AIOS
+
+- **One visual home for multiple models** — switch engines without rebuilding
+  your workflow around a different app.
+- **See the work, not just the answer** — progress, tool calls, approvals,
+  changed files, and previews stay visible.
+- **No terminal required for the normal loop** — prompt, approve, inspect, and
+  iterate from the desktop UI. The local CLIs remain the engine underneath.
+- **Your accounts, your machine, your files** — use existing subscriptions;
+  AIOS does not bake provider keys into the app.
+- **Designed to be customized** — add a pane, command, model adapter, theme, or
+  complete workflow without asking a platform vendor for permission.
+
+> AIOS gives non-terminal builders a friendly cockpit without hiding the real
+> files, tools, and execution underneath.
 
 ## 📸 Screenshots
 
@@ -196,32 +206,46 @@ discovered `~/Repo` projects), **view**, **actions**, and **app**.
 
 </details>
 
-## 🚀 Requirements
+## 🚀 Start building
+
+### 1. Install the foundations
 
 - **macOS 10.15+** or **Windows 10/11**. Windows uses native PowerShell/ConPTY;
   Unix-only fleet features degrade gracefully when tmux is unavailable.
 - **Rust** (stable, via [rustup](https://rustup.rs)) — for the Tauri backend.
-- **Node** 20+ and **pnpm** — for the frontend. Windows contributors may use
+- **Node 22+** and **pnpm** — for the frontend. Windows contributors may use
   the documented npm launcher in [WINDOWS.md](./WINDOWS.md).
-- _Optional:_ **tmux** + a `claude` CLI on your `PATH` — for the chat pane and
-  the oracle roster. Without them those panes are simply empty.
+- At least one supported local AI CLI: **Claude Code**, **Codex**, or
+  **OpenCode**.
+- _Optional:_ **tmux** — for persistent oracle sessions. Without it the roster
+  simply stays empty.
 - _Optional:_ a **whisper.cpp** server on `:9000` — for push-to-talk voice.
-- _Optional:_ the `codex` CLI — to use the ChatGPT-subscription chat engine.
 
-## 🛠 Build & Run
+### 2. Run the workspace
 
 ```bash
-pnpm install          # install frontend deps
-pnpm tauri dev        # run AIOS in dev (hot-reload frontend + backend)
-pnpm tauri build      # produce a release bundle (.app / .msi / binary)
+git clone https://github.com/ferazfhansurie/aios-superapp.git
+cd aios-superapp
+pnpm install
+pnpm tauri dev
 ```
 
+That opens the real desktop app with frontend hot reload and the Rust backend.
+Choose any detected model from the composer and start building.
+
 Windows setup, PowerShell launchers, supported features, and known limitations
-are documented in [WINDOWS.md](./WINDOWS.md). Every push to `master` is built on
-both macOS and Windows by GitHub Actions; version tags create a draft release.
+are documented in [WINDOWS.md](./WINDOWS.md).
 
 (`pnpm tauri` proxies the Tauri CLI; `pnpm dev` runs just the Vite frontend on
 `:1420`.)
+
+### 3. Verify your changes
+
+```bash
+pnpm build
+pnpm test:chatpane
+cargo check --manifest-path src-tauri/Cargo.toml
+```
 
 ## ⚙️ Configuration
 
@@ -241,6 +265,19 @@ The MCP server list is read from `~/.claude.json` automatically (no config).
 App state — settings, sidebar layout, and per-pane chat drafts — persists in
 `localStorage` (`aios.settings`, `aios.sidebar`, `aios-chat-draft:<pane>`).
 
+## 🎛 Make it yours
+
+AIOS is intentionally a shell, not a prescribed workflow:
+
+- add a visual tool by creating a pane component and registering its command;
+- add a model by implementing an adapter behind the shared chat transport;
+- change the full personality through CSS tokens, density, icons, and layout;
+- connect your own MCP servers, local skills, memory, and project conventions;
+- remove everything you do not need — optional systems degrade quietly.
+
+Start with [CONTRIBUTING.md](./CONTRIBUTING.md), then follow the nearest existing
+pane or adapter. Small extensions should stay small and understandable.
+
 ## 🧩 Architecture
 
 ```
@@ -251,9 +288,8 @@ src/            React + TypeScript frontend (Vite)
   App.tsx         the superapp shell — pane grid, layout, keybinds, dispatch
   App.css         the design system (color tokens, type scale, radii, spacing)
 src-tauri/      Rust (Tauri v2) backend — ~47 #[tauri::command]s across:
-  src/            pty · chat · browser · files · memory · oracles · voice
-                  db · crm · inbox · motion · automations · bridges · plugins
-                  device · stats · usage · telemetry · monitor
+  src/            pty · chat · browser · files · memory · oracles · bridges
+                  plugins · device · stats · usage · telemetry · monitor
   tauri.conf.json app config (name "AIOS", id com.adletic.aios, window, bundle)
 ```
 
