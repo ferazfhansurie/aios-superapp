@@ -26,10 +26,9 @@ pnpm install
 pnpm tauri dev
 ```
 
-You'll need Rust (stable, via [rustup](https://rustup.rs)), Node 20+, and pnpm.
-On macOS the Tauri prerequisites come with the Xcode command-line tools. On
-Windows, install the Visual Studio 2022 C++ build tools described in
-[WINDOWS.md](./WINDOWS.md).
+You'll need Rust (stable, via [rustup](https://rustup.rs)), Node 20+, pnpm, and
+the macOS Xcode command-line tools. Other platforms are not officially
+supported; community ports should start in contributor forks.
 
 Before opening a PR:
 
