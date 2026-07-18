@@ -13,7 +13,7 @@ then rearrange, extend, and brand the workspace until it feels like yours.
 
 <br />
 
-[![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-000)](#-requirements)
+[![platform](https://img.shields.io/badge/platform-macOS-000)](#-requirements)
 [![built with Tauri](https://img.shields.io/badge/built%20with-Tauri%20v2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
 [![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-stable-000?logo=rust&logoColor=white)](https://rustup.rs)
@@ -210,11 +210,9 @@ discovered `~/Repo` projects), **view**, **actions**, and **app**.
 
 ### 1. Install the foundations
 
-- **macOS 10.15+** or **Windows 10/11**. Windows uses native PowerShell/ConPTY;
-  Unix-only fleet features degrade gracefully when tmux is unavailable.
+- **macOS 10.15+**. Other platforms are not officially supported.
 - **Rust** (stable, via [rustup](https://rustup.rs)) — for the Tauri backend.
-- **Node 22+** and **pnpm** — for the frontend. Windows contributors may use
-  the documented npm launcher in [WINDOWS.md](./WINDOWS.md).
+- **Node 22+** and **pnpm** — for the frontend.
 - At least one supported local AI CLI: **Claude Code**, **Codex**, or
   **OpenCode**.
 - _Optional:_ **tmux** — for persistent oracle sessions. Without it the roster
@@ -232,9 +230,6 @@ pnpm tauri dev
 
 That opens the real desktop app with frontend hot reload and the Rust backend.
 Choose any detected model from the composer and start building.
-
-Windows setup, PowerShell launchers, supported features, and known limitations
-are documented in [WINDOWS.md](./WINDOWS.md).
 
 (`pnpm tauri` proxies the Tauri CLI; `pnpm dev` runs just the Vite frontend on
 `:1420`.)
@@ -331,8 +326,6 @@ The core panes described above are shipped today. On deck:
   richer markdown (tables, task lists, syntax highlighting).
 - **Model-agnostic chat** — a live model catalog, OpenRouter key onboarding, and
   BYO-key native APIs (OpenAI / OpenRouter / Ollama) with secure key storage.
-- **Windows parity** — persistent terminal detach/reattach and the remaining
-  Unix-only fleet integrations.
 
 ## 🙏 Credits
 
