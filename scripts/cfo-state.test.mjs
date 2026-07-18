@@ -39,7 +39,9 @@ test("initializes, rounds money, and derives July totals", async () => {
   assert.equal(json.spent, 6300);
   assert.equal(json.remaining_budget, 400);
   assert.equal(json.net_cash, 821.09);
-  assert.equal((await stat(state)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal((await stat(state)).mode & 0o777, 0o600);
+  }
   assert.notEqual((await run(state, initArgs)).code, 0);
 });
 

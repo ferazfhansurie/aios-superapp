@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
-const src = new URL("..", import.meta.url).pathname;
+const src = fileURLToPath(new URL("..", import.meta.url));
 const fill = "bg-[var(--color-accent)]";
 const fg = "text-[var(--color-accent-fg)]";
 const hover = "hover:bg-[var(--color-accent-hover)]";
