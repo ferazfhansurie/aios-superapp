@@ -69,11 +69,10 @@ jobs:
           releaseDraft: true
 
       - name: upload installers
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aios-${{ matrix.platform }}
-          if-no-files-found: ignore
+          if-no-files-found: error
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
