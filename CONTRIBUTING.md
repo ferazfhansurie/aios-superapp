@@ -1,6 +1,23 @@
 # Contributing to AIOS
 
-Thanks for wanting to hack on Cockpit. It's small on purpose — keep it that way.
+Thanks for wanting to improve AIOS. Keep changes focused, testable, and easy to
+review.
+
+## Contribution workflow
+
+AIOS uses a fork-first workflow so the upstream repository stays clean:
+
+1. Fork `ferazfhansurie/aios-superapp` to your GitHub account.
+2. Create a short-lived branch in your fork from the latest `master`.
+3. Use a descriptive name such as `feat/add-pane`, `fix/history-order`, or
+   `docs/setup-guide`.
+4. Push the branch to your fork and open a pull request into upstream `master`.
+5. Delete the branch after the pull request is merged or closed.
+
+Even maintainers should use a fork for feature work. The upstream repository
+keeps only the protected `master` branch unless a maintained release line is
+introduced later. Do not create personal or long-lived development branches in
+upstream.
 
 ## Dev setup
 
@@ -58,6 +75,8 @@ frontend never touches the OS directly, it goes through `src/lib/*`.
 ## PR etiquette
 
 - Keep PRs focused — one pane or one fix at a time.
+- Open one PR per issue or independently reviewable change.
+- Rebase or merge the latest upstream `master` before requesting final review.
 - Match the surrounding style; the Rust modules are heavily commented, so
   comment the *why*.
 - Don't add dependencies casually — the dependency list is intentionally lean.
