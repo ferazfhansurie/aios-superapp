@@ -266,7 +266,7 @@ same shape here:
   class of "works in dev, silently fails when built" bugs this repo has hit before — verify in the built
   `.app`, not just `tauri dev`).
 
-Signing today: `tauri.conf.json:45-46` — `signingIdentity: "Apple Development: Firaz…"`,
+Signing is injected by the release workflow; contributor builds do not require a committed identity.
 `entitlements: ./Entitlements.plist`. App is **not sandboxed** (`Entitlements.plist:35-36`), which is what
 makes broad screen-capture + input synthesis even possible.
 

@@ -972,11 +972,10 @@ test("shell exposes a policy-gated agent control bridge", () => {
   assert.match(controller, /!policy\.allowed/);
 });
 
-test("mac bundle uses stable development signing for tcc permissions", () => {
+test("mac bundle keeps signing identity release-configurable", () => {
   const tauri = read("src-tauri/tauri.conf.json");
 
-  assert.equal(tauri.includes('"signingIdentity": "-"'), false);
-  assert.match(tauri, /Apple Development: Firaz Fhansurie \(KL78M575FW\)/);
+  assert.equal(tauri.includes('"signingIdentity"'), false);
   assert.match(tauri, /"entitlements": "\.\/Entitlements\.plist"/);
 });
 

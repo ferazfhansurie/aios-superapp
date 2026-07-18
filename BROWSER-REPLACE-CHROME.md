@@ -93,7 +93,7 @@ bounds-synced to a slot div. wry 0.55.1 / tauri 2.11.2, `unstable` feature for
 | Pinned sites (sidebar) | `App.tsx:726-727, 3046`; `lib/sidebar` | the seed of a bookmarks system |
 | Per-pane URL memory | `lib/browser-mem` (`rememberUrl`) | session-restore primitive already exists |
 
-Signing: `tauri.conf.json:45-46` — ad-hoc `Apple Development: Firaz…`, hardened
+Signing: injected by the release workflow; hardened runtime remains release-configurable.
 runtime, **not sandboxed** (`Entitlements.plist`). The repo already ate the
 hardened-runtime TCC lesson (mic), documented in `Entitlements.plist`.
 

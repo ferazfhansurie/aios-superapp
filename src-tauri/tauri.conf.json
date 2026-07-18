@@ -42,7 +42,6 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "Apple Development: Firaz Fhansurie (KL78M575FW)",
       "entitlements": "./Entitlements.plist"
     }
   }

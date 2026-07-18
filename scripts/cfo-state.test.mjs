@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
-const script = new URL("./cfo-state.mjs", import.meta.url).pathname;
+const script = fileURLToPath(new URL("./cfo-state.mjs", import.meta.url));
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "cfo-state-"));
@@ -123,7 +124,7 @@ test("rollover archives without carrying spend or adjustments", async () => {
   assert.equal(current.month, "2026-08");
   assert.equal(current.opening_spent, 0);
   assert.equal(current.adjustments.length, 0);
-  const archived = JSON.parse(await readFile(join(new URL(".", `file://${state}`).pathname, "history", "2026-07.json"), "utf8"));
+  const archived = JSON.parse(await readFile(join(dirname(state), "history", "2026-07.json"), "utf8"));
   assert.equal(archived.adjustments.length, 1);
   const late = await run(state, ["add-adjustment", "--month", "2026-07", "--event-id", "late-1", "--at", "2026-07-20T00:00:00+08:00", "--kind", "correction", "--amount", "5"]);
   assert.equal(late.code, 0, late.stderr);
