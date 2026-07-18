@@ -26,9 +26,16 @@ export async function readDir(path: string): Promise<DirEntry[]> {
   return invoke<DirEntry[]>("read_dir", { path });
 }
 
-/** Dir listing for the VS Code-style tree — includes dotfiles (hides .git/.DS_Store). */
-export async function readDirTree(path: string): Promise<DirEntry[]> {
-  return invoke<DirEntry[]>("read_dir_tree", { path });
+/** Dir listing for the VS Code-style tree. By default hides dotfiles (VS Code
+ *  style) and prunes heavy build/dep dirs (node_modules, target, dist, .next, …),
+ *  matching what ⌘P searches. `.git`/`.DS_Store` are always hidden. Pass
+ *  `showHidden`/`showAll` to reveal those classes. */
+export async function readDirTree(
+  path: string,
+  showHidden = false,
+  showAll = false,
+): Promise<DirEntry[]> {
+  return invoke<DirEntry[]>("read_dir_tree", { path, showHidden, showAll });
 }
 
 export type GitCode = "M" | "A" | "D" | "R" | "U";
@@ -41,6 +48,26 @@ export interface GitStatus {
   entries: GitEntry[];
 }
 
+export interface GitBranch {
+  name: string;
+  current: boolean;
+  remote: boolean;
+}
+
+export interface GitGraphLine {
+  text: string;
+}
+
+export interface GitSnapshot {
+  root: string | null;
+  current: string;
+  branches: GitBranch[];
+  entries: GitEntry[];
+  ahead: number;
+  behind: number;
+  graph: GitGraphLine[];
+}
+
 export interface ShellSourceStatus {
   root: string | null;
   branch: string;
@@ -51,6 +78,18 @@ export interface ShellSourceStatus {
 /** Git status for the repo containing `path` (absolute path → status letter). */
 export async function gitStatus(path: string): Promise<GitStatus> {
   return invoke<GitStatus>("git_status", { path });
+}
+
+export async function gitSnapshot(path: string): Promise<GitSnapshot> {
+  return invoke<GitSnapshot>("git_snapshot", { path });
+}
+
+export async function gitCheckout(path: string, branch: string): Promise<GitSnapshot> {
+  return invoke<GitSnapshot>("git_checkout", { path, branch });
+}
+
+export async function gitCommit(path: string, message: string): Promise<GitSnapshot> {
+  return invoke<GitSnapshot>("git_commit", { path, message });
 }
 
 export async function shellSourceStatus(): Promise<ShellSourceStatus> {
@@ -95,14 +134,75 @@ export async function readTextFile(path: string): Promise<string> {
   return invoke<string>("read_text_file", { path });
 }
 
-/** Writes UTF-8 contents back to a file (editor save, atomic via temp+rename). */
-export async function writeTextFile(path: string, content: string): Promise<void> {
-  return invoke<void>("write_text_file", { path, content });
+/** File last-modified time in unix MILLISECONDS (0 if missing). The editor pane
+ *  captures this on load for save-conflict detection. */
+export async function fileMtime(path: string): Promise<number> {
+  return invoke<number>("file_mtime", { path });
+}
+
+/** Thrown by {@link writeTextFile} when the on-disk file changed since the
+ *  editor loaded it (AI or human edited it underneath us). `currentMtime` is the
+ *  file's now-current mtime in ms, for re-basing after an explicit overwrite. */
+export class SaveConflictError extends Error {
+  constructor(public currentMtime: number) {
+    super("file changed on disk");
+    this.name = "SaveConflictError";
+  }
+}
+
+/** Writes UTF-8 contents back to a file (editor save, atomic via temp+rename).
+ *  When `expectedMtime` is given, the backend refuses the write if the file
+ *  changed on disk since load (throws {@link SaveConflictError}). Returns the
+ *  file's new mtime in ms so the caller can re-base its conflict guard. */
+export async function writeTextFile(
+  path: string,
+  content: string,
+  expectedMtime?: number,
+): Promise<number> {
+  try {
+    return await invoke<number>("write_text_file", {
+      path,
+      content,
+      expectedMtime: expectedMtime ?? null,
+    });
+  } catch (e) {
+    const msg = String(e);
+    const m = /^conflict:([\d.]+)$/.exec(msg);
+    if (m) throw new SaveConflictError(Number(m[1]));
+    throw e;
+  }
 }
 
 /** Deletes a single file (notes CRUD). No-op if it's already gone; refuses dirs. */
 export async function deletePath(path: string): Promise<void> {
   return invoke<void>("delete_path", { path });
+}
+
+/** Flat list of every file under `root` (relative paths), honoring .gitignore +
+ *  pruning node_modules. Powers the ⌘P fuzzy finder — call once, cache, score
+ *  client-side. `max` caps the walk (default backend = generous). */
+export async function findFiles(root: string, max = 20000): Promise<string[]> {
+  return invoke<string[]>("find_files", { root, max });
+}
+
+/** One content-search hit. `path` is RELATIVE to the search root; `line`/`col`
+ *  are 1-based; `text` is the trimmed matching line. */
+export interface SearchHit {
+  path: string;
+  line: number;
+  col: number;
+  text: string;
+}
+
+/** Literal, case-insensitive content search under `root` (ripgrep w/ Rust
+ *  fallback). Returns flat hits (≤`max`, default 1000); the UI groups by file.
+ *  Powers ⌘⇧F. */
+export async function searchInFiles(
+  root: string,
+  query: string,
+  max = 1000,
+): Promise<SearchHit[]> {
+  return invoke<SearchHit[]>("search_in_files", { root, query, max });
 }
 
 /** Converts an office doc (docx/xlsx/pptx/…) to a cached PDF via headless
@@ -117,4 +217,12 @@ export async function convertOfficeToPdf(path: string): Promise<string> {
  *  (claude code) for vision. `ext` is the file extension, e.g. "png". */
 export async function saveImageTemp(data: string, ext: string): Promise<string> {
   return invoke<string>("save_image_temp", { data, ext });
+}
+
+/** Reveals a file or folder in the OS file manager (macOS Finder via `open -R`,
+ *  Windows Explorer via `/select`), selecting the item. Reuses the generic
+ *  reveal command the browser downloads panel already uses. Best-effort: a
+ *  missing path / failed spawn rejects with an error string. */
+export async function revealInFinder(path: string): Promise<void> {
+  return invoke("browser_reveal_in_finder", { path });
 }

@@ -1,7 +1,7 @@
 import type { ChatEvent } from "./chat.ts";
 
 export type ChatTurn =
-  | { kind: "user"; id: string; text: string; steered?: boolean }
+  | { kind: "user"; id: string; text: string; steered?: boolean; images?: string[] }
   | { kind: "assistant"; id: string; text: string; streaming: boolean }
   | {
       kind: "thinking";
@@ -52,6 +52,47 @@ export interface ChatStreamReduceResult {
   state: ChatStreamState;
 }
 
+/** Collapse consecutive token frames before reducers touch transcript history.
+ * Backends already batch opportunistically, but several frames can still land
+ * in one animation frame. Reducing each one separately clones the full turns
+ * array N times; this keeps ordering while paying that cost once per kind-run. */
+export function coalesceChatStreamDeltas(events: ChatEvent[]): ChatEvent[] {
+  const result: ChatEvent[] = [];
+  for (const event of events) {
+    const delta = event.type === "stream_event" ? event.event?.delta : undefined;
+    const kind = delta?.type;
+    const last = result[result.length - 1];
+    const lastDelta = last?.type === "stream_event" ? last.event?.delta : undefined;
+    if (kind === "text_delta" && lastDelta?.type === "text_delta") {
+      const fragment = delta?.text ?? "";
+      result[result.length - 1] = {
+        ...last,
+        event: {
+          ...last.event!,
+          delta: { ...lastDelta, text: `${lastDelta.text ?? ""}${fragment}` },
+        },
+      };
+      continue;
+    }
+    if (kind === "thinking_delta" && lastDelta?.type === "thinking_delta") {
+      const fragment = delta?.thinking ?? "";
+      result[result.length - 1] = {
+        ...last,
+        event: {
+          ...last.event!,
+          delta: {
+            ...lastDelta,
+            thinking: `${lastDelta.thinking ?? ""}${fragment}`,
+          },
+        },
+      };
+      continue;
+    }
+    result.push(event);
+  }
+  return result;
+}
+
 export function resultToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -73,7 +114,18 @@ function appendThinkingDelta(
 ): ChatStreamState {
   const turns = [...state.turns];
   const id = state.thinkingTurnId;
-  const idx = id ? turns.findIndex((t) => t.id === id) : -1;
+  // The streaming bubble is almost always the LAST turn — check it first to
+  // avoid an O(turns) findIndex scan per token (O(n²) over a turn). Fall back
+  // to the linear scan only if the tail isn't our streaming bubble.
+  let idx = -1;
+  if (id) {
+    const last = turns.length - 1;
+    if (last >= 0 && turns[last].id === id && turns[last].kind === "thinking") {
+      idx = last;
+    } else {
+      idx = turns.findIndex((t) => t.id === id);
+    }
+  }
   if (idx >= 0 && turns[idx].kind === "thinking") {
     const turn = turns[idx] as Extract<ChatTurn, { kind: "thinking" }>;
     turns[idx] = { ...turn, text: turn.text + text, streaming: true };
@@ -97,7 +149,18 @@ function appendAssistantDelta(
 ): ChatStreamState {
   const turns = [...state.turns];
   const id = state.streamingTurnId;
-  const idx = id ? turns.findIndex((t) => t.id === id) : -1;
+  // The streaming bubble is almost always the LAST turn — check it first to
+  // avoid an O(turns) findIndex scan per token (O(n²) over a turn). Fall back
+  // to the linear scan only if the tail isn't our streaming bubble.
+  let idx = -1;
+  if (id) {
+    const last = turns.length - 1;
+    if (last >= 0 && turns[last].id === id && turns[last].kind === "assistant") {
+      idx = last;
+    } else {
+      idx = turns.findIndex((t) => t.id === id);
+    }
+  }
   if (idx >= 0 && turns[idx].kind === "assistant") {
     const turn = turns[idx] as Extract<ChatTurn, { kind: "assistant" }>;
     turns[idx] = { ...turn, text: turn.text + text, streaming: true };
@@ -132,16 +195,50 @@ function reduceAssistantEvent(
 ): ChatStreamState {
   let next = settleThinking(state, options.now);
   const turns = [...next.turns];
+  // The final `message.content[].text` is the source of truth. If a bubble
+  // streamed via deltas, OVERWRITE it with the authoritative text rather than
+  // trusting the concatenated deltas — a lost/coalesced delta would otherwise
+  // permanently truncate the displayed reply. Multiple final text/thinking
+  // blocks land on the same streaming bubble in order (first overwrites, rest
+  // append) so nothing is dropped.
+  let streamTextSettled = false;
+  let thinkingTextSettled = false;
   for (const block of ev.message?.content ?? []) {
     if (block.type === "text") {
       const full = (block.text ?? "").trim();
-      if (full && next.streamingTurnId == null) {
+      if (full && next.streamingTurnId != null) {
+        const idx = turns.findIndex((t) => t.id === next.streamingTurnId);
+        if (idx >= 0 && turns[idx].kind === "assistant") {
+          const turn = turns[idx] as Extract<ChatTurn, { kind: "assistant" }>;
+          turns[idx] = {
+            ...turn,
+            text: streamTextSettled ? `${turn.text}\n${full}` : full,
+            streaming: false,
+          };
+          streamTextSettled = true;
+          continue;
+        }
+      }
+      if (full) {
         turns.push({ kind: "assistant", id: options.uid(), text: full, streaming: false });
       }
     }
     if (block.type === "thinking") {
       const full = (block.thinking ?? "").trim();
-      if (full && next.thinkingTurnId == null) {
+      if (full && next.thinkingTurnId != null) {
+        const idx = turns.findIndex((t) => t.id === next.thinkingTurnId);
+        if (idx >= 0 && turns[idx].kind === "thinking") {
+          const turn = turns[idx] as Extract<ChatTurn, { kind: "thinking" }>;
+          turns[idx] = {
+            ...turn,
+            text: thinkingTextSettled ? `${turn.text}\n${full}` : full,
+            streaming: false,
+          };
+          thinkingTextSettled = true;
+          continue;
+        }
+      }
+      if (full) {
         turns.push({ kind: "thinking", id: options.uid(), text: full, streaming: false });
       }
     }
@@ -167,11 +264,28 @@ function reduceToolResultEvent(state: ChatStreamState, ev: ChatEvent): ChatStrea
     if (block.type !== "tool_result") continue;
     const ref = block.tool_use_id;
     const text = resultToText(block.content);
-    turns = turns.map((turn) =>
-      turn.kind === "tool" && turn.id === ref
-        ? { ...turn, result: text, isError: block.is_error }
-        : turn,
-    );
+    // Primary match: a tool turn whose id equals tool_use_id.
+    let targetIdx = ref != null ? turns.findIndex((t) => t.kind === "tool" && t.id === ref) : -1;
+    // Order-based fallback: codex/opencode normalized output sometimes omits
+    // block.id on tool_use (so the turn got a random uid) or sends a
+    // tool_use_id that lines up with nothing. Rather than silently dropping the
+    // result, attach it to the most recent tool turn that has no result yet.
+    // Only target result-less turns so we never overwrite an already-attached
+    // result via the fallback.
+    if (targetIdx < 0) {
+      for (let i = turns.length - 1; i >= 0; i--) {
+        const turn = turns[i];
+        if (turn.kind === "tool" && turn.result == null) {
+          targetIdx = i;
+          break;
+        }
+      }
+    }
+    if (targetIdx < 0) continue; // genuinely no pending tool turn — leave unchanged
+    const next = [...turns];
+    const turn = next[targetIdx] as Extract<ChatTurn, { kind: "tool" }>;
+    next[targetIdx] = { ...turn, result: text, isError: block.is_error };
+    turns = next;
   }
   return { ...state, turns };
 }

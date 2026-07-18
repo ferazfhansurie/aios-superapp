@@ -1,0 +1,11 @@
+[package]
+name = "aios-chat-core"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-agnostic chat-session core (engine adapters, wire format, sink/event traits) shared by the AIOS Tauri shell and the headless aios-noded daemon."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.22"
+parking_lot = "0.12"

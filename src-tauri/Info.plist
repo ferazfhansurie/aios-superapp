@@ -6,5 +6,16 @@
 	<string>Cockpit uses the microphone for push-to-talk voice dictation.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Cockpit may use the camera for capture features.</string>
+	<!--
+	  Screen Recording usage string for the app-cast feature: AIOS live-mirrors a
+	  single user-picked app window into a pane via ScreenCaptureKit (appcast.rs).
+	  The first SCShareableContent call triggers the Screen Recording prompt; this
+	  string is what the prompt shows. As with the mic (Entitlements.plist), under
+	  the ad-hoc + hardened-runtime signing this app uses, the TCC service is
+	  refused SILENTLY without the usage string present, so this key is required —
+	  the app is NOT sandboxed, so no extra screen-capture entitlement is needed.
+	-->
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>AIOS mirrors a single app window you pick into a pane so your co-founder can watch it live. Only the window you choose is captured; nothing is recorded to disk.</string>
 </dict>
 </plist>

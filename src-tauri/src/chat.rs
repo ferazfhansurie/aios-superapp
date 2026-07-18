@@ -34,23 +34,255 @@
 //! UTF-8 boundaries and re-joined into whole lines so multibyte sequences and
 //! split JSON lines never corrupt a frame.
 
+use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
 
-/// How many raw output lines a detached session keeps for replay on reattach.
-/// Generous enough to reconstruct a long agentic run; oldest lines drop first.
-const REPLAY_CAP: usize = 6000;
+// Engine-agnostic wire format + the `Engine` tag now live in `aios-chat-core`
+// so the headless `aios-noded` daemon shares them verbatim (cross-machine sync).
+use aios_chat_core::adapt::{adapt_codex_line, adapt_opencode_line};
+#[cfg(test)]
+use aios_chat_core::codex_rpc::adapt_codex_appserver_frame;
+use aios_chat_core::codex_rpc::{
+    adapt_codex_appserver_frame_before_emit, codex_error_result_line, codex_fire_interrupt,
+    codex_fire_steer, codex_fire_turn, codex_next_rpc, codex_rpc_write, NEXT_REQ,
+};
+use aios_chat_core::session::{
+    buffer_push, fan_out, fan_out_split, ChatSession, PendingCodexControl,
+};
+use aios_chat_core::wire::{json_escape, slim_user_image_line, user_line, user_line_with_images};
+use aios_chat_core::{Engine, OutputSink};
+
+/// How long token deltas accumulate before a coalesced frame is flushed to the
+/// frontend. ~50ms caps the IPC rate at ~20 frames/sec regardless of how fast
+/// claude streams tokens — instead of one Tauri event per token (hundreds/sec on
+/// a fast turn), the renderer gets a steady, batched feed. Lower = snappier but
+/// more IPC; higher = fewer events but choppier text reveal.
+const COALESCE_FLUSH_MS: u64 = 50;
+
+/// Agent mode in the chatpane gets one orchestration layer. The main Claude
+/// session may fan out to `aios-worker`, but that worker cannot invoke `Agent`
+/// again. Without this explicit capability boundary, the global recursive-agent
+/// instruction causes general-purpose workers to spawn another copy of
+/// themselves synchronously until every generation waits forever.
+const CLAUDE_CHAT_AGENTS: &str = r#"{"aios-worker":{"description":"Executes one bounded chatpane task directly without further delegation","prompt":"Execute the delegated task directly. Use your available tools, return a concise result to the parent, and never delegate or spawn another agent.","disallowedTools":["Agent"],"model":"inherit"}}"#;
+
+/// A run of same-kind token deltas being accumulated before flush. `template` is
+/// the FIRST line of the run, parsed once; on flush we swap its delta text for
+/// the concatenated `text` and re-serialize — so the emitted frame is byte-shape
+/// identical to a single claude `stream_event` (same `index`, same nesting), just
+/// carrying many tokens' worth of text. The frontend handler is purely additive
+/// (`runEvents.ts` appends `delta.text` / `delta.thinking`), so a merged frame is
+/// indistinguishable from N separate ones.
+struct PendingRun {
+    /// "text_delta" or "thinking_delta" — runs of different kinds never merge.
+    kind: &'static str,
+    template: Value,
+    text: String,
+}
+
+#[derive(Default)]
+struct Coalescer {
+    pending: Option<PendingRun>,
+}
+
+/// Detects a coalescible claude token-delta line and returns its (kind, text).
+/// Gated behind a cheap substring check so non-delta lines never hit serde — the
+/// same hot-path discipline `ingest_line` uses. `index`/block bookkeeping is
+/// preserved by reusing the first line as the flush template, so we only need the
+/// delta text here.
+fn coalescible_delta(line: &str) -> Option<(&'static str, Value)> {
+    // Fast reject: a token frame is a stream_event content_block_delta carrying a
+    // text/thinking delta. If neither needle is present it can't be coalescible.
+    let is_text = line.contains("\"text_delta\"");
+    let is_thinking = !is_text && line.contains("\"thinking_delta\"");
+    if !is_text && !is_thinking {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    // Only coalesce the exact streaming shape; anything else passes through whole.
+    if v.get("type").and_then(|x| x.as_str()) != Some("stream_event") {
+        return None;
+    }
+    let event = v.get("event")?;
+    if event.get("type").and_then(|x| x.as_str()) != Some("content_block_delta") {
+        return None;
+    }
+    let delta = event.get("delta")?;
+    let kind = delta.get("type").and_then(|x| x.as_str())?;
+    match kind {
+        "text_delta" if delta.get("text").and_then(|x| x.as_str()).is_some() => {
+            Some(("text_delta", v))
+        }
+        "thinking_delta" if delta.get("thinking").and_then(|x| x.as_str()).is_some() => {
+            Some(("thinking_delta", v))
+        }
+        _ => None,
+    }
+}
+
+/// Pulls the delta text fragment out of a (already-validated) token line.
+fn delta_fragment(line: &Value, kind: &str) -> String {
+    let field = if kind == "thinking_delta" {
+        "thinking"
+    } else {
+        "text"
+    };
+    line.get("event")
+        .and_then(|e| e.get("delta"))
+        .and_then(|d| d.get(field))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Rebuilds a single coalesced `stream_event` line from a run: the run's template
+/// (first line) with its delta text replaced by the concatenated text.
+fn render_run(run: &PendingRun) -> Option<String> {
+    let mut v = run.template.clone();
+    let field = if run.kind == "thinking_delta" {
+        "thinking"
+    } else {
+        "text"
+    };
+    let slot = v
+        .get_mut("event")
+        .and_then(|e| e.get_mut("delta"))
+        .and_then(|d| d.get_mut(field))?;
+    *slot = Value::String(run.text.clone());
+    serde_json::to_string(&v).ok()
+}
+
+/// The Tauri-shell implementation of [`OutputSink`]: forwards each adapted line
+/// over a per-session `tauri::ipc::Channel<String>`. This is the ONE place the
+/// core's sink seam binds to Tauri on the laptop; `aios-noded` will provide a
+/// WebSocket-backed sink instead. Sends are lossy on a dropped receiver (a closed
+/// pane), exactly as before — the reader thread never wedges on a dead channel.
+///
+/// Per-token IPC batching: token deltas are accumulated into a coalescing buffer
+/// and flushed on a ~50ms timer, on turn end, or on ANY non-token line (so a tool
+/// call / result never overtakes the text preceding it). This trades one Tauri
+/// event per token (hundreds/sec) for ~20 frames/sec, with zero frontend change —
+/// a merged frame is a normal `stream_event` carrying more text. Ordering is
+/// preserved because every non-delta `send` flushes the pending run first.
+struct ChannelSink {
+    chan: Channel<String>,
+    coalescer: Arc<Mutex<Coalescer>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl ChannelSink {
+    fn new(chan: Channel<String>) -> Self {
+        let coalescer = Arc::new(Mutex::new(Coalescer::default()));
+        let alive = Arc::new(AtomicBool::new(true));
+        // One long-lived flush thread per sink: ticks every COALESCE_FLUSH_MS and
+        // flushes whatever has accumulated. Exits when the sink is dropped (the
+        // pane closes / detaches and the sink is swapped out). Cheap: it sleeps
+        // 50ms between ticks and does nothing when the buffer is empty.
+        {
+            let chan = chan.clone();
+            let coalescer = Arc::clone(&coalescer);
+            let alive = Arc::clone(&alive);
+            thread::spawn(move || {
+                while alive.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(COALESCE_FLUSH_MS));
+                    let flushed = {
+                        let mut c = coalescer.lock();
+                        c.pending.take()
+                    };
+                    if let Some(run) = flushed {
+                        if let Some(line) = render_run(&run) {
+                            let _ = chan.send(line);
+                        }
+                    }
+                }
+            });
+        }
+        Self {
+            chan,
+            coalescer,
+            alive,
+        }
+    }
+}
+
+impl Drop for ChannelSink {
+    fn drop(&mut self) {
+        // Stop the flush thread and flush any straggler tokens so a detach mid-run
+        // doesn't drop the tail of a sentence (the send is lossy if the pane is
+        // already gone, which is fine).
+        self.alive.store(false, Ordering::Relaxed);
+        let flushed = self.coalescer.lock().pending.take();
+        if let Some(run) = flushed {
+            if let Some(line) = render_run(&run) {
+                let _ = self.chan.send(line);
+            }
+        }
+    }
+}
+
+impl OutputSink for ChannelSink {
+    fn send(&self, line: &str) {
+        match coalescible_delta(line) {
+            Some((kind, parsed)) => {
+                let mut c = self.coalescer.lock();
+                let frag = delta_fragment(&parsed, kind);
+                match c.pending.as_mut() {
+                    // Same-kind run continues: append the fragment, keep the template.
+                    Some(run) if run.kind == kind => run.text.push_str(&frag),
+                    // A different-kind run is in flight (text↔thinking switch):
+                    // flush it whole before starting the new run, to keep order.
+                    Some(_) => {
+                        let prev = c.pending.take();
+                        drop(c);
+                        if let Some(run) = prev {
+                            if let Some(out) = render_run(&run) {
+                                let _ = self.chan.send(out);
+                            }
+                        }
+                        let mut c = self.coalescer.lock();
+                        c.pending = Some(PendingRun {
+                            kind,
+                            template: parsed,
+                            text: frag,
+                        });
+                    }
+                    None => {
+                        c.pending = Some(PendingRun {
+                            kind,
+                            template: parsed,
+                            text: frag,
+                        });
+                    }
+                }
+            }
+            // Any non-token line (assistant block, tool_use, result, usage, …):
+            // flush the pending run FIRST so the streamed text never lands after
+            // the event that logically follows it, then forward the line as-is.
+            None => {
+                let flushed = self.coalescer.lock().pending.take();
+                if let Some(run) = flushed {
+                    if let Some(out) = render_run(&run) {
+                        let _ = self.chan.send(out);
+                    }
+                }
+                let _ = self.chan.send(line.to_string());
+            }
+        }
+    }
+}
 
 fn detach_child_process(cmd: &mut Command) {
     #[cfg(unix)]
@@ -59,100 +291,134 @@ fn detach_child_process(cmd: &mut Command) {
     }
 }
 
-/// Which CLI backend drives a chat session. `claude` is a single PERSISTENT
-/// process (stream-json on stdin). `codex` (ChatGPT-subscription) is ALSO
-/// persistent now — it drives the standalone **codex app-server** over
-/// newline JSON-RPC (one process per session, survives across turns; no more
-/// per-turn `codex exec` cold-start). `opencode` (everything else — incl
-/// openrouter + free models) remains spawn-per-turn (a fresh subprocess each
-/// turn, resuming the prior session by id). Each engine's differing event shape
-/// is normalized into claude's wire shape in Rust (see `adapt_codex_appserver_*`
-/// / `adapt_opencode_line`) so the frontend is untouched.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Engine {
-    Claude,
-    Codex,
-    Opencode,
-}
-
-impl Engine {
-    fn parse(s: Option<&str>) -> Engine {
-        match s {
-            Some("codex") => Engine::Codex,
-            Some("opencode") => Engine::Opencode,
-            _ => Engine::Claude,
-        }
-    }
-    /// True for spawn-per-turn engines (no persistent stdin process). Codex is
-    /// NOT per-turn anymore — it runs a persistent app-server (see `Engine` doc).
-    fn per_turn(self) -> bool {
-        matches!(self, Engine::Opencode)
-    }
-}
-
-/// One live chat session. For `claude` this is a persistent child + its stdin
-/// (turns are pushed as stream-json lines). For `codex`/`opencode` there is no
-/// persistent process: `child` holds the CURRENT turn's subprocess (so an
-/// interrupt can kill it) and `thread_id` is the resume handle for the next turn.
-/// The reader thread forwards through the swappable `sink` and always appends to
-/// `buffer`, so the session keeps running (and buffering) after a pane closes.
-struct ChatSession {
-    /// Which CLI backend this session drives.
-    engine: Engine,
-    /// claude → the persistent process; codex/opencode → the in-flight turn's
-    /// child (None when idle). Kept so an interrupt can kill the current turn.
-    child: Mutex<Option<Child>>,
-    /// claude's persistent stdin. `None` for spawn-per-turn engines.
-    stdin: Mutex<Option<ChildStdin>>,
-    /// Resume handle for spawn-per-turn engines (codex thread_id / opencode ses_).
-    thread_id: Mutex<Option<String>>,
-    /// Working dir, captured for per-turn re-spawns.
-    cwd: Mutex<Option<String>>,
-    /// Model id, captured for per-turn re-spawns (e.g. `gpt-5.5`, `opencode/...`).
-    model: Mutex<Option<String>>,
-    /// Current frontend channel; `None` while detached (output only buffers).
-    sink: Mutex<Option<Channel<String>>>,
-    /// Ring buffer of recent raw lines, replayed verbatim on reattach.
-    buffer: Mutex<VecDeque<String>>,
-    /// claude's own session uuid (from the init event) — used to match a
-    /// reopened pane back to this live process.
-    claude_id: Mutex<Option<String>>,
-    /// Human label for the tray + notification.
-    title: Mutex<String>,
-    /// True while a turn is in flight (set on send, cleared on `result`).
-    busy: AtomicBool,
-    /// True once the pane closed but we kept the process alive.
-    detached: AtomicBool,
-    /// Fire an OS notification when the current/next turn completes.
-    notify_on_done: AtomicBool,
-    /// codex app-server: monotonic JSON-RPC request id for this session.
-    rpc_id: AtomicU64,
-    /// codex app-server: a turn's text queued until `thread/start` resolves the
-    /// threadId (the first turn races the handshake). Fired once the id lands.
-    pending_turn: Mutex<Option<String>>,
-    /// codex app-server: the in-flight turn's id (from `turn/started`), needed as
-    /// `expectedTurnId` to steer it. `None` between turns. Cleared on turn end.
-    active_turn: Mutex<Option<String>>,
-    /// codex app-server: the item id of the turn's REAL answer (the agentMessage
-    /// whose `phase` is `final_answer`). Codex also emits preamble/status agent
-    /// messages mid-turn; we route THOSE to the thinking block so only the final
-    /// answer renders as the reply (not an identical-looking text bubble).
-    answer_item: Mutex<Option<String>>,
-}
-
 /// Module-level registry of every live chat session, keyed by an incrementing
 /// id. Mirrors `PtyState` but as a `static` (the prompt asked for a module-level
 /// `static` Mutex<HashMap>) so no Tauri `State` wiring is required in `lib.rs`.
 static SESSIONS: Mutex<Option<HashMap<u32, Arc<ChatSession>>>> = Mutex::new(None);
+static WARM_CODEX: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+/// Renderer-owned lifecycle id for the one active turn in each backend session.
+/// It lives beside (not inside) `ChatSession` so the shared chat-core remains
+/// transport-neutral while every Tauri channel frame can still reject stale UI
+/// updates from an earlier turn.
+static RUNS: Mutex<Option<HashMap<u32, LiveRun>>> = Mutex::new(None);
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-/// Monotonic counter for control_request `request_id`s (interrupts, decisions).
-static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct LiveRun {
+    run_id: String,
+    interrupting: bool,
+}
 
 /// Runs `f` against the (lazily-initialised) session map.
 fn with_sessions<R>(f: impl FnOnce(&mut HashMap<u32, Arc<ChatSession>>) -> R) -> R {
     let mut guard = SESSIONS.lock();
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
+}
+
+fn with_warm_codex<R>(f: impl FnOnce(&mut HashMap<String, u32>) -> R) -> R {
+    let mut guard = WARM_CODEX.lock();
+    let map = guard.get_or_insert_with(HashMap::new);
+    f(map)
+}
+
+fn with_runs<R>(f: impl FnOnce(&mut HashMap<u32, LiveRun>) -> R) -> R {
+    let mut guard = RUNS.lock();
+    let map = guard.get_or_insert_with(HashMap::new);
+    f(map)
+}
+
+fn begin_run(sess: &Arc<ChatSession>, run_id: String) {
+    with_runs(|runs| {
+        runs.insert(
+            sess.id,
+            LiveRun {
+                run_id: run_id.clone(),
+                interrupting: false,
+            },
+        );
+    });
+    fan_out(
+        sess,
+        &format!(
+            r#"{{"type":"aios_run","state":"starting","runId":"{}"}}"#,
+            json_escape(&run_id)
+        ),
+    );
+}
+
+fn active_run_matches(session_id: u32, run_id: &str) -> bool {
+    with_runs(|runs| {
+        runs.get(&session_id)
+            .is_some_and(|active| active.run_id == run_id)
+    })
+}
+
+fn emit_running(sess: &Arc<ChatSession>) {
+    let run_id = with_runs(|runs| runs.get(&sess.id).map(|active| active.run_id.clone()));
+    if let Some(run_id) = run_id {
+        fan_out(
+            sess,
+            &format!(
+                r#"{{"type":"aios_run","state":"running","runId":"{}"}}"#,
+                json_escape(&run_id)
+            ),
+        );
+    }
+}
+
+fn mark_interrupting(sess: &Arc<ChatSession>, run_id: &str) -> Result<(), String> {
+    let marked = with_runs(|runs| {
+        let Some(active) = runs.get_mut(&sess.id) else {
+            return false;
+        };
+        if active.run_id != run_id {
+            return false;
+        }
+        active.interrupting = true;
+        true
+    });
+    if !marked {
+        return Err("stale or missing chat run".into());
+    }
+    fan_out(
+        sess,
+        &format!(
+            r#"{{"type":"aios_run","state":"interrupting","runId":"{}"}}"#,
+            json_escape(run_id)
+        ),
+    );
+    Ok(())
+}
+
+fn emit_terminal(sess: &Arc<ChatSession>, fallback: &str) {
+    let active = with_runs(|runs| runs.remove(&sess.id));
+    let Some(active) = active else { return };
+    let state = if active.interrupting {
+        "interrupted"
+    } else {
+        fallback
+    };
+    fan_out(
+        sess,
+        &format!(
+            r#"{{"type":"aios_run","state":"{}","runId":"{}"}}"#,
+            state,
+            json_escape(&active.run_id)
+        ),
+    );
+}
+
+/// Store one global warm app-server and return displaced session ids for
+/// teardown. A per-profile cache multiplies native processes as panes/models
+/// change; one spare captures the startup win without unbounded retention.
+fn store_single_warm_codex(warm: &mut HashMap<String, u32>, key: String, id: u32) -> Vec<u32> {
+    let evicted = warm
+        .drain()
+        .filter_map(|(_, existing)| (existing != id).then_some(existing))
+        .collect::<Vec<_>>();
+    warm.insert(key, id);
+    evicted
 }
 
 /// Resolves the `claude` binary. It's normally on PATH; if a bare `claude`
@@ -166,25 +432,95 @@ fn claude_bin() -> String {
             return p;
         }
     }
-    let candidates = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"];
-    for c in candidates {
-        if std::path::Path::new(c).exists() {
-            return c.to_string();
+    #[cfg(windows)]
+    {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            for rel in [r".local\bin\claude.exe", r".claude\local\claude.exe"] {
+                let p = std::path::Path::new(&home).join(rel);
+                if p.exists() {
+                    return p.to_string_lossy().into_owned();
+                }
+            }
+        }
+        if let Some(p) = which_on_path("claude.exe").or_else(|| which_on_path("claude.cmd")) {
+            return p;
+        }
+        return "claude.exe".to_string();
+    }
+    #[cfg(not(windows))]
+    {
+        let candidates = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
+        }
+        // Try the user's HOME-based installs (native installer / nvm current).
+        if let Ok(home) = std::env::var("HOME") {
+            let native = format!("{home}/.local/bin/claude");
+            if std::path::Path::new(&native).exists() {
+                return native;
+            }
+            let claude_local = format!("{home}/.claude/local/claude");
+            if std::path::Path::new(&claude_local).exists() {
+                return claude_local;
+            }
+        }
+        // Default: let the OS resolve it from PATH.
+        "claude".to_string()
+    }
+}
+
+#[cfg(windows)]
+fn which_on_path(exe: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(exe);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
-    // Try the user's HOME-based installs (native installer / nvm current).
+    None
+}
+
+/// Builds a PATH that prepends the user's real tool dirs (homebrew, `~/.local/bin`,
+/// the newest nvm-managed node bin) onto whatever the process inherited. A
+/// GUI-launched app (Finder/Dock) inherits only `/usr/bin:/bin:/usr/sbin:/sbin`,
+/// which starves anything `claude` spawns at session start — its MCP servers and
+/// SessionStart hooks are node/python launchers that can't resolve their runtime
+/// on the bare PATH, so the session DEADLOCKS on MCP init / hook resolution and the
+/// pane shows "Working…" forever. (Codex sidesteps this with a native binary + a
+/// stripped MCP profile; claude runs the real ~/.claude config, so it needs the
+/// PATH.) Order is preserved and dirs are de-duplicated.
+#[cfg(not(windows))]
+pub(crate) fn enriched_path() -> String {
+    let mut dirs: Vec<String> = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
-        let native = format!("{home}/.local/bin/claude");
-        if std::path::Path::new(&native).exists() {
-            return native;
-        }
-        let claude_local = format!("{home}/.claude/local/claude");
-        if std::path::Path::new(&claude_local).exists() {
-            return claude_local;
+        dirs.push(format!("{home}/.aios/state/bin"));
+        dirs.push(format!("{home}/.local/bin"));
+        // nvm: newest versioned node bin (claude's node-based MCP launchers live
+        // here once installed via the nvm global).
+        let nvm = format!("{home}/.nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm) {
+            let mut versions: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            versions.sort();
+            versions.reverse();
+            if let Some(v) = versions.first() {
+                dirs.push(v.join("bin").to_string_lossy().to_string());
+            }
         }
     }
-    // Default: let the OS resolve it from PATH.
-    "claude".to_string()
+    dirs.push("/opt/homebrew/bin".to_string());
+    dirs.push("/usr/local/bin".to_string());
+    dirs.push(
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string()),
+    );
+    let mut seen = std::collections::HashSet::new();
+    dirs.into_iter()
+        .flat_map(|d| d.split(':').map(|s| s.to_string()).collect::<Vec<_>>())
+        .filter(|d| !d.is_empty() && seen.insert(d.clone()))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Resolves a CLI binary that's normally on PATH but may live under an
@@ -389,30 +725,6 @@ fn codex_config_without_mcp_servers(src: &str) -> String {
 /// JSON-escapes a string for embedding in the stream-json user line. We build
 /// the line by hand (rather than pulling a serializer into the hot path) since
 /// the shape is fixed and tiny; only the text field is untrusted.
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Builds one newline-delimited stream-json user line for `text`.
-fn user_line(text: &str) -> String {
-    format!(
-        "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
-        json_escape(text)
-    )
-}
-
 /// Writes one already-formed line to a live session's stdin, flushing it. Shared
 /// by every "push a line to claude" path (turns, interrupts, control replies).
 /// `line` should already end in `\n`. No-op error text if the session is gone.
@@ -462,22 +774,58 @@ pub fn chat_start(
     app: AppHandle,
     on_event: Channel<String>,
     engine: Option<String>,
+    harness: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     effort: Option<String>,
     fast: Option<bool>,
     resume: Option<String>,
+    headroom: Option<bool>,
+    node: Option<String>,
+    account: Option<String>,
 ) -> Result<u32, String> {
-    let eng = Engine::parse(engine.as_deref());
+    // Remote node (the bisnesgpt box): the session runs on `aios-noded` over the
+    // tailnet, not locally. We allocate a local id (shared id space so the
+    // frontend treats it like any session), then attach over WS. The command
+    // handlers below consult the remote table first. Box is claude-only in v1.
+    if node
+        .as_deref()
+        .is_some_and(|n| !n.is_empty() && n != "local")
+    {
+        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        crate::remote::start(id, on_event, cwd, model, resume)?;
+        return Ok(id);
+    }
+
+    let requested_engine = Engine::parse(engine.as_deref());
+    let claude_adapter_harness =
+        harness.as_deref() == Some("claude") && matches!(requested_engine, Engine::Codex);
+    let eng = if claude_adapter_harness {
+        Engine::Claude
+    } else {
+        requested_engine
+    };
     // codex (ChatGPT sub) → persistent codex app-server process (JSON-RPC).
     if matches!(eng, Engine::Codex) {
+        if resume.as_deref().filter(|s| !s.is_empty()).is_none() && !fast.unwrap_or(false) {
+            if let Some(id) = claim_warm_codex(
+                on_event.clone(),
+                cwd.as_deref(),
+                model.as_deref(),
+                permission_mode.as_deref(),
+                effort.as_deref(),
+            ) {
+                return Ok(id);
+            }
+        }
         return start_codex_appserver(
             app,
-            on_event,
+            Some(on_event),
             cwd,
             model,
             permission_mode,
+            effort,
             resume,
             fast.unwrap_or(false),
         );
@@ -485,7 +833,7 @@ pub fn chat_start(
     // opencode (openrouter/everything) is spawn-per-turn — register the session
     // here, spawn nothing; chat_send runs each turn.
     if eng.per_turn() {
-        return start_per_turn(eng, on_event, cwd, model, resume);
+        return start_per_turn(eng, app, on_event, cwd, model, resume);
     }
 
     let mut cmd = Command::new(claude_bin());
@@ -495,10 +843,77 @@ pub fn chat_start(
         .arg("--input-format")
         .arg("stream-json")
         .arg("--include-partial-messages")
-        .arg("--verbose");
+        .arg("--verbose")
+        .arg("--agents")
+        .arg(CLAUDE_CHAT_AGENTS);
 
-    // resume a prior session id (continues that conversation's history)
-    if let Some(r) = resume.as_deref().filter(|s| !s.is_empty()) {
+    if claude_adapter_harness {
+        let home = std::env::var("HOME").map_err(|_| "HOME is unavailable".to_string())?;
+        let secret_path = std::env::var("AIOS_CODEX_ADAPTER_SECRET_FILE")
+            .unwrap_or_else(|_| format!("{home}/.aios/state/codex-anthropic-adapter/secret"));
+        let secret = std::fs::read_to_string(&secret_path)
+            .map_err(|_| "Codex Claude adapter is not installed".to_string())?;
+        let secret = secret.trim();
+        if secret.is_empty() {
+            return Err("Codex Claude adapter credential is empty".into());
+        }
+        let url = std::env::var("AIOS_CODEX_ADAPTER_URL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8791".to_string());
+        // Keep Claude's claude.ai OAuth login active so organization connectors
+        // remain available. API/auth-token env vars make Claude switch auth mode
+        // and explicitly disable those connectors. The loopback adapter uses a
+        // separate private header instead; Claude still sends its normal OAuth
+        // bearer, but the adapter never consumes or logs it.
+        cmd.env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env("ANTHROPIC_BASE_URL", url)
+            .env(
+                "ANTHROPIC_CUSTOM_HEADERS",
+                format!("x-aios-adapter-secret: {secret}"),
+            );
+    } else {
+        // Native Claude must never inherit adapter routing from the GUI app's
+        // launch environment. `open -a` can preserve ANTHROPIC_BASE_URL and the
+        // private adapter header from the shell that installed/relaunched AIOS;
+        // without this boundary a pane labelled "fable 5 · claude" silently
+        // talks to 127.0.0.1:8791, reports zero Claude usage, and its workers
+        // repeat the adapter's "do not use tools" instruction.
+        cmd.env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("ANTHROPIC_CUSTOM_HEADERS");
+    }
+
+    // Multi-account: run this session AS a specific claude login by pointing
+    // CLAUDE_CONFIG_DIR at that account's config dir (firaz has two Max subs).
+    // None / unknown id / the default account → normal ~/.claude login.
+    let account_dir = account
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(crate::usage::claude_account_config_dir);
+    if let Some(dir) = account_dir.as_deref() {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+
+    // resume a prior session id only if the transcript still exists. Claude
+    // exits immediately on stale ids, leaving the pane with a broken stdin.
+    // Transcripts are PER ACCOUNT (they live inside the config dir), so an
+    // account session validates against ITS dir — a ~/.claude transcript id
+    // would pass a home check and then kill the fhe spawn instantly.
+    let requested_resume_id = resume.filter(|s| !s.is_empty());
+    let (resume_id, pruned_resume_id) = match account_dir.as_deref() {
+        Some(dir) => validate_claude_resume_in_dir(std::path::Path::new(dir), requested_resume_id),
+        None => match std::env::var("HOME") {
+            Ok(home) => {
+                validate_claude_resume_in_home(std::path::Path::new(&home), requested_resume_id)
+            }
+            Err(_) => (requested_resume_id, None),
+        },
+    };
+    if let Some(stale) = pruned_resume_id.as_deref() {
+        prune_store_session(stale);
+    }
+    if let Some(r) = resume_id.as_deref().filter(|s| !s.is_empty()) {
         cmd.arg("--resume").arg(r);
     }
     if let Some(m) = model.as_deref().filter(|s| !s.is_empty()) {
@@ -511,6 +926,19 @@ pub fn chat_start(
     if let Some(ef) = effort.as_deref().filter(|s| !s.is_empty()) {
         cmd.arg("--effort").arg(ef);
     }
+    // Strip MCP servers for the chat pane. The user's ~/.claude config loads every
+    // configured MCP server on each spawn (memory, sentry, headroom, + plugin
+    // servers like blender via `uvx`, figma, vercel, …). claude blocks on the MCP
+    // init handshake before it will start a turn, so ONE slow/flaky server (e.g.
+    // `uvx blender-mcp` fetching a package or waiting on a Blender socket) wedges
+    // every chat turn on "Working…" forever with no reply. Codex's chat profile
+    // already strips MCP for exactly this reason — match it: load a single empty
+    // config and ignore all others, so the conversational chat pane spawns fast and
+    // reliably. (MCP-tool use belongs in the terminal/agent, not the chat pane.)
+    // Reversible: drop these two args to restore the full ~/.claude MCP set.
+    cmd.arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg("{\"mcpServers\":{}}");
     match cwd {
         Some(dir) if !dir.is_empty() => {
             cmd.current_dir(dir);
@@ -521,6 +949,32 @@ pub fn chat_start(
             }
         }
     }
+
+    // Headroom compression: route this claude turn through the local proxy so
+    // tool outputs / RAG get compressed before hitting the LLM. Gated on the
+    // cockpit toggle (claude engine only). Subscription auth is preserved — the
+    // proxy only rewrites the body, not the auth headers. Reversible: turn the
+    // toggle off and turns spawn against api.anthropic.com directly again.
+    if headroom.unwrap_or(false) {
+        // Headroom proxy listens on 8899 — deliberately OUTSIDE the control
+        // plane's port-scan window ([8787, 8787+16]) so the two can never race
+        // for the same socket. If they shared 8787, whichever bound first won
+        // and a headroom-on claude turn could silently POST to the control
+        // listener instead of Anthropic. Keep the proxy plist's --port in sync.
+        let url = std::env::var("HEADROOM_PROXY_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8899".to_string());
+        cmd.env("ANTHROPIC_BASE_URL", url);
+    }
+
+    // Give claude the user's real PATH. Without this, a GUI launch hands it the
+    // bare `/usr/bin:/bin:/usr/sbin:/sbin`, and the node/python MCP servers + hooks
+    // it spawns at session start can't resolve their runtime → the session
+    // deadlocks on MCP init and the pane "Working…"s forever (codex is unaffected:
+    // native binary + stripped MCP). Reversible: drop this line.
+    #[cfg(not(windows))]
+    cmd.env("PATH", enriched_path());
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -551,24 +1005,41 @@ pub fn chat_start(
     // Build the session up-front so the reader thread can forward through its
     // swappable sink + buffer (rather than a fixed channel that dies on close).
     let session = Arc::new(ChatSession {
+        id,
         engine: Engine::Claude,
         child: Mutex::new(Some(child)),
         stdin: Mutex::new(Some(stdin)),
         thread_id: Mutex::new(None),
         cwd: Mutex::new(None),
         model: Mutex::new(None),
-        sink: Mutex::new(Some(on_event)),
+        effort: Mutex::new(None), // claude passes effort as a CLI flag, not per turn
+        sink: Mutex::new(Some(Box::new(ChannelSink::new(on_event)))),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
+        buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
         title: Mutex::new(String::new()),
         busy: AtomicBool::new(false),
+        operation_lock: Mutex::new(()),
         detached: AtomicBool::new(false),
         notify_on_done: AtomicBool::new(false),
+        events: Box::new(TauriEvents { app: app.clone() }),
         rpc_id: AtomicU64::new(1),
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
+        pending_controls: Mutex::new(VecDeque::new()),
+        pending_steers: Mutex::new(HashMap::new()),
         answer_item: Mutex::new(None),
+        answer_streamed: AtomicBool::new(false),
+        pending_approvals: Mutex::new(HashMap::new()),
     });
+
+    if let Some(stale) = pruned_resume_id.as_deref() {
+        let line = format!(
+            "{{\"type\":\"aios_resume_pruned\",\"engine\":\"claude\",\"id\":\"{}\"}}",
+            json_escape(stale)
+        );
+        ingest_line(&session, &app, &line);
+    }
 
     // stdout reader: blocking reads → UTF-8-safe → whole lines. Each line is
     // appended to the replay buffer AND forwarded to the current sink (if any).
@@ -597,6 +1068,11 @@ pub fn chat_start(
                         ingest_line(&sess, &app_rdr, trimmed);
                     }
                 }
+                // A transient EINTR is NOT end-of-stream: a signal interrupted the
+                // blocking read mid-call. Retry instead of tearing down a live
+                // session (which would synthesize a bogus error result). Only real
+                // I/O errors / EOF (`Ok(0)`) end the loop.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
@@ -604,14 +1080,32 @@ pub fn chat_start(
         if !tail.is_empty() {
             ingest_line(&sess, &app_rdr, tail);
         }
-        sess.busy.store(false, Ordering::SeqCst);
-        let _ = app_rdr.emit("chat-exit", id);
+        // Process died mid-turn (crash / EOF / kill) without emitting its own
+        // `result` to close the turn. Synthesize an error result so the composer
+        // frees and the streaming cursor clears — exactly like the codex/opencode
+        // readers do (otherwise streaming=true forever, cursor never clears).
+        // `busy` is still true ONLY if no real `result` line already cleared it.
+        if sess.busy.swap(false, Ordering::SeqCst) {
+            let cid = sess.claude_id.lock().clone().unwrap_or_default();
+            let result = format!(
+                "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"text\":\"claude exited\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
+                json_escape(&cid)
+            );
+            ingest_line(&sess, &app_rdr, &result);
+        }
+        sess.events.on_exit(id);
     });
 
     // stderr reader: surface as synthetic error events through the same sink.
     if let Some(mut err) = stderr {
         let sess = Arc::clone(&session);
         let app_err = app.clone();
+        // The resume id we passed (if any) so we can detect claude REJECTING it.
+        // file-existence (our validation) ≠ resumable: claude can still exit with
+        // "No conversation found with session ID: …" and die. When that happens we
+        // emit `aios_resume_pruned` so the frontend drops the bad resume and respins
+        // a FRESH session instead of leaving a dead-stdin, wedged pane.
+        let resume_for_err = resume_id.clone();
         thread::spawn(move || {
             let mut pending_bytes: Vec<u8> = Vec::new();
             let mut buf = [0u8; 8192];
@@ -627,6 +1121,17 @@ pub fn chat_start(
                             if line.is_empty() {
                                 continue;
                             }
+                            // Resume rejected → tell the frontend to recover.
+                            if line.contains("No conversation found") {
+                                if let Some(stale) = resume_for_err.as_deref() {
+                                    prune_store_session(stale);
+                                    let pruned = format!(
+                                        "{{\"type\":\"aios_resume_pruned\",\"engine\":\"claude\",\"id\":\"{}\"}}",
+                                        json_escape(stale)
+                                    );
+                                    ingest_line(&sess, &app_err, &pruned);
+                                }
+                            }
                             let ev = format!(
                                 "{{\"type\":\"aios_stderr\",\"text\":\"{}\"}}",
                                 json_escape(line)
@@ -634,6 +1139,8 @@ pub fn chat_start(
                             ingest_line(&sess, &app_err, &ev);
                         }
                     }
+                    // EINTR on the stderr pipe is transient too — keep draining.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
@@ -651,6 +1158,7 @@ pub fn chat_start(
 /// a reopened chat keeps its history.
 fn start_per_turn(
     engine: Engine,
+    app: AppHandle,
     on_event: Channel<String>,
     cwd: Option<String>,
     model: Option<String>,
@@ -658,23 +1166,32 @@ fn start_per_turn(
 ) -> Result<u32, String> {
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let session = Arc::new(ChatSession {
+        id,
         engine,
         child: Mutex::new(None),
         stdin: Mutex::new(None),
         thread_id: Mutex::new(resume.filter(|s| !s.is_empty())),
         cwd: Mutex::new(cwd.filter(|s| !s.is_empty())),
         model: Mutex::new(model.filter(|s| !s.is_empty())),
-        sink: Mutex::new(Some(on_event)),
+        effort: Mutex::new(None), // opencode effort handled per-turn at send
+        sink: Mutex::new(Some(Box::new(ChannelSink::new(on_event)))),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
+        buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
         title: Mutex::new(String::new()),
         busy: AtomicBool::new(false),
+        operation_lock: Mutex::new(()),
         detached: AtomicBool::new(false),
         notify_on_done: AtomicBool::new(false),
+        events: Box::new(TauriEvents { app: app.clone() }),
         rpc_id: AtomicU64::new(1),
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
+        pending_controls: Mutex::new(VecDeque::new()),
+        pending_steers: Mutex::new(HashMap::new()),
         answer_item: Mutex::new(None),
+        answer_streamed: AtomicBool::new(false),
+        pending_approvals: Mutex::new(HashMap::new()),
     });
     // Bare init (no session_id) just flips claudeReady — the real id arrives on
     // turn 1. ingest into the buffer too so a reattach replays it.
@@ -685,15 +1202,9 @@ fn start_per_turn(
 
 /// Buffers + forwards a line on a session that has no AppHandle context (startup).
 fn ingest_line_arc(sess: &Arc<ChatSession>, line: &str) {
-    {
-        let mut b = sess.buffer.lock();
-        if b.len() >= REPLAY_CAP {
-            b.pop_front();
-        }
-        b.push_back(line.to_string());
-    }
+    buffer_push(sess, line);
     if let Some(ch) = sess.sink.lock().as_ref() {
-        let _ = ch.send(line.to_string());
+        ch.send(line);
     }
 }
 
@@ -818,6 +1329,8 @@ fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<
                         }
                     }
                 }
+                // Transient EINTR — retry rather than prematurely ending the turn.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
@@ -826,6 +1339,11 @@ fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<
             for out in adapt_line(&rsess, engine, tail) {
                 ingest_line(&rsess, &app, &out);
             }
+        }
+        // Reap the finished turn's child before nulling it — dropping the Child
+        // alone never wait()s it, leaking a zombie until the next turn replaces it.
+        if let Some(child) = rsess.child.lock().as_mut() {
+            let _ = child.wait();
         }
         *rsess.child.lock() = None;
         // Fallback close: if the engine never emitted a turn-end (crash / kill /
@@ -860,71 +1378,69 @@ fn run_per_turn(sess: Arc<ChatSession>, app: AppHandle, text: String) -> Result<
 // transport swap is localized to `codex_appserver_bin` + spawn. See
 // PLAN-chatpane-daily-driver.md.
 
-/// Resolves the codex binary that exposes a direct stdio `app-server`. The npm
-/// `codex` CANNOT (0.135: raw `app-server` needs a subcommand; the daemon needs a
-/// standalone install). The STANDALONE binary run as `<bin> app-server` IS a
-/// newline-JSON-RPC stdio server. Prefer the standalone managed under the chat
-/// CODEX_HOME, then the Codex.app desktop bundle, then the override / native.
+/// Pick the newest normally-installed app-server before AIOS's cached snapshot.
+/// The cache is intentionally last: it is a startup optimisation, never a
+/// source of model compatibility.
+fn select_codex_appserver_bin(
+    desktop: Option<String>,
+    installed: Option<String>,
+    cached_snapshot: Option<String>,
+) -> Option<String> {
+    desktop.or(installed).or(cached_snapshot)
+}
+
+/// Resolves the codex binary that exposes a direct stdio `app-server`.
+///
+/// Preference order: explicit override → installed Codex.app → the current
+/// native CLI → AIOS's cached standalone snapshot. The snapshot can lag behind
+/// the signed-in CLI and reject a newly released model, so it must stay last.
 fn codex_appserver_bin() -> String {
     if let Ok(p) = std::env::var("AIOS_CODEX_APPSERVER_BIN") {
         if !p.is_empty() {
             return p;
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let standalone = format!("{home}/.codex-chat/packages/standalone/current/codex");
-        if std::path::Path::new(&standalone).exists() {
-            return standalone;
-        }
-    }
     let desktop = "/Applications/Codex.app/Contents/Resources/codex";
-    if std::path::Path::new(desktop).exists() {
-        return desktop.to_string();
-    }
-    codex_bin()
-}
-
-/// Writes one JSON-RPC value (newline-terminated) to a codex app-server session's
-/// stdin — handshake, turns, interrupts, and server-request replies all go here.
-fn codex_rpc_write(sess: &Arc<ChatSession>, val: &serde_json::Value) {
-    let mut line = val.to_string();
-    line.push('\n');
-    if let Some(stdin) = sess.stdin.lock().as_mut() {
-        let _ = stdin.write_all(line.as_bytes());
-        let _ = stdin.flush();
-    }
-}
-
-/// Next JSON-RPC request id for this session.
-fn codex_next_rpc(sess: &Arc<ChatSession>) -> u64 {
-    sess.rpc_id.fetch_add(1, Ordering::SeqCst)
-}
-
-/// Sends `turn/start` for an (already-known) thread, with the session model.
-fn codex_fire_turn(sess: &Arc<ChatSession>, thread_id: &str, text: &str) {
-    let id = codex_next_rpc(sess);
-    let mut params = json!({
-        "threadId": thread_id,
-        "input": [{ "type": "text", "text": text }],
+    let desktop = std::path::Path::new(desktop)
+        .exists()
+        .then(|| desktop.to_string());
+    // `resolve_bin` checks stable GUI-safe locations such as
+    // /opt/homebrew/bin before PATH, where Firaz's up-to-date Codex cask lives.
+    let installed = resolve_bin("codex", "AIOS_CODEX_BIN", &[]);
+    let installed = std::path::Path::new(&installed)
+        .exists()
+        .then_some(installed);
+    let cached_snapshot = std::env::var("HOME").ok().and_then(|home| {
+        let path = format!("{home}/.codex-chat/packages/standalone/current/codex");
+        std::path::Path::new(&path).exists().then_some(path)
     });
-    if let Some(m) = sess.model.lock().clone().filter(|s| !s.is_empty()) {
-        params["model"] = json!(m);
-    }
-    codex_rpc_write(
-        sess,
-        &json!({ "jsonrpc": "2.0", "id": id, "method": "turn/start", "params": params }),
-    );
+
+    select_codex_appserver_bin(desktop, installed, cached_snapshot).unwrap_or_else(codex_bin)
 }
 
 /// Public turn entry for codex: fire `turn/start` if the thread is ready, else
 /// queue the text until `thread/start` resolves (the first turn races handshake).
-fn codex_send_turn(sess: &Arc<ChatSession>, text: String) -> Result<(), String> {
+fn codex_send_turn(
+    sess: &Arc<ChatSession>,
+    text: String,
+    image_paths: &[String],
+) -> Result<(), String> {
     let tid = sess.thread_id.lock().clone();
     match tid {
-        Some(t) if !t.is_empty() => codex_fire_turn(sess, &t, &text),
-        _ => *sess.pending_turn.lock() = Some(text),
+        Some(t) if !t.is_empty() => {
+            codex_fire_turn(sess, &t, &text, image_paths).map_err(|error| error.to_string())?
+        }
+        _ => *sess.pending_turn.lock() = Some((text, image_paths.to_vec())),
     }
     Ok(())
+}
+
+fn codex_turn_started(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_owned))
+        .as_deref()
+        == Some("turn/started")
 }
 
 /// Steers the in-flight codex turn: injects `text` into the RUNNING turn without
@@ -933,41 +1449,157 @@ fn codex_send_turn(sess: &Arc<ChatSession>, text: String) -> Result<(), String> 
 /// in `active_turn`). Returns Err if there's no live turn to steer, so the caller
 /// can fall back to a normal/queued send.
 fn codex_steer(sess: &Arc<ChatSession>, text: &str) -> Result<(), String> {
+    // Serialize the active-id check with the adapter's pending-control drain so a
+    // steer cannot land in the crack after `turn/started` set the id but before
+    // it drained the queue.
+    let mut pending = sess.pending_controls.lock();
     let tid = sess.thread_id.lock().clone().unwrap_or_default();
     let turn = sess.active_turn.lock().clone().unwrap_or_default();
-    if tid.is_empty() || turn.is_empty() {
+    if turn.is_empty() {
+        if sess.busy.load(Ordering::SeqCst) {
+            pending.push_back(PendingCodexControl::Steer(text.to_string()));
+            return Ok(());
+        }
         return Err("no active codex turn to steer".into());
     }
-    let id = codex_next_rpc(sess);
-    codex_rpc_write(
-        sess,
-        &json!({
-            "jsonrpc": "2.0", "id": id, "method": "turn/steer",
-            "params": {
-                "threadId": tid,
-                "expectedTurnId": turn,
-                "input": [{ "type": "text", "text": text }],
+    if tid.is_empty() {
+        return Err("no active codex turn to steer".into());
+    }
+    drop(pending);
+    codex_fire_steer(sess, &tid, &turn, text).map_err(|error| error.to_string())
+}
+
+fn codex_finish_stopped_turn(sess: &Arc<ChatSession>) {
+    *sess.active_turn.lock() = None;
+    sess.pending_controls.lock().clear();
+    *sess.answer_item.lock() = None;
+    sess.answer_streamed.store(false, Ordering::SeqCst);
+    sess.pending_approvals.lock().clear();
+    if sess.busy.swap(false, Ordering::SeqCst) {
+        fan_out(sess, &codex_error_result_line(sess, "stopped by user"));
+        // This synthetic stop bypasses ingest_line, so emit the terminal frame
+        // explicitly after the result to preserve transcript/lifecycle order.
+        emit_terminal(sess, "interrupted");
+    }
+}
+
+const CODEX_INTERRUPT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Codex normally confirms an interrupt with `turn/completed`, but a wedged
+/// tool can prevent that forever. The deadline is tied to this session's busy
+/// flag: normal settlement wins by clearing it; otherwise this watchdog closes
+/// the transcript and lifecycle exactly once.
+fn arm_codex_interrupt_deadline(sess: Arc<ChatSession>, deadline: Duration) {
+    let Some(watched_run_id) = with_runs(|runs| runs.get(&sess.id).map(|run| run.run_id.clone()))
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
+        let _operation = sess.operation_lock.lock();
+        // A graceful interrupt may settle and a new turn may begin before this
+        // timer wakes. Never let an old watchdog touch that newer run.
+        if !active_run_matches(sess.id, &watched_run_id) {
+            return;
+        }
+        if sess.busy.swap(false, Ordering::SeqCst) {
+            // Escalation must stop the work, not merely free the UI. A wedged
+            // app-server may ignore JSON-RPC forever, so close its input then
+            // kill and reap it. The stored thread id remains available to the
+            // host's normal resume/replacement path.
+            sess.stdin.lock().take();
+            if let Some(mut child) = sess.child.lock().take() {
+                let _ = child.kill();
+                let _ = child.wait();
             }
-        }),
-    );
-    Ok(())
+            *sess.active_turn.lock() = None;
+            sess.pending_controls.lock().clear();
+            fan_out(
+                &sess,
+                &codex_error_result_line(&sess, "interrupt timed out; turn stopped locally"),
+            );
+            emit_terminal(&sess, "interrupted");
+            // The app-server pipe is gone. Remove the dead registry entry and
+            // tell the renderer to spin up a fresh session before the next send.
+            with_sessions(|sessions| {
+                sessions.remove(&sess.id);
+            });
+            fan_out(
+                &sess,
+                r#"{"type":"aios_session_dead","reason":"interrupt_timeout"}"#,
+            );
+        }
+    });
 }
 
 /// Interrupts the in-flight codex turn via `turn/interrupt` (keeps process+thread).
 fn codex_interrupt(sess: &Arc<ChatSession>) -> Result<(), String> {
+    *sess.pending_turn.lock() = None;
+    let mut pending = sess.pending_controls.lock();
     let tid = sess.thread_id.lock().clone().unwrap_or_default();
+    let active_turn = sess.active_turn.lock().clone().unwrap_or_default();
     if tid.is_empty() {
+        pending.clear();
+        drop(pending);
+        codex_finish_stopped_turn(sess);
         return Ok(());
     }
-    let id = codex_next_rpc(sess);
-    codex_rpc_write(
-        sess,
-        &json!({
-            "jsonrpc": "2.0", "id": id, "method": "turn/interrupt",
-            "params": { "threadId": tid }
-        }),
-    );
+    if active_turn.is_empty() {
+        if sess.busy.load(Ordering::SeqCst) {
+            // `turn/start` was accepted but its `turn/started` notification has
+            // not supplied the required id yet. Interrupt supersedes any steers;
+            // the adapter sends it as soon as the id lands.
+            pending.clear();
+            pending.push_back(PendingCodexControl::Interrupt);
+            drop(pending);
+            arm_codex_interrupt_deadline(Arc::clone(sess), CODEX_INTERRUPT_DEADLINE);
+            return Ok(());
+        }
+        pending.clear();
+        drop(pending);
+        codex_finish_stopped_turn(sess);
+        return Ok(());
+    }
+    pending.clear();
+    drop(pending);
+    codex_fire_interrupt(sess, &tid, &active_turn).map_err(|error| error.to_string())?;
+    arm_codex_interrupt_deadline(Arc::clone(sess), CODEX_INTERRUPT_DEADLINE);
     Ok(())
+}
+
+fn codex_profile_key(
+    cwd: Option<&str>,
+    model: Option<&str>,
+    permission_mode: Option<&str>,
+    effort: Option<&str>,
+) -> String {
+    format!(
+        "cwd={}|model={}|perm={}|effort={}",
+        cwd.unwrap_or(""),
+        model.unwrap_or(""),
+        permission_mode.unwrap_or(""),
+        effort.unwrap_or("")
+    )
+}
+
+fn claim_warm_codex(
+    on_event: Channel<String>,
+    cwd: Option<&str>,
+    model: Option<&str>,
+    permission_mode: Option<&str>,
+    effort: Option<&str>,
+) -> Option<u32> {
+    let key = codex_profile_key(cwd, model, permission_mode, effort);
+    let id = with_warm_codex(|warm| warm.remove(&key))?;
+    let session = with_sessions(|m| m.get(&id).cloned())?;
+    if session.busy.load(Ordering::SeqCst) {
+        return None;
+    }
+    for line in session.buffer.lock().iter() {
+        let _ = on_event.send(line.clone());
+    }
+    *session.sink.lock() = Some(Box::new(ChannelSink::new(on_event)));
+    Some(id)
 }
 
 /// Starts a persistent codex app-server session: spawns `<bin> app-server`,
@@ -976,15 +1608,21 @@ fn codex_interrupt(sess: &Arc<ChatSession>) -> Result<(), String> {
 /// lines. Mirrors `chat_start`'s claude path but over the JSON-RPC transport.
 fn start_codex_appserver(
     app: AppHandle,
-    on_event: Channel<String>,
+    on_event: Option<Channel<String>>,
     cwd: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    effort: Option<String>,
     resume: Option<String>,
     fast: bool,
 ) -> Result<u32, String> {
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let mut cmd = Command::new(codex_appserver_bin());
     cmd.arg("app-server");
+    cmd.env("AIOS_PARENT_CHAT_SESSION", id.to_string());
+    cmd.env("AIOS_PARENT_CHAT_ENGINE", "codex");
+    #[cfg(not(windows))]
+    cmd.env("PATH", enriched_path());
     if let Some(ch) = codex_chat_home(fast) {
         cmd.env("CODEX_HOME", ch);
     }
@@ -1017,25 +1655,35 @@ fn start_codex_appserver(
         .ok_or_else(|| "failed to capture codex app-server stdout".to_string())?;
     let stderr = child.stderr.take();
 
-    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let session = Arc::new(ChatSession {
+        id,
         engine: Engine::Codex,
         child: Mutex::new(Some(child)),
         stdin: Mutex::new(Some(stdin)),
         thread_id: Mutex::new(None),
         cwd: Mutex::new(dir),
         model: Mutex::new(model.filter(|s| !s.is_empty())),
-        sink: Mutex::new(Some(on_event)),
+        effort: Mutex::new(effort.filter(|s| !s.is_empty())),
+        sink: Mutex::new(
+            on_event.map(|chan| Box::new(ChannelSink::new(chan)) as Box<dyn OutputSink>),
+        ),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
+        buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
         title: Mutex::new(String::new()),
         busy: AtomicBool::new(false),
+        operation_lock: Mutex::new(()),
         detached: AtomicBool::new(false),
         notify_on_done: AtomicBool::new(false),
+        events: Box::new(TauriEvents { app: app.clone() }),
         rpc_id: AtomicU64::new(1),
         pending_turn: Mutex::new(None),
         active_turn: Mutex::new(None),
+        pending_controls: Mutex::new(VecDeque::new()),
+        pending_steers: Mutex::new(HashMap::new()),
         answer_item: Mutex::new(None),
+        answer_streamed: AtomicBool::new(false),
+        pending_approvals: Mutex::new(HashMap::new()),
     });
 
     // Bare init (no session_id) flips claudeReady now; the real session_id lands
@@ -1052,11 +1700,13 @@ fn start_codex_appserver(
                 "capabilities": { "experimentalApi": false, "requestAttestation": false }
             }
         }),
-    );
+    )
+    .map_err(|error| error.to_string())?;
     codex_rpc_write(
         &session,
         &json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
-    );
+    )
+    .map_err(|error| error.to_string())?;
     // thread/start (or resume a prior thread). The composer's permission picker
     // maps to codex's sandbox + approval policy so codex can actually BUILD when
     // you give it write access (not just answer). `never` approval keeps the chat
@@ -1072,7 +1722,23 @@ fn start_codex_appserver(
         Some("acceptEdits") => ("workspace-write", "never"),
         _ => ("danger-full-access", "never"), // full access = full bypass
     };
-    let resume_id = resume.filter(|s| !s.is_empty());
+    let requested_resume_id = resume.filter(|s| !s.is_empty());
+    let resume_id = requested_resume_id.and_then(|t| {
+        let Ok(home) = std::env::var("HOME") else {
+            return Some(t);
+        };
+        if find_codex_rollout_in_home(std::path::Path::new(&home), &t).is_some() {
+            Some(t)
+        } else {
+            prune_store_session(&t);
+            let line = format!(
+                "{{\"type\":\"aios_resume_pruned\",\"engine\":\"codex\",\"id\":\"{}\"}}",
+                json_escape(&t)
+            );
+            ingest_line_arc(&session, &line);
+            None
+        }
+    });
     let (method, mut params) = match &resume_id {
         Some(t) => ("thread/resume", json!({ "threadId": t })),
         None => ("thread/start", json!({})),
@@ -1088,7 +1754,7 @@ fn start_codex_appserver(
     codex_rpc_write(
         &session,
         &json!({ "jsonrpc": "2.0", "id": codex_next_rpc(&session), "method": method, "params": params }),
-    );
+    ).map_err(|error| error.to_string())?;
 
     // stdout reader: newline JSON-RPC frames → adapt → ingest.
     let sess = Arc::clone(&session);
@@ -1111,11 +1777,21 @@ fn start_codex_appserver(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        for out in adapt_codex_appserver_frame(&sess, trimmed) {
+                        // Commit the server-minted active turn id before the
+                        // renderer sees `running`; an immediate steer from that
+                        // event can then target the turn instead of being queued.
+                        let is_turn_started = codex_turn_started(trimmed);
+                        for out in adapt_codex_appserver_frame_before_emit(&sess, trimmed, || {
+                            if is_turn_started {
+                                emit_running(&sess);
+                            }
+                        }) {
                             ingest_line(&sess, &app_rdr, &out);
                         }
                     }
                 }
+                // Transient EINTR — retry rather than tearing down the session.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
@@ -1128,7 +1804,7 @@ fn start_codex_appserver(
             );
             ingest_line(&sess, &app_rdr, &result);
         }
-        let _ = app_rdr.emit("chat-exit", id);
+        sess.events.on_exit(id);
     });
 
     // stderr reader: codex app-server logs skill-parse warnings etc. — drain + drop
@@ -1148,231 +1824,36 @@ fn start_codex_appserver(
     Ok(id)
 }
 
-/// Adapts one codex app-server JSON-RPC frame → claude-shaped event line(s).
-/// Three frame kinds:
-///   • server→client REQUEST (`method` AND `id`) — reply `{}` so nothing stalls.
-///     With approvalPolicy=never these shouldn't fire; auth is self-managed so
-///     `account/chatgptAuthTokens/refresh` never arrives.
-///   • RESPONSE to our request (`id`, no `method`) — capture the threadId from a
-///     `thread/start`|`thread/resume` result (→ system/init + fire a queued turn).
-///   • NOTIFICATION (`method`, no `id`) — map item/turn events to claude lines.
-fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Vec::new();
-    };
-    let method = v.get("method").and_then(|x| x.as_str());
-    let has_id = v.get("id").is_some();
-    let mut out = Vec::new();
-
-    // server→client request: echo the id, reply {} so the turn can't hang.
-    if method.is_some() && has_id {
-        if let Some(idv) = v.get("id") {
-            codex_rpc_write(sess, &json!({ "jsonrpc": "2.0", "id": idv, "result": {} }));
+#[tauri::command]
+pub fn chat_prewarm_codex(
+    app: AppHandle,
+    cwd: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    effort: Option<String>,
+) -> Result<u32, String> {
+    let key = codex_profile_key(
+        cwd.as_deref(),
+        model.as_deref(),
+        permission_mode.as_deref(),
+        effort.as_deref(),
+    );
+    if let Some(existing) = with_warm_codex(|warm| warm.get(&key).copied()) {
+        if with_sessions(|m| m.contains_key(&existing)) {
+            return Ok(existing);
         }
-        return out;
+        with_warm_codex(|warm| {
+            warm.remove(&key);
+        });
     }
-
-    // response to one of our requests — only thread/start|resume carries thread.id.
-    if has_id {
-        if let Some(tid) = v
-            .get("result")
-            .and_then(|r| r.get("thread"))
-            .and_then(|t| t.get("id"))
-            .and_then(|x| x.as_str())
-        {
-            let fresh = {
-                let mut g = sess.thread_id.lock();
-                let fresh = g.as_deref() != Some(tid);
-                *g = Some(tid.to_string());
-                fresh
-            };
-            if fresh {
-                out.push(format!(
-                    "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{}\"}}",
-                    json_escape(tid)
-                ));
-            }
-            // Fire any turn queued before the thread existed.
-            if let Some(text) = sess.pending_turn.lock().take() {
-                codex_fire_turn(sess, tid, &text);
-            }
-        }
-        return out;
+    let id = start_codex_appserver(app, None, cwd, model, permission_mode, effort, None, false)?;
+    let evicted = with_warm_codex(|warm| store_single_warm_codex(warm, key, id));
+    for old_id in evicted {
+        // Best effort: the old spare has no attached pane, so removing it from
+        // the session registry and killing its child cannot disrupt live work.
+        let _ = chat_stop(old_id, None);
     }
-
-    // notification.
-    let Some(m) = method else { return out };
-    let params = v.get("params");
-    match m {
-        // live token stream: codex emits `item/agentMessage/delta` (and reasoning
-        // summary deltas) as the model writes. Map each to a claude stream_event so
-        // the bubble types out live — the difference between codex feeling alive vs
-        // dumping a wall of text at the end. Routed by name so reasoning vs answer
-        // lands in the right block; field is `delta` (fallback `text`).
-        _ if m.ends_with("/delta") => {
-            let tok = params
-                .and_then(|p| p.get("delta"))
-                .and_then(|x| x.as_str())
-                .or_else(|| params.and_then(|p| p.get("text")).and_then(|x| x.as_str()))
-                .unwrap_or("");
-            if !tok.is_empty() {
-                // Only the final-answer item streams as the REPLY; reasoning and
-                // preamble/status agentMessages stream into the thinking block so
-                // they don't look identical to the answer.
-                let item_id = params
-                    .and_then(|p| p.get("itemId"))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                let is_answer =
-                    !m.contains("reasoning") && sess.answer_item.lock().as_deref() == Some(item_id);
-                if is_answer {
-                    out.push(text_delta_line(tok));
-                } else {
-                    out.push(thinking_delta_line(tok));
-                }
-            }
-        }
-        "item/started" => {
-            // Record the final-answer item id so its deltas route to the reply
-            // (everything else mid-turn is preamble → thinking).
-            if let Some(item) = params.and_then(|p| p.get("item")) {
-                let item_type = item.get("type").and_then(|x| x.as_str());
-                let phase = item.get("phase").and_then(|x| x.as_str()).unwrap_or("");
-                let is_final_answer = matches!(item_type, Some("agentMessage" | "agent_message"))
-                    && !matches!(phase, "preamble" | "status" | "reasoning");
-                if is_final_answer {
-                    if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
-                        *sess.answer_item.lock() = Some(id.to_string());
-                    }
-                }
-                if codex_is_action_item(item) {
-                    let id = codex_item_id(item);
-                    out.push(assistant_tool_use_line(
-                        &id,
-                        &codex_tool_name(item),
-                        codex_tool_input(item),
-                    ));
-                }
-            }
-        }
-        "item/completed" => {
-            if let Some(item) = params.and_then(|p| p.get("item")) {
-                let itype = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                match itype {
-                    "agentMessage" | "agent_message" => {
-                        // final_answer → the reply; any other phase (preamble /
-                        // status) → thinking, so it doesn't mirror the answer.
-                        let is_final = item
-                            .get("phase")
-                            .and_then(|x| x.as_str())
-                            .map_or(true, |p| p == "final_answer");
-                        if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
-                            if !t.is_empty() {
-                                if is_final {
-                                    out.push(assistant_text_line(t));
-                                } else {
-                                    out.push(assistant_thinking_line(t));
-                                }
-                            }
-                        }
-                    }
-                    "reasoning" => {
-                        // reasoning item carries `content: Array<string>`.
-                        let joined = item
-                            .get("content")
-                            .and_then(|c| c.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|x| x.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            })
-                            .unwrap_or_default();
-                        if !joined.is_empty() {
-                            out.push(assistant_thinking_line(&joined));
-                        }
-                    }
-                    _ if codex_is_action_item(item) => {
-                        let id = codex_item_id(item);
-                        out.push(user_tool_result_line(
-                            &id,
-                            &codex_tool_result_text(item),
-                            codex_item_is_error(item),
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "turn/started" => {
-            // new turn → reset the answer-item marker; capture the turn id so a
-            // steer can target it via expectedTurnId.
-            *sess.answer_item.lock() = None;
-            if let Some(id) = params
-                .and_then(|p| p.get("turn"))
-                .and_then(|t| t.get("id"))
-                .and_then(|x| x.as_str())
-            {
-                *sess.active_turn.lock() = Some(id.to_string());
-            }
-        }
-        "turn/completed" => {
-            *sess.active_turn.lock() = None;
-            *sess.answer_item.lock() = None;
-            let tid = sess.thread_id.lock().clone().unwrap_or_default();
-            let usage = params
-                .and_then(|p| {
-                    p.get("turn")
-                        .and_then(|t| t.get("usage"))
-                        .or_else(|| p.get("usage"))
-                })
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "{}".to_string());
-            out.push(format!(
-                "{{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"{}\",\"usage\":{usage},\"total_cost_usd\":0}}",
-                json_escape(&tid)
-            ));
-        }
-        "turn/failed" => {
-            *sess.active_turn.lock() = None;
-            *sess.answer_item.lock() = None;
-            let tid = sess.thread_id.lock().clone().unwrap_or_default();
-            out.push(format!(
-                "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
-                json_escape(&tid)
-            ));
-        }
-        "account/rateLimits/updated" => {
-            // Codex pushes this whenever the ChatGPT-sub windows move — the live
-            // signal for the composer's usage bar. The rate-limits object may sit
-            // under `rateLimits`/`rate_limits` or directly in params; try each.
-            if let Some(rl) = params
-                .and_then(|p| p.get("rateLimits").or_else(|| p.get("rate_limits")))
-                .or(params)
-            {
-                if rl.get("primary").is_some() || rl.get("secondary").is_some() {
-                    out.push(codex_usage_event(rl));
-                }
-            }
-        }
-        "error" => {
-            // Transient errors retry (willRetry:true) — do NOT end the turn, or the
-            // composer would free mid-stream. Only a non-retryable error is fatal.
-            let will_retry = params
-                .and_then(|p| p.get("willRetry"))
-                .and_then(|x| x.as_bool())
-                .unwrap_or(false);
-            if !will_retry {
-                let tid = sess.thread_id.lock().clone().unwrap_or_default();
-                out.push(format!(
-                    "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
-                    json_escape(&tid)
-                ));
-            }
-        }
-        _ => {} // thread/started, item/started, deltas, mcp status — ignored in v1
-    }
-    out
+    Ok(id)
 }
 
 /// Routes a raw engine line to the right adapter; claude lines pass through.
@@ -1384,316 +1865,86 @@ fn adapt_line(sess: &Arc<ChatSession>, engine: Engine, line: &str) -> Vec<String
     }
 }
 
-/// One claude-shaped streaming TEXT delta (a `content_block_delta`/`text_delta`),
-/// so codex's `item/agentMessage/delta` tokens type out live exactly like claude's
-/// partial-message stream — instead of the whole answer landing at once.
-fn text_delta_line(tok: &str) -> String {
-    format!(
-        "{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}}}",
-        json_escape(tok)
-    )
-}
-
-/// One claude-shaped streaming THINKING delta — codex's reasoning-summary tokens
-/// stream into the collapsible thinking block as they arrive.
-fn thinking_delta_line(tok: &str) -> String {
-    format!(
-        "{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"{}\"}}}}}}",
-        json_escape(tok)
-    )
-}
-
-/// One claude-shaped assistant text line.
-fn assistant_text_line(text: &str) -> String {
-    format!(
-        "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}",
-        json_escape(text)
-    )
-}
-
-/// One claude-shaped assistant thinking line.
-fn assistant_thinking_line(text: &str) -> String {
-    format!(
-        "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"{}\"}}]}}}}",
-        json_escape(text)
-    )
-}
-
-fn assistant_tool_use_line(id: &str, name: &str, input: Value) -> String {
-    json!({
-        "type": "assistant",
-        "message": {
-            "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": id,
-                "name": name,
-                "input": input,
-            }]
-        }
-    })
-    .to_string()
-}
-
-fn user_tool_result_line(id: &str, content: &str, is_error: bool) -> String {
-    json!({
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": id,
-                "content": content,
-                "is_error": is_error,
-            }]
-        }
-    })
-    .to_string()
-}
-
-fn codex_item_id(item: &Value) -> String {
-    item.get("id")
-        .and_then(|x| x.as_str())
-        .or_else(|| item.get("call_id").and_then(|x| x.as_str()))
-        .or_else(|| item.get("callId").and_then(|x| x.as_str()))
-        .unwrap_or("codex-action")
-        .to_string()
-}
-
-fn codex_item_type(item: &Value) -> &str {
-    item.get("type").and_then(|x| x.as_str()).unwrap_or("")
-}
-
-fn codex_is_action_item(item: &Value) -> bool {
-    !matches!(
-        codex_item_type(item),
-        "" | "agentMessage" | "agent_message" | "reasoning"
-    )
-}
-
-fn codex_tool_name(item: &Value) -> String {
-    if let Some(name) = item.get("name").and_then(|x| x.as_str()) {
-        return name.to_string();
-    }
-    match codex_item_type(item) {
-        "commandExecution" | "command_execution" | "exec" | "command" => "bash",
-        "fileChange" | "file_change" | "patch" | "apply_patch" => "edit",
-        "webSearch" | "web_search" => "websearch",
-        "mcpToolCall" | "mcp_tool_call" => "mcp",
-        other if !other.is_empty() => other,
-        _ => "codex_action",
-    }
-    .to_string()
-}
-
-fn codex_tool_input(item: &Value) -> Value {
-    if let Some(args) = item.get("arguments").or_else(|| item.get("args")) {
-        if let Some(s) = args.as_str() {
-            return serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({ "arguments": s }));
-        }
-        return args.clone();
-    }
-    let mut out = serde_json::Map::new();
-    for key in [
-        "command",
-        "cmd",
-        "cwd",
-        "path",
-        "file",
-        "query",
-        "url",
-        "server",
-        "tool",
-        "status",
-        "description",
-    ] {
-        if let Some(v) = item.get(key) {
-            out.insert(key.to_string(), v.clone());
-        }
-    }
-    if out.is_empty() {
-        item.clone()
-    } else {
-        Value::Object(out)
-    }
-}
-
-fn codex_tool_result_text(item: &Value) -> String {
-    for key in ["output", "result", "content", "text", "error", "message"] {
-        if let Some(v) = item.get(key) {
-            if let Some(s) = v.as_str() {
-                if !s.is_empty() {
-                    return s.to_string();
-                }
-            }
-            if !v.is_null() {
-                return v.to_string();
-            }
-        }
-    }
-    item.get("status")
-        .and_then(|x| x.as_str())
-        .unwrap_or("completed")
-        .to_string()
-}
-
-fn codex_item_is_error(item: &Value) -> bool {
-    item.get("is_error")
-        .or_else(|| item.get("isError"))
-        .and_then(|x| x.as_bool())
-        .unwrap_or_else(|| {
-            item.get("status")
-                .and_then(|x| x.as_str())
-                .map(|s| matches!(s, "failed" | "error" | "cancelled"))
-                .unwrap_or(false)
-        })
-}
-
-/// Maps Codex `exec --json` JSONL → claude-shaped event lines.
-/// `thread.started{thread_id}` → capture resume id + real `system/init`;
-/// `item.completed{agent_message|reasoning}` → assistant text/thinking;
-/// `turn.completed{usage}` → `result`; `turn.failed`/`error` → error result.
-fn adapt_codex_line(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Vec::new();
-    };
-    let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    let mut out = Vec::new();
-    match t {
-        "thread.started" => {
-            if let Some(tid) = v.get("thread_id").and_then(|x| x.as_str()) {
-                let mut g = sess.thread_id.lock();
-                let fresh = g.as_deref() != Some(tid);
-                *g = Some(tid.to_string());
-                drop(g);
-                if fresh {
-                    out.push(format!(
-                        "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{}\"}}",
-                        json_escape(tid)
-                    ));
-                }
-            }
-        }
-        "item.completed" => {
-            if let Some(item) = v.get("item") {
-                let itype = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                let txt = item
-                    .get("text")
-                    .and_then(|x| x.as_str())
-                    .or_else(|| item.get("content").and_then(|x| x.as_str()))
-                    .unwrap_or("");
-                match itype {
-                    "agent_message" if !txt.is_empty() => out.push(assistant_text_line(txt)),
-                    "reasoning" if !txt.is_empty() => out.push(assistant_thinking_line(txt)),
-                    _ if codex_is_action_item(item) => {
-                        let id = codex_item_id(item);
-                        out.push(assistant_tool_use_line(
-                            &id,
-                            &codex_tool_name(item),
-                            codex_tool_input(item),
-                        ));
-                        out.push(user_tool_result_line(
-                            &id,
-                            &codex_tool_result_text(item),
-                            codex_item_is_error(item),
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "turn.completed" => {
-            let tid = sess.thread_id.lock().clone().unwrap_or_default();
-            let usage = v
-                .get("usage")
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "{}".to_string());
-            out.push(format!(
-                "{{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"{}\",\"usage\":{usage},\"total_cost_usd\":0}}",
-                json_escape(&tid)
-            ));
-        }
-        "turn.failed" | "error" => {
-            let tid = sess.thread_id.lock().clone().unwrap_or_default();
-            out.push(format!(
-                "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
-                json_escape(&tid)
-            ));
-        }
-        _ => {}
-    }
-    out
-}
-
-/// Maps opencode `run --format json` JSONL → claude-shaped event lines.
-/// First `sessionID` (`ses_…`) → resume id + real `system/init`; `text` parts →
-/// assistant text; `reasoning` parts → thinking. Turn-end is handled by the EOF
-/// fallback in `run_per_turn` (opencode just exits when the run completes).
-fn adapt_opencode_line(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    if let Some(sid) = v.get("sessionID").and_then(|x| x.as_str()) {
-        let mut g = sess.thread_id.lock();
-        if g.is_none() {
-            *g = Some(sid.to_string());
-            drop(g);
-            out.push(format!(
-                "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{}\"}}",
-                json_escape(sid)
-            ));
-        }
-    }
-    let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    let part_text = v
-        .get("part")
-        .and_then(|p| p.get("text"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
-    match t {
-        "text" if !part_text.is_empty() => out.push(assistant_text_line(part_text)),
-        "reasoning" if !part_text.is_empty() => out.push(assistant_thinking_line(part_text)),
-        _ => {}
-    }
-    out
-}
-
-/// Appends one line to the replay buffer AND forwards it to the live sink (if a
-/// pane is attached). The low-level fan-out shared by `ingest_line` and by
-/// synthetic lines we inject (e.g. the live `usage` tick after a turn).
-fn fan_out(sess: &Arc<ChatSession>, line: &str) {
-    {
-        let mut b = sess.buffer.lock();
-        if b.len() >= REPLAY_CAP {
-            b.pop_front();
-        }
-        b.push_back(line.to_string());
-    }
-    if let Some(ch) = sess.sink.lock().as_ref() {
-        let _ = ch.send(line.to_string());
-    }
-}
-
 /// Handles one complete output line: append to the replay buffer, update session
 /// state (claude id, busy, done-notification), and forward to the live sink.
 fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
-    // Learn claude's session uuid once, from the init event.
-    if sess.claude_id.lock().is_none() {
-        if let Some(sid) = extract_json_str(line, "session_id") {
-            *sess.claude_id.lock() = Some(sid);
+    // Parse the line ONCE — but only when a cheap substring pre-check says it
+    // could matter (a `result` close, or a `session_id` we haven't learned yet).
+    // This keeps the hot delta path (token streams) allocation-free: those lines
+    // contain neither needle so we never touch serde_json. Parsing at the TOP
+    // level (rather than raw `line.contains`) means model output that merely
+    // ECHOES `"type":"result"` / `"session_id"` inside its own text can't falsely
+    // close a turn or hijack the session id.
+    let want_session_id = sess.claude_id.lock().is_none() && line.contains("session_id");
+    let want_result = line.contains("result");
+    // claude echoes the user turn back on stdout; an image-bearing echo embeds
+    // base64 (`"type":"image"`). Detect it cheaply so we can slim the BUFFERED
+    // copy (FIX 1) instead of pinning the megabytes for the whole session. Hot
+    // delta/text lines never contain this needle, so the parse stays gated.
+    let want_user_image =
+        line.contains("\"type\":\"image\"") || line.contains("\"type\": \"image\"");
+    let parsed: Option<Value> = if want_session_id || want_result || want_user_image {
+        serde_json::from_str::<Value>(line).ok()
+    } else {
+        None
+    };
+
+    // Learn claude's session uuid once, from the init event (top-level field only).
+    if want_session_id {
+        if let Some(sid) = parsed
+            .as_ref()
+            .and_then(|v| v.get("session_id"))
+            .and_then(|x| x.as_str())
+        {
+            *sess.claude_id.lock() = Some(sid.to_string());
         }
     }
 
-    // A `result` event ends the current turn.
-    let is_result = line.contains("\"type\":\"result\"");
+    // A `result` event ends the current turn — match the TOP-LEVEL `type` only.
+    let is_result = parsed
+        .as_ref()
+        .map(|v| v.get("type").and_then(|x| x.as_str()) == Some("result"))
+        .unwrap_or(false);
+    let result_failed = is_result
+        && parsed
+            .as_ref()
+            .and_then(|v| v.get("is_error"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-    // Forward the line itself first (buffer + live sink), so the pane sees the
-    // turn close before the usage tick that follows it.
-    fan_out(sess, line);
+    // Serialize result settlement against send/steer/interrupt. In particular,
+    // an old steer must not validate, then inject after this result frees the
+    // session for a newer renderer run.
+    let _operation = is_result.then(|| sess.operation_lock.lock());
 
+    // Clear `busy` BEFORE forwarding a `result`: the frontend reacts to the
+    // result line by immediately firing any queued follow-up via `chat_send`,
+    // and chat_send's compare_exchange would bounce it if the flag were still
+    // set. Clearing first makes "see result → send next" race-free.
     if is_result {
         sess.busy.store(false, Ordering::SeqCst);
+    }
+
+    // Forward the line itself first (buffer + live sink), so the pane sees the
+    // turn close before the usage tick that follows it. For an image-bearing
+    // user echo, send the REAL line live but buffer only a slimmed placeholder
+    // (FIX 1) so base64 image bytes aren't retained / re-replayed for the session.
+    let slimmed = if want_user_image {
+        parsed.as_ref().and_then(slim_user_image_line)
+    } else {
+        None
+    };
+    match slimmed {
+        Some(buffered) => fan_out_split(sess, line, &buffered),
+        None => fan_out(sess, line),
+    }
+
+    if is_result {
+        // Keep result → terminal lifecycle adjacent in the SAME channel. The
+        // renderer may paint the final answer from `result`, but only this tagged
+        // frame releases its run gate; stale terminal events are impossible to
+        // apply to a newer frontend run id.
+        emit_terminal(sess, if result_failed { "failed" } else { "completed" });
         if sess.detached.load(Ordering::SeqCst) && sess.notify_on_done.swap(false, Ordering::SeqCst)
         {
             let title = sess.title.lock().clone();
@@ -1702,93 +1953,102 @@ fn ingest_line(sess: &Arc<ChatSession>, app: &AppHandle, line: &str) {
             } else {
                 title
             };
-            notify_done(app, &label);
+            sess.events.on_notify(sess.id, &label);
         }
-        // Live usage tick: right after each claude turn, re-read the statusline's
-        // usage.json and push a synthetic `usage` event so the composer's usage
-        // bar moves AS YOU TALK. Codex pushes its own `account/rateLimits/updated`
-        // (handled in the app-server adapter), so only claude needs this poll.
+        // Live usage tick: right after each claude turn, read the same unified
+        // Claude usage source as the sidebar (OAuth first, statusline fallback)
+        // and push a synthetic `usage` event so the composer moves as you talk.
+        // Codex pushes its own `account/rateLimits/updated`.
+        //
+        // The usage read does BLOCKING I/O (OAuth file read, possibly shelling out
+        // to a node `ccusage` CLI). Running it inline here would stall THIS session's
+        // stdout reader thread at every turn-end — stdout backs up while usage is
+        // fetched. So offload to a short-lived detached thread: the reader continues
+        // immediately, and the synthetic `usage` event fans out a few ms later
+        // (timing slack is fine). Clone the AppHandle + session Arc in so the
+        // closure is `Send + 'static`.
         if matches!(sess.engine, Engine::Claude) {
-            if let Some(u) = claude_usage_event() {
-                fan_out(sess, &u);
-            }
+            let app_usage = app.clone();
+            let sess_usage = Arc::clone(sess);
+            thread::spawn(move || {
+                if let Some(u) = claude_usage_event(&app_usage) {
+                    fan_out(&sess_usage, &u);
+                }
+            });
         }
     }
 }
 
-/// Reads the statusline's `~/.aios/state/usage.json` and builds a claude-shaped
-/// `usage` event line (5h/7d windows), or `None` if it's not written yet.
-fn claude_usage_event() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = format!("{home}/.aios/state/usage.json");
-    let s = std::fs::read_to_string(&path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-    let rl = v.get("rate_limits")?;
+/// Builds a claude-shaped `usage` event line (5h/7d windows), or `None` if no
+/// usage source is available.
+fn claude_usage_event(app: &AppHandle) -> Option<String> {
+    let v = crate::usage::claude_usage_value(Some(app));
+    if v.is_null() {
+        return None;
+    }
     let win = |k: &str| -> serde_json::Value {
-        let w = &rl[k];
+        let w = &v[k];
         json!({
-            "pct": w.get("used_percentage").and_then(|x| x.as_f64()),
-            "resets_at": w.get("resets_at").and_then(|x| x.as_i64()),
+            "pct": w.get("pct").and_then(|x| x.as_f64()),
+            "resets_at": w.get("resetsAt").and_then(|x| x.as_i64()),
         })
     };
     Some(
         json!({
             "type": "usage",
             "provider": "claude",
-            "five_hour": win("five_hour"),
-            "seven_day": win("seven_day"),
+            "five_hour": win("fiveHour"),
+            "seven_day": win("sevenDay"),
         })
         .to_string(),
     )
 }
 
-/// Builds a claude-shaped `usage` event line from a codex app-server rate-limits
-/// object (primary = 5h, secondary = 7d), mirroring `claude_usage_event`'s shape.
-fn codex_usage_event(rl: &serde_json::Value) -> String {
-    // Field names verified live against codex 0.135's app-server push:
-    //   params.rateLimits.{primary,secondary}.{usedPercent,resetsAt}
-    // The logs_2.sqlite path uses snake_case (used_percent / reset_at); accept
-    // both so this helper works for the push AND any sqlite-shaped caller.
-    let win = |k: &str| -> serde_json::Value {
-        let w = &rl[k];
-        json!({
-            "pct": w.get("usedPercent")
-                .or_else(|| w.get("used_percent"))
-                .and_then(|x| x.as_f64()),
-            "resets_at": w.get("resetsAt")
-                .or_else(|| w.get("reset_at"))
-                .or_else(|| w.get("resetAt"))
-                .and_then(|x| x.as_i64()),
-        })
-    };
-    json!({
-        "type": "usage",
-        "provider": "codex",
-        "five_hour": win("primary"),
-        "seven_day": win("secondary"),
-    })
-    .to_string()
+/// Payload for the in-app `aios-notify` event. The front-end turns this into a
+/// clickable `AiosNotification` whose target reattaches the chat by session id.
+#[derive(serde::Serialize, Clone)]
+struct AiosNotifyPayload {
+    kind: String,
+    session_id: u32,
+    title: String,
 }
 
-/// Cheap extractor for a top-level `"key":"value"` string field — avoids pulling
-/// a JSON parser into the hot path for the one field we need (`session_id`).
-fn extract_json_str(line: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = line.find(&needle)? + needle.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+/// The Tauri-shell implementation of the crate's [`aios_chat_core::SessionEvents`]
+/// seam: a session's lifecycle callbacks become `AppHandle::emit` (plus a native
+/// completion toast). On the box, `aios-noded` supplies its own impl, so the
+/// session runtime in `aios-chat-core` never names Tauri. This struct is the ONLY
+/// thing that turns those callbacks back into Tauri events.
+struct TauriEvents {
+    app: AppHandle,
 }
 
-/// Fires a native OS notification that a backgrounded chat finished.
-fn notify_done(app: &AppHandle, title: &str) {
-    use tauri_plugin_notification::NotificationExt;
-    let _ = app
-        .notification()
-        .builder()
-        .title("✓ chat finished")
-        .body(format!("{title} — done. click to reopen."))
-        .show();
+impl aios_chat_core::SessionEvents for TauriEvents {
+    /// Backing process exited → tell the frontend so the pane can flip state.
+    fn on_exit(&self, session_id: u32) {
+        let _ = self.app.emit("chat-exit", session_id);
+    }
+
+    /// A backgrounded chat finished → native OS notification AND the in-app
+    /// `aios-notify` event (bell + toast, carrying the session id so the click
+    /// reattaches the exact chat).
+    fn on_notify(&self, session_id: u32, title: &str) {
+        use tauri_plugin_notification::NotificationExt;
+        let _ = self
+            .app
+            .notification()
+            .builder()
+            .title("✓ chat finished")
+            .body(format!("{title} — done. click to reopen."))
+            .show();
+        let _ = self.app.emit(
+            "aios-notify",
+            AiosNotifyPayload {
+                kind: "chat.done".to_string(),
+                session_id,
+                title: title.to_string(),
+            },
+        );
+    }
 }
 
 /// Sends one user turn. For claude: writes a stream-json user line to the live
@@ -1796,18 +2056,100 @@ fn notify_done(app: &AppHandle, title: &str) {
 /// resuming the prior thread, whose output is adapted into claude-shaped events.
 /// The reply streams back over the session's Channel. No-op if the session's gone.
 #[tauri::command]
-pub fn chat_send(app: AppHandle, session_id: u32, text: String) -> Result<(), String> {
+pub fn chat_send(
+    app: AppHandle,
+    session_id: u32,
+    text: String,
+    image_paths: Option<Vec<String>>,
+    run_id: String,
+) -> Result<(), String> {
+    // Box-backed session → reverse-pipe the turn over the WS (images are not
+    // forwarded to the remote in v1).
+    if crate::remote::is_remote(session_id) {
+        return crate::remote::send(session_id, &text, &run_id);
+    }
     let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) else {
         return Err(format!("chat session {session_id} not found"));
     };
-    s.busy.store(true, Ordering::SeqCst);
+    let _operation = s.operation_lock.lock();
+    // FIX (busy race): claim the turn atomically. A plain `store(true)` let two
+    // racing sends both proceed (double-fired turns, crossed results); the CAS
+    // makes the second caller bounce with a clean error instead. Mid-turn
+    // follow-ups should go through `chat_steer` (claude stdin inject / codex
+    // turn/steer) or the frontend queue — never a second chat_send.
+    if s.busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("session busy — a turn is already in flight (steer or queue instead)".into());
+    }
+    // The renderer minted this id before invoking us. Emit its accepted-start
+    // frame before any engine work so every subsequent lifecycle frame has one
+    // ordered, session-local identity.
+    begin_run(&s, run_id);
+    let images = image_paths.unwrap_or_default();
     if matches!(s.engine, Engine::Codex) {
-        return codex_send_turn(&s, text);
+        if let Err(e) = codex_send_turn(&s, text, &images) {
+            s.busy.store(false, Ordering::SeqCst);
+            emit_terminal(&s, "failed");
+            return Err(e);
+        }
+        // Codex transitions to `running` only from its `turn/started` callback.
+        return Ok(());
     }
     if s.engine.per_turn() {
-        return run_per_turn(s, app, text);
+        // spawn-per-turn engines have no multimodal channel; fall back to quoting
+        // the paths inline so the model can at least Read them.
+        let merged = if images.is_empty() {
+            text
+        } else {
+            let paths = images
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() {
+                paths
+            } else {
+                format!("{paths} {text}")
+            }
+        };
+        // FIX 3: `busy` was set true above. If the per-turn spawn fails BEFORE the
+        // reader thread starts, no EOF-fallback `result` ever fires (there's no
+        // thread), so the session would be wedged busy=true forever and the
+        // composer never re-enables. On the spawn-error path, clear busy and emit
+        // a synthetic error `result` (the same surfacing pattern the reader's EOF
+        // fallback uses) so the composer frees and the failure is visible.
+        if let Err(e) = run_per_turn(Arc::clone(&s), app.clone(), merged) {
+            s.busy.store(false, Ordering::SeqCst);
+            let tid = s.thread_id.lock().clone().unwrap_or_default();
+            let result = format!(
+                "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"text\":\"{}\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
+                json_escape(&e),
+                json_escape(&tid)
+            );
+            ingest_line(&s, &app, &result);
+            return Err(e);
+        }
+        emit_running(&s);
+        return Ok(());
     }
-    write_line(session_id, &user_line(&text))
+    let line = if images.is_empty() {
+        user_line(&text)
+    } else {
+        user_line_with_images(&text, &images)
+    };
+    let res = write_line(session_id, &line);
+    if res.is_err() {
+        // The turn never reached claude — release the claim or the session
+        // wedges busy=true forever (no `result` will ever clear it).
+        s.busy.store(false, Ordering::SeqCst);
+        emit_terminal(&s, "failed");
+    } else {
+        // Claude's persistent stdin write is its accepted live-turn boundary.
+        emit_running(&s);
+    }
+    res
 }
 
 /// Detaches a session from its pane WITHOUT killing it: clears the sink so
@@ -1816,6 +2158,12 @@ pub fn chat_send(app: AppHandle, session_id: u32, text: String) -> Result<(), St
 /// finish. Called when the user closes a still-working chat.
 #[tauri::command]
 pub fn chat_detach(session_id: u32, notify: bool) -> Result<(), String> {
+    // Remote sessions keep running on the box and buffer there; detaching the
+    // pane just leaves the WS pumping in the background (v1 — no local sink to
+    // null out). Reattach for remote is a future step.
+    if crate::remote::is_remote(session_id) {
+        return Ok(());
+    }
     let s = with_sessions(|m| m.get(&session_id).cloned())
         .ok_or_else(|| format!("chat session {session_id} not found"))?;
     s.detached.store(true, Ordering::SeqCst);
@@ -1827,25 +2175,72 @@ pub fn chat_detach(session_id: u32, notify: bool) -> Result<(), String> {
 #[derive(serde::Serialize)]
 pub struct ChatReattachInfo {
     pub busy: bool,
+    /// Renderer lifecycle snapshot. Replay normally carries these frames, but a
+    /// bounded buffer can evict the opening frame while a long run is detached.
+    pub run_id: Option<String>,
+    pub run_state: Option<String>,
+    /// Which engine drives this session (`claude` | `codex` | `opencode`), so a
+    /// reattached pane re-syncs its `model` state to the RIGHT engine instead of
+    /// staying on the default claude (which would give the wrong stop-strategy,
+    /// hide steer, and read the wrong usage provider). The linchpin parity fix.
+    pub engine: String,
+    /// Model id the session was started with, if known (so the pane can restore
+    /// the exact composer entry, not just the engine).
+    pub model: Option<String>,
+    /// The engine's own session uuid (claude session_id / codex threadId).
+    pub claude_id: Option<String>,
 }
 
 /// Reattaches a reopened pane to a live (possibly backgrounded) session: rebinds
 /// the channel, replays the buffered lines so the pane reconstructs the whole
 /// run and catches up to live, and clears the detached/notify flags.
 #[tauri::command]
-pub fn chat_reattach(session_id: u32, on_event: Channel<String>) -> Result<ChatReattachInfo, String> {
+pub fn chat_reattach(
+    session_id: u32,
+    on_event: Channel<String>,
+) -> Result<ChatReattachInfo, String> {
     let s = with_sessions(|m| m.get(&session_id).cloned())
         .ok_or_else(|| format!("chat session {session_id} not found"))?;
-    // Replay buffer first, then go live — order matters so the pane sees history
-    // before new deltas.
+    // Keep replay, sink rebinding, busy, and the lifecycle snapshot mutually
+    // consistent with send/steer/interrupt/result settlement.
+    let _operation = s.operation_lock.lock();
+    // Hold the sink lock while replaying and rebinding. fan_out appends to the
+    // buffer before taking this lock; a line that lands during replay therefore
+    // either appears in the replay or waits and reaches the freshly bound sink —
+    // never vanishes in the replay→sink handoff gap.
+    let mut sink = s.sink.lock();
     for line in s.buffer.lock().iter() {
         let _ = on_event.send(line.clone());
     }
-    *s.sink.lock() = Some(on_event);
+    *sink = Some(Box::new(ChannelSink::new(on_event)));
+    drop(sink);
     s.detached.store(false, Ordering::SeqCst);
     s.notify_on_done.store(false, Ordering::SeqCst);
+    let busy = s.busy.load(Ordering::SeqCst);
+    let lifecycle = with_runs(|runs| runs.get(&session_id).cloned());
+    let run_id = lifecycle.as_ref().map(|run| run.run_id.clone());
+    let run_state = lifecycle.map(|run| {
+        if run.interrupting {
+            "interrupting".to_string()
+        } else {
+            "running".to_string()
+        }
+    });
+    let engine = match s.engine {
+        Engine::Claude => "claude",
+        Engine::Codex => "codex",
+        Engine::Opencode => "opencode",
+    }
+    .to_string();
+    let model = s.model.lock().clone().filter(|m| !m.is_empty());
+    let claude_id = s.claude_id.lock().clone();
     Ok(ChatReattachInfo {
-        busy: s.busy.load(Ordering::SeqCst),
+        busy,
+        run_id,
+        run_state,
+        engine,
+        model,
+        claude_id,
     })
 }
 
@@ -1875,9 +2270,7 @@ pub struct LiveChat {
 pub fn list_chat_live() -> Vec<LiveChat> {
     with_sessions(|m| {
         m.iter()
-            .filter(|(_, s)| {
-                s.detached.load(Ordering::SeqCst) || s.busy.load(Ordering::SeqCst)
-            })
+            .filter(|(_, s)| s.detached.load(Ordering::SeqCst) || s.busy.load(Ordering::SeqCst))
             .map(|(id, s)| LiveChat {
                 id: *id,
                 claude_id: s.claude_id.lock().clone(),
@@ -1895,6 +2288,26 @@ pub fn has_busy_sessions() -> bool {
     with_sessions(|m| m.values().any(|s| s.busy.load(Ordering::SeqCst)))
 }
 
+/// App-exit reaper: kills + reaps EVERY live chat session's child. Called from
+/// the lib.rs exit handler ONLY on the path where exit actually proceeds (no busy
+/// session blocked it). Without this, `detach_child_process` reparents the spawned
+/// `claude`/`codex`/`opencode` children out of the cockpit's process group, so on
+/// a normal quit they'd keep running forever — burning tokens + memory. We kill
+/// then wait() so nothing is left as a zombie either. Idempotent: an already-dead
+/// child's kill/wait errors are ignored.
+pub fn kill_all_sessions() {
+    with_sessions(|m| {
+        for s in m.values() {
+            if let Some(c) = s.child.lock().as_mut() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        m.clear();
+    });
+    with_runs(|runs| runs.clear());
+}
+
 /// Interrupts the in-flight turn of a live chat session.
 ///
 /// Uses claude's stream-json **control protocol** (verified live against claude
@@ -1906,8 +2319,15 @@ pub fn has_busy_sessions() -> bool {
 /// turn normally — so this is a true interrupt, not a kill/respawn. The frontend
 /// stops consuming deltas and re-enables the composer when it sees the result.
 #[tauri::command]
-pub fn chat_interrupt(session_id: u32) -> Result<(), String> {
+pub fn chat_interrupt(session_id: u32, run_id: String) -> Result<(), String> {
+    if crate::remote::is_remote(session_id) {
+        return crate::remote::interrupt(session_id, &run_id);
+    }
     if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
+        let _operation = s.operation_lock.lock();
+        // Stop is a request, not a completion. This frame deliberately leaves
+        // the renderer non-runnable until the terminal result/exit below lands.
+        mark_interrupting(&s, &run_id)?;
         // codex app-server: a real `turn/interrupt` (stop the turn, keep the
         // process + thread alive) — not a kill. The server ends the turn; our
         // adapter emits a `result` that frees the composer.
@@ -1920,29 +2340,105 @@ pub fn chat_interrupt(session_id: u32) -> Result<(), String> {
         if s.engine.per_turn() {
             if let Some(child) = s.child.lock().as_mut() {
                 let _ = child.kill();
+                // Reap immediately so the killed turn's process doesn't linger as
+                // a zombie until the next turn (the reader thread's `child = None`
+                // drops the handle without waiting, so wait() here).
+                let _ = child.wait();
             }
             return Ok(());
         }
+    } else {
+        return Err(format!("chat session {session_id} not found"));
     }
     let rid = NEXT_REQ.fetch_add(1, Ordering::SeqCst);
     let line = format!(
         "{{\"type\":\"control_request\",\"request_id\":\"int-{rid}\",\"request\":{{\"subtype\":\"interrupt\"}}}}\n"
     );
-    write_line(session_id, &line)
+    match write_line(session_id, &line) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // The interrupt request never reached Claude, so no result/EOF can
+            // close the lifecycle. Terminalize it ourselves after the ordered
+            // interrupting frame instead of leaving the renderer stranded.
+            if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
+                s.busy.store(false, Ordering::SeqCst);
+                let cid = s.claude_id.lock().clone().unwrap_or_default();
+                fan_out(
+                    &s,
+                    &format!(
+                        "{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"text\":\"{}\",\"session_id\":\"{}\",\"total_cost_usd\":0}}",
+                        json_escape(&format!("interrupt failed: {error}")),
+                        json_escape(&cid),
+                    ),
+                );
+                emit_terminal(&s, "failed");
+            }
+            Err(error)
+        }
+    }
 }
 
-/// Steers the in-flight turn with a follow-up message WITHOUT interrupting it
-/// (codex `turn/steer` — the model folds it into the running turn). Only codex
-/// supports true mid-turn steering today; other engines return Err so the
-/// frontend queues the message to fire when the current turn completes.
+/// Steers the in-flight turn with a follow-up message WITHOUT interrupting it.
+/// This is the unified mid-turn dispatcher — it picks the right mechanism per
+/// engine, and returns Err when the message must wait in the frontend queue:
+///
+/// - **claude**: writes the user line straight to the persistent process's
+///   stdin. Verified empirically against claude 2.1.170 (stream-json stdin
+///   mode): a user line written mid-turn is picked up between agent steps and
+///   folded into the SAME turn, codex-style — no interrupt, no second turn.
+///   Because stdin injection is a full user line, it carries image content
+///   blocks too (`user_line_with_images`).
+/// - **codex**: `turn/steer` RPC (text-only — the RPC takes text input items;
+///   image-carrying messages return Err so the frontend keeps them queued and
+///   they fire as a normal turn with real content blocks).
+/// - **opencode**: no live process mid-turn — always Err → frontend queue.
 #[tauri::command]
-pub fn chat_steer(session_id: u32, text: String) -> Result<(), String> {
+pub fn chat_steer(
+    session_id: u32,
+    text: String,
+    image_paths: Option<Vec<String>>,
+    run_id: String,
+) -> Result<(), String> {
+    if crate::remote::is_remote(session_id) {
+        return crate::remote::steer(session_id, &text, &run_id);
+    }
     let s = with_sessions(|m| m.get(&session_id).cloned())
         .ok_or_else(|| format!("chat session {session_id} not found"))?;
-    if matches!(s.engine, Engine::Codex) {
-        return codex_steer(&s, &text);
+    let _operation = s.operation_lock.lock();
+    if !active_run_matches(session_id, &run_id) {
+        return Err("stale or missing chat run".into());
     }
-    Err("steering not supported for this engine".into())
+    let steerable = with_runs(|runs| {
+        runs.get(&session_id)
+            .is_some_and(|active| active.run_id == run_id && !active.interrupting)
+    });
+    if !steerable {
+        return Err("chat run is interrupting".into());
+    }
+    let images = image_paths.unwrap_or_default();
+    match s.engine {
+        Engine::Codex => {
+            if !images.is_empty() {
+                return Err("codex steer is text-only — image messages stay queued".into());
+            }
+            codex_steer(&s, &text)
+        }
+        Engine::Claude => {
+            // No live turn → nothing to steer into; Err makes the frontend fall
+            // back to a normal send/queue instead of silently starting a turn
+            // the composer doesn't know about.
+            if !s.busy.load(Ordering::SeqCst) {
+                return Err("no active claude turn to steer".into());
+            }
+            let line = if images.is_empty() {
+                user_line(&text)
+            } else {
+                user_line_with_images(&text, &images)
+            };
+            write_line(session_id, &line)
+        }
+        Engine::Opencode => Err("steering not supported for this engine".into()),
+    }
 }
 
 /// Writes a raw, already-formed JSON line to a session's stdin (must end in
@@ -1953,6 +2449,52 @@ pub fn chat_steer(session_id: u32, text: String) -> Result<(), String> {
 /// without touching Rust (same philosophy as the dumb-pipe stdout reader).
 #[tauri::command]
 pub fn chat_send_raw(session_id: u32, line: String) -> Result<(), String> {
+    // codex sessions don't speak claude's control protocol. The frontend sends
+    // the SAME claude `control_response` shape for an approval decision (parity
+    // with the ApprovalCard); translate it into codex's JSON-RPC response on the
+    // held request id (see pending_approvals). Anything that isn't a recognized
+    // codex approval reply is dropped (codex has no other raw-stdin protocol).
+    if let Some(s) = with_sessions(|m| m.get(&session_id).cloned()) {
+        if matches!(s.engine, Engine::Codex) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                let resp = v.get("response");
+                let rid = resp
+                    .and_then(|r| r.get("request_id"))
+                    .and_then(|x| x.as_str());
+                if let Some(rid) = rid {
+                    if let Some(rpc_id) = s.pending_approvals.lock().remove(rid) {
+                        // claude inner shape: response.response.behavior = allow|deny.
+                        let behavior = resp
+                            .and_then(|r| r.get("response"))
+                            .and_then(|inner| inner.get("behavior"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("deny");
+                        let allow_always = resp
+                            .and_then(|r| r.get("response"))
+                            .and_then(|inner| inner.get("updatedPermissions"))
+                            .is_some();
+                        // codex decision enum: approved | approved_for_session |
+                        // denied | abort.
+                        let decision = match (behavior, allow_always) {
+                            ("allow", true) => "approved_for_session",
+                            ("allow", false) => "approved",
+                            _ => "denied",
+                        };
+                        codex_rpc_write(
+                            &s,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": rpc_id,
+                                "result": { "decision": decision }
+                            }),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
     let line = if line.ends_with('\n') {
         line
     } else {
@@ -1965,9 +2507,37 @@ pub fn chat_send_raw(session_id: u32, line: String) -> Result<(), String> {
 /// errors from an already-dead child. Dropping the stored `ChildStdin` closes
 /// the pipe, which lets the child exit cleanly if `kill` raced.
 #[tauri::command]
-pub fn chat_stop(session_id: u32) -> Result<(), String> {
-    let removed = with_sessions(|m| m.remove(&session_id));
+pub fn chat_stop(session_id: u32, run_id: Option<String>) -> Result<(), String> {
+    if crate::remote::is_remote(session_id) {
+        return crate::remote::stop(session_id);
+    }
+    // Resolve the exact Arc before locking. A later registry mutation must never
+    // let this stop tear down a replacement session that reused the numeric id.
+    let Some(session) = with_sessions(|m| m.get(&session_id).cloned()) else {
+        return Ok(());
+    };
+    let _operation = session.operation_lock.lock();
+    if let Some(run_id) = run_id.as_deref() {
+        if !active_run_matches(session_id, run_id) {
+            return Err("stale or missing chat run".into());
+        }
+    }
+    let removed = with_sessions(|m| {
+        if m.get(&session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &session))
+        {
+            m.remove(&session_id)
+        } else {
+            None
+        }
+    });
     if let Some(s) = removed {
+        // The per-turn engine is killed rather than RPC-interrupted, but the
+        // renderer still needs the same truthful running → interrupting →
+        // interrupted progression before this synthetic result lands.
+        if let Some(run_id) = run_id.as_deref() {
+            mark_interrupting(&s, run_id)?;
+        }
         s.busy.store(false, Ordering::SeqCst);
         s.detached.store(false, Ordering::SeqCst);
         s.notify_on_done.store(false, Ordering::SeqCst);
@@ -1975,6 +2545,7 @@ pub fn chat_stop(session_id: u32) -> Result<(), String> {
             &s,
             "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"text\":\"stopped by user\",\"total_cost_usd\":0}",
         );
+        emit_terminal(&s, "interrupted");
         if let Some(child) = s.child.lock().as_mut() {
             let _ = child.kill();
             let _ = child.wait();
@@ -2003,6 +2574,21 @@ pub struct ChatSessionInfo {
     /// Model id used when the session was recorded, if known.
     #[serde(default)]
     pub model: String,
+    /// The MOST RECENT user message in the conversation (preview line in the
+    /// /resume picker). The `title` stays the FIRST user message (a stable
+    /// label); this surfaces "where you left off". Populated lazily by
+    /// `list_chat_sessions` from the transcript/rollout; empty when unknown.
+    #[serde(default)]
+    pub last_user: String,
+    /// Provenance of a Codex thread — the catalog `source` / rollout `originator`
+    /// (`aios-shell`, `Codex Desktop`, `cli`, `vscode`, …). Lets the picker badge
+    /// where a thread came from. Empty for claude/opencode or when unknown.
+    #[serde(default)]
+    pub source: String,
+    /// Whether a Codex thread is archived in Codex's catalog. Archived threads are
+    /// filtered out of the picker; always false for claude/opencode + AIOS-local.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// One rendered turn loaded from a transcript, to repaint a resumed conversation.
@@ -2019,16 +2605,61 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn sessions_store_in(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".aios/state/chat-sessions.json")
+}
+
 fn sessions_store() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(std::path::PathBuf::from(home).join(".aios/state/chat-sessions.json"))
+    Some(sessions_store_in(std::path::Path::new(&home)))
+}
+
+fn load_store_in(home: &std::path::Path) -> Vec<ChatSessionInfo> {
+    std::fs::read_to_string(sessions_store_in(home))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<ChatSessionInfo>>(&s).ok())
+        .unwrap_or_default()
 }
 
 fn load_store() -> Vec<ChatSessionInfo> {
-    sessions_store()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<Vec<ChatSessionInfo>>(&s).ok())
-        .unwrap_or_default()
+    match std::env::var("HOME") {
+        Ok(home) => load_store_in(std::path::Path::new(&home)),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_store_in(home: &std::path::Path, store: &[ChatSessionInfo]) {
+    let path = sessions_store_in(home);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(json) = serde_json::to_string(store) {
+        let _ = std::fs::write(&tmp, json);
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+fn save_store(store: &[ChatSessionInfo]) {
+    if let Some(path) = sessions_store() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(json) = serde_json::to_string(store) {
+            let _ = std::fs::write(&tmp, json);
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+fn prune_store_session(id: &str) {
+    let mut store = load_store();
+    let before = store.len();
+    store.retain(|session| session.id != id);
+    if store.len() != before {
+        save_store(&store);
+    }
 }
 
 /// Records (upserts) a chat-pane session so `/resume` can list ONLY the chats
@@ -2040,13 +2671,22 @@ pub fn record_chat_session(
     cwd: Option<String>,
     engine: Option<String>,
     model: Option<String>,
+    // True only on a REAL content advance (a genuine user send). False for
+    // bookkeeping upserts — a no-op resume that merely re-keys the entry to a
+    // fresh claude session_id, or a metadata refresh. Bumping mtime on every
+    // upsert scrambled the recency order in the /resume picker (a session you
+    // only RE-OPENED jumped to the top over one you actually worked in), so we
+    // only advance mtime when there's true activity. Defaults to true so older
+    // callers / the web path keep the previous behavior.
+    bump_mtime: Option<bool>,
 ) -> Result<(), String> {
     if id.trim().is_empty() {
         return Ok(());
     }
+    let bump_mtime = bump_mtime.unwrap_or(true);
     let mut store = load_store();
     let trimmed = {
-        let t = title.trim().replace('\n', " ");
+        let t = clean_chat_resume_text(&title);
         if t.chars().count() > 90 {
             format!("{}…", t.chars().take(90).collect::<String>())
         } else if t.is_empty() {
@@ -2057,7 +2697,9 @@ pub fn record_chat_session(
     };
     let now = now_secs();
     if let Some(existing) = store.iter_mut().find(|s| s.id == id) {
-        existing.mtime = now;
+        if bump_mtime {
+            existing.mtime = now;
+        }
         if !title.trim().is_empty() {
             existing.title = trimmed;
         }
@@ -2075,43 +2717,353 @@ pub fn record_chat_session(
             mtime: now,
             engine: engine.unwrap_or_default(),
             model: model.unwrap_or_default(),
+            last_user: String::new(),
+            source: String::new(),
+            archived: false,
         });
     }
     store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
     store.truncate(200);
-    if let Some(path) = sessions_store() {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string(&store) {
-            let _ = std::fs::write(&tmp, json);
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
+    save_store(&store);
     Ok(())
 }
 
-/// Lists chat-pane sessions plus local Codex rollouts, newest first.
+/// Lists chat-pane sessions for the `/resume` picker, newest first. Merges TWO
+/// sources: the AIOS-local allowlist (`~/.aios/state/chat-sessions.json`, chats
+/// STARTED in the pane) and Codex's shared thread catalog (Codex Desktop / TUI
+/// threads AIOS never recorded but which live in the same `~/.codex`). See
+/// `list_chat_sessions_in_home` for the merge/dedup logic.
 #[tauri::command]
 pub fn list_chat_sessions(limit: Option<u32>) -> Vec<ChatSessionInfo> {
-    let mut store = load_store();
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::Path::new(&home);
-        for session in &mut store {
-            if session.engine.is_empty() {
-                session.engine = infer_session_engine(home, &session.id).to_string();
-            }
+    match std::env::var("HOME") {
+        Ok(home) => list_chat_sessions_in_home(std::path::Path::new(&home), limit),
+        Err(_) => {
+            // No HOME → can't resolve either source. Fall back to the raw store
+            // (which will also be empty without HOME), sorted + truncated.
+            let mut store = load_store();
+            store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+            store.truncate(limit.unwrap_or(40) as usize);
+            store
         }
-        for session in discover_codex_sessions(home, 200) {
-            if !store.iter().any(|existing| existing.id == session.id) {
-                store.push(session);
+    }
+}
+
+/// Home-scoped core of `list_chat_sessions` (testable against a fixture home).
+/// 1. Load the AIOS-local store, infer missing engines, prune dead transcripts.
+/// 2. Merge Codex's shared catalog, deduped by thread id — the AIOS-local entry
+///    ALWAYS wins (keeps its curated title + activity-tracked mtime); a catalog
+///    row only ADDS threads AIOS never recorded (Codex Desktop / TUI). Archived
+///    catalog threads and threads whose rollout is gone are skipped.
+/// 3. Sort most-recently-updated first, truncate, enrich the visible window with
+///    each thread's last user message (the "where you left off" preview).
+fn list_chat_sessions_in_home(home: &std::path::Path, limit: Option<u32>) -> Vec<ChatSessionInfo> {
+    let mut store = load_store_in(home);
+    for session in &mut store {
+        if session.engine.is_empty() {
+            session.engine = infer_session_engine(home, &session.id).to_string();
+        }
+    }
+    let before_prune = store.len();
+    store.retain(|session| match session.engine.as_str() {
+        "codex" => find_codex_rollout_in_home(home, &session.id).is_some(),
+        "claude" => find_claude_transcript_in_home(home, &session.id).is_some(),
+        _ => true,
+    });
+    if store.len() != before_prune {
+        save_store_in(home, &store);
+    }
+
+    // ── merge Codex's shared catalog (Desktop/TUI threads absent from the store) ──
+    let known: std::collections::HashSet<String> = store.iter().map(|s| s.id.clone()).collect();
+    // one walk of the sessions trees, not one find_codex_rollout_in_home() walk
+    // per catalog row — the catalog can hold hundreds of threads.
+    let mut rollout_ids = HashSet::new();
+    for rel in [".codex/sessions", ".codex-chat/sessions"] {
+        collect_codex_rollout_ids(&home.join(rel), &mut rollout_ids, 0);
+    }
+    for row in read_codex_catalog(home) {
+        if row.archived {
+            continue; // archived threads stay out of the picker
+        }
+        if known.contains(&row.id) {
+            continue; // AIOS-local entry wins the dedup — never double-list
+        }
+        // resume needs the rollout file on disk; skip catalog rows whose rollout
+        // was pruned (keeps parity with the store's own existence check above).
+        if !rollout_ids.contains(&row.id) {
+            continue;
+        }
+        store.push(row);
+    }
+
+    store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    store.truncate(limit.unwrap_or(40) as usize);
+    // Enrich ONLY the returned (post-truncate) entries with their most-recent
+    // user message, for the picker's "where you left off" preview. Bounded to
+    // the visible window so we never read hundreds of transcripts.
+    for session in &mut store {
+        session.title = clean_chat_resume_text(&session.title);
+        session.last_user = last_user_text(home, &session.id).unwrap_or_default();
+    }
+    store
+}
+
+/// Reads Codex's shared thread catalog into `ChatSessionInfo` rows (engine=codex).
+/// Primary source is the sqlite catalog (`~/.codex/state_5.sqlite`, table
+/// `threads`) opened READ-ONLY + immutable so we never lock/mutate Codex's live
+/// db. Falls back to scanning `~/.codex/sessions/**/rollout-*.jsonl` metadata if
+/// the db is missing or its schema drifts (returns nothing parseable).
+fn read_codex_catalog(home: &std::path::Path) -> Vec<ChatSessionInfo> {
+    let db = home.join(".codex/state_5.sqlite");
+    match read_codex_catalog_sqlite(&db) {
+        Ok(rows) if !rows.is_empty() => rows,
+        _ => read_codex_catalog_rollouts(home),
+    }
+}
+
+/// Percent-encodes the handful of characters that would break a `file:` sqlite
+/// URI (space / query / fragment / percent). Enough for real home paths.
+fn encode_sqlite_uri_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            ' ' => out.push_str("%20"),
+            '?' => out.push_str("%3F"),
+            '#' => out.push_str("%23"),
+            '%' => out.push_str("%25"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Codex owns this database. `mode=ro` gets a normal SQLite read-only
+/// connection so a WAL-backed catalog includes the newest committed desktop
+/// threads; it never creates, writes, or upgrades the database. Do not use
+/// `immutable=1` here: immutable snapshots ignore the live WAL file and can
+/// make the picker miss a thread that was just created in Codex Desktop.
+fn codex_catalog_read_uri(db: &std::path::Path) -> String {
+    format!("file:{}?mode=ro", encode_sqlite_uri_path(db))
+}
+
+fn read_codex_catalog_sqlite(db: &std::path::Path) -> Result<Vec<ChatSessionInfo>, String> {
+    if !db.exists() {
+        return Err("no codex catalog db".into());
+    }
+    let uri = codex_catalog_read_uri(db);
+    let conn = rusqlite::Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| e.to_string())?;
+    // A writer can briefly own a non-WAL migration lock. Wait a tiny bounded
+    // interval, then the caller falls back to rollout scanning rather than
+    // making the `/resume` picker feel stuck.
+    conn.busy_timeout(std::time::Duration::from_millis(150))
+        .map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, \
+                    COALESCE(NULLIF(title,''), NULLIF(first_user_message,''), NULLIF(preview,'')) AS title, \
+                    COALESCE(NULLIF(preview,''), NULLIF(first_user_message,'')) AS preview, \
+                    cwd, \
+                    COALESCE(updated_at_ms/1000, updated_at, 0) AS upd, \
+                    COALESCE(NULLIF(source,''), NULLIF(thread_source,'')) AS source, \
+                    COALESCE(NULLIF(model,''), '') AS model, \
+                    COALESCE(archived, 0) AS archived \
+             FROM threads \
+             ORDER BY COALESCE(recency_at_ms, updated_at_ms, updated_at*1000, 0) DESC \
+             LIMIT 500",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            let id: String = r.get(0)?;
+            let title: Option<String> = r.get(1)?;
+            let preview: Option<String> = r.get(2)?;
+            let cwd: Option<String> = r.get(3)?;
+            let upd: i64 = r.get(4).unwrap_or(0);
+            let source: Option<String> = r.get(5)?;
+            let model: Option<String> = r.get(6)?;
+            let archived: i64 = r.get(7).unwrap_or(0);
+            Ok(ChatSessionInfo {
+                id,
+                title: title
+                    .clone()
+                    .or_else(|| preview.clone())
+                    .unwrap_or_default(),
+                cwd: cwd.unwrap_or_default(),
+                mtime: upd.max(0) as u64,
+                engine: "codex".to_string(),
+                model: model.unwrap_or_default(),
+                last_user: preview.unwrap_or_default(),
+                source: source.unwrap_or_default(),
+                archived: archived != 0,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        if !row.id.trim().is_empty() {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// Fallback catalog: scan `~/.codex/sessions` (and the legacy fast-mode home) for
+/// rollout files and build a row from each rollout's `session_meta` + first/last
+/// user turn. Used only when the sqlite catalog is unreadable.
+fn read_codex_catalog_rollouts(home: &std::path::Path) -> Vec<ChatSessionInfo> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for rel in [".codex/sessions", ".codex-chat/sessions"] {
+        collect_rollout_catalog(&home.join(rel), &mut out, &mut seen, 0);
+    }
+    out
+}
+
+fn collect_rollout_catalog(
+    dir: &std::path::Path,
+    out: &mut Vec<ChatSessionInfo>,
+    seen: &mut std::collections::HashSet<String>,
+    depth: u8,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_catalog(&path, out, seen, depth + 1);
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                if let Some(row) = rollout_catalog_entry(&path) {
+                    if seen.insert(row.id.clone()) {
+                        out.push(row);
+                    }
+                }
             }
         }
     }
-    store.sort_by(|a, b| b.mtime.cmp(&a.mtime));
-    store.truncate(limit.unwrap_or(40) as usize);
-    store
+}
+
+fn rollout_catalog_entry(path: &std::path::Path) -> Option<ChatSessionInfo> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut id = String::new();
+    let mut cwd = String::new();
+    let mut source = String::new();
+    let mut model = String::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+            if let Some(p) = v.get("payload") {
+                id = p
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                cwd = p
+                    .get("cwd")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                source = p
+                    .get("originator")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| p.get("source").and_then(|x| x.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                model = p
+                    .get("model")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| p.get("model_provider").and_then(|x| x.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+            }
+            break; // session_meta is the first line — metadata done
+        }
+    }
+    if id.trim().is_empty() {
+        id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(id_from_codex_rollout_stem)
+            .unwrap_or_default();
+    }
+    if id.trim().is_empty() {
+        return None;
+    }
+    let turns = parse_codex_rollout(&text);
+    let title = turns
+        .iter()
+        .find(|t| t.role == "user")
+        .map(|t| t.text.clone())
+        .unwrap_or_else(|| "(codex thread)".to_string());
+    let last_user = turns
+        .iter()
+        .rev()
+        .find(|t| t.role == "user")
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(ChatSessionInfo {
+        id,
+        title,
+        cwd,
+        mtime,
+        engine: "codex".to_string(),
+        model,
+        last_user,
+        source,
+        archived: false,
+    })
+}
+
+/// Reads the MOST RECENT user-authored text from a session's transcript/rollout.
+/// Handles both engines via the same files `read_chat_transcript` reads: a claude
+/// `*.jsonl` at `~/.claude/projects/*/<id>.jsonl`, or a codex rollout. Returns the
+/// last user turn (trimmed, single-lined, capped) — what the user said last, i.e.
+/// where they left off. `None` if no transcript / no user turn is found.
+fn last_user_text(home: &std::path::Path, id: &str) -> Option<String> {
+    let mut turns: Option<Vec<ChatTurn>> =
+        find_claude_transcript_in_home(home, id).and_then(|fp| {
+            std::fs::read_to_string(fp)
+                .ok()
+                .map(|text| parse_claude_transcript(&text))
+        });
+    if turns.is_none() {
+        if let Some(fp) = find_codex_rollout_in_home(home, id) {
+            if let Ok(text) = std::fs::read_to_string(&fp) {
+                turns = Some(parse_codex_rollout(&text));
+            }
+        }
+    }
+    let last = turns?
+        .into_iter()
+        .rev()
+        .find(|t| t.role == "user")
+        .map(|t| t.text)?;
+    let one_line = clean_chat_resume_text(&last);
+    if one_line.is_empty() {
+        return None;
+    }
+    Some(if one_line.chars().count() > 120 {
+        format!("{}…", one_line.chars().take(120).collect::<String>())
+    } else {
+        one_line
+    })
 }
 
 /// Loads a past session's conversation (user + assistant text turns) so the pane
@@ -2125,16 +3077,9 @@ pub fn read_chat_transcript(id: String) -> Vec<ChatTurn> {
     let Ok(home) = std::env::var("HOME") else {
         return Vec::new();
     };
-    // ── claude: ~/.claude/projects/*/<id>.jsonl ──
-    let projects = std::path::PathBuf::from(&home).join(".claude/projects");
-    if let Ok(dirs) = std::fs::read_dir(&projects) {
-        for dir in dirs.flatten() {
-            let cand = dir.path().join(format!("{id}.jsonl"));
-            if cand.is_file() {
-                if let Ok(text) = std::fs::read_to_string(&cand) {
-                    return parse_claude_transcript(&text);
-                }
-            }
+    if let Some(fp) = find_claude_transcript_in_home(std::path::Path::new(&home), &id) {
+        if let Ok(text) = std::fs::read_to_string(fp) {
+            return parse_claude_transcript(&text);
         }
     }
     // ── codex: ~/.codex-chat/sessions OR ~/.codex/sessions ──
@@ -2147,6 +3092,25 @@ pub fn read_chat_transcript(id: String) -> Vec<ChatTurn> {
         }
     }
     Vec::new()
+}
+
+/// Fast batch existence check for history cleanup. This intentionally validates
+/// against transcript/rollout filenames, not arbitrary text matches inside a
+/// transcript body, so pasted "stale resume id" errors do not keep dead rows alive.
+#[tauri::command]
+pub fn chat_transcripts_exist(ids: Vec<String>) -> Vec<String> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    chat_transcripts_exist_in_home(std::path::Path::new(&home), ids)
+}
+
+fn chat_transcripts_exist_in_home(home: &std::path::Path, ids: Vec<String>) -> Vec<String> {
+    let known = known_chat_transcript_ids(home);
+    ids.into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty() && known.contains(id))
+        .collect()
 }
 
 /// Parses a claude `*.jsonl` transcript → user/assistant text turns.
@@ -2176,7 +3140,7 @@ fn parse_claude_transcript(text: &str) -> Vec<ChatTurn> {
                 }
             }
         }
-        let text_acc = text_acc.trim().to_string();
+        let text_acc = display_claude_turn_text(role, &text_acc);
         if !text_acc.is_empty() {
             turns.push(ChatTurn {
                 role: role.to_string(),
@@ -2185,6 +3149,65 @@ fn parse_claude_transcript(text: &str) -> Vec<ChatTurn> {
         }
     }
     turns
+}
+
+fn display_claude_turn_text(role: &str, text: &str) -> String {
+    let mut out = text.trim().to_string();
+    if role == "user" {
+        out = strip_aios_context_capsule(&out);
+        out = strip_aios_micro_context(&out);
+        out = strip_channel_message_header(&out);
+    }
+    out.trim().to_string()
+}
+
+fn clean_chat_resume_text(text: &str) -> String {
+    let mut out = text.trim().replace('\n', " ");
+    out = strip_aios_context_capsule(&out);
+    out = strip_aios_micro_context(&out);
+    out = strip_channel_message_header(&out);
+    out.replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_aios_context_capsule(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("<aios_context>") {
+        return trimmed.to_string();
+    }
+    trimmed
+        .find("</aios_context>")
+        .map(|idx| trimmed[idx + "</aios_context>".len()..].trim().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn strip_aios_micro_context(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("── AIOS MICRO-CONTEXT") {
+        return trimmed.to_string();
+    }
+    trimmed
+        .find("\n────")
+        .map(|idx| trimmed[idx + "\n────".len()..].trim().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn strip_channel_message_header(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('[') {
+        return trimmed.to_string();
+    }
+    let Some(end) = trimmed.find("]\n") else {
+        return trimmed.to_string();
+    };
+    let header = &trimmed[1..end];
+    if header.contains(" from ") {
+        trimmed[end + 2..].trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Finds the codex rollout file for a thread id by walking the YYYY/MM/DD tree
@@ -2216,167 +3239,62 @@ fn find_codex_rollout(root: &std::path::Path, id: &str) -> Option<std::path::Pat
     walk(root, &suffix, 0)
 }
 
-/// Finds a rollout in the ChatPane-specific Codex home first, then falls back to
-/// the user's normal Codex home for older sessions created before isolation.
+/// Finds a rollout in the user's normal Codex home first, then falls back to
+/// the old ChatPane-specific Codex home used by fast mode.
 fn find_codex_rollout_in_home(home: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
-    [".codex-chat/sessions", ".codex/sessions"]
+    [".codex/sessions", ".codex-chat/sessions"]
         .iter()
         .find_map(|rel| find_codex_rollout(&home.join(rel), id))
 }
 
-fn discover_codex_sessions(home: &std::path::Path, limit: usize) -> Vec<ChatSessionInfo> {
-    let mut sessions = Vec::new();
-    for rel in [".codex-chat/sessions", ".codex/sessions"] {
-        collect_codex_rollouts(&home.join(rel), &mut sessions, limit.saturating_mul(2), 0);
+fn known_chat_transcript_ids(home: &std::path::Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    collect_claude_transcript_ids(home, &mut ids);
+    for rel in [".codex/sessions", ".codex-chat/sessions"] {
+        collect_codex_rollout_ids(&home.join(rel), &mut ids, 0);
     }
-    sessions.sort_by(|a, b| b.mtime.cmp(&a.mtime));
-    let mut seen = std::collections::HashSet::new();
-    sessions.retain(|session| seen.insert(session.id.clone()));
-    sessions.truncate(limit);
-    sessions
+    ids
 }
 
-fn collect_codex_rollouts(
-    dir: &std::path::Path,
-    out: &mut Vec<ChatSessionInfo>,
-    max: usize,
-    depth: u8,
-) {
-    if depth > 4 || out.len() >= max {
+fn collect_claude_transcript_ids(home: &std::path::Path, out: &mut HashSet<String>) {
+    let projects = home.join(".claude/projects");
+    let Ok(dirs) = std::fs::read_dir(&projects) else {
+        return;
+    };
+    for dir in dirs.flatten() {
+        let Ok(files) = std::fs::read_dir(dir.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                out.insert(stem.to_string());
+            }
+        }
+    }
+}
+
+fn collect_codex_rollout_ids(dir: &std::path::Path, out: &mut HashSet<String>, depth: u8) {
+    if depth > 4 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if out.len() >= max {
-            return;
-        }
         let path = entry.path();
         if path.is_dir() {
-            collect_codex_rollouts(&path, out, max, depth + 1);
-        } else if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
-        {
-            if let Some(session) = codex_session_info_from_rollout(&path) {
-                out.push(session);
-            }
-        }
-    }
-}
-
-fn codex_session_info_from_rollout(path: &std::path::Path) -> Option<ChatSessionInfo> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut id = String::new();
-    let mut cwd = String::new();
-    let mut model = String::new();
-    let mut title = String::new();
-
-    for line in text.lines().take(200) {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(payload) = v.get("payload") else {
-            continue;
-        };
-        if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
-            if let Some(s) = payload.get("id").and_then(|x| x.as_str()) {
-                id = s.to_string();
-            }
-            if let Some(s) = payload.get("cwd").and_then(|x| x.as_str()) {
-                cwd = s.to_string();
-            }
-            if let Some(s) = payload.get("model").and_then(|x| x.as_str()) {
-                model = s.to_string();
-            }
-            if model.is_empty() {
-                if let Some(s) = payload.get("model_slug").and_then(|x| x.as_str()) {
-                    model = s.to_string();
+            collect_codex_rollout_ids(&path, out, depth + 1);
+        } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    out.insert(id_from_codex_rollout_stem(stem));
                 }
             }
-            continue;
         }
-        if title.is_empty() {
-            if let Some(candidate) = first_codex_user_text(payload) {
-                title = title_from_text(&candidate);
-            }
-        }
-        if !id.is_empty() && !title.is_empty() {
-            break;
-        }
-    }
-
-    if id.is_empty() {
-        id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(id_from_codex_rollout_stem)
-            .unwrap_or_default();
-    }
-    if id.is_empty() {
-        return None;
-    }
-    if title.is_empty() {
-        title = "(untitled codex chat)".to_string();
-    }
-    let mtime = path
-        .metadata()
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    Some(ChatSessionInfo {
-        id,
-        title,
-        cwd,
-        mtime,
-        engine: "codex".to_string(),
-        model,
-    })
-}
-
-fn first_codex_user_text(payload: &serde_json::Value) -> Option<String> {
-    if payload.get("type").and_then(|t| t.as_str()) != Some("message") {
-        return None;
-    }
-    if payload.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return None;
-    }
-    let mut text_acc = String::new();
-    for block in payload.get("content").and_then(|c| c.as_array())? {
-        match block.get("type").and_then(|t| t.as_str()) {
-            Some("input_text") | Some("text") => {
-                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                    text_acc.push_str(t);
-                }
-            }
-            _ => {}
-        }
-    }
-    let text = text_acc.trim();
-    if text.is_empty()
-        || text.starts_with("<permissions")
-        || text.starts_with("<user_instructions")
-        || text.starts_with("<environment_context")
-    {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
-fn title_from_text(text: &str) -> String {
-    let one_line = text.trim().replace('\n', " ");
-    if one_line.chars().count() > 90 {
-        format!("{}…", one_line.chars().take(90).collect::<String>())
-    } else if one_line.is_empty() {
-        "(untitled codex chat)".to_string()
-    } else {
-        one_line
     }
 }
 
@@ -2386,6 +3304,53 @@ fn id_from_codex_rollout_stem(stem: &str) -> String {
     stem.find("-019")
         .map(|idx| stem[idx + 1..].to_string())
         .unwrap_or_else(|| stem.strip_prefix("rollout-").unwrap_or(stem).to_string())
+}
+
+fn find_claude_transcript_in_home(home: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
+    find_claude_transcript_in_config_dir(&home.join(".claude"), id)
+}
+
+/// `config_dir` is a CLAUDE_CONFIG_DIR (e.g. ~/.claude or ~/.claude-fhe) —
+/// transcripts live at `<config_dir>/projects/<encoded-cwd>/<id>.jsonl`.
+fn find_claude_transcript_in_config_dir(
+    config_dir: &std::path::Path,
+    id: &str,
+) -> Option<std::path::PathBuf> {
+    if id.trim().is_empty() {
+        return None;
+    }
+    let projects = config_dir.join("projects");
+    let Ok(dirs) = std::fs::read_dir(&projects) else {
+        return None;
+    };
+    for dir in dirs.flatten() {
+        let cand = dir.path().join(format!("{id}.jsonl"));
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn validate_claude_resume_in_home(
+    home: &std::path::Path,
+    resume: Option<String>,
+) -> (Option<String>, Option<String>) {
+    validate_claude_resume_in_dir(&home.join(".claude"), resume)
+}
+
+fn validate_claude_resume_in_dir(
+    config_dir: &std::path::Path,
+    resume: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let Some(id) = resume.filter(|s| !s.trim().is_empty()) else {
+        return (None, None);
+    };
+    if find_claude_transcript_in_config_dir(config_dir, &id).is_some() {
+        (Some(id), None)
+    } else {
+        (None, Some(id))
+    }
 }
 
 fn infer_session_engine(home: &std::path::Path, id: &str) -> &'static str {
@@ -2472,9 +3437,632 @@ fn parse_codex_rollout(text: &str) -> Vec<ChatTurn> {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_config_without_mcp_servers, discover_codex_sessions, find_codex_rollout_in_home,
-        infer_session_engine,
+        adapt_codex_appserver_frame, buffer_push, chat_transcripts_exist_in_home,
+        codex_appserver_bin, codex_config_without_mcp_servers, find_claude_transcript_in_home,
+        find_codex_rollout_in_home, infer_session_engine, list_chat_sessions_in_home,
+        parse_claude_transcript, read_codex_catalog, slim_user_image_line,
+        validate_claude_resume_in_home, ChatSession, Engine,
     };
+    use aios_chat_core::session::REPLAY_BYTE_CAP;
+    use parking_lot::Mutex;
+    use serde_json::json;
+    use std::collections::{HashMap, VecDeque};
+    use std::io::Read;
+    use std::process::{Child, ChildStdout, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn test_codex_session() -> Arc<ChatSession> {
+        Arc::new(ChatSession {
+            id: 0,
+            engine: Engine::Codex,
+            child: Mutex::new(None),
+            stdin: Mutex::new(None),
+            thread_id: Mutex::new(None),
+            cwd: Mutex::new(None),
+            model: Mutex::new(None),
+            effort: Mutex::new(None),
+            sink: Mutex::new(None),
+            buffer: Mutex::new(VecDeque::new()),
+            buffer_bytes: AtomicUsize::new(0),
+            claude_id: Mutex::new(None),
+            title: Mutex::new(String::new()),
+            busy: AtomicBool::new(false),
+            operation_lock: Mutex::new(()),
+            detached: AtomicBool::new(false),
+            notify_on_done: AtomicBool::new(false),
+            events: Box::new(aios_chat_core::NoopEvents),
+            rpc_id: AtomicU64::new(1),
+            pending_turn: Mutex::new(None),
+            active_turn: Mutex::new(None),
+            pending_controls: Mutex::new(VecDeque::new()),
+            pending_steers: Mutex::new(HashMap::new()),
+            answer_item: Mutex::new(None),
+            answer_streamed: AtomicBool::new(false),
+            pending_approvals: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn test_codex_session_with_rpc_capture() -> (Arc<ChatSession>, Child, ChildStdout) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn rpc capture");
+        let stdin = child.stdin.take().expect("capture stdin");
+        let stdout = child.stdout.take().expect("capture stdout");
+        let sess = test_codex_session();
+        *sess.stdin.lock() = Some(stdin);
+        (sess, child, stdout)
+    }
+
+    fn finish_rpc_capture(
+        sess: &Arc<ChatSession>,
+        mut child: Child,
+        mut stdout: ChildStdout,
+    ) -> String {
+        drop(sess.stdin.lock().take());
+        let mut captured = String::new();
+        stdout
+            .read_to_string(&mut captured)
+            .expect("read rpc capture");
+        child.wait().expect("wait rpc capture");
+        captured
+    }
+
+    /// Registers a session under a unique high id (clear of NEXT_ID's range)
+    /// so command-level tests can exercise the global registry without
+    /// interfering with each other.
+    fn register_test_session(id: u32, engine: Engine, busy: bool) {
+        let sess = Arc::new(ChatSession {
+            engine,
+            busy: AtomicBool::new(busy),
+            id,
+            ..match Arc::try_unwrap(test_codex_session()) {
+                Ok(s) => s,
+                Err(_) => unreachable!("fresh test session has one owner"),
+            }
+        });
+        super::with_sessions(|m| {
+            m.insert(id, sess);
+        });
+        super::with_runs(|runs| {
+            runs.insert(
+                id,
+                super::LiveRun {
+                    run_id: format!("test-run-{id}"),
+                    interrupting: false,
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn chat_steer_routes_and_rejects_per_engine() {
+        // claude with no live turn → Err (frontend falls back to send/queue)…
+        register_test_session(900_001, Engine::Claude, false);
+        let e = super::chat_steer(900_001, "x".into(), None, "test-run-900001".into()).unwrap_err();
+        assert!(e.contains("no active claude turn"), "got: {e}");
+        // …and with a live turn it attempts the stdin write (no stdin in the
+        // test session → the write path is reached and reports it, instead of
+        // the no-active-turn gate firing).
+        register_test_session(900_002, Engine::Claude, true);
+        let e = super::chat_steer(900_002, "x".into(), None, "test-run-900002".into()).unwrap_err();
+        assert!(e.contains("stdin"), "got: {e}");
+        // codex steering is text-only: image-carrying messages must stay queued.
+        register_test_session(900_003, Engine::Codex, true);
+        let e = super::chat_steer(
+            900_003,
+            "x".into(),
+            Some(vec!["/tmp/i.png".into()]),
+            "test-run-900003".into(),
+        )
+        .unwrap_err();
+        assert!(e.contains("text-only"), "got: {e}");
+        // opencode has no mid-turn channel at all.
+        register_test_session(900_004, Engine::Opencode, true);
+        assert!(super::chat_steer(900_004, "x".into(), None, "test-run-900004".into()).is_err());
+        // A stop wins over a concurrent steer even if the renderer has not yet
+        // received the interrupting lifecycle frame.
+        register_test_session(900_005, Engine::Claude, true);
+        let run_id = "test-run-900005";
+        super::mark_interrupting(
+            &super::with_sessions(|m| m.get(&900_005).cloned()).expect("session"),
+            run_id,
+        )
+        .expect("mark interrupting");
+        let e = super::chat_steer(900_005, "x".into(), None, run_id.into()).unwrap_err();
+        assert!(e.contains("interrupting"), "got: {e}");
+        super::with_sessions(|m| {
+            for id in [900_001, 900_002, 900_003, 900_004, 900_005] {
+                m.remove(&id);
+            }
+        });
+        super::with_runs(|runs| {
+            for id in [900_001, 900_002, 900_003, 900_004, 900_005] {
+                runs.remove(&id);
+            }
+        });
+    }
+
+    #[test]
+    fn codex_steer_mismatch_resyncs_from_the_error_and_retries_once() {
+        let (sess, child, stdout) = test_codex_session_with_rpc_capture();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        *sess.active_turn.lock() = Some("turn-old".into());
+        super::codex_steer(&sess, "new instruction").expect("steer accepted");
+        // codex rejects the stale expectedTurnId and reports the ACTUAL id —
+        // the adapter must resync + retry, not tear the running turn down.
+        let out = super::adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"expected active turn id `turn-old` but found `turn-new`"}}"#,
+        );
+        assert!(out.is_empty(), "mismatch must recover silently: {out:?}");
+        assert_eq!(sess.active_turn.lock().as_deref(), Some("turn-new"));
+        let captured = finish_rpc_capture(&sess, child, stdout);
+        let steers: Vec<&str> = captured
+            .lines()
+            .filter(|l| l.contains("turn/steer"))
+            .collect();
+        assert_eq!(steers.len(), 2, "original + exactly one retry: {captured}");
+        assert!(
+            steers[1].contains(r#""expectedTurnId":"turn-new""#),
+            "retry must use the server-reported id: {captured}"
+        );
+        // A SECOND rejection of the (marked) retry re-queues to the frontend
+        // instead of looping — and still leaves the live turn's state intact.
+        let out = super::adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"expected active turn id `turn-new` but found `turn-newer`"}}"#,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(
+            out[0].contains("codex_steer_requeued") && out[0].contains("new instruction"),
+            "got: {out:?}"
+        );
+        assert!(
+            out[0].contains(r#""type":"system""#),
+            "must not be a fatal result line: {out:?}"
+        );
+        assert!(
+            sess.active_turn.lock().is_some(),
+            "steer failure must not clear the running turn"
+        );
+    }
+
+    #[test]
+    fn codex_steer_success_response_resyncs_active_turn() {
+        let (sess, child, stdout) = test_codex_session_with_rpc_capture();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        *sess.active_turn.lock() = Some("turn-a".into());
+        super::codex_steer(&sess, "go").expect("steer accepted");
+        // the response names the turn actually steered into — adopt it.
+        let out = super::adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"turnId":"turn-b"}}"#,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(sess.active_turn.lock().as_deref(), Some("turn-b"));
+        finish_rpc_capture(&sess, child, stdout);
+    }
+
+    #[test]
+    fn codex_turn_end_requeues_undelivered_pending_steers() {
+        let sess = test_codex_session();
+        sess.busy.store(true, Ordering::SeqCst);
+        // steer lands in the turn/start → turn/started window (no id yet) …
+        super::codex_steer(&sess, "queued steer").expect("queued");
+        // … and the turn ends before `turn/started` ever supplied one. The
+        // text goes back to the frontend queue, BEFORE the result line so the
+        // pane re-queues it by the time the end-of-turn flush runs.
+        let out = super::adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"t1","usage":{}}}}"#,
+        );
+        let requeue_idx = out
+            .iter()
+            .position(|l| l.contains("codex_steer_requeued") && l.contains("queued steer"))
+            .unwrap_or_else(|| panic!("missing requeue frame: {out:?}"));
+        let result_idx = out
+            .iter()
+            .position(|l| l.contains(r#""type":"result""#))
+            .unwrap_or_else(|| panic!("missing result frame: {out:?}"));
+        assert!(
+            requeue_idx < result_idx,
+            "requeue must precede the result: {out:?}"
+        );
+    }
+
+    #[test]
+    fn claude_interrupt_write_failure_still_emits_a_terminal_lifecycle_frame() {
+        let id = 900_006;
+        register_test_session(id, Engine::Claude, true);
+        let run_id = format!("test-run-{id}");
+
+        let error = super::chat_interrupt(id, run_id.clone()).expect_err("stdin is absent");
+        assert!(error.contains("stdin"), "got: {error}");
+        let sess = super::with_sessions(|m| m.get(&id).cloned()).expect("session");
+        let frames = sess.buffer.lock().iter().cloned().collect::<Vec<_>>();
+        assert!(frames
+            .iter()
+            .any(|frame| frame.contains(r#""state":"interrupting""#)));
+        let result_idx = frames
+            .iter()
+            .position(|frame| frame.contains(r#""type":"result""#))
+            .expect("synthetic result");
+        let terminal_idx = frames
+            .iter()
+            .position(|frame| frame.contains(r#""state":"interrupted""#))
+            .expect("terminal frame");
+        assert!(
+            result_idx < terminal_idx,
+            "result must close the transcript first: {frames:?}"
+        );
+        assert!(frames.iter().any(|frame| {
+            frame.contains(r#""state":"interrupted""#) && frame.contains(&run_id)
+        }));
+
+        super::with_sessions(|m| {
+            m.remove(&id);
+        });
+        super::with_runs(|runs| {
+            runs.remove(&id);
+        });
+    }
+
+    #[test]
+    fn chat_stop_waits_for_the_session_operation_lock_before_removing_it() {
+        let id = 900_007;
+        register_test_session(id, Engine::Claude, true);
+        let run_id = format!("test-run-{id}");
+        let session = super::with_sessions(|m| m.get(&id).cloned()).expect("session");
+        let operation = session.operation_lock.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let run_id = run_id.clone();
+            move || {
+                started_tx.send(()).expect("started");
+                super::chat_stop(id, Some(run_id))
+            }
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop started");
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            super::with_sessions(|m| m.contains_key(&id)),
+            "stop must not remove the session before acquiring its operation lock"
+        );
+        drop(operation);
+        worker.join().expect("stop thread").expect("stop");
+        assert!(!super::with_sessions(|m| m.contains_key(&id)));
+        super::with_runs(|runs| {
+            runs.remove(&id);
+        });
+    }
+
+    #[test]
+    fn codex_adapter_waits_for_operation_lock_before_setting_active_turn() {
+        let sess = test_codex_session();
+        let operation = sess.operation_lock.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader_session = Arc::clone(&sess);
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).expect("started");
+            let _ = super::adapt_codex_appserver_frame(
+                &reader_session,
+                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"turn-lock"},"threadId":"thread-lock"}}"#,
+            );
+            done_tx.send(()).expect("done");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader started");
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert!(sess.active_turn.lock().is_none());
+        drop(operation);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader finished");
+        reader.join().expect("reader join");
+        assert_eq!(sess.active_turn.lock().as_deref(), Some("turn-lock"));
+    }
+
+    #[test]
+    fn lifecycle_frames_are_ordered_and_terminal_once_per_renderer_run() {
+        let sess = test_codex_session();
+        let id = 900_101;
+        let sess = Arc::new(ChatSession {
+            id,
+            ..match Arc::try_unwrap(sess) {
+                Ok(s) => s,
+                Err(_) => unreachable!("fresh test session has one owner"),
+            }
+        });
+
+        super::begin_run(&sess, "render-run-a".into());
+        super::emit_running(&sess);
+        super::mark_interrupting(&sess, "render-run-a").expect("mark interrupting");
+        super::emit_terminal(&sess, "failed");
+        super::emit_terminal(&sess, "failed");
+
+        let frames = sess.buffer.lock().iter().cloned().collect::<Vec<_>>();
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        assert!(frames[0].contains(r#""state":"starting""#));
+        assert!(frames[1].contains(r#""state":"running""#));
+        assert!(frames[2].contains(r#""state":"interrupting""#));
+        assert!(frames[3].contains(r#""state":"interrupted""#));
+        assert!(frames
+            .iter()
+            .all(|frame| frame.contains(r#""runId":"render-run-a""#)));
+    }
+
+    #[test]
+    fn codex_appserver_streams_agent_message_delta_without_item_id_as_answer() {
+        let sess = test_codex_session();
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hello"}}"#,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("\"text_delta\""));
+        assert!(out[0].contains("hello"));
+        assert!(sess.answer_streamed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn codex_appserver_streams_agent_message_delta_with_snake_item_id_as_answer() {
+        let sess = test_codex_session();
+        let _ = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"ans-1","type":"agentMessage","phase":"final_answer"}}}"#,
+        );
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"item_id":"ans-1","delta":"hello"}}"#,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("\"text_delta\""));
+        assert!(out[0].contains("hello"));
+        assert!(sess.answer_streamed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn codex_appserver_suppresses_completed_answer_after_streamed_delta_without_item_id() {
+        let sess = test_codex_session();
+        let _ = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hello"}}"#,
+        );
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","phase":"final_answer","text":"hello"}}}"#,
+        );
+
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn codex_appserver_error_response_closes_busy_turn() {
+        let sess = test_codex_session();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        sess.busy.store(true, Ordering::SeqCst);
+
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"turn already active"}}"#,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains(r#""type":"result""#), "{out:?}");
+        assert!(
+            out[0].contains(r#""subtype":"error_during_execution""#),
+            "{out:?}"
+        );
+        assert!(out[0].contains(r#""is_error":true"#), "{out:?}");
+        assert!(out[0].contains("turn already active"), "{out:?}");
+    }
+
+    #[test]
+    fn codex_appserver_nonretry_error_surfaces_server_message() {
+        let sess = test_codex_session();
+        *sess.thread_id.lock() = Some("thread-1".into());
+
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"error","params":{"willRetry":false,"error":{"message":"The 'gpt-5.6-sol' model requires a newer version of Codex."}}}"#,
+        );
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains(r#""is_error":true"#), "{out:?}");
+        assert!(
+            out[0].contains("requires a newer version of Codex"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn codex_appserver_ignores_echoed_user_message_items() {
+        let sess = test_codex_session();
+        let frame = r#"{"jsonrpc":"2.0","method":"item/started","params":{"item":{"type":"userMessage","id":"user-1","content":[{"type":"text","text":"yo"}]}}}"#;
+        assert!(adapt_codex_appserver_frame(&sess, frame).is_empty());
+
+        let frame = r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"userMessage","id":"user-1","content":[{"type":"text","text":"yo"}]}}}"#;
+        assert!(adapt_codex_appserver_frame(&sess, frame).is_empty());
+    }
+
+    #[test]
+    fn codex_interrupt_before_thread_ready_drops_queued_turn_and_frees_busy() {
+        let sess = test_codex_session();
+        *sess.pending_turn.lock() = Some(("do it".into(), Vec::new()));
+        sess.busy.store(true, Ordering::SeqCst);
+
+        let res = super::codex_interrupt(&sess);
+
+        assert!(res.is_ok());
+        assert!(sess.pending_turn.lock().is_none());
+        assert!(!sess.busy.load(Ordering::SeqCst));
+        assert!(
+            sess.buffer
+                .lock()
+                .iter()
+                .any(|line| line.contains("stopped by user") && line.contains(r#""type":"result""#)),
+            "buffer: {:?}",
+            sess.buffer.lock()
+        );
+    }
+
+    #[test]
+    fn codex_interrupt_targets_the_exact_active_turn() {
+        let (sess, child, stdout) = test_codex_session_with_rpc_capture();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        *sess.active_turn.lock() = Some("turn-7".into());
+        sess.busy.store(true, Ordering::SeqCst);
+
+        super::codex_interrupt(&sess).expect("interrupt active codex turn");
+
+        let captured = finish_rpc_capture(&sess, child, stdout);
+        let request: serde_json::Value =
+            serde_json::from_str(captured.trim()).expect("valid interrupt request");
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(request["params"]["threadId"], "thread-1");
+        assert_eq!(request["params"]["turnId"], "turn-7");
+    }
+
+    #[test]
+    fn codex_interrupt_deadline_synthesizes_one_terminal_result() {
+        let id = 900_108;
+        register_test_session(id, Engine::Codex, true);
+        let sess = super::with_sessions(|m| m.get(&id).cloned()).expect("session");
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("wedged process");
+        *sess.child.lock() = Some(child);
+        super::arm_codex_interrupt_deadline(Arc::clone(&sess), Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(40));
+        super::arm_codex_interrupt_deadline(Arc::clone(&sess), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(10));
+        let frames = sess.buffer.lock().iter().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|line| line.contains(r#""type":"result""#))
+                .count(),
+            1,
+            "{frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|line| line.contains(r#""state":"interrupted""#))
+                .count(),
+            1,
+            "{frames:?}"
+        );
+        assert!(
+            sess.child.lock().is_none(),
+            "deadline must reap the wedged process"
+        );
+        super::with_sessions(|m| {
+            m.remove(&id);
+        });
+    }
+
+    #[test]
+    fn old_codex_interrupt_deadline_never_kills_a_new_run() {
+        let id = 900_109;
+        register_test_session(id, Engine::Codex, true);
+        let sess = super::with_sessions(|m| m.get(&id).cloned()).expect("session");
+        let old_run = format!("test-run-{id}");
+        super::arm_codex_interrupt_deadline(Arc::clone(&sess), Duration::from_millis(20));
+        super::emit_terminal(&sess, "interrupted");
+        super::begin_run(&sess, format!("{old_run}-next"));
+        sess.busy.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            sess.busy.load(Ordering::SeqCst),
+            "stale watchdog touched the next run"
+        );
+        super::with_sessions(|m| {
+            m.remove(&id);
+        });
+        super::with_runs(|runs| {
+            runs.remove(&id);
+        });
+    }
+
+    #[test]
+    fn codex_interrupt_during_turn_start_waits_for_turn_id_then_targets_it() {
+        let (sess, child, stdout) = test_codex_session_with_rpc_capture();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        sess.busy.store(true, Ordering::SeqCst);
+
+        super::codex_interrupt(&sess).expect("queue interrupt until turn starts");
+        assert!(
+            sess.busy.load(Ordering::SeqCst),
+            "the run stays active until codex confirms the interruption"
+        );
+
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-8"}}}"#,
+        );
+        assert!(out.is_empty(), "turn start is lifecycle-only: {out:?}");
+
+        let captured = finish_rpc_capture(&sess, child, stdout);
+        let requests = captured
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid rpc request"))
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1, "captured: {captured}");
+        assert_eq!(requests[0]["method"], "turn/interrupt");
+        assert_eq!(requests[0]["params"]["threadId"], "thread-1");
+        assert_eq!(requests[0]["params"]["turnId"], "turn-8");
+    }
+
+    #[test]
+    fn codex_steer_during_turn_start_waits_for_turn_id_then_targets_it() {
+        let (sess, child, stdout) = test_codex_session_with_rpc_capture();
+        *sess.thread_id.lock() = Some("thread-1".into());
+        sess.busy.store(true, Ordering::SeqCst);
+
+        super::codex_steer(&sess, "change direction").expect("queue steer until turn starts");
+
+        let out = adapt_codex_appserver_frame(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-9"}}}"#,
+        );
+        assert!(out.is_empty(), "turn start is lifecycle-only: {out:?}");
+
+        let captured = finish_rpc_capture(&sess, child, stdout);
+        let requests = captured
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid rpc request"))
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1, "captured: {captured}");
+        assert_eq!(requests[0]["method"], "turn/steer");
+        assert_eq!(requests[0]["params"]["threadId"], "thread-1");
+        assert_eq!(requests[0]["params"]["expectedTurnId"], "turn-9");
+        assert_eq!(
+            requests[0]["params"]["input"][0]["text"],
+            "change direction"
+        );
+    }
+
+    #[test]
+    fn codex_prewarm_registry_keeps_only_one_spare() {
+        let mut warm = HashMap::from([("old-profile".to_string(), 41_u32)]);
+        let evicted = super::store_single_warm_codex(&mut warm, "new-profile".to_string(), 42);
+
+        assert_eq!(warm, HashMap::from([("new-profile".to_string(), 42)]));
+        assert_eq!(evicted, vec![41]);
+    }
 
     #[test]
     fn codex_chat_config_keeps_terminal_defaults_but_strips_mcp_servers() {
@@ -2488,7 +4076,7 @@ enabled = true
 command = "node"
 
 [mcp_servers.memory.env]
-CODEX_HOME = "/Users/firazfhansurie/.codex"
+CODEX_HOME = "/Users/example/.codex"
 
 [features]
 js_repl = false
@@ -2505,7 +4093,7 @@ js_repl = false
     }
 
     #[test]
-    fn finds_chatpane_codex_rollout_before_normal_codex_home() {
+    fn finds_normal_codex_rollout_before_chatpane_fast_home() {
         let root =
             std::env::temp_dir().join(format!("aios-chat-rollout-test-{}", std::process::id()));
         let chat = root.join(".codex-chat/sessions/2026/06/01");
@@ -2518,22 +4106,107 @@ js_repl = false
         std::fs::write(&chat_file, "").unwrap();
         std::fs::write(&normal_file, "").unwrap();
 
+        assert_eq!(find_codex_rollout_in_home(&root, id), Some(normal_file));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn falls_back_to_chatpane_fast_home_for_older_rollouts() {
+        let root =
+            std::env::temp_dir().join(format!("aios-normal-rollout-test-{}", std::process::id()));
+        let chat = root.join(".codex-chat/sessions/2026/06/01");
+        std::fs::create_dir_all(&chat).unwrap();
+        let id = "019e-old-thread";
+        let chat_file = chat.join(format!("rollout-chat-{id}.jsonl"));
+        std::fs::write(&chat_file, "").unwrap();
+
         assert_eq!(find_codex_rollout_in_home(&root, id), Some(chat_file));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn falls_back_to_normal_codex_home_for_older_rollouts() {
-        let root =
-            std::env::temp_dir().join(format!("aios-normal-rollout-test-{}", std::process::id()));
-        let normal = root.join(".codex/sessions/2026/06/01");
+    fn transcript_existence_uses_filenames_not_mentions_inside_rollouts() {
+        let root = std::env::temp_dir().join(format!(
+            "aios-transcript-exists-test-{}",
+            std::process::id()
+        ));
+        let normal = root.join(".codex/sessions/2026/06/20");
         std::fs::create_dir_all(&normal).unwrap();
-        let id = "019e-old-thread";
-        let normal_file = normal.join(format!("rollout-normal-{id}.jsonl"));
-        std::fs::write(&normal_file, "").unwrap();
+        let real_id = "019ee0ab-326f-7dd2-9568-4b36dd17f8d3";
+        let pasted_stale_id = "019ee09d-bef8-7173-bbd2-99076b7537ea";
+        let rollout = normal.join(format!("rollout-2026-06-20T00-16-16-{real_id}.jsonl"));
+        std::fs::write(
+            &rollout,
+            format!(
+                r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"stale codex resume id {pasted_stale_id}"}}]}}}}"#
+            ),
+        )
+        .unwrap();
 
-        assert_eq!(find_codex_rollout_in_home(&root, id), Some(normal_file));
+        let valid = chat_transcripts_exist_in_home(
+            &root,
+            vec![real_id.to_string(), pasted_stale_id.to_string()],
+        );
+
+        assert_eq!(valid, vec![real_id.to_string()]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finds_claude_transcript_before_resuming() {
+        let root = std::env::temp_dir().join(format!(
+            "aios-claude-transcript-test-{}",
+            std::process::id()
+        ));
+        let project = root.join(".claude/projects/-Users-firazfhansurie");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = "019ee0e5-a016-7b43-a0db-8a29ca2d35eb";
+        let transcript = project.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(find_claude_transcript_in_home(&root, id), Some(transcript));
+        assert_eq!(find_claude_transcript_in_home(&root, "missing"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_claude_resume_id_is_dropped_before_spawn() {
+        let root =
+            std::env::temp_dir().join(format!("aios-claude-resume-test-{}", std::process::id()));
+        let project = root.join(".claude/projects/-Users-firazfhansurie");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = "existing-claude-session";
+        std::fs::write(project.join(format!("{id}.jsonl")), "").unwrap();
+
+        assert_eq!(
+            validate_claude_resume_in_home(&root, Some(id.to_string())),
+            (Some(id.to_string()), None)
+        );
+        assert_eq!(
+            validate_claude_resume_in_home(&root, Some("missing".to_string())),
+            (None, Some("missing".to_string()))
+        );
+        assert_eq!(validate_claude_resume_in_home(&root, None), (None, None));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_transcript_repaints_bridge_message_without_transport_context() {
+        let transcript = r#"{"type":"queue-operation","operation":"enqueue","content":"ignored"}
+{"type":"user","message":{"role":"user","content":"\n── AIOS MICRO-CONTEXT ──\ntime: 2026-06-19 13:08 UTC (Fri)\n\nrecent cross-tool activity...\n────\n\n\n[discord from ferazfhansurie 21:08]\nyo"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"yo. what's up."}]}}"#;
+
+        let turns = parse_claude_transcript(transcript);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "yo");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].text, "yo. what's up.");
     }
 
     #[test]
@@ -2551,28 +4224,262 @@ js_repl = false
     }
 
     #[test]
-    fn discovers_normal_codex_rollouts_for_resume() {
-        let root =
-            std::env::temp_dir().join(format!("aios-discover-codex-test-{}", std::process::id()));
-        let normal = root.join(".codex/sessions/2026/06/01");
-        std::fs::create_dir_all(&normal).unwrap();
-        let id = "019e7f41-aaaa-bbbb-cccc-000000000001";
-        let rollout = normal.join(format!("rollout-2026-06-01t02-18-15-{id}.jsonl"));
-        let text = format!(
-            r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"/Users/firazfhansurie/Repo/firaz/aios/shell","model":"gpt-5-codex"}}}}
-{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"make resume and buttons commercial ready"}}]}}}}
-"#
+    fn slim_user_image_line_replaces_base64_with_placeholder() {
+        let line = json!({
+            "type": "user",
+            "message": { "role": "user", "content": [
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAA_huge_base64_AAAA" } },
+                { "type": "text", "text": "what is this" }
+            ]}
+        });
+        let slim = slim_user_image_line(&line).expect("image line should slim");
+        assert!(
+            !slim.contains("AAAA_huge_base64_AAAA"),
+            "base64 must be dropped: {slim}"
         );
-        std::fs::write(&rollout, text).unwrap();
+        assert!(!slim.contains("base64"), "no image source retained: {slim}");
+        assert!(slim.contains("[image]"), "placeholder kept: {slim}");
+        assert!(slim.contains("what is this"), "user text kept: {slim}");
+    }
 
-        let sessions = discover_codex_sessions(&root, 40);
+    #[test]
+    fn slim_user_image_line_ignores_text_only_user_lines() {
+        let line = json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "hi" }] }
+        });
+        assert!(slim_user_image_line(&line).is_none());
+    }
 
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, id);
-        assert_eq!(sessions[0].engine, "codex");
-        assert_eq!(sessions[0].model, "gpt-5-codex");
-        assert_eq!(sessions[0].title, "make resume and buttons commercial ready");
-        assert_eq!(sessions[0].cwd, "/Users/firazfhansurie/Repo/firaz/aios/shell");
-        let _ = std::fs::remove_dir_all(root);
+    // ---- Codex shared-catalog merge into /resume ----
+
+    /// Builds a fixture home with a rollout for `id` under
+    /// `.codex/sessions/2026/07/09/` carrying one user turn, so the thread passes
+    /// the rollout-existence filter and its title/last_user enrich.
+    fn write_fixture_rollout(root: &std::path::Path, ts: &str, id: &str, user_text: &str) {
+        let day = root.join(".codex/sessions/2026/07/09");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-07-09T{ts}-{id}.jsonl")),
+            format!(
+                r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{user_text}"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_chat_sessions_merges_codex_desktop_thread_absent_from_store() {
+        use rusqlite::Connection;
+        let root = std::env::temp_dir().join(format!("aios-catalog-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // AIOS-local codex thread (present in BOTH store + catalog → must dedup).
+        let local_id = "019f1111-aaaa-bbbb-cccc-000000000001";
+        // Codex Desktop thread (ONLY in the catalog → must be merged in).
+        let desktop_id = "019f2222-dddd-eeee-ffff-000000000002";
+        write_fixture_rollout(&root, "00-00-00", local_id, "local hello");
+        write_fixture_rollout(&root, "01-00-00", desktop_id, "desktop hello");
+
+        // AIOS store: local thread only, with a curated title AIOS must keep.
+        let store_dir = root.join(".aios/state");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(
+            store_dir.join("chat-sessions.json"),
+            format!(
+                r#"[{{"id":"{local_id}","title":"aios curated title","cwd":"/tmp","mtime":100,"engine":"codex","model":"gpt-5.5","last_user":""}}]"#
+            ),
+        )
+        .unwrap();
+
+        // Codex catalog with a schema subset matching the real `threads` table.
+        let db = root.join(".codex/state_5.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, first_user_message TEXT,
+                preview TEXT, cwd TEXT, updated_at INTEGER, updated_at_ms INTEGER,
+                recency_at_ms INTEGER, source TEXT, thread_source TEXT, model TEXT,
+                model_provider TEXT, archived INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES (?1,'','catalog title for local','local hello','local hello','/tmp',200,200000,200000,'cli','user','gpt-5.5','openai',0)",
+            [local_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES (?1,'','desktop title','desktop hello','desktop hello','/work',300,300000,300000,'Codex Desktop','user','gpt-5.5','openai',0)",
+            [desktop_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = list_chat_sessions_in_home(&root, Some(40));
+
+        // Desktop thread — invisible to the old store-only path — is now merged in.
+        let desktop = out
+            .iter()
+            .find(|s| s.id == desktop_id)
+            .expect("codex desktop thread must be merged from the catalog");
+        assert_eq!(desktop.engine, "codex");
+        assert_eq!(desktop.source, "Codex Desktop");
+        assert!(!desktop.title.is_empty(), "desktop title populated");
+        assert_eq!(desktop.last_user, "desktop hello");
+
+        // Local thread present EXACTLY once; the AIOS-local title wins the dedup.
+        let locals: Vec<_> = out.iter().filter(|s| s.id == local_id).collect();
+        assert_eq!(locals.len(), 1, "thread id must not double-list");
+        assert_eq!(locals[0].title, "aios curated title");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_catalog_falls_back_to_rollout_scan_without_sqlite() {
+        let root =
+            std::env::temp_dir().join(format!("aios-catalog-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // No state_5.sqlite → must scan rollout metadata instead.
+        let id = "019f3333-1111-2222-3333-000000000003";
+        write_fixture_rollout(&root, "02-00-00", id, "fallback hello");
+
+        let rows = read_codex_catalog(&root);
+        let row = rows
+            .iter()
+            .find(|r| r.id == id)
+            .expect("rollout fallback must surface the thread");
+        assert_eq!(row.engine, "codex");
+        assert_eq!(row.title, "fallback hello");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_catalog_uri_is_read_only_without_immutable_snapshot_mode() {
+        let uri = super::codex_catalog_read_uri(std::path::Path::new(
+            "/tmp/codex catalog/state_5.sqlite",
+        ));
+
+        assert_eq!(uri, "file:/tmp/codex%20catalog/state_5.sqlite?mode=ro");
+        assert!(!uri.contains("immutable"));
+    }
+
+    #[test]
+    fn codex_appserver_bin_honors_explicit_override() {
+        // The env override wins over any installed binary — deterministic across
+        // machines and documents the intended precedence after the inversion.
+        std::env::set_var("AIOS_CODEX_APPSERVER_BIN", "/tmp/custom-codex-appserver");
+        assert_eq!(codex_appserver_bin(), "/tmp/custom-codex-appserver");
+        std::env::remove_var("AIOS_CODEX_APPSERVER_BIN");
+    }
+
+    /// Live sanity check against the real `~/.codex/state_5.sqlite`. Ignored by
+    /// default (machine-dependent); run with:
+    ///   cargo test -p aios-shell --lib -- --ignored live_codex_catalog
+    #[test]
+    #[ignore]
+    fn live_codex_catalog_parses() {
+        let home = std::env::var("HOME").expect("HOME");
+        let rows = read_codex_catalog(std::path::Path::new(&home));
+        assert!(!rows.is_empty(), "expected codex threads in real ~/.codex");
+        assert!(rows.iter().all(|r| !r.id.trim().is_empty()));
+    }
+
+    #[test]
+    fn buffer_push_evicts_under_byte_budget() {
+        let sess = test_codex_session();
+        // One line a touch over half the byte cap; the third push must evict the
+        // oldest so total bytes stay under REPLAY_BYTE_CAP.
+        let big = "x".repeat(REPLAY_BYTE_CAP / 2 + 1024);
+        buffer_push(&sess, &big);
+        buffer_push(&sess, &big);
+        buffer_push(&sess, &big);
+        let bytes = sess.buffer_bytes.load(Ordering::Relaxed);
+        assert!(bytes <= REPLAY_BYTE_CAP, "over byte cap: {bytes}");
+        // Accounting matches the actual buffered content.
+        let actual: usize = sess.buffer.lock().iter().map(|l| l.len()).sum();
+        assert_eq!(actual, bytes, "byte counter drifted from buffer");
+    }
+
+    // ---- per-token IPC coalescing ----
+
+    fn text_delta_line(text: &str) -> String {
+        json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": text }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn coalescible_detects_text_delta() {
+        let line = text_delta_line("hel");
+        let got = super::coalescible_delta(&line);
+        assert!(got.is_some(), "text_delta should be coalescible");
+        let (kind, _) = got.unwrap();
+        assert_eq!(kind, "text_delta");
+    }
+
+    #[test]
+    fn coalescible_ignores_non_delta_lines() {
+        // A result / assistant / tool_use line must NOT be coalesced.
+        assert!(super::coalescible_delta(r#"{"type":"result","subtype":"success"}"#).is_none());
+        assert!(super::coalescible_delta(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#
+        )
+        .is_none());
+        // A line that merely echoes "text_delta" inside model text must not parse
+        // as a real stream_event delta.
+        assert!(super::coalescible_delta(
+            r#"{"type":"result","text":"the token type is text_delta"}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn render_run_concatenates_text_shape_identical() {
+        // Two deltas of the same kind merge into ONE stream_event carrying the
+        // concatenated text, with the index + nesting preserved.
+        let (_, template) = super::coalescible_delta(&text_delta_line("hel")).unwrap();
+        let run = super::PendingRun {
+            kind: "text_delta",
+            template,
+            text: "hello".to_string(),
+        };
+        let out = super::render_run(&run).expect("render");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["type"], "stream_event");
+        assert_eq!(v["event"]["type"], "content_block_delta");
+        assert_eq!(v["event"]["index"], 0);
+        assert_eq!(v["event"]["delta"]["type"], "text_delta");
+        assert_eq!(v["event"]["delta"]["text"], "hello");
+    }
+
+    #[test]
+    fn delta_fragment_reads_text_and_thinking() {
+        let (_, v) = super::coalescible_delta(&text_delta_line("abc")).unwrap();
+        assert_eq!(super::delta_fragment(&v, "text_delta"), "abc");
+        let think = json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": { "type": "thinking_delta", "thinking": "hmm" }
+            }
+        });
+        assert_eq!(super::delta_fragment(&think, "thinking_delta"), "hmm");
+    }
+
+    #[test]
+    fn codex_appserver_prefers_current_native_binary_over_stale_chat_snapshot() {
+        let selected = super::select_codex_appserver_bin(
+            None,
+            Some("/opt/homebrew/bin/codex".into()),
+            Some("/Users/example/.codex-chat/packages/standalone/current/codex".into()),
+        );
+
+        assert_eq!(selected.as_deref(), Some("/opt/homebrew/bin/codex"));
     }
 }

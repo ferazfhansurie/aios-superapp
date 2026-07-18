@@ -5,6 +5,7 @@
  * Self-polls so spawns/kills elsewhere reflect automatically.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
 import {
   Check,
@@ -25,19 +26,21 @@ import {
   createOracle,
   deleteOracle,
   killTmuxSession,
-  listOracles,
-  listTmuxSessions,
+  listRoster,
   renameOracle,
   type OracleInfo,
   type TmuxSession,
 } from "../lib/pty";
 import { isTauriRuntime } from "../lib/tauri";
+import { useVisible } from "../lib/useVisible";
 import { SidebarUsage } from "./SidebarUsage";
 
 interface Props {
   iconsOnly?: boolean;
   onAttachOracle: (identity: string) => void;
   onAttachTmux: (socket: string, session: string) => void;
+  moneyAgentsSlot?: ReactNode;
+  chatpaneAgentsOnly?: boolean;
 }
 
 /**
@@ -59,7 +62,13 @@ const loadHidden = (): Set<string> => {
 
 const COLLAPSE_KEY = "aios.agentsCollapsed";
 
-export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }: Props) {
+export function OracleRoster({
+  iconsOnly = false,
+  onAttachOracle,
+  onAttachTmux,
+  moneyAgentsSlot,
+  chatpaneAgentsOnly = false,
+}: Props) {
   const nativeReady = isTauriRuntime();
   const [oracles, setOracles] = useState<OracleInfo[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
@@ -90,6 +99,11 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
     });
   }, []);
 
+  // Gate polling to when the roster is actually on screen (sidebar open + not
+  // collapsed + app focused). Attached to the outermost element of both render
+  // paths below.
+  const { ref: rootRef, visible } = useVisible<HTMLDivElement>();
+
   const refresh = useCallback(async () => {
     setError(null);
     if (!nativeReady) {
@@ -99,7 +113,9 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
       return;
     }
     try {
-      const [o, s] = await Promise.all([listOracles(), listTmuxSessions()]);
+      // ONE backend call + ONE socket sweep (was listOracles()+listTmuxSessions()
+      // — two commands each re-spawning tmux on the oracle socket).
+      const { oracles: o, sessions: s } = await listRoster();
       setOracles(o);
       setSessions(s);
     } catch (e) {
@@ -110,10 +126,14 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
   }, [nativeReady]);
 
   useEffect(() => {
+    // Always do one refresh on mount so the roster isn't empty before first
+    // becoming visible, then only POLL while visible + expanded. Collapsed or
+    // sidebar-hidden → no tmux spawns at all. Interval backed off 5s → 15s.
     refresh();
-    const interval = setInterval(refresh, 5000);
+    if (!visible || collapsed) return;
+    const interval = setInterval(refresh, 15_000);
     return () => clearInterval(interval);
-  }, [refresh]);
+  }, [refresh, visible, collapsed]);
 
   // Non-oracle sessions only (oracles already live in the roster above).
   const otherSessions = sessions.filter((s) => !s.is_oracle);
@@ -139,8 +159,9 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
   };
 
   if (iconsOnly) {
+    if (chatpaneAgentsOnly) return <>{moneyAgentsSlot}</>;
     return (
-      <div className="flex flex-col items-center gap-1 border-t border-[var(--color-border)] pt-2">
+      <div ref={rootRef} className="flex flex-col items-center gap-1 border-t border-[var(--color-border)] pt-2">
         <button
           onClick={toggleCollapsed}
           className="grid h-8 w-8 place-items-center rounded-md text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
@@ -189,7 +210,7 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
   }
 
   return (
-    <div className="flex flex-col gap-3">
+    <div ref={rootRef} className="flex flex-col gap-3">
       {/* ---- oracles ---- */}
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
@@ -204,7 +225,7 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
               <span className="text-[var(--color-faint)]">({oracles.length})</span>
             )}
           </button>
-          {!collapsed && nativeReady && (
+          {!collapsed && nativeReady && !chatpaneAgentsOnly && (
             <div className="flex items-center gap-0.5">
               <button
                 onClick={() => setCreating((v) => !v)}
@@ -245,7 +266,7 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
 
         {!collapsed && (
         <div className="flex flex-col gap-1">
-          {nativeReady && !primaryRunning && (
+          {nativeReady && !primaryRunning && !chatpaneAgentsOnly && (
             <button
               onClick={spawnPrimary}
               disabled={spawning}
@@ -267,34 +288,36 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
               </div>
             </button>
           )}
-          {visibleOracles.map((o) => (
-            <OracleRow
-              key={o.session}
-              oracle={o}
-              onAttach={() => onAttachOracle(o.identity)}
-              onHide={() => toggleHidden(o.identity, true)}
-              onRename={async (to) => {
-                try {
-                  await renameOracle(o.identity, to);
-                  await refresh();
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
-                }
-              }}
-              onDelete={async (force) => {
-                try {
-                  await deleteOracle(o.identity, force);
-                  await refresh();
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
-                }
-              }}
-            />
-          ))}
+          {!chatpaneAgentsOnly &&
+            visibleOracles.map((o) => (
+              <OracleRow
+                key={o.session}
+                oracle={o}
+                onAttach={() => onAttachOracle(o.identity)}
+                onHide={() => toggleHidden(o.identity, true)}
+                onRename={async (to) => {
+                  try {
+                    await renameOracle(o.identity, to);
+                    await refresh();
+                  } catch (e) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  }
+                }}
+                onDelete={async (force) => {
+                  try {
+                    await deleteOracle(o.identity, force);
+                    await refresh();
+                  } catch (e) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  }
+                }}
+              />
+            ))}
+          {moneyAgentsSlot}
         </div>
         )}
 
-        {!collapsed && hiddenOracles.length > 0 && (
+        {!collapsed && hiddenOracles.length > 0 && !chatpaneAgentsOnly && (
           <div className="flex flex-col gap-1">
             <button
               onClick={() => setShowHidden((v) => !v)}
@@ -330,7 +353,7 @@ export function OracleRoster({ iconsOnly = false, onAttachOracle, onAttachTmux }
       </div>
 
       {/* ---- all tmux sessions ---- */}
-      {!collapsed && otherSessions.length > 0 && (
+      {!collapsed && otherSessions.length > 0 && !chatpaneAgentsOnly && (
         <div className="flex flex-col gap-1">
           <button
             onClick={() => setShowAll((v) => !v)}
@@ -637,7 +660,7 @@ function CreateOracleForm({
       <button
         type="submit"
         disabled={!name.trim()}
-        className="rounded-md bg-[var(--color-accent)] px-2 py-1 text-[11px] font-semibold text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)] disabled:opacity-40"
+        className="rounded-md bg-[var(--color-accent)] px-2 py-1 text-[11px] font-semibold text-[var(--color-accent-fg)] transition-colors hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)] disabled:opacity-40"
       >
         create
       </button>

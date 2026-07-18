@@ -135,6 +135,8 @@ interface SlashCommand {
 }
 
 export function TerminalComposer({
+  active = true,
+  hidden = false,
   onSend,
   onRaw,
   onInterrupt,
@@ -146,6 +148,8 @@ export function TerminalComposer({
   liveModel,
   liveCtxPct,
 }: {
+  active?: boolean;
+  hidden?: boolean;
   /** Write the composed text to the PTY (the pane appends the CR). */
   onSend: (text: string) => void;
   /**
@@ -190,18 +194,17 @@ export function TerminalComposer({
     const raw = onRaw;
     raw?.("\x15");
     raw?.("/clear\r");
-    // after /clear settles, drop in the resume prompt, THEN submit with a
-    // SEPARATE \r on its own tick. claude code's TUI buffers a \r that arrives
-    // in the same chunk as a long paste as a newline (multiline composer mode)
-    // instead of Enter — so it sits in the box unsent. Writing the body first,
-    // then \r on a later tick, registers as the submit key (the dual-enter
-    // gotcha; see the relay-to-oracle skill).
+    // R6: drop the resume prompt as a BRACKETED paste with a real Enter OUTSIDE
+    // the paste brackets, all in one write. The `\x1b[201~` terminator closes
+    // the paste so the trailing \r is a genuine submit — no longer relying on
+    // 600ms/150ms setTimeouts to win the dual-enter race (which broke on a loaded
+    // machine: the \r could land inside the paste → newline, prompt sits unsent).
+    // A small delay still lets the prior /clear settle before the paste arrives.
+    const PROMPT =
+      "read HANDOFF-SESSION.md (this repo, else ~/.aios/state/handoffs/ newest) and continue exactly where the last session left off";
     setTimeout(() => {
-      raw?.(
-        "read HANDOFF-SESSION.md (this repo, else ~/.aios/state/handoffs/ newest) and continue exactly where the last session left off",
-      );
-      setTimeout(() => raw?.("\r"), 150);
-    }, 600);
+      raw?.(`\x1b[200~${PROMPT}\x1b[201~\r`);
+    }, 250);
     setHandoffArmed(false);
   }, [onRaw]);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -279,6 +282,7 @@ export function TerminalComposer({
   // straight through to the terminal, so deliberate terminal interaction (incl.
   // ⌘-hotkeys, ^C, scrolling) is never hijacked.
   useEffect(() => {
+    if (!active || hidden) return;
     const onKeyCapture = (e: KeyboardEvent) => {
       // only bare printable characters (length-1 keys: letters/digits/punct/space)
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -329,7 +333,7 @@ export function TerminalComposer({
     // capture phase: beat xterm's own key handling to the keystroke.
     window.addEventListener("keydown", onKeyCapture, true);
     return () => window.removeEventListener("keydown", onKeyCapture, true);
-  }, []);
+  }, [active, hidden]);
 
   // ── bottom context bar (cwd / repo) ────────────────────────────────────────
   // Resolve a friendly label for this pane: prefer the git repo's basename,
@@ -864,7 +868,7 @@ export function TerminalComposer({
           <button
             type="button"
             onClick={finishHandoff}
-            className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:brightness-110 active:scale-95"
+            className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-accent-fg)] transition-all hover:brightness-110 active:scale-95"
           >
             <Rocket size={13} />
             clear + start fresh
@@ -1000,7 +1004,7 @@ export function TerminalComposer({
               type="button"
               onClick={() => void micStop()}
               title="stop dictation (esc to cancel)"
-              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
+              className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-accent-fg)] transition-colors hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)]"
             >
               <Square size={14} className="fill-current" />
             </button>

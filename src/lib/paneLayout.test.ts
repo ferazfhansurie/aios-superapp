@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { gridTrackStorageKey, movePane } from "./paneLayout.ts";
+import { CORE_PANE_TYPES, gridTrackStorageKey, isCorePaneKind, migrateLayoutPanes, movePane, newPaneKey } from "./paneLayout.ts";
 
 test("movePane reorders panes and returns selected destination", () => {
   const state = movePane(["a", "b", "c"], 1, -1);
@@ -18,4 +18,135 @@ test("movePane clamps at edges", () => {
 
 test("gridTrackStorageKey scopes persisted sizes by grid shape", () => {
   assert.equal(gridTrackStorageKey("aios.grid", 2, 3), "aios.grid:2x3");
+});
+
+test("core pane policy keeps the lean shell surfaces plus terminal-backed restores", () => {
+  assert.deepEqual([...CORE_PANE_TYPES], ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "loop", "ticket", "analytics", "system", "wrms-device", "live-room"]);
+  for (const type of ["browser", "chat", "files", "file", "editor", "history", "oracle", "shell", "tmux", "loop", "ticket", "analytics", "system", "wrms-device", "live-room"]) {
+    assert.equal(isCorePaneKind(type), true, `${type} should be core`);
+  }
+  for (const type of ["app", "appcast", "apps", "bridges", "chrome", "git", "memory", "mission", "money-agents", "notes", "notifications", "plugins", "pulse", "agents", "oracle-roster"]) {
+    assert.equal(isCorePaneKind(type), false, `${type} should be cut from the runtime shell`);
+  }
+});
+
+test("newPaneKey mints k-<kind>-<shortid> and respects the taken set", () => {
+  const key = newPaneKey("shell");
+  assert.match(key, /^k-shell-[a-z0-9]+$/);
+  // kind is sanitized so the key stays tmux-session-safe
+  assert.match(newPaneKey("Money Agents!"), /^k-money-agents-[a-z0-9]+$/);
+  assert.match(newPaneKey("///"), /^k-pane-[a-z0-9]+$/);
+  // uniqueness against an existing layout
+  const taken = new Set([key]);
+  assert.notEqual(newPaneKey("shell", taken), key);
+});
+
+test("migrateLayoutPanes assigns keys ONCE to keyless entries and flags the change", () => {
+  const { panes, changed } = migrateLayoutPanes([
+    { label: "terminal", kind: { type: "shell", cwd: "/tmp" } },
+    { label: "browser", kind: { type: "browser", url: "https://x.com" } },
+  ]);
+  assert.equal(changed, true);
+  assert.equal(panes.length, 2);
+  assert.match(panes[0].key, /^k-shell-/);
+  assert.match(panes[1].key, /^k-browser-/);
+  assert.notEqual(panes[0].key, panes[1].key);
+  // payload survives untouched
+  assert.deepEqual(panes[0].kind, { type: "shell", cwd: "/tmp" });
+  assert.equal(panes[1].label, "browser");
+});
+
+test("migrateLayoutPanes passes through existing keys untouched (changed=false)", () => {
+  const saved = [
+    { key: "k12-ab3f", label: "terminal", kind: { type: "shell" } }, // legacy key shape
+    { key: "k-chat-x7q2p1", label: "chat", kind: { type: "chat", cwd: "/x" } },
+  ];
+  const { panes, changed } = migrateLayoutPanes(saved);
+  assert.equal(changed, false);
+  assert.deepEqual(
+    panes.map((p) => p.key),
+    ["k12-ab3f", "k-chat-x7q2p1"],
+  );
+});
+
+test("migrateLayoutPanes preserves a persisted chat task id", () => {
+  const taskId = "task:k-chat-owned";
+  const { panes, changed } = migrateLayoutPanes([
+    {
+      key: "k-chat-owned",
+      label: "chat",
+      kind: { type: "chat", cwd: "/repo", taskId },
+    },
+  ]);
+
+  assert.equal(changed, false);
+  assert.equal(panes[0].kind.taskId, taskId);
+});
+
+test("migrateLayoutPanes drops non-core panes and persists the cleanup", () => {
+  const { panes, changed } = migrateLayoutPanes([
+    {
+      key: "k-plugins-aaaa",
+      label: "plugins",
+      kind: { type: "plugins" },
+    },
+    {
+      key: "k-editor-bbbb",
+      label: "editor",
+      kind: { type: "editor", path: "/repo/a.ts", name: "a.ts" },
+    },
+    {
+      key: "k-file-dddd",
+      label: "readme",
+      kind: { type: "file", path: "/repo/readme.md", name: "readme.md" },
+    },
+    {
+      key: "k-chat-good",
+      label: "chat",
+      kind: { type: "chat", cwd: "/repo", modelId: "x" },
+    },
+    { key: "k-history-good", label: "history", kind: { type: "history" } },
+    { key: "k-browser-good", label: "browser", kind: { type: "browser", url: "https://x.com" } },
+    { key: "k-pulse-cccc", label: "pulse", kind: { type: "pulse" } },
+  ]);
+  assert.equal(changed, true);
+  assert.deepEqual(
+    panes.map((p) => p.kind.type),
+    ["editor", "file", "chat", "history", "browser"],
+  );
+  assert.equal(panes[0].key, "k-editor-bbbb");
+  assert.equal(panes[1].key, "k-file-dddd");
+  assert.equal(panes[2].key, "k-chat-good");
+  assert.equal(panes[2].kind.cwd, "/repo");
+});
+
+test("migrateLayoutPanes tolerates junk without nuking valid entries", () => {
+  const { panes, changed } = migrateLayoutPanes([
+    null,
+    42,
+    { label: "no kind here" },
+    { key: "k-shell-good1", label: "ok", kind: { type: "shell" } },
+  ]);
+  // skips never set changed (a parse oddity must not rewrite stored data)
+  assert.equal(changed, false);
+  assert.equal(panes.length, 1);
+  assert.equal(panes[0].key, "k-shell-good1");
+});
+
+test("migrateLayoutPanes returns empty for non-array input", () => {
+  assert.deepEqual(migrateLayoutPanes(null), { panes: [], changed: false });
+  assert.deepEqual(migrateLayoutPanes({ not: "an array" }), { panes: [], changed: false });
+});
+
+test("migrateLayoutPanes minted keys never collide with keys already in the layout", () => {
+  // run enough iterations that a collision-prone impl would trip
+  for (let i = 0; i < 50; i++) {
+    const { panes } = migrateLayoutPanes([
+      { key: "k-shell-fixed", label: "a", kind: { type: "shell" } },
+      { label: "b", kind: { type: "shell" } },
+      { label: "c", kind: { type: "shell" } },
+    ]);
+    const keys = panes.map((p) => p.key);
+    assert.equal(new Set(keys).size, keys.length);
+  }
 });

@@ -1,0 +1,8 @@
+allowBuilds:
+  esbuild: set this to true or false
+# pnpm 11 reads settings from here (no longer from the "pnpm" key in package.json).
+# Allow esbuild's postinstall so `pnpm install` exits 0 and Vite gets its native
+# Windows binary. Without this, the ignored-build warning makes pnpm exit 1, which
+# trips up `tauri dev`'s dependency check.
+onlyBuiltDependencies:
+  - esbuild

@@ -10,6 +10,8 @@ import {
 } from "lucide-react";
 
 import { focusMacApp, listMacApps, type MacAppInfo } from "../lib/macApps";
+import { useVisible } from "../lib/useVisible";
+import { useSharedInterval } from "../lib/ticker";
 
 export function AttachAppsPane({
   onAttachApp,
@@ -20,6 +22,11 @@ export function AttachAppsPane({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [focusing, setFocusing] = useState<string | null>(null);
+  // Gate polling to when the pane is actually visible — hidden panes stay
+  // mounted (display:none) in the cockpit, so this timer would otherwise keep
+  // re-enumerating every running app forever in the background. (`paneVisible`
+  // to avoid clashing with the `visible` filtered-apps memo below.)
+  const { ref: rootRef, visible: paneVisible } = useVisible<HTMLDivElement>();
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -33,10 +40,13 @@ export function AttachAppsPane({
   }, []);
 
   useEffect(() => {
+    // One load on mount / when becoming visible so the pane isn't blank. The
+    // steady poll rides the shared 30s interval below (the native side also
+    // caches for 5s, so a manual refresh stays snappy).
     void refresh();
-    const timer = window.setInterval(refresh, 10_000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, paneVisible]);
+  // Poll only while visible — hidden pane doesn't subscribe → zero I/O.
+  useSharedInterval(30_000, refresh, paneVisible);
 
   const visible = useMemo(
     () => apps.filter((app) => app.bundle_id !== "com.adletic.aios"),
@@ -53,7 +63,7 @@ export function AttachAppsPane({
   }, []);
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--color-bg)] text-[var(--color-text)]">
+    <div ref={rootRef} className="flex h-full min-h-0 flex-col bg-[var(--color-bg)] text-[var(--color-text)]">
       <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--color-border)] px-3">
         <div className="flex min-w-0 items-center gap-2">
           <MonitorUp size={14} className="shrink-0 text-[var(--color-accent)]" />
@@ -119,7 +129,7 @@ export function AttachAppsPane({
                       <button
                         type="button"
                         onClick={() => onAttachApp?.(app)}
-                        className="flex h-7 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)]"
+                        className="flex h-7 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)]"
                         title="attach as pane"
                       >
                         <PanelTopOpen size={12} />

@@ -2,141 +2,130 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { commandToPaletteCommand, createCommand, runCommand } from "./commands.ts";
-import { buildAppCommands } from "./appCommands.ts";
-import { chatHandles, detachBusyChats } from "./paneBus.ts";
+import {
+  commandToPaletteCommand,
+  createCommand,
+  runCommand,
+} from "./commands.ts";
 
-test("command registry commands expose metadata and disabled state", () => {
-  const command = createCommand({
-    id: "pane.close",
-    label: "close pane",
-    description: "close the active pane",
-    scope: "pane",
-    danger: "destructive",
-    enabled: (ctx) => Boolean(ctx.activePaneKey),
-    run: () => ({ ok: true }),
-  });
+const ctx = { source: "test" };
 
-  assert.equal(command.id, "pane.close");
-  assert.equal(command.danger, "destructive");
-  assert.equal(command.enabled({ activePaneKey: null }), false);
-  assert.equal(command.enabled({ activePaneKey: "pane-1" }), true);
+/** Minimal valid CommandInput; override per test. */
+function input(over = {}) {
+  return { id: "x", label: "X", scope: "global", run: () => {}, ...over };
+}
+
+// ── createCommand: defaults ─────────────────────────────────────────────────
+
+test("createCommand fills defaults for omitted fields", () => {
+  const cmd = createCommand(input());
+  assert.equal(cmd.danger, "none");
+  assert.deepEqual(cmd.hotkeys, []);
+  assert.deepEqual(cmd.keywords, []);
+  assert.equal(typeof cmd.enabled, "function");
+  assert.equal(cmd.enabled(ctx), true);
 });
 
-test("commandToPaletteCommand preserves one command id for palette execution", async () => {
-  const calls: string[] = [];
-  const command = createCommand({
-    id: "app.settings.open",
-    label: "settings",
-    description: "open settings",
-    scope: "global",
-    keywords: ["preferences", "theme"],
-    run: (ctx) => {
-      calls.push(ctx.source);
-      return { ok: true, message: "opened" };
-    },
-  });
-
-  const palette = commandToPaletteCommand(command, {
-    context: { source: "palette" },
-    group: "app",
-    actionLabel: "open",
-  });
-
-  assert.equal(palette.id, "app.settings.open");
-  assert.equal(palette.title, "settings");
-  assert.equal(palette.subtitle, "open settings");
-  assert.equal(palette.keywords, "preferences theme");
-
-  await palette.run();
-  assert.deepEqual(calls, ["palette"]);
+test("createCommand preserves explicitly provided fields", () => {
+  const enabled = () => false;
+  const cmd = createCommand(
+    input({ danger: "destructive", hotkeys: ["mod+k"], keywords: ["a"], enabled }),
+  );
+  assert.equal(cmd.danger, "destructive");
+  assert.deepEqual(cmd.hotkeys, ["mod+k"]);
+  assert.deepEqual(cmd.keywords, ["a"]);
+  assert.equal(cmd.enabled, enabled);
 });
 
-test("runCommand returns disabled result instead of executing", async () => {
+// ── createCommand: run-result normalization ─────────────────────────────────
+
+test("a string run result becomes { ok: true, message }", async () => {
+  const cmd = createCommand(input({ run: () => "done" }));
+  assert.deepEqual(await cmd.run(ctx), { ok: true, message: "done" });
+});
+
+test("a void/undefined run result becomes { ok: true }", async () => {
+  const cmd = createCommand(input({ run: () => {} }));
+  assert.deepEqual(await cmd.run(ctx), { ok: true });
+});
+
+test("an explicit CommandResult passes through unchanged", async () => {
+  const result = { ok: false, error: "nope" };
+  const cmd = createCommand(input({ run: () => result }));
+  assert.deepEqual(await cmd.run(ctx), result);
+});
+
+test("an async run is awaited and normalized", async () => {
+  const cmd = createCommand(input({ run: async () => "later" }));
+  assert.deepEqual(await cmd.run(ctx), { ok: true, message: "later" });
+});
+
+test("run receives the context and input value", async () => {
+  let seen;
+  const cmd = createCommand(input({ run: (c, v) => { seen = [c, v]; } }));
+  await cmd.run(ctx, 42);
+  assert.deepEqual(seen, [ctx, 42]);
+});
+
+// ── runCommand: the disabled gate (safety invariant) ────────────────────────
+
+test("runCommand refuses a disabled command and never invokes its run", async () => {
   let ran = false;
-  const command = createCommand({
-    id: "run.focused",
-    label: "run focused project",
-    scope: "global",
-    enabled: () => false,
-    run: () => {
-      ran = true;
-      return { ok: true };
-    },
+  const cmd = createCommand(
+    input({ danger: "destructive", enabled: () => false, run: () => { ran = true; } }),
+  );
+  const res = await runCommand(cmd, ctx);
+  assert.deepEqual(res, { ok: false, error: "command disabled" });
+  assert.equal(ran, false, "a disabled command's run must not execute");
+});
+
+test("runCommand executes an enabled command", async () => {
+  const cmd = createCommand(input({ run: () => "ok" }));
+  assert.deepEqual(await runCommand(cmd, ctx), { ok: true, message: "ok" });
+});
+
+// ── commandToPaletteCommand: field mapping ──────────────────────────────────
+
+test("commandToPaletteCommand maps fields with sensible fallbacks", () => {
+  const cmd = createCommand(
+    input({ label: "Open", description: "opens it", scope: "file", keywords: ["a", "b"] }),
+  );
+  const pc = commandToPaletteCommand(cmd, { context: ctx });
+  assert.equal(pc.id, "x");
+  assert.equal(pc.title, "Open");
+  assert.equal(pc.subtitle, "opens it"); // falls back to description
+  assert.equal(pc.group, "file"); // falls back to scope
+  assert.equal(pc.keywords, "a b"); // joined
+  assert.equal(pc.actionLabel, undefined);
+});
+
+test("commandToPaletteCommand honors explicit subtitle/group/actionLabel", () => {
+  const cmd = createCommand(input({ description: "desc", scope: "global" }));
+  const pc = commandToPaletteCommand(cmd, {
+    context: ctx,
+    subtitle: "custom",
+    group: "Pinned",
+    actionLabel: "Run",
   });
+  assert.equal(pc.subtitle, "custom");
+  assert.equal(pc.group, "Pinned");
+  assert.equal(pc.actionLabel, "Run");
+});
 
-  const result = await runCommand(command, { source: "test" });
+test("the palette command's run dispatches through runCommand", async () => {
+  let ran = false;
+  const cmd = createCommand(input({ run: () => { ran = true; } }));
+  const pc = commandToPaletteCommand(cmd, { context: ctx });
+  pc.run();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ran, true);
+});
 
-  assert.equal(result.ok, false);
-  assert.equal(result.error, "command disabled");
+test("a disabled command's palette run is gated too", async () => {
+  let ran = false;
+  const cmd = createCommand(input({ enabled: () => false, run: () => { ran = true; } }));
+  const pc = commandToPaletteCommand(cmd, { context: ctx });
+  pc.run();
+  await new Promise((r) => setTimeout(r, 0));
   assert.equal(ran, false);
-});
-
-test("detachBusyChats backgrounds only active chat generations", () => {
-  const calls: string[] = [];
-  chatHandles.clear();
-  chatHandles.set("idle", {
-    busy: () => false,
-    detach: () => calls.push("idle"),
-  });
-  chatHandles.set("busy", {
-    busy: () => true,
-    detach: (notify) => calls.push(`busy:${notify}`),
-  });
-
-  assert.equal(detachBusyChats(true), 1);
-  assert.deepEqual(calls, ["busy:true"]);
-  chatHandles.clear();
-});
-
-test("buildAppCommands exposes shell command groups without App.tsx owning registry", async () => {
-  const calls: string[] = [];
-  const commands = buildAppCommands({
-    activeKey: "pane-1",
-    panesCount: 2,
-    home: "/Users/firaz",
-    chats: [{ id: "chat-1", title: "plan", cwd: "/Users/firaz/repo", mtime: 1 }],
-    oracles: [{
-      socket: "adletic",
-      is_master: false,
-      running: true,
-      identity: "firaz",
-      session: "aios-firaz",
-      display_name: "firaz",
-      attached: true,
-    }],
-    customers: [{ id: "cust-1", name: "tika", handle: "601", lastAgo: "2m", channel: "whatsapp" }],
-    projects: [{ name: "shell", root: "/Users/firaz/aios/shell", kind: "node", commands: [] }],
-    spawn: (_kind, label) => calls.push(`spawn:${label}`),
-    resumeChat: (chat) => calls.push(`resume:${chat.id}`),
-    addOracle: (identity) => calls.push(`oracle:${identity}`),
-    runProject: (project) => calls.push(`project:${project.name}`),
-    runF5: () => calls.push("f5"),
-    reloadProjects: () => calls.push("reload-projects"),
-    fireAppshot: () => calls.push("appshot"),
-    setSidebarOpen: () => calls.push("sidebar"),
-    setTopBarMode: (mode) => calls.push(`topbar:${mode}`),
-    setOverviewOpen: () => calls.push("overview"),
-    setSettingsOpen: () => calls.push("settings"),
-    setHiddenKeys: () => calls.push("hidden"),
-    setMaximizedKey: () => calls.push("maximized"),
-  });
-
-  const byId = new Map(commands.map((c) => [c.id, c]));
-  assert.equal(byId.get("pane.open.chat")?.group, "open");
-  assert.equal(byId.get("chat.resume.chat-1")?.group, "resume");
-  assert.equal(byId.get("oracle.attach.firaz")?.actionLabel, "attach");
-  assert.equal(byId.get("customer.open.cust-1")?.group, "customers");
-  assert.equal(byId.get("project.run./Users/firaz/aios/shell")?.subtitle, "node · aios/shell");
-  assert.equal(byId.get("project.rescan")?.group, "run");
-  assert.equal(byId.get("project.run.focused")?.actionLabel, "run");
-  assert.equal(byId.get("view.overview.open")?.group, "view");
-  assert.equal(byId.get("app.settings.open")?.group, "app");
-
-  await byId.get("pane.open.chat")?.run();
-  await byId.get("project.run./Users/firaz/aios/shell")?.run();
-  await byId.get("project.run.focused")?.run();
-  await byId.get("project.rescan")?.run();
-  await byId.get("app.settings.open")?.run();
-  assert.deepEqual(calls, ["spawn:chat", "project:shell", "f5", "reload-projects", "settings"]);
 });

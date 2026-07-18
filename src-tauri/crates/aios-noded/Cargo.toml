@@ -1,0 +1,19 @@
+[package]
+name = "aios-noded"
+version = "0.1.0"
+edition = "2021"
+description = "Headless AIOS node daemon: runs chat sessions on a remote GUI box and exposes them over a tailnet-only HTTP/WS API so a Mac cockpit pane can attach live. RCE by design — bind tailscale IP only, bearer-auth required."
+
+[[bin]]
+name = "aios-noded"
+path = "src/main.rs"
+
+[dependencies]
+aios-chat-core = { path = "../aios-chat-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+axum = { version = "0.7", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+parking_lot = "0.12"
+getrandom = "0.2"
+futures-util = "0.3"

@@ -101,6 +101,24 @@ export async function bridgeActivity(
   return invoke<BridgeActivity>("bridge_activity", { id, limit });
 }
 
+export interface DiscordBridgeSession {
+  ok: boolean;
+  sessionId?: string;
+  bridgeSessionId?: string;
+  userId?: string;
+  engine?: string;
+  model?: string;
+  cwd?: string;
+  mtime?: number;
+  error?: string;
+}
+
+/** Reads the Discord bridge's persisted session mapping so the shell can surface
+ *  the active Discord conversation as a resumable chat pane. */
+export async function discordBridgeSession(): Promise<DiscordBridgeSession> {
+  return invoke<DiscordBridgeSession>("discord_bridge_session");
+}
+
 export interface PairResult {
   ok: boolean;
   /** 8-digit pairing code "ABCD-EFGH" on success. */

@@ -7,7 +7,8 @@
 //! graph (`nodes` + `edges`) the cockpit renders as a force-directed view.
 //!
 //! Vault path resolves portably so the cockpit works for ANY user, not just the
-//! original author. Resolution order (first that exists wins):
+//! original author. Save/create still target the primary vault, but search and
+//! file reads scan every known vault:
 //!   1. `$AIOS_MEMORY_VAULT` — explicit override, used verbatim if it's a dir.
 //!   2. `$HOME/.claude/projects/<encoded-$HOME>/memory` — Claude Code encodes a
 //!      project's cwd by replacing `/` with `-`; for the user's home dir this is
@@ -15,11 +16,13 @@
 //!   3. `$HOME/.claude/projects/*/memory` — first existing per-project memory
 //!      dir for whatever user (sorted for determinism).
 //!   4. `$HOME/.claude/memory` — a flat top-level vault, if present.
+//!   5. `$HOME/.aios/state/memory` — AIOS-local memory, if present.
 //! When none exist the graph command returns an empty (but valid) graph rather
 //! than panicking — graceful degradation on machines without AIOS memory.
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use walkdir::WalkDir;
 
 /// A single memory note surfaced to the frontend.
@@ -36,8 +39,24 @@ struct MemoryNode {
     description: String,
     /// Absolute path to the source file.
     path: String,
+    /// Human-readable source vault label.
+    vault: String,
+    /// Absolute path to the source vault.
+    vault_path: String,
+    /// File modified time, unix seconds.
+    mtime: i64,
     /// Outbound `[[wikilink]]` targets that resolve to a known node.
     links: Vec<String>,
+    /// Inbound links from notes that reference this node.
+    backlinks: Vec<String>,
+    /// Unlinked notes mentioned by id/title in this note body.
+    suggested_links: Vec<String>,
+    /// Link count used by the graph to size important memories.
+    degree: usize,
+    /// Stable graph cluster label.
+    cluster: String,
+    /// True when the node has no committed inbound/outbound edges.
+    orphan: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,27 +67,56 @@ pub struct MemoryHit {
     node_type: String,
     description: String,
     path: String,
+    vault: String,
+    mtime: i64,
     score: i32,
     reasons: Vec<String>,
     preview: String,
 }
 
-/// Resolves the memory vault directory in a portable, env-overridable way.
-/// See the module header for the full precedence. Returns whatever path we
-/// settle on — callers tolerate it being absent (empty graph).
-fn vault_dir() -> std::path::PathBuf {
-    // 1. Explicit override wins, used verbatim when it points at a real dir.
+#[derive(Debug, Clone)]
+struct VaultDir {
+    path: std::path::PathBuf,
+    label: String,
+    primary: bool,
+}
+
+fn push_vault(out: &mut Vec<VaultDir>, path: std::path::PathBuf, label: String, primary: bool) {
+    if !path.is_dir() {
+        return;
+    }
+    let canon = std::fs::canonicalize(&path).unwrap_or(path.clone());
+    if out
+        .iter()
+        .any(|v| std::fs::canonicalize(&v.path).unwrap_or_else(|_| v.path.clone()) == canon)
+    {
+        return;
+    }
+    out.push(VaultDir {
+        path,
+        label,
+        primary,
+    });
+}
+
+/// Resolves every known memory vault. The first entry is the primary write
+/// target; reads/searches can safely scan all entries.
+fn vault_dirs() -> Vec<VaultDir> {
+    let mut out = Vec::new();
+
+    // 1. Explicit override wins and intentionally narrows the universe.
     if let Some(v) = std::env::var_os("AIOS_MEMORY_VAULT") {
         let p = std::path::PathBuf::from(v);
         if p.is_dir() {
-            return p;
+            push_vault(&mut out, p, "override".to_string(), true);
+            return out;
         }
     }
 
     let home = match std::env::var_os("HOME") {
         Some(h) => std::path::PathBuf::from(h),
         // No $HOME (rare for a GUI app) — nothing portable to resolve.
-        None => return std::path::PathBuf::new(),
+        None => return out,
     };
 
     let projects = home.join(".claude").join("projects");
@@ -77,18 +125,26 @@ fn vault_dir() -> std::path::PathBuf {
     //    encodes a cwd by swapping every `/` (and `.`) for `-`; for `$HOME` this
     //    yields e.g. `-Users-alice`. Resolves to the author's existing path too.
     if let Some(home_str) = home.to_str() {
+        // Claude Code encodes a cwd by replacing path-ish chars with '-'. On unix
+        // that's '/' and '.'; on Windows the drive colon and backslashes too, so
+        // `C:\Users\user` → `C--Users-user` (matching the real on-disk dir name).
         let encoded: String = home_str
             .chars()
-            .map(|c| if c == '/' || c == '.' { '-' } else { c })
+            .map(|c| {
+                if matches!(c, '/' | '\\' | ':' | '.') {
+                    '-'
+                } else {
+                    c
+                }
+            })
             .collect();
         let p = projects.join(&encoded).join("memory");
         if p.is_dir() {
-            return p;
+            push_vault(&mut out, p, "home".to_string(), true);
         }
     }
 
-    // 3. Otherwise pick the first existing `*/memory` under projects/ (sorted so
-    //    the choice is stable across runs).
+    // 3. Add every existing per-project memory vault, sorted for stable output.
     if let Ok(rd) = std::fs::read_dir(&projects) {
         let mut candidates: Vec<std::path::PathBuf> = rd
             .filter_map(|e| e.ok())
@@ -96,19 +152,54 @@ fn vault_dir() -> std::path::PathBuf {
             .filter(|p| p.is_dir())
             .collect();
         candidates.sort();
-        if let Some(first) = candidates.into_iter().next() {
-            return first;
+        for path in candidates {
+            let label = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("project")
+                .trim_start_matches('-')
+                .replace('-', "/");
+            let primary = out.is_empty();
+            push_vault(&mut out, path, label, primary);
         }
     }
 
     // 4. A flat top-level vault, if the user keeps one there.
     let flat = home.join(".claude").join("memory");
-    if flat.is_dir() {
-        return flat;
-    }
+    let primary = out.is_empty();
+    push_vault(&mut out, flat, "claude".to_string(), primary);
 
-    // Nothing found — return an empty path; the walk below yields no nodes.
-    std::path::PathBuf::new()
+    // 5. AIOS-local memory stream/materialized notes.
+    let aios = home.join(".aios").join("state").join("memory");
+    let primary = out.is_empty();
+    push_vault(&mut out, aios, "aios".to_string(), primary);
+
+    out
+}
+
+/// Resolves the primary writable memory vault. Returns an empty path when no
+/// vault exists; callers that write create it.
+fn vault_dir() -> std::path::PathBuf {
+    vault_dirs()
+        .into_iter()
+        .find(|v| v.primary)
+        .map(|v| v.path)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|h| h.join(".claude").join("memory"))
+                .unwrap_or_default()
+        })
+}
+
+fn file_mtime_secs(path: &std::path::Path) -> i64 {
+    path.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Extracts a top-level scalar frontmatter field (`name:`/`description:`) from a
@@ -218,7 +309,7 @@ fn type_from_id(id: &str) -> String {
     "reference".to_string()
 }
 
-fn memory_nodes_from_dir(dir: &std::path::Path) -> Vec<(MemoryNode, String)> {
+fn memory_nodes_from_vault(dir: &std::path::Path, vault: &str) -> Vec<(MemoryNode, String)> {
     let mut nodes: Vec<(MemoryNode, String)> = Vec::new();
     for entry in WalkDir::new(dir)
         .max_depth(2)
@@ -253,13 +344,26 @@ fn memory_nodes_from_dir(dir: &std::path::Path) -> Vec<(MemoryNode, String)> {
                 node_type,
                 description,
                 path: path.to_string_lossy().to_string(),
+                vault: vault.to_string(),
+                vault_path: dir.to_string_lossy().to_string(),
+                mtime: file_mtime_secs(path),
                 links,
+                backlinks: Vec::new(),
+                suggested_links: Vec::new(),
+                degree: 0,
+                cluster: String::new(),
+                orphan: true,
             },
             body.to_string(),
         ));
     }
     nodes.sort_by(|a, b| a.0.id.to_lowercase().cmp(&b.0.id.to_lowercase()));
     nodes
+}
+
+#[cfg(test)]
+fn memory_nodes_from_dir(dir: &std::path::Path) -> Vec<(MemoryNode, String)> {
+    memory_nodes_from_vault(dir, "primary")
 }
 
 fn compact_preview(body: &str) -> String {
@@ -289,8 +393,13 @@ fn score_memory(
     let description = node.description.to_lowercase();
     let body_l = body.to_lowercase();
     let path = node.path.to_lowercase();
-    let mut score = 0;
+    let mut score = if q.is_empty() { 1 } else { 0 };
     let mut reasons = Vec::new();
+    // Did the query (or cwd) actually match this node? Baseline bonuses below
+    // must NOT qualify a node on their own — otherwise the same well-connected
+    // user/feedback notes surface for EVERY query ("always the same 3 auto
+    // memories"). A real query requires a real match to be eligible.
+    let mut relevance_hit = false;
 
     if !q.is_empty() {
         for token in q.split_whitespace() {
@@ -299,18 +408,22 @@ fn score_memory(
             }
             if id.contains(token) {
                 score += 18;
+                relevance_hit = true;
                 reasons.push(format!("id matches `{token}`"));
             }
             if title.contains(token) {
                 score += 24;
+                relevance_hit = true;
                 reasons.push(format!("title matches `{token}`"));
             }
             if description.contains(token) {
                 score += 14;
+                relevance_hit = true;
                 reasons.push(format!("description matches `{token}`"));
             }
             if body_l.contains(token) {
                 score += 6;
+                relevance_hit = true;
                 reasons.push(format!("body mentions `{token}`"));
             }
         }
@@ -318,16 +431,27 @@ fn score_memory(
 
     if !cwd.is_empty() && (path.contains(&cwd) || body_l.contains(&cwd)) {
         score += 16;
+        relevance_hit = true;
         reasons.push("matches current project path".to_string());
     }
 
+    // Baseline relevance — TIEBREAKERS among already-matched notes only. Kept
+    // small (and degree capped low) so query relevance dominates the ranking.
     match node.node_type.as_str() {
-        "user" | "identity" | "preference" => score += 5,
-        "project" | "plan" | "workflow" => score += 4,
+        "user" | "identity" | "preference" => score += 4,
+        "project" | "plan" | "workflow" | "decision" => score += 3,
         _ => {}
     }
-    score += (node.links.len() as i32).min(8);
+    score += (node.links.len() as i32).min(4);
+    if node.mtime > 0 {
+        score += 1;
+    }
 
+    // With a real query, baseline alone can't surface a memory — it must have
+    // hit the query or the cwd. (Empty query → browse mode, baseline ranks.)
+    if !q.is_empty() && !relevance_hit {
+        return None;
+    }
     if score <= 0 {
         return None;
     }
@@ -339,12 +463,15 @@ fn score_memory(
         node_type: node.node_type.clone(),
         description: node.description.clone(),
         path: node.path.clone(),
+        vault: node.vault.clone(),
+        mtime: node.mtime,
         score,
         reasons,
         preview: compact_preview(body),
     })
 }
 
+#[cfg(test)]
 fn search_memory_dir(
     dir: &std::path::Path,
     query: String,
@@ -360,58 +487,312 @@ fn search_memory_dir(
     hits
 }
 
-/// Builds the full memory graph: nodes (one per `*.md`) and edges (one per
-/// resolvable `[[link]]`). Returns `{ nodes, edges, vault_path, count }`.
-/// Always succeeds — an unreadable/empty vault yields an empty graph.
-#[tauri::command]
-pub fn memory_graph() -> Value {
-    let dir = vault_dir();
-    let nodes: Vec<MemoryNode> = memory_nodes_from_dir(&dir)
+fn search_memory_vaults(
+    vaults: &[VaultDir],
+    query: String,
+    cwd: Option<String>,
+    limit: Option<u32>,
+) -> Vec<MemoryHit> {
+    let q_empty = query.trim().is_empty();
+    let mut hits: Vec<MemoryHit> = vaults
+        .iter()
+        .flat_map(|v| {
+            memory_nodes_from_vault(&v.path, &v.label)
+                .into_iter()
+                .filter_map(|(node, body)| score_memory(&node, &body, &query, cwd.as_deref()))
+        })
+        .collect();
+    if q_empty {
+        hits.sort_by(|a, b| {
+            b.mtime
+                .cmp(&a.mtime)
+                .then_with(|| b.score.cmp(&a.score))
+                .then_with(|| a.title.cmp(&b.title))
+        });
+    } else {
+        hits.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| b.mtime.cmp(&a.mtime))
+                .then_with(|| a.title.cmp(&b.title))
+        });
+    }
+    hits.truncate(limit.unwrap_or(8).clamp(1, 200) as usize);
+    hits
+}
+
+fn normalize_link_key(s: &str) -> String {
+    s.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn searchable_text(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+}
+
+fn cluster_for_type(node_type: &str) -> String {
+    match node_type.trim().to_lowercase().as_str() {
+        "user" | "identity" | "preference" => "user".to_string(),
+        "project" | "plan" | "workflow" | "decision" => "project".to_string(),
+        "feedback" | "lesson" => "feedback".to_string(),
+        "reference" | "doc" | "docs" => "reference".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "reference".to_string(),
+    }
+}
+
+fn build_memory_graph(items: Vec<(MemoryNode, String)>, vaults: Vec<VaultDir>) -> Value {
+    let mut nodes: Vec<MemoryNode> = items.iter().map(|(node, _)| node.clone()).collect();
+    let bodies: HashMap<String, String> = items
         .into_iter()
-        .map(|(node, _)| node)
+        .map(|(node, body)| (node.id, body))
         .collect();
 
-    // Edges only connect to nodes that actually exist in the vault.
-    let known: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-    let mut edges: Vec<Value> = Vec::new();
-    for n in &nodes {
-        for target in &n.links {
-            if known.contains(target.as_str()) {
-                edges.push(json!({ "source": n.id, "target": target }));
+    let mut aliases: HashMap<String, String> = HashMap::new();
+    for node in &nodes {
+        aliases.insert(node.id.clone(), node.id.clone());
+        aliases.insert(normalize_link_key(&node.id), node.id.clone());
+        aliases.insert(normalize_link_key(&node.title), node.id.clone());
+    }
+
+    let mut resolved_links: HashMap<String, Vec<String>> = HashMap::new();
+    let mut backlinks: HashMap<String, Vec<String>> = HashMap::new();
+    let mut edge_pairs: HashSet<(String, String)> = HashSet::new();
+
+    for node in &nodes {
+        let mut links = Vec::new();
+        for raw_target in &node.links {
+            let target = aliases
+                .get(raw_target)
+                .or_else(|| aliases.get(&normalize_link_key(raw_target)));
+            let Some(target_id) = target else {
+                continue;
+            };
+            if target_id == &node.id || links.iter().any(|id| id == target_id) {
+                continue;
+            }
+            links.push(target_id.clone());
+            backlinks
+                .entry(target_id.clone())
+                .or_default()
+                .push(node.id.clone());
+            edge_pairs.insert((node.id.clone(), target_id.clone()));
+        }
+        resolved_links.insert(node.id.clone(), links);
+    }
+
+    let node_lookup: HashMap<String, MemoryNode> = nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect();
+
+    for node in &mut nodes {
+        let links = resolved_links.remove(&node.id).unwrap_or_default();
+        let mut incoming = backlinks.remove(&node.id).unwrap_or_default();
+        incoming.sort();
+        incoming.dedup();
+
+        let body = searchable_text(bodies.get(&node.id).map(String::as_str).unwrap_or_default());
+        let linked: HashSet<&str> = links.iter().map(String::as_str).collect();
+        let mut suggested = Vec::new();
+        for candidate in node_lookup.values() {
+            if candidate.id == node.id || linked.contains(candidate.id.as_str()) {
+                continue;
+            }
+            let id_phrase = normalize_link_key(&candidate.id).replace('_', " ");
+            let title_phrase = searchable_text(&candidate.title);
+            let id_match = id_phrase.len() >= 4 && body.contains(&id_phrase);
+            let title_match = title_phrase.trim().len() >= 4 && body.contains(title_phrase.trim());
+            if id_match || title_match {
+                suggested.push(candidate.id.clone());
+            }
+            if suggested.len() >= 8 {
+                break;
             }
         }
+        suggested.sort();
+        suggested.dedup();
+
+        node.links = links;
+        node.backlinks = incoming;
+        node.degree = node.links.len() + node.backlinks.len();
+        node.orphan = node.degree == 0;
+        node.suggested_links = suggested;
+        node.cluster = cluster_for_type(&node.node_type);
     }
+
+    nodes.sort_by(|a, b| {
+        a.cluster
+            .cmp(&b.cluster)
+            .then_with(|| b.degree.cmp(&a.degree))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+
+    let mut edges: Vec<Value> = edge_pairs
+        .into_iter()
+        .map(|(source, target)| {
+            json!({
+                "source": source,
+                "target": target,
+                "kind": "wikilink",
+                "weight": 1,
+            })
+        })
+        .collect();
+    edges.sort_by(|a, b| {
+        let a_key = format!(
+            "{}:{}",
+            a.get("source").and_then(|v| v.as_str()).unwrap_or_default(),
+            a.get("target").and_then(|v| v.as_str()).unwrap_or_default()
+        );
+        let b_key = format!(
+            "{}:{}",
+            b.get("source").and_then(|v| v.as_str()).unwrap_or_default(),
+            b.get("target").and_then(|v| v.as_str()).unwrap_or_default()
+        );
+        a_key.cmp(&b_key)
+    });
 
     let count = nodes.len();
     json!({
         "nodes": nodes,
         "edges": edges,
-        "vault_path": dir.to_string_lossy(),
+        "vault_path": vaults.first().map(|v| v.path.to_string_lossy().to_string()).unwrap_or_default(),
+        "vaults": vaults.iter().map(|v| json!({
+            "path": v.path.to_string_lossy(),
+            "label": v.label.clone(),
+            "primary": v.primary,
+        })).collect::<Vec<_>>(),
         "count": count,
     })
 }
 
+/// Builds the full memory graph: nodes (one per `*.md`) and edges (one per
+/// resolvable `[[link]]`). Returns `{ nodes, edges, vault_path, count }`.
+/// Always succeeds — an unreadable/empty vault yields an empty graph.
+#[tauri::command]
+pub fn memory_graph() -> Value {
+    let vaults = vault_dirs();
+    let items: Vec<(MemoryNode, String)> = vaults
+        .iter()
+        .flat_map(|v| memory_nodes_from_vault(&v.path, &v.label).into_iter())
+        .collect();
+    build_memory_graph(items, vaults)
+}
+
 #[tauri::command]
 pub fn memory_search(query: String, cwd: Option<String>, limit: Option<u32>) -> Vec<MemoryHit> {
-    search_memory_dir(&vault_dir(), query, cwd, limit)
+    search_memory_vaults(&vault_dirs(), query, cwd, limit)
 }
 
 /// Returns the raw contents of a memory file. Guarded: `path` must resolve to a
-/// location inside the vault directory, otherwise the read is rejected.
+/// location inside a known memory vault, otherwise the read is rejected.
 #[tauri::command]
 pub fn memory_file(path: String) -> Result<String, String> {
-    let dir = vault_dir();
-    let canon_dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-    let target = std::path::PathBuf::from(&path);
-    let canon_target = std::fs::canonicalize(&target).map_err(|e| e.to_string())?;
-
-    if !canon_target.starts_with(&canon_dir) {
-        return Err("path is outside the memory vault".into());
-    }
+    let canon_target = canonical_known_memory_file(&path)?;
     if canon_target.extension().and_then(|e| e.to_str()) != Some("md") {
         return Err("not a markdown file".into());
     }
     std::fs::read_to_string(&canon_target).map_err(|e| e.to_string())
+}
+
+fn canonical_known_memory_file(path: &str) -> Result<std::path::PathBuf, String> {
+    let target = std::path::PathBuf::from(path);
+    let canon_target = std::fs::canonicalize(&target).map_err(|e| e.to_string())?;
+    let vaults = vault_dirs();
+    let allowed = vaults.iter().any(|v| {
+        let canon_dir = std::fs::canonicalize(&v.path).unwrap_or_else(|_| v.path.clone());
+        canon_target.starts_with(canon_dir)
+    });
+    if !allowed {
+        return Err("path is outside the memory vaults".into());
+    }
+    Ok(canon_target)
+}
+
+/// Writes raw markdown back to an existing memory file. Guarded to known vaults.
+#[tauri::command]
+pub fn memory_save_raw(path: String, body: String) -> Result<(), String> {
+    let target = canonical_known_memory_file(&path)?;
+    if target.extension().and_then(|e| e.to_str()) != Some("md") {
+        return Err("not a markdown file".into());
+    }
+    atomic_write(&target, body.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// Deletes a memory file by path. Guarded to known vaults.
+#[tauri::command]
+pub fn memory_delete_path(path: String) -> Result<(), String> {
+    let target = canonical_known_memory_file(&path)?;
+    if target.extension().and_then(|e| e.to_str()) != Some("md") {
+        return Err("not a markdown file".into());
+    }
+    let name = target
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let dir = target.parent().map(|p| p.to_path_buf());
+    std::fs::remove_file(&target).map_err(|e| e.to_string())?;
+    if let Some(dir) = dir {
+        update_index_remove(&dir, &name);
+    }
+    Ok(())
+}
+
+/// The idle homescreen's FOCUS tile: the freshest curated note in the vault,
+/// surfaced as `{ tag, title }`. Prefers the newest `project_*.md` (the user's
+/// current focus); if there are none, falls back to the newest note overall.
+/// Always returns a valid object — an empty/absent vault yields nulls.
+#[tauri::command]
+pub fn memory_focus() -> Value {
+    let mut newest_project: Option<(i64, std::path::PathBuf)> = None;
+    let mut newest_any: Option<(i64, std::path::PathBuf)> = None;
+
+    for v in vault_dirs() {
+        for (node, _) in memory_nodes_from_vault(&v.path, &v.label) {
+            let path = std::path::PathBuf::from(&node.path);
+            if node.id.eq_ignore_ascii_case("MEMORY") {
+                continue;
+            }
+            if node.id.starts_with("project_")
+                && newest_project
+                    .as_ref()
+                    .map_or(true, |(t, _)| node.mtime > *t)
+            {
+                newest_project = Some((node.mtime, path.clone()));
+            }
+            if newest_any.as_ref().map_or(true, |(t, _)| node.mtime > *t) {
+                newest_any = Some((node.mtime, path));
+            }
+        }
+    }
+
+    let Some((_, path)) = newest_project.or(newest_any) else {
+        return json!({ "tag": Value::Null, "title": Value::Null });
+    };
+
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let (fm, _body) = split_frontmatter(&text);
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let name = frontmatter_field(fm, "name").unwrap_or(id);
+    let tag = name.trim_start_matches("project_").replace('_', " ");
+    let title = frontmatter_field(fm, "description").unwrap_or_default();
+
+    json!({
+        "tag": if tag.trim().is_empty() { Value::Null } else { json!(tag.trim()) },
+        "title": if title.trim().is_empty() { Value::Null } else { json!(title.trim()) },
+    })
 }
 
 /// A slug is safe if it's a bare filename — letters, digits, `-`, `_` only.
@@ -464,7 +845,7 @@ pub fn memory_save(
     out.push('\n');
 
     let path = dir.join(format!("{name}.md"));
-    std::fs::write(&path, &out).map_err(|e| e.to_string())?;
+    atomic_write(&path, out.as_bytes()).map_err(|e| e.to_string())?;
 
     // Rename: drop the previous file + index line if the slug changed.
     if let Some(old) = old_name.as_deref() {
@@ -492,6 +873,34 @@ pub fn memory_delete(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Atomically writes `data` to `path` via a unique tmp file + rename. firaz runs
+/// several oracle sessions against the SAME `~/.aios/state` vault concurrently, so
+/// a plain `fs::write` can interleave (partial write seen by a reader) or two
+/// writers can clobber. tmp+rename makes the swap atomic on POSIX (rename is a
+/// single inode flip), and the pid+nanos suffix keeps two concurrent writers from
+/// fighting over one tmp path. The final `rename` is still last-writer-wins at the
+/// content level — but the file is NEVER left half-written / truncated.
+fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let nonce = format!(
+        "{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp = path.with_extension(format!("tmp.{nonce}"));
+    std::fs::write(&tmp, data)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Don't leak the tmp file if the rename failed.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Inserts or replaces the `MEMORY.md` pointer line for a note. Best-effort —
 /// the index is a convenience, so failures here don't fail the save.
 fn update_index_upsert(dir: &std::path::Path, name: &str, description: &str) {
@@ -515,7 +924,7 @@ fn update_index_upsert(dir: &std::path::Path, name: &str, description: &str) {
         }
         lines.push(line);
     }
-    let _ = std::fs::write(&index, lines.join("\n") + "\n");
+    let _ = atomic_write(&index, (lines.join("\n") + "\n").as_bytes());
 }
 
 /// Removes a note's `MEMORY.md` pointer line, if present. Best-effort.
@@ -527,12 +936,12 @@ fn update_index_remove(dir: &std::path::Path, name: &str) {
         Err(_) => return,
     };
     let kept: Vec<&str> = existing.lines().filter(|l| !l.contains(&marker)).collect();
-    let _ = std::fs::write(&index, kept.join("\n") + "\n");
+    let _ = atomic_write(&index, (kept.join("\n") + "\n").as_bytes());
 }
 
 #[cfg(test)]
 mod tests {
-    use super::search_memory_dir;
+    use super::{build_memory_graph, memory_nodes_from_dir, search_memory_dir};
 
     #[test]
     fn memory_search_ranks_title_and_project_matches() {
@@ -548,7 +957,7 @@ metadata:
   type: project
 ---
 
-repo: /Users/firazfhansurie/Repo/firaz/aios/shell
+repo: /Users/example/Projects/aios/shell
 the shell uses panes, command registry, and memory context.
 "#,
         )
@@ -570,7 +979,7 @@ browser note that mentions shell once.
         let hits = search_memory_dir(
             &root,
             "aios shell".to_string(),
-            Some("/Users/firazfhansurie/Repo/firaz/aios/shell".to_string()),
+            Some("/Users/example/Projects/aios/shell".to_string()),
             Some(5),
         );
 
@@ -582,6 +991,98 @@ browser note that mentions shell once.
             .reasons
             .iter()
             .any(|r| r == "matches current project path"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_graph_resolves_backlinks_clusters_and_suggested_links() {
+        let root = std::env::temp_dir().join(format!("aios-memory-graph-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("project_aios_shell.md"),
+            r#"---
+name: aios shell
+description: superapp cockpit
+metadata:
+  type: project
+---
+
+links to [[feedback-no-context-bloat-ai]] and should suggest the browser pane note.
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("feedback_no_context_bloat_ai.md"),
+            r#"---
+name: no context bloat
+description: keep model context lean
+metadata:
+  type: feedback
+---
+
+use lean context.
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("reference_browser_pane.md"),
+            r#"---
+name: browser pane
+description: native browser work surface
+metadata:
+  type: reference
+---
+
+browser pane can feed context into memory.
+"#,
+        )
+        .unwrap();
+
+        let graph = build_memory_graph(memory_nodes_from_dir(&root), Vec::new());
+        let project = graph
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .find(|node| node.get("id").and_then(|v| v.as_str()) == Some("project_aios_shell"))
+            .unwrap();
+        let feedback = graph
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .find(|node| {
+                node.get("id").and_then(|v| v.as_str()) == Some("feedback_no_context_bloat_ai")
+            })
+            .unwrap();
+
+        assert_eq!(
+            project.get("cluster").and_then(|v| v.as_str()),
+            Some("project")
+        );
+        assert_eq!(project.get("orphan").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            feedback
+                .get("backlinks")
+                .and_then(|v| v.as_array())
+                .unwrap()[0],
+            "project_aios_shell"
+        );
+        assert!(project
+            .get("suggested_links")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("reference_browser_pane")));
+        assert!(graph
+            .get("edges")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .any(|edge| edge.get("target").and_then(|v| v.as_str())
+                == Some("feedback_no_context_bloat_ai")));
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

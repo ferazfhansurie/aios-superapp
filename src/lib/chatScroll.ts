@@ -7,6 +7,18 @@ export interface ScrollMetrics {
 
 export const BOTTOM_STICKY_THRESHOLD_PX = 8;
 
+/**
+ * The threshold used to decide whether NEW content should keep the viewport
+ * pinned to the bottom (autoscroll). Deliberately MUCH wider than the
+ * pause/unpause threshold: a fast token stream grows `scrollHeight` by tens of
+ * px between layout passes, so an 8px window let the bottom overshoot and the
+ * view silently fell off. 96px keeps the view pinned through fast streams while
+ * still releasing the instant the user scrolls up (the scroll handler pauses on
+ * an "up" intent regardless of this number). Keep this separate from
+ * `BOTTOM_STICKY_THRESHOLD_PX` so user-driven pause stays crisp.
+ */
+export const AUTOSCROLL_STICK_THRESHOLD_PX = 96;
+
 export function distanceFromBottom(metrics: ScrollMetrics): number {
   return metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight;
 }
@@ -28,7 +40,11 @@ export function nextAutoscrollPaused(
   paused: boolean,
   metrics: ScrollMetrics,
   intent: ScrollIntent,
-  thresholdPx: number = BOTTOM_STICKY_THRESHOLD_PX,
+  // Resume/un-pause uses the WIDE 96px stick threshold (same as
+  // `shouldAutoscroll`), not the crisp 8px pause threshold: a fast stream grows
+  // `scrollHeight` between layout passes, so an 8px window almost never passes
+  // mid-stream and autoscroll never re-stuck after the user scrolled back down.
+  thresholdPx: number = AUTOSCROLL_STICK_THRESHOLD_PX,
 ): boolean {
   if (intent === "up") return true;
   if (distanceFromBottom(metrics) < thresholdPx) return false;

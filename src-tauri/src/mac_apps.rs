@@ -8,16 +8,30 @@
 //! permits it.
 
 use std::process::Command;
+use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 pub struct MacAppInfo {
     pub name: String,
     pub bundle_id: Option<String>,
     pub windows: Vec<String>,
     pub window_error: Option<String>,
 }
+
+/// Short-lived cache for the (expensive) running-apps enumeration. The pane polls
+/// on a timer + has a manual refresh button; without this, every tick re-spawned
+/// osascript. A few seconds of staleness is invisible for an app list, and it
+/// collapses bursty refreshes (poll + manual tap landing together) into one scan.
+const APPS_CACHE_TTL: Duration = Duration::from_secs(5);
+
+struct AppsCache {
+    at: Instant,
+    apps: Vec<MacAppInfo>,
+}
+
+static APPS_CACHE: Mutex<Option<AppsCache>> = Mutex::new(None);
 
 fn osascript(script: &str) -> Result<String, String> {
     let out = Command::new("/usr/bin/osascript")
@@ -36,55 +50,116 @@ fn osascript(script: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn split_apple_list(raw: &str) -> Vec<String> {
-    raw.split(", ")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 fn apple_quote(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn app_windows(name: &str) -> (Vec<String>, Option<String>) {
+/// ASCII control chars used as delimiters in the combined-script output. App and
+/// window titles routinely contain commas/spaces, so the old ", " split was
+/// already fragile — these can't appear in window/app names.
+const REC_SEP: char = '\u{1e}'; // between processes
+const FIELD_SEP: &str = "\u{1f}"; // name / bundle / windows-blob within a process
+const WIN_SEP: &str = "\u{1d}"; // between window titles
+
+/// Enumerates running (non-background) apps with their bundle ids AND window
+/// titles in a SINGLE osascript pass.
+///
+/// Idle-CPU fix: the old path spawned osascript twice (names, then bundle ids)
+/// PLUS once per app for window titles — 40+ process spawns per poll on a busy
+/// desktop. This walks every process once in one script, building a delimited
+/// record per app. Window titles still need Accessibility; if that's denied the
+/// inner `try` yields an empty blob and we surface the usual hint per app rather
+/// than failing the whole list.
+fn enumerate_apps_uncached() -> Result<Vec<MacAppInfo>, String> {
+    // One pass over the process list. For each process emit:
+    //   name <FIELD_SEP> bundleId <FIELD_SEP> win1 <WIN_SEP> win2 …
+    // records joined by <REC_SEP>. Window enumeration is wrapped in try so a
+    // single AX-restricted app can't abort the whole scan.
     let script = format!(
-        "tell application \"System Events\" to tell application process \"{}\" to get name of every window",
-        apple_quote(name),
+        r#"set fs to (ASCII character 31)
+set rs to (ASCII character 30)
+set ws to (ASCII character 29)
+set outv to ""
+tell application "System Events"
+  set procs to (every application process whose background only is false)
+  repeat with p in procs
+    set pname to name of p
+    try
+      set bid to bundle identifier of p
+    on error
+      set bid to ""
+    end try
+    if bid is missing value then set bid to ""
+    set wins to ""
+    try
+      set wnames to name of every window of p
+      repeat with w in wnames
+        if wins is not "" then set wins to wins & ws
+        set wins to wins & (w as string)
+      end repeat
+    end try
+    if outv is not "" then set outv to outv & rs
+    set outv to outv & pname & fs & bid & fs & wins
+  end repeat
+end tell
+return outv"#,
     );
-    match osascript(&script) {
-        Ok(raw) => (split_apple_list(&raw), None),
-        Err(e) => (Vec::new(), Some(e)),
+
+    let raw = osascript(&script)?;
+    let mut apps = Vec::new();
+    for rec in raw.split(REC_SEP) {
+        if rec.trim().is_empty() {
+            continue;
+        }
+        let mut fields = rec.splitn(3, FIELD_SEP);
+        let name = fields.next().unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let bundle_id = fields
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "missing value");
+        let win_blob = fields.next().unwrap_or("");
+        let windows: Vec<String> = win_blob
+            .split(WIN_SEP)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        apps.push(MacAppInfo {
+            name,
+            bundle_id,
+            windows,
+            // Per-app window errors are no longer distinguishable in the single
+            // pass; the frontend already shows a generic "needs accessibility"
+            // hint when an app has no windows, which covers the AX-denied case.
+            window_error: None,
+        });
     }
+    Ok(apps)
 }
 
 #[tauri::command]
 pub fn mac_list_apps() -> Result<Vec<MacAppInfo>, String> {
-    let names = split_apple_list(&osascript(
-        "tell application \"System Events\" to get name of every application process whose background only is false",
-    )?);
-    let bundle_ids = split_apple_list(&osascript(
-        "tell application \"System Events\" to get bundle identifier of every application process whose background only is false",
-    )?);
-
-    Ok(names
-        .into_iter()
-        .enumerate()
-        .map(|(idx, name)| {
-            let bundle_id = bundle_ids
-                .get(idx)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && s != "missing value");
-            let (windows, window_error) = app_windows(&name);
-            MacAppInfo {
-                name,
-                bundle_id,
-                windows,
-                window_error,
+    // Serve from cache if fresh — collapses bursty refreshes into one scan.
+    if let Ok(guard) = APPS_CACHE.lock() {
+        if let Some(c) = guard.as_ref() {
+            if c.at.elapsed() < APPS_CACHE_TTL {
+                return Ok(c.apps.clone());
             }
-        })
-        .collect())
+        }
+    }
+
+    let apps = enumerate_apps_uncached()?;
+
+    if let Ok(mut guard) = APPS_CACHE.lock() {
+        *guard = Some(AppsCache {
+            at: Instant::now(),
+            apps: apps.clone(),
+        });
+    }
+    Ok(apps)
 }
 
 #[tauri::command]

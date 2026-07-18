@@ -1,0 +1,12 @@
+#!/bin/zsh
+set -euo pipefail
+
+SECRET_FILE="$HOME/.aios/state/codex-anthropic-adapter/secret"
+if [[ ! -r "$SECRET_FILE" ]]; then
+  echo "adapter not installed; run scripts/install-codex-anthropic-adapter.sh" >&2
+  exit 1
+fi
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8791"
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_CUSTOM_HEADERS="x-aios-adapter-secret: $(tr -d '\n' < "$SECRET_FILE")"
+exec claude "$@"

@@ -5,12 +5,14 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { MessageSquarePlus, X } from "lucide-react";
+import { FolderOpen, MessageSquarePlus, RotateCw, X } from "lucide-react";
 import { Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { createTerminalOutputPump, type TerminalOutputPump } from "../lib/terminalOutputPump";
 
 import {
   ptyKill,
@@ -22,9 +24,24 @@ import {
   spawnTmux,
 } from "../lib/pty";
 import { homeDir, saveImageTemp } from "../lib/fs";
-import { paneWriters, paneSubmitters } from "../lib/paneBus";
+import { paneWriters, paneSubmitters, openUrlInPane, spawnPane, taskSpawnContext } from "../lib/paneBus";
 import { isTauriRuntime } from "../lib/tauri";
+import type { TaskId } from "../lib/taskWorkspace";
+
+/** Wrap text in bracketed-paste markers so a TUI (claude code, vim, a shell with
+ *  bracketed-paste mode on) treats it as ONE atomic paste — the trailing CR
+ *  inside the brackets is delivered literally instead of racing a separate
+ *  setTimeout'd Enter (the old 40/150/600ms "dual-enter" hack). For a shell this
+ *  also means a multi-line clipboard paste lands as one editable block instead of
+ *  auto-executing each line. ESC[200~ … ESC[201~. */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+function bracketed(text: string): string {
+  return `${PASTE_START}${text}${PASTE_END}`;
+}
 import { TerminalComposer } from "./TerminalComposer";
+import { PaneDropZone } from "./PaneDropZone";
+import { reportDiag } from "../lib/diag";
 
 /** Adletic-orange dark palette (Tomorrow Night base). */
 const THEME = {
@@ -86,6 +103,20 @@ export type PaneKind =
   | { type: "oracle"; identity: string }
   | { type: "tmux"; socket: string; session: string };
 
+type TerminalPaneProps = {
+  kind: PaneKind;
+  paneKey?: string;
+  active?: boolean;
+  hidden?: boolean;
+  taskId?: TaskId;
+};
+
+type ClaudeStatus = {
+  mode?: string;
+  model?: string;
+  ctxPct?: number;
+};
+
 /**
  * Derives a stable, tmux-safe session name (`[a-z0-9_-]`) from a pane key so the
  * SAME pane reattaches to the SAME persistent `aios-term-<name>` session across
@@ -93,7 +124,7 @@ export type PaneKind =
  * (that pane just won't persist across full app restarts — acceptable).
  */
 let termFallbackSeq = 0;
-function termSessionName(paneKey?: string): string {
+export function termSessionName(paneKey?: string): string {
   const base = (paneKey ?? `pane-${++termFallbackSeq}`)
     .toLowerCase()
     .replace(/[^a-z0-9_-]+/g, "-")
@@ -101,9 +132,54 @@ function termSessionName(paneKey?: string): string {
   return base || `pane-${++termFallbackSeq}`;
 }
 
-export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: string }) {
+function cleanTerminalWindow(raw: string): string {
+  // eslint-disable-next-line no-control-regex
+  return raw
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+function nextClaudeStatus(clean: string, prev: ClaudeStatus): ClaudeStatus {
+  const next = { ...prev };
+  const modeM = clean.match(
+    /(bypass permissions|accept edits|plan mode|normal mode)\b/i,
+  );
+  if (modeM) {
+    const m = modeM[1].toLowerCase();
+    next.mode = m.startsWith("bypass")
+      ? "full access"
+      : m.startsWith("accept")
+        ? "accept edits"
+        : m.startsWith("plan")
+          ? "plan"
+          : "ask each time";
+  }
+  const modelM = clean.match(/\b(opus|sonnet|haiku)\s+(\d+(?:\.\d+)?)/i);
+  if (modelM) {
+    next.model = `${modelM[1][0].toUpperCase()}${modelM[1].slice(1).toLowerCase()} ${modelM[2]}`;
+  }
+  const ctxM = clean.match(/(\d+)%\s*context\s*(?:left|remaining)/i);
+  if (ctxM) next.ctxPct = Number(ctxM[1]);
+  return next;
+}
+
+function buttonOptions(clean: string, lastButton: string): { raw: string; options: string[] } | null {
+  const matches = [...clean.matchAll(/\[\[btn:\s*([^\]]+?)\]\]/gi)];
+  const last = matches[matches.length - 1];
+  if (!last || last[1] === lastButton) return null;
+  const options = last[1]
+    .split("|")
+    // eslint-disable-next-line no-control-regex
+    .map((s) => s.replace(/[\x00-\x1f]/g, "").trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  return options.length ? { raw: last[1], options } : null;
+}
+
+export function TerminalPane({ kind, paneKey, active = true, hidden = false, taskId }: TerminalPaneProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<number | null>(null);
+  const hiddenRef = useRef(hidden);
   const [dragOver, setDragOver] = useState(false);
   // Compose box (multi-line prompt affordance). Default-open for the dedicated
   // "claude code" pane so the chat-grade surface is there from the first frame.
@@ -116,6 +192,12 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       (kind.type === "shell" && !!kind.cmd && kind.cmd.startsWith("claude")),
   );
   const [savingImg, setSavingImg] = useState(false);
+  // B3: the backend emits `pty-exit <sessionId>` when the child/reader dies.
+  // When THIS pane's session exits we surface an inline "process exited" state
+  // (⏎ restart / ⌘W close) instead of silently swallowing the user's keystrokes
+  // into a dead PTY. `restartNonce` bumps to re-run the mount effect → respawn.
+  const [exited, setExited] = useState(false);
+  const [restartNonce, setRestartNonce] = useState(0);
   // Best-effort cwd for the composer's context bar: a shell pane's explicit cwd,
   // else the home dir (oracle/tmux panes don't carry one). Read-only label only.
   const [paneCwd, setPaneCwd] = useState<string | undefined>(
@@ -145,10 +227,19 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // writing — the common "wrong spot" is a scrolled-up terminal (reading backlog
   // / tmux copy-mode) that would eat the sent line.
   const termRef = useRef<Xterm | null>(null);
+  const outputPumpRef = useRef<TerminalOutputPump | null>(null);
+
+  useEffect(() => {
+    hiddenRef.current = hidden;
+    outputPumpRef.current?.setHidden(hidden);
+  }, [hidden]);
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
+    // B3: starting (or restarting) a session → clear any prior exit state so the
+    // fresh terminal renders instead of the "process exited" overlay.
+    setExited(false);
 
     const term = new Xterm({
       fontFamily: FONT_FAMILY,
@@ -171,7 +262,22 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     termRef.current = term;
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.loadAddon(new WebLinksAddon());
+    // N5: route clicked URLs into the IN-APP browser pane (you stay in the
+    // cockpit) instead of bouncing to the OS browser. openUrlInPane returns false
+    // if no pane host is registered (e.g. running outside the desktop shell) —
+    // fall back to the default OS open in that case.
+    term.loadAddon(
+      new WebLinksAddon((event, uri) => {
+        if (event.button !== 0) return; // left-click only, like the default
+        if (!openUrlInPane(uri, "browser", taskSpawnContext(taskId))) {
+          try {
+            window.open(uri, "_blank", "noopener,noreferrer");
+          } catch {
+            /* nothing more we can do */
+          }
+        }
+      }),
+    );
     term.open(host);
 
     // Save an image blob to a temp file and write its shell-quoted path (+space)
@@ -182,7 +288,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       try {
         const b64 = await blobToBase64(blob);
         const path = await saveImageTemp(b64, imageExt(mime));
-        ptyWrite(sid, `${quotePath(path)} `).catch(() => {});
+        ptyWrite(sid, `${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "dropPath" }));
       } catch {
         /* best-effort */
       } finally {
@@ -210,7 +316,10 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       }
       try {
         const t = await navigator.clipboard.readText();
-        if (t && sid != null) ptyWrite(sid, t).catch(() => {});
+        // R6: bracketed paste so a MULTI-LINE clipboard paste into a shell lands
+        // as one editable block instead of auto-executing each line (the
+        // paste-injection footgun). No trailing CR — pasting never submits.
+        if (t && sid != null) ptyWrite(sid, bracketed(t)).catch((e) => reportDiag("terminal.write", e, { action: "pasteBracketed" }));
       } catch {
         /* nothing pasteable */
       }
@@ -225,7 +334,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       // Shift+Enter → soft newline, NOT submit. Claude Code / Ink TUIs treat
       // meta+Enter (ESC then CR) as "insert newline"; plain Enter still submits.
       if (e.key === "Enter" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
-        if (sid != null) ptyWrite(sid, "\x1b\r").catch(() => {});
+        if (sid != null) ptyWrite(sid, "\x1b\r").catch((e) => reportDiag("terminal.write", e, { action: "altEnter" }));
         return false;
       }
       // Cmd+V → paste from the system clipboard into the PTY (Ctrl+V stays
@@ -240,7 +349,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       // reaches the PTY as SIGINT (^C) — matching Alacritty on macOS.
       if (e.key === "c" && e.metaKey && !e.ctrlKey && term.hasSelection()) {
         const sel = term.getSelection();
-        if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+        if (sel) navigator.clipboard.writeText(sel).catch((e) => reportDiag("terminal.clipboard", e, { action: "copySelection" }));
         return false;
       }
       return true;
@@ -249,7 +358,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     // Copy-on-select: as soon as a selection settles, mirror it to the clipboard.
     term.onSelectionChange(() => {
       const sel = term.getSelection();
-      if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+      if (sel) navigator.clipboard.writeText(sel).catch((e) => reportDiag("terminal.clipboard", e, { action: "copySelection" }));
     });
 
     // Middle-click paste (X11/Alacritty muscle memory).
@@ -260,14 +369,30 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       navigator.clipboard
         .readText()
         .then((t) => {
-          if (t && sid != null) ptyWrite(sid, t).catch(() => {});
+          // R6: bracketed paste — same multi-line-safety as Cmd+V.
+          if (t && sid != null) ptyWrite(sid, bracketed(t)).catch((e) => reportDiag("terminal.write", e, { action: "pasteBracketed" }));
         })
-        .catch(() => {});
+        .catch((e) => reportDiag("terminal.clipboard", e, { action: "readText" }));
     };
     host.addEventListener("auxclick", onAuxClick);
     // WebGL renderer for speed; silently fall back to the default if unavailable.
+    // R2: WebGL renderer for speed. On sleep/wake (or GPU pressure) the browser
+    // can drop the WebGL context — without handling onContextLoss the addon
+    // throws on the next draw and the pane goes black. Dispose the dead addon so
+    // xterm transparently falls back to its DOM/canvas renderer; the pane keeps
+    // painting (slower, but alive) until the next mount restores WebGL.
+    let webgl: WebglAddon | null = null;
     try {
-      term.loadAddon(new WebglAddon());
+      webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        try {
+          webgl?.dispose();
+        } catch {
+          /* already torn down */
+        }
+        webgl = null;
+      });
+      term.loadAddon(webgl);
     } catch {
       /* canvas/dom fallback */
     }
@@ -275,11 +400,60 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     let sessionId: number | null = null;
     let disposed = false;
     let inputDisposer: { dispose: () => void } | null = null;
+    // B3: unlisten handle for this pane's `pty-exit` subscription.
+    let unlistenExit: (() => void) | null = null;
+    let lastMetadataParseAt = 0;
+
+    const parseTerminalMetadata = (text: string) => {
+      // keep the rolling window hot even while hidden, but skip regex/status work
+      // until the pane is visible again.
+      const raw = (bufRef.current + text).slice(-4000);
+      bufRef.current = raw;
+      if (hiddenRef.current) return;
+
+      const now = Date.now();
+      const hasButtonSentinel = raw.includes("[[btn:");
+      if (!hasButtonSentinel && now - lastMetadataParseAt < 120) return;
+      lastMetadataParseAt = now;
+
+      const clean = cleanTerminalWindow(raw);
+      const prev = claudeStatusRef.current;
+      const next = nextClaudeStatus(clean, prev);
+      if (
+        next.mode !== prev.mode ||
+        next.model !== prev.model ||
+        next.ctxPct !== prev.ctxPct
+      ) {
+        claudeStatusRef.current = next;
+        setClaudeStatus(next);
+      }
+
+      const parsedButtons = buttonOptions(clean, lastBtnRef.current);
+      if (parsedButtons) {
+        lastBtnRef.current = parsedButtons.raw;
+        setButtons(parsedButtons.options);
+      }
+    };
+
+    const outputPump = createTerminalOutputPump({
+      write: (text, done) => {
+        term.write(text, () => {
+          parseTerminalMetadata(text);
+          done();
+        });
+      },
+      schedule: (callback, delayMs) => window.setTimeout(callback, delayMs),
+      cancel: (handle) => window.clearTimeout(handle as number),
+    });
+    outputPump.setHidden(hiddenRef.current);
+    outputPumpRef.current = outputPump;
 
     if (!isTauriRuntime()) {
       term.write("\r\n\x1b[33m[aios] terminal panes run inside the desktop shell.\x1b[0m\r\n");
       return () => {
         disposed = true;
+        outputPump.dispose();
+        if (outputPumpRef.current === outputPump) outputPumpRef.current = null;
         host.removeEventListener("auxclick", onAuxClick);
         term.dispose();
       };
@@ -288,65 +462,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const onData = new Channel<string>();
     onData.onmessage = (chunk) => {
       if (disposed) return;
-      term.write(chunk);
-      // scan a rolling window for the button sentinel across chunk boundaries.
-      // strip ANSI/OSC escapes first — the raw PTY stream interleaves cursor
-      // moves (\x1b[10G) + colors with the text, which garbles the labels.
-      const raw = (bufRef.current + chunk).slice(-4000);
-      bufRef.current = raw;
-      // eslint-disable-next-line no-control-regex
-      const clean = raw
-        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-        .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
-      // parse claude-code's live status out of the same cleaned window:
-      //   mode  — the footer hint "⏵⏵ bypass permissions on / plan mode on / …"
-      //   model — "Opus 4.8" / "Sonnet 4.6" / "Haiku 4.5" wherever it's printed
-      //   ctx%  — claude's "NN% context left" / "context: NN%" readout
-      // Best-effort + sticky: update only on a fresh match, keep last otherwise.
-      {
-        const prev = claudeStatusRef.current;
-        const next = { ...prev };
-        const modeM = clean.match(
-          /(bypass permissions|accept edits|plan mode|normal mode)\b/i,
-        );
-        if (modeM) {
-          const m = modeM[1].toLowerCase();
-          next.mode = m.startsWith("bypass")
-            ? "full access"
-            : m.startsWith("accept")
-              ? "accept edits"
-              : m.startsWith("plan")
-                ? "plan"
-                : "ask each time";
-        }
-        const modelM = clean.match(/\b(opus|sonnet|haiku)\s+(\d+(?:\.\d+)?)/i);
-        if (modelM) {
-          next.model = `${modelM[1][0].toUpperCase()}${modelM[1].slice(1).toLowerCase()} ${modelM[2]}`;
-        }
-        const ctxM = clean.match(/(\d+)%\s*context\s*(?:left|remaining)/i);
-        if (ctxM) next.ctxPct = Number(ctxM[1]);
-        if (
-          next.mode !== prev.mode ||
-          next.model !== prev.model ||
-          next.ctxPct !== prev.ctxPct
-        ) {
-          claudeStatusRef.current = next;
-          setClaudeStatus(next);
-        }
-      }
-
-      const matches = [...clean.matchAll(/\[\[btn:\s*([^\]]+?)\]\]/gi)];
-      const last = matches[matches.length - 1];
-      if (last && last[1] !== lastBtnRef.current) {
-        lastBtnRef.current = last[1];
-        const opts = last[1]
-          .split("|")
-          // eslint-disable-next-line no-control-regex
-          .map((s) => s.replace(/[\x00-\x1f]/g, "").trim())
-          .filter(Boolean)
-          .slice(0, 5);
-        if (opts.length) setButtons(opts);
-      }
+      outputPump.push(chunk);
     };
 
     (async () => {
@@ -388,11 +504,29 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       }
 
       if (disposed) {
-        if (sessionId != null) ptyKill(sessionId).catch(() => {});
+        if (sessionId != null) ptyKill(sessionId).catch((e) => reportDiag("terminal.kill", e, { action: "kill" }));
         return;
       }
 
       sessionIdRef.current = sessionId;
+      // B3: listen for THIS session's exit. The backend evicts the session from
+      // its registry (B4) then emits `pty-exit <id>`. When it's ours, drop the
+      // session ref (so further writes no-op instead of black-holing into a dead
+      // PTY) and surface the inline "process exited" state. A plain shell or
+      // `claude` quitting is the common trigger.
+      {
+        const mySid = sessionId;
+        listen<number>("pty-exit", (e) => {
+          if (disposed || e.payload !== mySid) return;
+          sessionIdRef.current = null;
+          setExited(true);
+        })
+          .then((un) => {
+            if (disposed) un();
+            else unlistenExit = un;
+          })
+          .catch((e) => reportDiag("terminal.listen", e, { action: "exit" }));
+      }
       // Pane writer for cross-cutting features (voice dictation, file drops).
       // Prefer the compose box when it's open (so dictation lands in the box and
       // is editable before send, like ChatPane); else write straight to the PTY.
@@ -400,10 +534,10 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         paneWriters.set(paneKey, (t) => {
           const toBox = composerAppendRef.current;
           if (toBox) toBox(t);
-          else ptyWrite(sessionId!, t).catch(() => {});
+          else ptyWrite(sessionId!, t).catch((e) => reportDiag("terminal.write", e, { action: "input" }));
         });
       inputDisposer = term.onData((d) => {
-        if (sessionId != null) ptyWrite(sessionId, d).catch(() => {});
+        if (sessionId != null) ptyWrite(sessionId, d).catch((e) => reportDiag("terminal.write", e, { action: "data" }));
       });
       // auto-run an init command (e.g. `aios`) once the shell is ready.
       // Skip for persistent panes — there `cmd` is the tmux session's startup
@@ -412,18 +546,31 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         const c = kind.cmd;
         const sid = sessionId;
         setTimeout(() => {
-          if (!disposed && sid != null) ptyWrite(sid, `${c}\r`).catch(() => {});
+          if (!disposed && sid != null) ptyWrite(sid, `${c}\r`).catch((e) => reportDiag("terminal.write", e, { action: "command" }));
         }, 300);
       }
     })();
 
-    const onResize = () => {
+    // R1: debounce the ResizeObserver. The raw callback fires on EVERY pixel
+    // change while dragging a pane divider; running fit.fit() + ptyResize (an IPC
+    // round-trip + SIGWINCH to the child) per frame floods the PTY and flickers.
+    // Coalesce to a single trailing fit+resize ~60ms after motion settles.
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastResize: { cols: number; rows: number } | null = null;
+    const applyResize = () => {
+      if (hiddenRef.current) return;
       try {
         fit.fit();
-        if (sessionId != null) ptyResize(sessionId, term.cols, term.rows).catch(() => {});
+        if (lastResize?.cols === term.cols && lastResize.rows === term.rows) return;
+        lastResize = { cols: term.cols, rows: term.rows };
+        if (sessionId != null) ptyResize(sessionId, term.cols, term.rows).catch((e) => reportDiag("terminal.resize", e, { action: "resize" }));
       } catch {
         /* ignore */
       }
+    };
+    const onResize = () => {
+      if (resizeTimer != null) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(applyResize, 60);
     };
     const ro = new ResizeObserver(onResize);
     ro.observe(host);
@@ -433,26 +580,53 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       if (paneKey) paneWriters.delete(paneKey);
       host.removeEventListener("auxclick", onAuxClick);
       ro.disconnect();
+      if (resizeTimer != null) clearTimeout(resizeTimer);
+      outputPump.dispose();
+      if (outputPumpRef.current === outputPump) outputPumpRef.current = null;
+      unlistenExit?.();
       inputDisposer?.dispose();
-      if (sessionId != null) ptyKill(sessionId).catch(() => {});
+      if (sessionId != null) ptyKill(sessionId).catch((e) => reportDiag("terminal.kill", e, { action: "cleanup" }));
       term.dispose();
     };
-    // Mount once: each pane has a stable React key and fixed kind.
+    // Re-runs on restartNonce (B3 restart): tears down the dead terminal + respawns
+    // — for a tmux-backed pane this reattaches the persistent `aios-term-<name>`
+    // (recreating it via `new-session -A` if the process had exited).
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restartNonce]);
+
+  // B3: restart an exited session — bump the nonce so the mount effect re-runs
+  // (respawn + reattach). Clear the exit flag optimistically.
+  const restartSession = useCallback(() => {
+    setExited(false);
+    setRestartNonce((n) => n + 1);
   }, []);
+
+  // While exited, ⏎ restarts (mirrors the overlay hint). Scoped to keydown on
+  // the host so it doesn't fight global shortcuts; ⌘W (close) is App's job.
+  useEffect(() => {
+    if (!exited) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        restartSession();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [exited, restartSession]);
 
   // Click a button → "type" that choice into the session (text + Enter).
   const sendChoice = (opt: string) => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, `${opt}\r`).catch(() => {});
+    // R6: bracketed-paste the choice text + a real Enter outside the brackets
+    // (same atomic submit as composerSend) so it can't race / get split.
+    if (id != null) ptyWrite(id, bracketed(opt) + "\r").catch((e) => reportDiag("terminal.write", e, { action: "selectOption" }));
     setButtons(null);
     bufRef.current = "";
   };
 
-  // Compose box → write the text, then send Enter as a SEPARATE keystroke a beat
-  // later. Claude Code / Ink TUIs can swallow a CR glued to a pasted block
-  // (bracketed paste), so the prompt wouldn't actually submit. Splitting them
-  // makes the Enter land as a real submit and generation starts.
+  // Compose box → bracketed-paste the text, with a real Enter OUTSIDE the paste
+  // brackets as the submit (see the body comment). One atomic write, no timer.
   const composerSend = (text: string) => {
     const id = sessionIdRef.current;
     if (id == null) return;
@@ -462,8 +636,17 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     // already at the bottom, so normal sends are unaffected.
     termRef.current?.scrollToBottom();
     termRef.current?.focus();
-    ptyWrite(id, text).catch(() => {});
-    setTimeout(() => ptyWrite(id, "\r").catch(() => {}), 40);
+    // R6: bracketed-paste the TEXT (atomic — the TUI inserts it verbatim, no
+    // per-line auto-exec, no garbled multibyte), then a REAL Enter OUTSIDE the
+    // paste brackets as the submit key — all in ONE write, no setTimeout race.
+    //
+    // Why the CR is outside the brackets (the claude-submit caution): claude
+    // code's TUI buffers a \r that arrives INSIDE a paste as a literal newline
+    // (multiline-compose), so it would sit unsent — that's the whole reason the
+    // old code split text + a delayed \r. The `\x1b[201~` terminator closes the
+    // paste, so the trailing \r is then processed as a genuine Enter = submit.
+    // This preserves the claude-code submit flow without any magic timer.
+    ptyWrite(id, bracketed(text) + "\r").catch((e) => reportDiag("terminal.write", e, { action: "send" }));
   };
 
   // Expose composerSend as this pane's SUBMITTER so "send to AI" (notes pane)
@@ -481,7 +664,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // Interrupt the running CLI (^C) — visible "stop" affordance.
   const interrupt = () => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, "\x03").catch(() => {});
+    if (id != null) ptyWrite(id, "\x03").catch((e) => reportDiag("terminal.write", e, { action: "interrupt" }));
   };
 
   // Write RAW bytes straight to the PTY (no auto-CR, no quoting). The compose
@@ -490,7 +673,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // (\x1b[Z) — exactly as if the user typed them in the terminal.
   const sendRaw = (bytes: string) => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, bytes).catch(() => {});
+    if (id != null) ptyWrite(id, bytes).catch((e) => reportDiag("terminal.write", e, { action: "bytes" }));
   };
 
   // Fall back to the home dir for the composer's context chip when this pane has
@@ -502,7 +685,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       .then((h) => {
         if (alive) setPaneCwd(h);
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("terminal.load", e, { action: "homeDir" }));
     return () => {
       alive = false;
     };
@@ -519,7 +702,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
   // message. Lets you drive claude's Esc behaviour from the compose box.
   const sendEscape = () => {
     const id = sessionIdRef.current;
-    if (id != null) ptyWrite(id, "\x1b").catch(() => {});
+    if (id != null) ptyWrite(id, "\x1b").catch((e) => reportDiag("terminal.write", e, { action: "escape" }));
   };
 
   // Save a dropped image → temp file → insert its quoted path into the PTY.
@@ -530,7 +713,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     try {
       const b64 = await blobToBase64(blob);
       const path = await saveImageTemp(b64, imageExt(mime));
-      ptyWrite(id, `${quotePath(path)} `).catch(() => {});
+      ptyWrite(id, `${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "dropPath" }));
     } catch {
       /* best-effort */
     } finally {
@@ -557,10 +740,36 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     const path =
       e.dataTransfer.getData("application/x-aios-path") || e.dataTransfer.getData("text/plain");
     if (!path) return;
-    ptyWrite(id, `${quotePath(path)} `).catch(() => {});
+    // a folder → `cd <dir>`; a file → just its quoted path.
+    if (e.dataTransfer.getData("application/x-aios-dir")) {
+      ptyWrite(id, `cd ${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "cdPath" }));
+      return;
+    }
+    ptyWrite(id, `${quotePath(path)} `).catch((e) => reportDiag("terminal.write", e, { action: "insertPath" }));
+  };
+
+  // Insert a dropped path at the prompt (quoted, trailing space). Used by the
+  // PaneDropZone overlay — which floats ABOVE xterm's canvas while a drag is
+  // armed, so the drop actually reaches React instead of being swallowed.
+  const insertDroppedPath = (raw: string) => {
+    const id = sessionIdRef.current;
+    const s = raw.trim();
+    if (id == null || !s) return;
+    ptyWrite(id, `${quotePath(s)} `).catch((e) => reportDiag("terminal.write", e, { action: "insertPath" }));
+  };
+
+  // A FOLDER dropped onto a terminal → prefill a `cd <dir>` at the prompt (no
+  // auto-Enter, so the user confirms). The sensible thing for a dir vs a file.
+  const insertCd = (dir: string): boolean => {
+    const id = sessionIdRef.current;
+    const s = dir.trim();
+    if (id == null || !s) return false;
+    ptyWrite(id, `cd ${quotePath(s)} `).catch((e) => reportDiag("terminal.write", e, { action: "cdPath" }));
+    return true;
   };
 
   return (
+    <PaneDropZone onPath={insertDroppedPath} onDir={insertCd} label="drop to insert path">
     <div
       className="relative flex h-full min-h-0 w-full flex-col"
       onDragOver={(e) => {
@@ -575,6 +784,37 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
     >
       <div className="relative min-h-0 flex-1">
         <div ref={hostRef} className="h-full min-h-0 w-full" />
+        {/* B3: process-exited overlay — the shell/CLI died, so writes would
+            black-hole. Tell the user + offer ⏎ restart (respawn/reattach) and
+            point at ⌘W to close. Replaces the silent corpse the old code left. */}
+        {exited && (
+          <div className="absolute inset-0 z-30 grid place-items-center bg-[var(--color-bg)]/80 backdrop-blur-sm">
+            <div className="flex flex-col items-center gap-3 rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel)]/95 px-6 py-5 text-center shadow-2xl shadow-black/50">
+              <span className="text-[13px] text-[var(--color-text)]">
+                process exited
+              </span>
+              <span className="text-[11px] text-[var(--color-faint)]">
+                press ⏎ to restart · ⌘W to close
+              </span>
+              <button
+                onClick={restartSession}
+                className="flex items-center gap-1.5 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-fg)]"
+              >
+                <RotateCw size={13} />
+                restart
+              </button>
+            </div>
+          </div>
+        )}
+        {/* spawn a files pane rooted at this terminal's cwd ("open files here") */}
+        <button
+          onClick={() => spawnPane("files", { path: paneCwd, ...taskSpawnContext(taskId) })}
+          title={`Open files here${paneCwd ? `\n${paneCwd}` : ""}`}
+          className="absolute left-2 top-2 z-20 flex items-center gap-1 rounded-md border border-[var(--color-border-strong)] bg-[var(--color-panel)]/90 px-2 py-1 text-[11px] text-[var(--color-text-2)] opacity-40 backdrop-blur transition-all hover:border-[var(--color-accent)]/50 hover:text-[var(--color-text)] hover:opacity-100"
+        >
+          <FolderOpen size={13} />
+          <span>files</span>
+        </button>
         {/* toggle the compose box (chat-grade prompt surface for CLI AIs) */}
         {!composerOpen && (
           <button
@@ -597,7 +837,7 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
               <button
                 key={i}
                 onClick={() => sendChoice(b)}
-                className="rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)]"
+                className="rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-3 py-1.5 text-[12px] text-[var(--color-text)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-fg)]"
               >
                 {b}
               </button>
@@ -621,6 +861,8 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
       </div>
       {composerOpen && (
         <TerminalComposer
+          active={active && !hidden}
+          hidden={hidden}
           onSend={composerSend}
           onRaw={sendRaw}
           onInterrupt={interrupt}
@@ -637,5 +879,6 @@ export function TerminalPane({ kind, paneKey }: { kind: PaneKind; paneKey?: stri
         />
       )}
     </div>
+    </PaneDropZone>
   );
 }

@@ -1,11 +1,12 @@
 // @ts-nocheck -- source-boundary regression checks run directly in node.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
 const root = process.cwd();
 const read = (path: string) => readFileSync(join(root, path), "utf8");
+const exists = (path: string) => existsSync(join(root, path));
 const hasRuntimeImport = (source: string, specifier: string) => {
   const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`^import(?!\\\\s+type)[^\\n]*from\\\\s+["']${escaped}["']`, "m").test(source);
@@ -14,12 +15,11 @@ const hasRuntimeImport = (source: string, specifier: string) => {
 test("app shell does not statically import heavy pane implementations", () => {
   const app = read("src/App.tsx");
   const forbidden = [
+    "./components/BrowserPane",
     "./components/ChatPane",
-    "./components/DatabasePane",
     "./components/EditorPane",
+    "./components/FilesPane",
     "./components/TerminalRuntime",
-    "./components/MemoryPane",
-    "./components/MotionPane",
   ];
 
   for (const specifier of forbidden) {
@@ -31,8 +31,14 @@ test("app shell does not statically import heavy pane implementations", () => {
   }
 
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/ChatPane"\)/);
-  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/DatabasePane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/BrowserPane"\)/);
   assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/EditorPane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/FileViewerPane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/FilesPane"\)/);
+  assert.match(app, /lazy\(\(\) =>\s*import\("\.\/components\/TerminalPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/GitPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/MoneyAgentsPane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/MemoryPane"\)/);
 });
 
 test("editor pane keeps monaco behind an async runtime import", () => {
@@ -52,84 +58,62 @@ test("terminal pane keeps xterm behind terminal runtime", () => {
   assert.match(runtime, /@xterm\/xterm/);
 });
 
-test("memory pane keeps three.js graph behind graph runtime", () => {
-  const pane = read("src/components/MemoryPane.tsx");
-  const graph = read("src/components/MemoryGraph3D.tsx");
+test("pet system stays removed from shell surfaces", () => {
+  const removedFiles = [
+    "src/components/PetPane.tsx",
+    "src/components/DesktopPetOverlay.tsx",
+    "src/lib/pet.ts",
+    "src/lib/desktopPet.ts",
+    "public/pets/aios-bot/pet.json",
+    "public/pets/aios-bot/spritesheet.svg",
+    "public/pets/aios-bot/spritesheet.png",
+    "docs/pet-concepts/aios-robot-concept-sheet.png",
+  ];
+  for (const file of removedFiles) {
+    assert.equal(exists(file), false, `${file} should not exist`);
+  }
 
-  assert.equal(hasRuntimeImport(pane, "3d-force-graph"), false);
-  assert.equal(hasRuntimeImport(pane, "three"), false);
-  assert.equal(hasRuntimeImport(pane, "three/examples/jsm/postprocessing/UnrealBloomPass.js"), false);
-  assert.match(pane, /import\("\.\/MemoryGraph3D"\)/);
-  assert.match(graph, /3d-force-graph/);
-  assert.match(graph, /from "three"/);
-});
-
-test("pet pane uses a seeded code-drawn 8-bit game pet", () => {
-  const pane = read("src/components/PetPane.tsx");
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const main = read("src/main.tsx");
+  const idle = read("src/components/IdleControlCenter.tsx");
+  const dashboard = read("src/components/IdleDashboard.tsx");
+  const chat = read("src/components/ChatPane.tsx");
   const css = read("src/App.css");
+  const capabilities = read("src-tauri/capabilities/default.json");
+  const tauriConfig = read("src-tauri/tauri.conf.json");
 
-  assert.match(pane, /PET_VARIANT_KEY/);
-  assert.match(pane, /PET_LEGACY_VARIANT_KEY/);
-  assert.match(pane, /PET_REROLL_DAILY_LIMIT/);
-  assert.match(pane, /PET_REROLL_KEY/);
-  assert.match(pane, /PET_ONBOARDING_KEY/);
-  assert.match(pane, /ACCENT_ORDER/);
-  assert.match(pane, /setAccent/);
-  assert.match(pane, /accentToHex/);
-  assert.match(pane, /subscribeAccent/);
-  assert.match(pane, /THEME_TONES/);
-  assert.match(pane, /theme locked/);
-  assert.match(pane, /first hatch/);
-  assert.match(pane, /chooseStarter/);
-  assert.match(pane, /makeVariant/);
-  assert.match(pane, /TOPPERS/);
-  assert.match(pane, /PATTERNS/);
-  assert.match(pane, /TAILS/);
-  assert.match(pane, /variant\.tone/);
-  assert.match(pane, /variant\.eyes/);
-  assert.match(pane, /variant\.legs/);
-  assert.match(pane, /variant\.environment/);
-  assert.match(pane, /variant\.topper/);
-  assert.match(pane, /variant\.pattern/);
-  assert.match(pane, /variant\.tail/);
-  assert.match(pane, /ACTIVITY_BY_MOOD/);
-  assert.match(pane, /pet-pixel/);
-  assert.match(pane, /pet-pixel-body/);
-  assert.match(pane, /pet-pixel-pattern/);
-  assert.match(pane, /pet-pixel-tail/);
-  assert.match(pane, /pet-world/);
-  assert.match(pane, /pet-job/);
-  assert.match(pane, /hatch roll/);
-  assert.match(pane, /disabled=\{rerollsLeft <= 0\}/);
-  assert.doesNotMatch(pane, /pet-antenna/);
-  assert.doesNotMatch(pane, /<img/);
-  assert.match(css, /seeded code-drawn 8-bit game pet/);
-  assert.match(css, /\.pet-reroll-bank/);
-  assert.match(css, /\.pet-action-btn:disabled/);
-  assert.match(css, /\.pet-hatch-onboarding/);
-  assert.match(css, /\.pet-hatch-swatch/);
-  assert.match(css, /\.pet-starter-card/);
-  assert.match(css, /\.pet-pixel--starter/);
-  assert.match(css, /\.pet-canvas--arcade/);
-  assert.match(css, /\.pet-canvas--lagoon/);
-  assert.match(css, /--pet-room-glow/);
-  assert.match(css, /\.pet-world-avatar/);
-  assert.match(css, /\.pet-job--coding/);
-  assert.match(css, /\.pet-pixel-topper--horns/);
-  assert.match(css, /\.pet-pixel-tail--spark/);
-  assert.match(css, /\.pet-pixel-pattern--stripe/);
-  assert.match(css, /\.pet-pixel/);
-  assert.match(css, /image-rendering: pixelated/);
-  assert.match(css, /grid-template-columns: repeat\(var\(--pet-leg-count\), 1fr\)/);
-  assert.match(css, /\.pet-pixel--happy/);
-  assert.match(css, /\.pet-pixel--critical/);
+  assert.doesNotMatch(apps, /\{ type: "pet" \}/);
+  assert.doesNotMatch(apps, /id: "pet"/);
+  assert.doesNotMatch(app, /PetPane|type: "pet"|onOpenPet/);
+  assert.doesNotMatch(main, /DesktopPetOverlay|pet-overlay/);
+  assert.doesNotMatch(idle, /PetDashboardCompanion|PetPane|onOpenPet|aios-mascot|pet pane/);
+  assert.doesNotMatch(dashboard, /onOpenPet/);
+  assert.doesNotMatch(chat, /onPet|"\.\.\/lib\/pet"/);
+  assert.doesNotMatch(css, /\.pet-|\.aios-pet-|\.aios-mascot-|aios-bot/);
+  assert.doesNotMatch(capabilities, /aios-pet-overlay|allow-create|allow-set-always-on-top/);
+  assert.doesNotMatch(tauriConfig, /macOSPrivateApi/);
 });
 
-test("sidebar usage does not render claude account usage", () => {
-  const source = read("src/components/SidebarUsage.tsx");
+test("sidebar usage renders a real claude meter (not the spark proxy)", () => {
+  // The usage rendering moved to the shared UsageGlance (components/dashboard);
+  // SidebarUsage is now a thin alias of it. Both surfaces draw from one source.
+  const source = read("src/components/dashboard/UsageGlance.tsx");
+  const sidebar = read("src/components/SidebarUsage.tsx");
 
-  assert.equal(source.includes('ProviderBlock name="claude"'), false);
+  // firaz 2026-06-06: replaced the gpt-5.3-codex-spark block with a real claude
+  // meter sourced from ~/.aios/state/usage.json (claude_usage → claudeRate).
+  // one source means the same terminal-active ~/.claude identity runs chats and
+  // supplies the sidebar meter; stale alternate account configs stay hidden.
+  assert.match(source, /const claudeName = claude\?\.label/);
+  assert.match(source, /ProviderBlock name=\{claudeName\}/);
+  assert.match(source, /claudeRate\(\)/);
+  assert.match(source, /% used/);
+  assert.doesNotMatch(source, /showRemaining/);
+  assert.equal(source.includes("gpt-5.3-codex-spark"), false);
   assert.equal(source.includes("idleRate()"), false);
+  assert.match(sidebar, /<UsageGlance \/>/);
+  assert.match(sidebar, /<FinanceGlance \/>/);
 });
 
 test("browser video fullscreen avoids macos native space transition", () => {
@@ -194,7 +178,7 @@ test("hosted web opens the real shell unless the url is a mirror link", () => {
   assert.match(app, /const webMirrorMode = !nativeRuntime && mirrorPairing != null/);
   assert.match(app, /if \(webMirrorMode\) \{/);
   assert.doesNotMatch(app, /if \(!nativeRuntime\) \{\s+return \(\s+<MirrorViewer/);
-  assert.match(app, /if \(panes\.length === 0\) return idleDash/);
+  assert.match(app, /if \(exposedPanes\.length === 0\) return idleDash/);
 });
 
 test("hosted web chat uses a cloud chat transport instead of a dead preview", () => {
@@ -224,6 +208,47 @@ test("hosted web shell is mobile and ipad first", () => {
   assert.match(app, /function MobileBottomNav/);
 });
 
+test("superapp runtime keeps core panes plus local file/editor surfaces", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const commands = read("src/lib/appCommands.ts");
+  const sidebar = read("src/lib/sidebar.ts");
+  const paneBus = read("src/lib/paneBus.ts");
+  const palette = read("src/components/CommandPalette.tsx");
+  const settings = read("src/components/Settings.tsx");
+
+  // Keep the sidebar/app catalog intentionally small. Everything here is a
+  // first-rank daily surface; retired panes must not creep back into defaults.
+  for (const id of ["chat", "terminal", "files", "browser", "history", "loop", "ticket", "wrms-device"]) {
+    assert.match(apps, new RegExp(`id: "${id}"`));
+  }
+  for (const cut of ["agents", "apps", "appcast", "chrome", "git", "memory", "mission", "money-agents", "notes", "oracle-roster"]) {
+    assert.doesNotMatch(apps, new RegExp(`id: "${cut}"`));
+  }
+
+  assert.match(app, /const EditorPane = lazy/);
+  assert.match(app, /const FileViewerPane = lazy/);
+  assert.doesNotMatch(app, /AttachAppsPane|AppAttachPane|AppCastPane|BridgesPane|CdpChromePane|MoneyAgentsPane|PluginsPane|PulsePane/);
+  assert.doesNotMatch(app, /moneyAgentBootstrapRef|loadConfiguredMoneyAgents|buildMoneyAgentRunCommand|MoneyAgentsSection/);
+  assert.doesNotMatch(commands, /oracle\.attach|project\.run\.(?!focused)|project\.rescan|oracle\.appshot|app\.settings\.open/);
+  assert.doesNotMatch(palette, /CdpChromePane|dev\.cdp-chrome|cdp spike/);
+  assert.doesNotMatch(settings, /BridgesPane|PluginsPane|channels|plugins/);
+  assert.match(sidebar, /SCHEMA_VERSION = 6/);
+  assert.match(paneBus, /export type SpawnPaneKind = "terminal" \| "files" \| "browser" \| "chat"/);
+});
+
+test("idle dashboard renders instantly without mount-time data loaders", () => {
+  const idle = read("src/components/IdleDashboard.tsx");
+  const controlCenter = read("src/components/IdleControlCenter.tsx");
+
+  assert.doesNotMatch(idle, /usageExtras|idleRate|memoryFocus|gitPulse|loadMoneyAgentSummaries|pm2List|setInterval|windowVisible|useUsageRates|ProviderBlock/);
+  assert.doesNotMatch(controlCenter, /useUsageRates|ProviderBlock|claudeRate|codexRate/);
+  assert.doesNotMatch(controlCenter, /MemoryFocus|RepoPulse|MoneyAgentSummary|AiosNotification|Pm2Monitor|StatusFooter|AmbientLine|Flame|Target|GitBranch/);
+  assert.match(controlCenter, /const CORE_LAUNCHERS/);
+  assert.match(controlCenter, /new browser/);
+  assert.match(controlCenter, /new files/);
+});
+
 test("sidebar exposes an icon-only rail mode", () => {
   const app = read("src/App.tsx");
   const settings = read("src/lib/settings.ts");
@@ -235,18 +260,141 @@ test("sidebar exposes an icon-only rail mode", () => {
   assert.match(app, /iconsOnly/);
 });
 
-test("shell exposes a shared notification center and controls", () => {
+test("sidebar keeps usage visible outside the idle dashboard", () => {
+  const app = read("src/App.tsx");
+  const sidebarUsage = read("src/components/SidebarUsage.tsx");
+  const controlCenter = read("src/components/IdleControlCenter.tsx");
+
+  assert.match(sidebarUsage, /<UsageGlance \/>/);
+  assert.match(sidebarUsage, /<FinanceGlance \/>/);
+  assert.match(app, /<SidebarUsage \/>/);
+  assert.doesNotMatch(controlCenter, /SidebarUsage|UsageGlance|useUsageRates/);
+});
+
+test("notification center pane is cut from the core shell runtime", () => {
   const app = read("src/App.tsx");
   const settings = read("src/lib/settings.ts");
   const settingsPane = read("src/components/Settings.tsx");
+  const commands = read("src/lib/appCommands.ts");
+  const apps = read("src/lib/apps.ts");
 
-  assert.match(app, /NotificationCenter/);
-  assert.match(app, /subscribeNotifications/);
-  assert.match(app, /openNotificationTarget/);
-  assert.match(app, /open source pane/);
-  assert.match(app, /focusPane\(pane\.key\)/);
+  assert.doesNotMatch(app, /NotificationCenter|subscribeNotifications|openNotificationTarget|openNotificationsPane/);
+  assert.doesNotMatch(apps, /id: "notifications"/);
+  assert.doesNotMatch(commands, /notifications|notification center/i);
   assert.match(settings, /notificationNativeMode: NotificationNativeMode/);
   assert.match(settingsPane, /native alerts/);
+});
+
+test("money agents are cut from the core shell runtime", () => {
+  const app = read("src/App.tsx");
+  const idle = read("src/components/IdleDashboard.tsx");
+  const controlCenter = read("src/components/IdleControlCenter.tsx");
+  const apps = read("src/lib/apps.ts");
+  const chatPane = read("src/components/ChatPane.tsx");
+
+  assert.doesNotMatch(apps, /id: "money-agents"|agentId\?:/);
+  assert.doesNotMatch(app, /MoneyAgentsPane|MoneyAgentsSection|moneyAgent|loadConfiguredMoneyAgents|buildMoneyAgentRunCommand/);
+  assert.doesNotMatch(idle, /onOpenMoneyAgentChat|MoneyAgent/);
+  assert.doesNotMatch(controlCenter, /MoneyAgent/);
+  assert.doesNotMatch(chatPane, /moneyAgents|saveMoneyAgentChatSession/);
+});
+
+test("idle dashboard is a minimal home: clock + command line + usage glance, not lanes", () => {
+  const app = read("src/App.tsx");
+  const idle = read("src/components/IdleDashboard.tsx");
+  const controlCenter = read("src/components/IdleControlCenter.tsx");
+  const usageGlance = read("src/components/dashboard/UsageGlance.tsx");
+  const sidebarUsage = read("src/components/SidebarUsage.tsx");
+
+  // IdleDashboard is a pure wrapper: no mount-time loaders before the dashboard
+  // appears. The instant control center owns only local clock state.
+  assert.match(idle, /<IdleControlCenter/);
+  assert.doesNotMatch(idle, /useEffect|setInterval|load[A-Z]|pm2List|gitPulse|notifications=\{notifications\}/);
+
+  // The home is core-only: hero clock, command line, and direct launchers for
+  // chat/terminal/browser/files. Usage polling belongs outside the idle route.
+  assert.match(controlCenter, /HeroClock/);
+  assert.match(controlCenter, /CommandLine/);
+  assert.doesNotMatch(controlCenter, /ProviderBlock|useUsageRates/);
+  assert.match(controlCenter, /CORE_LAUNCHERS/);
+  assert.match(controlCenter, /new chat/);
+  assert.match(controlCenter, /new terminal/);
+  assert.match(controlCenter, /new browser/);
+  assert.match(controlCenter, /new files/);
+  assert.match(controlCenter, /QuickActions/);
+  assert.doesNotMatch(controlCenter, /PetDashboardCompanion/);
+
+  // The overloaded control-center lanes are gone (deleted, not just hidden).
+  assert.doesNotMatch(controlCenter, /JarvisBriefingLane|NotificationCommandLane|AgentOperationsLane|ControlCenterCharts|PulseIdentityBand/);
+  assert.doesNotMatch(controlCenter, /RecentProjects|StatusFooter|Pm2Monitor|AmbientLine|MoneyAgent|RepoPulse|MemoryFocus/);
+
+  // usage rendering is shared: SidebarUsage aliases the dashboard UsageGlance,
+  // so the sidebar + home draw the bars from one source.
+  assert.match(usageGlance, /export function ProviderBlock/);
+  assert.match(usageGlance, /export function useUsageRates/);
+  assert.match(sidebarUsage, /<UsageGlance \/>/);
+  assert.match(sidebarUsage, /<FinanceGlance \/>/);
+  assert.doesNotMatch(app, /notifications=\{notifications\}/);
+});
+
+test("sidebar leaves session resume to history and in-chat resume", () => {
+  const app = read("src/App.tsx");
+  const commands = read("src/lib/appCommands.ts");
+
+  assert.doesNotMatch(app, /latestSessions|LatestSessionsSection|onResumeChat|resumeChat|setChats|listChatSessions|ChatSessionInfo/);
+  assert.doesNotMatch(commands, /ChatSessionInfo|deps\.chats|resumeChat|chat\.resume/);
+  assert.match(app, /HistoryPane/);
+  assert.match(app, /recordPaneHistory/);
+});
+
+test("chat panes opened from sidebar history hydrate the resumed transcript", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+
+  assert.match(chatPane, /useEffect\(\(\) => \{[\s\S]*const incomingResume = resume;[\s\S]*shouldApplyResumeProp\(incomingResume\.id, ownSessionIdsRef\.current\)[\s\S]*readChatTranscript\(incomingResume\.id\)[\s\S]*setTurns\(transcriptToTurns\(rows\)\)/);
+});
+
+test("pane history is a lightweight core pane with reopen and cleanup controls", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const layout = read("src/lib/paneLayout.ts");
+  const tauriLib = read("src-tauri/src/lib.rs");
+
+  assert.equal(exists("src/lib/paneHistory.ts"), true);
+  assert.equal(exists("src/components/HistoryPane.tsx"), true);
+  assert.equal(exists("src-tauri/src/pane_history.rs"), true);
+  const history = read("src/lib/paneHistory.ts");
+  const pane = read("src/components/HistoryPane.tsx");
+  const rustHistory = read("src-tauri/src/pane_history.rs");
+
+  assert.match(apps, /id: "history"/);
+  assert.match(apps, /type: "history"/);
+  assert.match(layout, /"history"/);
+  assert.match(app, /HistoryPane/);
+  assert.match(app, /recordPaneHistory/);
+  assert.match(app, /onOpenHistoryItem/);
+  assert.match(history, /describePaneHistoryItem/);
+  assert.match(history, /paneHistoryKindLabel/);
+  assert.match(history, /removePaneHistory/);
+  assert.match(history, /clearPaneHistory/);
+  assert.match(history, /hydratePaneHistoryStore/);
+  assert.match(history, /load_pane_history/);
+  assert.match(history, /save_pane_history/);
+  assert.match(pane, /reopen/);
+  assert.match(pane, /delete/);
+  assert.match(pane, /clear all/);
+  assert.match(pane, /hydratePaneHistoryStore/);
+  assert.match(rustHistory, /\.aios\/state\/pane-history\.json/);
+  assert.match(rustHistory, /pub fn load_pane_history/);
+  assert.match(rustHistory, /pub fn save_pane_history/);
+  // atomic write via a UNIQUE per-writer tmp (pid/nonce) + rename — concurrent
+  // oracle sessions must not clobber a shared tmp.
+  assert.match(rustHistory, /with_extension\(format!\("json\.tmp/);
+  assert.match(rustHistory, /std::fs::rename\(&tmp, &path\)/);
+  assert.match(tauriLib, /mod pane_history/);
+  assert.match(tauriLib, /pane_history::load_pane_history/);
+  assert.match(tauriLib, /pane_history::save_pane_history/);
+  assert.doesNotMatch(pane, /kind\.resume\.title[\s\S]*item\.detail/);
+  assert.doesNotMatch(pane, /useUsageRates|claudeRate|codexRate|listChatSessions/);
 });
 
 test("pane overview is button driven, not a global scroll gesture", () => {
@@ -294,33 +442,74 @@ test("command palette promotes chatpane intelligence for freeform search", () =>
 
 test("codex usage surfaces pace-risk warnings", () => {
   const chatPane = read("src/components/ChatPane.tsx");
-  const sidebarUsage = read("src/components/SidebarUsage.tsx");
+  // pace-risk rendering lives in the shared UsageGlance (sidebar + idle home).
+  const usageGlance = read("src/components/dashboard/UsageGlance.tsx");
   const usagePace = read("src/lib/usagePace.ts");
 
   assert.match(chatPane, /usagePaceRisk/);
   assert.match(chatPane, /contextLedger/);
-  assert.match(chatPane, /est tok/);
-  assert.match(sidebarUsage, /PaceWarning/);
-  assert.match(sidebarUsage, /usagePaceRisk/);
+  assert.match(chatPane, /tok next send/);
+  assert.match(usageGlance, /PaceWarning/);
+  assert.match(usageGlance, /usagePaceRisk/);
   assert.match(usagePace, /fast pace/);
   assert.match(usagePace, /slow down/);
 });
 
-test("gpt chatpane stop hard-stops and restarts the backend", () => {
+test("chatpane stop waits for the backend lifecycle terminal frame", () => {
   const chatPane = read("src/components/ChatPane.tsx");
-  const state = read("src/lib/chatPaneState.ts");
   const chat = read("src/lib/chat.ts");
   const rust = read("src-tauri/src/chat.rs");
 
-  assert.match(state, /stopStrategy/);
-  assert.match(state, /kill-and-restart/);
-  assert.match(chatPane, /chatStop\(id\)/);
-  assert.match(chatPane, /gpt backend restarted/);
+  // Stops are tagged and the renderer remains non-runnable until Rust emits the
+  // matching terminal lifecycle frame. OpenCode has no control protocol, so it
+  // is the only engine that kill-restarts; all other engines interrupt in place.
+  assert.match(rust, /codex_interrupt/);
+  assert.match(
+    chatPane,
+    /const strategy = stopStrategy\(runtimeEngine\);[\s\S]{0,300}strategy === "kill-and-restart"[\s\S]{0,160}\? chatStop\(id, runId\)[\s\S]{0,160}: chatInterrupt\(id, runId\)/,
+  );
+  // Teardown is intentionally untagged: it may run after a pane is detached
+  // or its lifecycle state has already been cleared.
+  assert.match(chatPane, /chatStop\(id\)\.catch\(\(e\) => reportDiag\("chat\.stop", e, \{ action: "cleanup" \}\)\)/);
+  assert.match(chatPane, /Do not settle locally/);
+  assert.match(chatPane, /aios_run/);
   assert.match(chatPane, /backendBusy/);
-  assert.match(chatPane, /activeRunRef\.current = streaming \|\| backendBusy/);
+  assert.match(chatPane, /activeRunRef\.current = !canStartNormalSend\(lifecycle\)/);
   assert.match(chatPane, /busy: \(\) => activeRunRef\.current/);
   assert.match(chat, /ChatReattachInfo/);
   assert.match(rust, /ChatReattachInfo/);
+});
+
+test("chatpane exposes sol, terra, and luna with model-specific effort capabilities", () => {
+  const chat = read("src/lib/chat.ts");
+  assert.match(chat, /id:\s*["']gpt-5\.6-sol["']/);
+  assert.match(chat, /id:\s*["']gpt-5\.6-terra["']/);
+  assert.match(chat, /id:\s*["']gpt-5\.6-luna["']/);
+  assert.match(chat, /supportedEfforts/);
+  assert.match(chat, /defaultEffort/);
+  assert.match(chat, /gpt-5\.6-luna[\s\S]{0,500}supportedEfforts:\s*\[[^\]]*["']max["'][^\]]*\]/);
+  assert.doesNotMatch(
+    chat.match(/gpt-5\.6-luna[\s\S]{0,500}/)?.[0] ?? "",
+    /["']ultra["']/,
+  );
+});
+
+test("effort remains a separate codex-style slider control", () => {
+  const composer = read("src/components/Composer.tsx");
+  assert.match(composer, /role=["']slider["']/);
+  assert.match(composer, /aria-valuetext/);
+  assert.match(composer, /nearestEffortIndex/);
+  assert.match(composer, />\s*advanced\s*</i);
+  assert.match(composer, /model selector/i);
+});
+
+test("sidebar and chatpane show one terminal-active claude source", () => {
+  const pane = read("src/components/ChatPane.tsx");
+  const usage = read("src/components/dashboard/UsageGlance.tsx");
+  assert.doesNotMatch(pane, /claudeAccountsRate|AccountUsageRow|switchClaudeAccount/);
+  assert.doesNotMatch(usage, /claudeAccounts\.map|AccountLoginHint/);
+  assert.match(usage, /name=\{claudeName\}/);
+  assert.match(pane, /claude · \$\{claudeIdentityLabel\}/);
 });
 
 test("codex chatpane uses terminal-grade codex context by default", () => {
@@ -336,6 +525,11 @@ test("codex chatpane uses terminal-grade codex context by default", () => {
   assert.match(chat, /gpt-5\.5/);
 });
 
+test("chatpanes do not prewarm an extra heavyweight codex app-server", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+  assert.doesNotMatch(chatPane, /chatPrewarmCodex/);
+});
+
 test("spark model labeling is explicitly gpt-5.3, never 5.5", () => {
   const chatPane = read("src/components/ChatPane.tsx");
   const sidebarUsage = read("src/components/SidebarUsage.tsx");
@@ -343,10 +537,10 @@ test("spark model labeling is explicitly gpt-5.3, never 5.5", () => {
   const source = [chatPane, sidebarUsage, chat].join("\n");
 
   assert.match(chat, /id: "gpt-5\.3-codex-spark"/);
+  // SidebarUsage no longer labels spark (its block became the claude meter);
+  // the spark model labeling now lives only in the chat model picker.
   assert.match(chatPane, /return "gpt-5\.3 spark"/);
-  assert.match(sidebarUsage, /return "gpt-5\.3 spark"/);
   assert.match(chatPane, /\^gpt-5\\\.3-codex-spark\$/);
-  assert.match(sidebarUsage, /\^gpt-5\\\.3-codex-spark\$/);
   assert.doesNotMatch(source, /5\.5[^"\n]*spark|spark[^"\n]*5\.5/i);
   assert.doesNotMatch(chatPane, /return "spark"/);
 }
@@ -354,11 +548,26 @@ test("spark model labeling is explicitly gpt-5.3, never 5.5", () => {
 
 test("chatpane handoff can target any model", () => {
   const chatPane = read("src/components/ChatPane.tsx");
+  const paneBus = read("src/lib/paneBus.ts");
+  const app = read("src/App.tsx");
 
   assert.match(chatPane, /handoffPanelOpen/);
   assert.match(chatPane, /handoff target/);
   assert.match(chatPane, /CHAT_MODELS\.map\(\(target\)/);
-  assert.match(chatPane, /continuing this exact session in \$\{target\.label\}/);
+  assert.match(chatPane, /requestChatHandoffPane/);
+  assert.match(chatPane, /modelId: target\.id/);
+  assert.match(chatPane, /handoff · \$\{target\.label\}/);
+  assert.match(paneBus, /requestChatHandoffPane/);
+  assert.match(app, /modelId: ctx\?\.modelId/);
+});
+
+test("resume picker rows stay human-readable", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+
+  assert.match(chatPane, /function resumeAbsoluteTime/);
+  assert.match(chatPane, /last: \$\{preview\}/);
+  assert.match(chatPane, /line-clamp-2/);
+  assert.match(chatPane, /title=\{tooltip\}/);
 });
 
 test("chatpane does not auto-timeout long agent runs", () => {
@@ -377,26 +586,52 @@ test("chatpane memory search is explicit slash command only", () => {
   assert.doesNotMatch(chatPane, /q\.length < 4/);
 });
 
-test("status pane surfaces long-running build status inside the shell", () => {
+test("memory pane is pruned while chat memory stays inline", () => {
   const app = read("src/App.tsx");
   const apps = read("src/lib/apps.ts");
-  const statusPane = read("src/components/StatusPane.tsx");
+  const chatPane = read("src/components/ChatPane.tsx");
+  const rust = read("src-tauri/src/memory.rs");
+  const lib = read("src-tauri/src/lib.rs");
+
+  assert.doesNotMatch(apps, /id: "memory"/);
+  assert.doesNotMatch(app, /MemoryPane/);
+  assert.match(chatPane, /memoryPanelOpen/);
+  assert.match(chatPane, /setMemoryPanelOpen\(true\)/);
+  assert.match(chatPane, /memorySearch\(/);
+  assert.doesNotMatch(chatPane, /spawnPane\("memory"/);
+  assert.match(rust, /fn vault_dirs\(\)/);
+  assert.match(rust, /pub fn memory_save_raw/);
+  assert.match(lib, /memory::memory_save_raw/);
+});
+
+test("claude usage follows the terminal-active identity, not a browser account", () => {
+  const usage = read("src-tauri/src/usage.rs");
+  const dashboard = read("src/lib/dashboard.ts");
+
+  assert.match(usage, /terminal_claude_identity/);
+  assert.match(usage, /oauthAccount\/emailAddress/);
+  assert.match(usage, /attach_terminal_claude_identity/);
+  assert.match(usage, /claude_usage_from_helper/);
+  assert.match(usage, /api\.anthropic\.com\/api\/oauth\/usage/);
+  assert.match(usage, /CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.match(usage, /oauth-2025-04-20/);
+  assert.match(dashboard, /label: string \| null/);
+  const resolver = usage.slice(
+    usage.indexOf("pub fn claude_usage_value"),
+    usage.indexOf("fn write_claude_usage_cache"),
+  );
+  assert.doesNotMatch(resolver, /claude_usage_from_webview/);
+  const oauthFirst = resolver.indexOf("claude_usage_from_oauth()");
+  const helperSecond = resolver.indexOf("claude_usage_from_helper()");
+  const statusThird = resolver.indexOf("claude_usage_from_statusline()");
+  assert.ok(oauthFirst >= 0, "terminal oauth usage must be first");
+  assert.ok(helperSecond > oauthFirst, "helper fallback must follow terminal oauth");
+  assert.ok(statusThird > helperSecond, "statusline fallback must remain last");
+});
+
+test("shell still surfaces source build state via the source-status backend", () => {
   const chatRust = read("src-tauri/src/chat.rs");
 
-  assert.match(app, /StatusPane/);
-  assert.match(app, /onReattachChat/);
-  assert.match(apps, /type: "status"/);
-  assert.match(statusPane, /aios-shell-tauri-build\.log/);
-  assert.match(statusPane, /pending install note/);
-  assert.match(statusPane, /source state/);
-  assert.match(statusPane, /shellSourceStatus/);
-  assert.match(statusPane, /source has changes not guaranteed to be in the installed app/);
-  assert.match(statusPane, /listChatLive/);
-  assert.match(statusPane, /chatStop/);
-  assert.match(statusPane, /stop chat run/);
-  assert.match(statusPane, /listAutomations/);
-  assert.match(statusPane, /chatpane runs/);
-  assert.match(statusPane, /background agents/);
   assert.match(chatRust, /detached\.load\(Ordering::SeqCst\) \|\| s\.busy\.load/);
   assert.match(chatRust, /stopped by user/);
   assert.match(read("src/lib/fs.ts"), /shell_source_status/);
@@ -404,35 +639,161 @@ test("status pane surfaces long-running build status inside the shell", () => {
   assert.match(read("src-tauri/src/lib.rs"), /files::shell_source_status/);
 });
 
-test("shell exposes running mac apps as attachable pane targets", () => {
+test("mac app attach panes are cut from the core shell runtime", () => {
   const app = read("src/App.tsx");
   const apps = read("src/lib/apps.ts");
-  const pane = read("src/components/AttachAppsPane.tsx");
-  const attachedPane = read("src/components/AppAttachPane.tsx");
-  const bridge = read("src/lib/macApps.ts");
   const rust = read("src-tauri/src/mac_apps.rs");
   const lib = read("src-tauri/src/lib.rs");
 
-  assert.match(app, /AttachAppsPane/);
-  assert.match(app, /AppAttachPane/);
-  assert.match(app, /onAttachApp/);
-  assert.match(apps, /type: "apps"/);
-  assert.match(apps, /type: "app"/);
-  assert.match(pane, /attach as pane/);
-  assert.match(pane, /focusMacApp/);
-  assert.match(attachedPane, /attached external app/);
-  assert.match(attachedPane, /capture preview/);
-  assert.match(attachedPane, /captureMacApp/);
-  assert.match(attachedPane, /fileSrc\(capturePath\)/);
-  assert.match(attachedPane, /direct native window embedding is not reliable on macos/);
-  assert.match(bridge, /mac_list_apps/);
-  assert.match(bridge, /mac_focus_app/);
-  assert.match(bridge, /mac_capture_app/);
+  assert.doesNotMatch(app, /AttachAppsPane|AppAttachPane|onAttachApp/);
+  assert.doesNotMatch(apps, /id: "apps"/);
   assert.match(rust, /MacAppInfo/);
   assert.match(rust, /screencapture/);
   assert.match(lib, /mac_apps::mac_list_apps/);
   assert.match(lib, /mac_apps::mac_focus_app/);
   assert.match(lib, /mac_apps::mac_capture_app/);
+});
+
+test("appcast separates screen recording from accessibility control", () => {
+  const pane = read("src/components/AppCastPane.tsx");
+  const rust = read("src-tauri/src/appcast.rs");
+
+  assert.match(pane, /ACCESSIBILITY_SETTINGS_URL/);
+  assert.match(pane, /Privacy_Accessibility/);
+  assert.match(pane, /isAccessibilityDeclined/);
+  assert.match(pane, /no mirrorable windows found/);
+  assert.doesNotMatch(pane, /m\.includes\("no capturable windows"\)/);
+  assert.match(pane, /Accessibility not enabled/);
+  assert.match(pane, /control mirrored windows/);
+  assert.match(rust, /AXIsProcessTrusted/);
+  assert.match(rust, /AXIsProcessTrustedWithOptions/);
+  assert.match(rust, /AXTrustedCheckOptionPrompt/);
+  assert.match(rust, /accessibility_trusted/);
+  assert.match(rust, /accessibility_trusted_or_prompt/);
+  assert.match(rust, /Accessibility not enabled/);
+});
+
+test("live room disables recording controls until durable capture exists", () => {
+  const pane = read("src/components/LiveRoomPane.tsx");
+  const liveRoom = read("src/lib/liveRoom.ts");
+
+  assert.match(liveRoom, /LIVE_ROOM_RECORDING_AVAILABLE = false/);
+  assert.match(pane, /LIVE_ROOM_RECORDING_UNAVAILABLE_REASON/);
+  assert.match(pane, /recording unavailable/);
+  assert.doesNotMatch(pane, /title="record"/);
+  assert.doesNotMatch(pane, /pause recording/);
+  assert.doesNotMatch(pane, /stop capture/);
+  assert.doesNotMatch(pane, /\bCircle\b/);
+  assert.doesNotMatch(pane, /\bPause\b/);
+  assert.doesNotMatch(pane, /\bSquare\b/);
+});
+
+test("local mac install keeps a stable tcc identity", () => {
+  const pkg = read("package.json");
+  const script = read("scripts/install-mac-local.sh");
+
+  assert.match(pkg, /"install:mac-local": "bash scripts\/install-mac-local\.sh"/);
+  assert.match(script, /tauri -- build --bundles app --no-sign/);
+  assert.match(script, /stable_requirement='=designated => identifier "com\.adletic\.aios"'/);
+  assert.match(script, /codesign --force --deep --sign - --requirements "\$stable_requirement"/);
+  assert.match(script, /codesign --verify --deep --strict "\$installed_app"/);
+});
+
+test("native browser and appcast panes resync through fullscreen settle", () => {
+  const browser = read("src/components/BrowserPane.tsx");
+  const appcast = read("src/components/AppCastPane.tsx");
+
+  for (const source of [browser, appcast]) {
+    assert.match(source, /syncSettled/);
+    assert.match(source, /fullscreenchange/);
+  }
+  // AppCast still uses the staged settle cadence, with a slow 1s safety poll —
+  // now riding the shared 1Hz ticker (gated on the pane being live) instead of
+  // its own setInterval.
+  assert.match(appcast, /\[40, 120, 260, 520, 900\]/);
+  assert.match(appcast, /useSharedInterval\(1000, \(\) => syncRef\.current\?\.\(\),/);
+  // BrowserPane was reworked: debounced settle (no timer storm) + RO-driven
+  // bounds with a slow 1s safety poll instead of the 250ms hammer.
+  assert.match(browser, /resizeTimer = setTimeout\(sync, 120\)/);
+  assert.match(browser, /setInterval\(sync, 1000\)/);
+  assert.match(browser, /new ResizeObserver\(sync\)/);
+});
+
+test("background utility panes are not mounted by the core shell runtime", () => {
+  const app = read("src/App.tsx");
+
+  assert.doesNotMatch(app, /windowVisible|visibilitychange|listChatSessions/);
+  // TicketPane is now a first-class CORE pane (peer to LoopPane), intentionally
+  // rendered in the App.tsx pane switch — so it's excluded from this guard.
+  assert.doesNotMatch(app, /<BridgesPane|<PulsePane|<AppAttachPane|<NotesPane|<AgentsSection|<OracleRoster/);
+  assert.doesNotMatch(app, /import\("\.\/components\/BridgesPane"\)|import\("\.\/components\/PulsePane"\)/);
+  assert.doesNotMatch(app, /import\("\.\/components\/AppAttachPane"\)/);
+});
+
+test("files pane exposes fast core workspace context actions", () => {
+  const files = read("src/components/FilesPane.tsx");
+
+  assert.match(files, /detectProject/);
+  assert.match(files, /contextMenu/);
+  assert.match(files, /onContextMenu/);
+  assert.match(files, /runContextProject/);
+  assert.match(files, /copyPath/);
+  assert.match(files, /openContextTerminal/);
+  assert.match(files, /openContextDefault/);
+  assert.match(files, /openContextEditor/);
+  assert.match(files, /openContextViewer/);
+  assert.match(files, /openContextChat/);
+  assert.match(files, /open containing files pane/);
+  assert.doesNotMatch(files, /openContextGit|openGitPane|spawnPane\("git"|gitStatus|gitDecorations/);
+});
+
+test("git pane is pruned from the core shell runtime", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+  const tauriFiles = read("src-tauri/src/files.rs");
+  const tauriLib = read("src-tauri/src/lib.rs");
+
+  assert.doesNotMatch(apps, /id: "git"/);
+  assert.doesNotMatch(app, /GitPane/);
+  assert.doesNotMatch(app, /pane\.kind\.type === "git"/);
+  const filesPane = read("src/components/FilesPane.tsx");
+  assert.doesNotMatch(filesPane, /spawnPane\("git"|openContextGit/);
+  assert.match(tauriFiles, /pub fn git_snapshot/);
+  assert.match(tauriFiles, /pub fn git_checkout/);
+  assert.match(tauriLib, /files::git_snapshot/);
+  assert.match(tauriLib, /files::git_checkout/);
+});
+
+test("manual appshot attaches to chat (the ⌘⌘ gesture was removed)", () => {
+  const app = read("src/App.tsx");
+  const pty = read("src/lib/pty.ts");
+  const oracles = read("src-tauri/src/oracles.rs");
+  const lib = read("src-tauri/src/lib.rs");
+  const commands = read("src/lib/appCommands.ts");
+
+  // The double-command global gesture is gone: no polling monitor thread, no
+  // in-webview ⌘⌘ keydown, no "global-appshot" listener.
+  assert.equal(exists("src-tauri/src/global_monitor.rs"), false);
+  assert.doesNotMatch(lib, /global_monitor/);
+  assert.doesNotMatch(app, /global-appshot/);
+
+  // The MANUAL appshot path (toolbar button → capture → attach to chat) stays.
+  assert.match(lib, /oracles::appshot_capture/);
+  assert.match(oracles, /pub fn appshot_capture/);
+  assert.match(pty, /export async function appshotCapture/);
+  assert.match(app, /import \{ appshotCapture/);
+  assert.match(app, /paneImageDrop\.get\(key\)/);
+  assert.match(app, /appshot attached to chat/);
+  assert.doesNotMatch(commands, /appshot - attach to chat|oracle\.appshot/);
+  assert.doesNotMatch(commands, /screenshot to oracle/);
+});
+
+test("closing panes is visually instant even for busy chats", () => {
+  const app = read("src/App.tsx");
+
+  assert.match(app, /if \(handle\?\.busy\(\)\) handle\.detach\(true\);[\s\S]*closePane\(key\)/);
+  assert.doesNotMatch(app, /setClosePrompt\(key\)/);
+  assert.doesNotMatch(app, /this chat is still working/);
 });
 
 test("chatpane autoscroll follows live output until user scrolls away", () => {
@@ -466,6 +827,113 @@ test("chatpane pending steer queue stays attached to the shared composer", () =>
   assert.match(chatPane, /editQueued\(q\)/);
 });
 
+test("chatpane conversation rail is an accessible narrow component", () => {
+  const railPath = "src/components/chat/ConversationRail.tsx";
+  assert.equal(exists(railPath), true, "conversation rail must be a standalone chat component");
+  const pane = read("src/components/ChatPane.tsx");
+  const rail = read(railPath);
+
+  assert.match(pane, /import \{ ConversationRail \} from "\.\/chat\/ConversationRail"/);
+  assert.match(pane, /<ConversationRail items=\{conversationMarks\} onNavigate=\{navigateConversationMark\}/);
+  assert.match(rail, /export function ConversationRail/);
+  assert.match(rail, /aria-label="conversation map"/);
+  assert.match(rail, /onClick=\{\(\) => onNavigate\(item\.id\)\}/);
+  assert.match(rail, /items\.length < 2/);
+});
+
+test("chat transcript leaf components forward their own URL callback prop", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+  const transcriptStart = chatPane.indexOf("const TranscriptBlocks = memo(function TranscriptBlocks");
+  const transcriptEnd = chatPane.indexOf("const ThinkingBlock", transcriptStart);
+  const assistantStart = chatPane.indexOf("const AssistantBubble = memo(function AssistantBubble");
+  const assistantEnd = chatPane.indexOf("function RecentSessions", assistantStart);
+
+  assert.ok(transcriptStart >= 0 && transcriptEnd > transcriptStart);
+  assert.match(chatPane.slice(transcriptStart, transcriptEnd), /onOpenUrl=\{onOpenUrl\}/);
+  assert.doesNotMatch(chatPane.slice(transcriptStart, transcriptEnd), /onTaskOpenUrl/);
+  assert.ok(assistantStart >= 0 && assistantEnd > assistantStart);
+  assert.match(chatPane.slice(assistantStart, assistantEnd), /<Markdown text=\{body\} onOpenUrl=\{onOpenUrl\}/);
+  assert.doesNotMatch(chatPane.slice(assistantStart, assistantEnd), /onTaskOpenUrl/);
+});
+
+test("task ids survive chat persistence and explicit stable-key re-fires", () => {
+  const app = read("src/App.tsx");
+  const history = read("src/lib/paneHistory.ts");
+
+  assert.match(app, /const taskKind: PaneContent =/);
+  assert.match(app, /bindChatTaskId\(kind, key\)/);
+  assert.match(app, /bindChatTaskId\(p\.kind, p\.key\)/);
+  assert.match(app, /bindChatTaskId\(pane\.kind as PaneContent, pane\.key\)/);
+  assert.match(app, /if \(resume \|\| taskId\)/);
+  assert.match(history, /taskId: kind\.taskId/);
+});
+
+test("chatpane hydrates and persists the durable steer queue per pane without stale flushes", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+  const queue = read("src/lib/chatQueue.ts");
+
+  assert.match(chatPane, /import \{[^}]*hydrateChatQueue[^}]*saveChatQueue[^}]*\} from "\.\.\/lib\/chatQueue"/);
+  assert.match(chatPane, /const queueStorageKey = paneKey \?\? null/);
+  assert.match(chatPane, /const queueHydrationId = \+\+queueHydrationIdRef\.current;/);
+  assert.match(chatPane, /if \(queueHydrationIdRef\.current !== queueHydrationId\) return/);
+  assert.match(chatPane, /hydrateChatQueue\(localStorage, queueStorageKey\)/);
+  assert.match(chatPane, /hydrated\.droppedMessages/);
+  assert.match(chatPane, /if \(hydratedQueuePaneKey !== queueStorageKey\) return/);
+  assert.match(chatPane, /saveChatQueue\(localStorage, queueStorageKey, \{ items: queued, selected: queuedIdx \}\)/);
+  assert.match(chatPane, /if \(!queueStorageKey\) return/);
+  assert.match(chatPane, /if \(hydratedQueuePaneKey !== queueStorageKey\) return;[\s\S]{0,250}if \(!canStartNormalSend\(runLifecycle\)\) return/);
+  assert.match(queue, /MAX_IMAGE_PATHS/);
+  assert.doesNotMatch(queue, /b64|base64|ArrayBuffer/);
+});
+
+test("chatpane releases queued image pins on pane switch and clear", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+  const hydrationStart = chatPane.indexOf("const queueHydrationId = ++queueHydrationIdRef.current;");
+  const hydrationEnd = chatPane.indexOf("}, [queueStorageKey]);", hydrationStart);
+  const clearStart = chatPane.indexOf("const clearSession = useCallback");
+  const clearEnd = chatPane.indexOf("}, [runEventsKey", clearStart);
+
+  assert.ok(hydrationStart >= 0 && hydrationEnd > hydrationStart);
+  assert.match(chatPane.slice(hydrationStart, hydrationEnd), /pinnedImagesRef\.current\.clear\(\)/);
+  assert.ok(clearStart >= 0 && clearEnd > clearStart);
+  assert.match(chatPane.slice(clearStart, clearEnd), /pinnedImagesRef\.current\.clear\(\)/);
+});
+
+test("fresh blank chat panes start lazily while resume paths stay eager", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+
+  assert.match(
+    chatPane,
+    /const eagerSessionStart = Boolean\(seed\) \|\| resumeId != null \|\| reattach != null \|\| webChatRuntime/,
+  );
+  assert.match(
+    chatPane,
+    /if \(!sessionStartRequested && !eagerSessionStart\) return/,
+  );
+  assert.match(
+    chatPane,
+    /const composerSessionReady = started \|\| \(!sessionStartRequested && !eagerSessionStart\)/,
+  );
+  assert.match(chatPane, /started: composerSessionReady/);
+});
+
+test("the first lazy send requests one backend session before queue flush", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+
+  assert.match(
+    chatPane,
+    /const requestSessionStart = useCallback\(\(\) => \{[\s\S]*if \(sessionIdRef\.current != null \|\| sessionStartRequestedRef\.current\) return;[\s\S]*sessionStartRequestedRef\.current = true;[\s\S]*setSessionStartRequested\(true\)/,
+  );
+  assert.match(
+    chatPane,
+    /if \(sessionIdRef\.current == null\) \{[\s\S]*requestSessionStart\(\);[\s\S]*enqueue\(text, imgPaths\.length \? imgPaths : undefined\)/,
+  );
+  assert.match(
+    chatPane,
+    /sessionIdRef\.current = id;[\s\S]*setStarted\(true\)/,
+  );
+});
+
 test("chatpane docked composer can collapse and reopen", () => {
   const chatPane = read("src/components/ChatPane.tsx");
   const composerStart = chatPane.indexOf("const composer = useMemo");
@@ -482,6 +950,15 @@ test("chatpane docked composer can collapse and reopen", () => {
   assert.match(chatPane, /setComposerCollapsed\(false\)/);
 });
 
+test("chat panes receive concrete cwd for shell context", () => {
+  const app = read("src/App.tsx");
+  const apps = read("src/lib/apps.ts");
+
+  assert.match(apps, /type: "chat";[\s\S]*cwd\?: string/);
+  assert.match(app, /const chatCwd = pane\.kind\.type === "chat"/);
+  assert.match(app, /<ChatPane[\s\S]*cwd=\{chatCwd\}/);
+});
+
 test("shell exposes a policy-gated agent control bridge", () => {
   const app = read("src/App.tsx");
   const actions = read("src/lib/agentActions.ts");
@@ -495,10 +972,60 @@ test("shell exposes a policy-gated agent control bridge", () => {
   assert.match(controller, /!policy\.allowed/);
 });
 
-test("mac bundle uses stable development signing for tcc permissions", () => {
+test("mac bundle keeps signing identity release-configurable", () => {
   const tauri = read("src-tauri/tauri.conf.json");
 
-  assert.equal(tauri.includes('"signingIdentity": "-"'), false);
-  assert.match(tauri, /Apple Development: Firaz Fhansurie \(KL78M575FW\)/);
+  assert.equal(tauri.includes('"signingIdentity"'), false);
   assert.match(tauri, /"entitlements": "\.\/Entitlements\.plist"/);
+});
+
+test("chat cockpit uses semantic transcript, surface, and permission roles", () => {
+  const chatPane = read("src/components/ChatPane.tsx");
+  const taskSummary = read("src/components/chat/TaskSummary.tsx");
+  const conversationRail = read("src/components/chat/ConversationRail.tsx");
+  const approvalCards = read("src/components/chat/ApprovalCards.tsx");
+  const userStart = chatPane.indexOf("const UserBubble = memo(function UserBubble");
+  const assistantStart = chatPane.indexOf("const AssistantBubble = memo(function AssistantBubble");
+  const assistantEnd = chatPane.indexOf("// ── markdown renderer", assistantStart);
+  const stalledStart = chatPane.indexOf("{streaming && stalled && (");
+  const stalledEnd = chatPane.indexOf("{/* jump-to-latest pill", stalledStart);
+  const approvalStart = approvalCards.indexOf("export const ApprovalCard");
+  const approvalEnd = approvalCards.indexOf("// ── AskUserQuestion", approvalStart);
+
+  assert.ok(userStart >= 0 && assistantStart > userStart);
+  assert.match(chatPane.slice(userStart, assistantStart), /rounded-\[var\(--aios-radius-bubble\)\]/);
+  assert.match(chatPane.slice(userStart, assistantStart), /shell-elevated/);
+  assert.ok(assistantEnd > assistantStart);
+  assert.match(
+    chatPane.slice(assistantStart, assistantEnd),
+    /<div className="min-w-0 font-sans text-\[14\.5px\] leading-relaxed text-\[var\(--color-text-2\)\]">\s*<Markdown/,
+  );
+
+  assert.match(taskSummary, /shell-card/);
+  assert.match(taskSummary, /shell-elevated/);
+  assert.doesNotMatch(taskSummary, /white\//);
+  assert.doesNotMatch(taskSummary, /rounded-\[28px\]/);
+
+  assert.match(conversationRail, /shell-card/);
+  assert.match(conversationRail, /shell-elevated/);
+  assert.doesNotMatch(conversationRail, /border-white|bg-white/);
+
+  assert.ok(stalledStart >= 0 && stalledEnd > stalledStart);
+  assert.match(chatPane.slice(stalledStart, stalledEnd), /--color-warning-accent/);
+  assert.match(chatPane.slice(stalledStart, stalledEnd), /--color-warning-soft/);
+  assert.ok(approvalStart >= 0 && approvalEnd > approvalStart);
+  assert.match(approvalCards.slice(approvalStart, approvalEnd), /--color-warning-accent/);
+  assert.match(approvalCards.slice(approvalStart, approvalEnd), /--color-warning-soft/);
+  assert.match(approvalCards.slice(approvalStart, approvalEnd), /--color-focus/);
+  assert.doesNotMatch(approvalCards.slice(approvalStart, approvalEnd), /--color-accent/);
+});
+
+test("gui tmux resolution includes user-local aios installs", () => {
+  const monitor = read("src-tauri/src/monitor.rs");
+  const oracles = read("src-tauri/src/oracles.rs");
+
+  for (const source of [monitor, oracles]) {
+    assert.match(source, /\.local\/bin\/tmux/);
+    assert.match(source, /\.aios\/state\/bin\/tmux/);
+  }
 });

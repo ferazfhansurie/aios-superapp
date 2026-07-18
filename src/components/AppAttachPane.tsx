@@ -11,14 +11,18 @@ import {
 
 import { fileSrc } from "../lib/fs";
 import { captureMacApp, focusMacApp, listMacApps, type MacAppInfo } from "../lib/macApps";
+import { useVisible } from "../lib/useVisible";
 
 export function AppAttachPane({
+  active = true,
   name,
   bundleId,
 }: {
+  active?: boolean;
   name: string;
   bundleId?: string | null;
 }) {
+  const { ref: rootRef, visible: paneVisible } = useVisible<HTMLDivElement>();
   const [apps, setApps] = useState<MacAppInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [focusing, setFocusing] = useState(false);
@@ -38,10 +42,11 @@ export function AppAttachPane({
   }, []);
 
   useEffect(() => {
+    if (!active || !paneVisible) return;
     void refresh();
-    const timer = window.setInterval(refresh, 5_000);
+    const timer = window.setInterval(refresh, 30_000);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [active, paneVisible, refresh]);
 
   const app = useMemo(
     () =>
@@ -84,7 +89,7 @@ export function AppAttachPane({
   }, [app]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--color-bg)] text-[var(--color-text)]">
+    <div ref={rootRef} className="flex h-full min-h-0 flex-col bg-[var(--color-bg)] text-[var(--color-text)]">
       <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--color-border)] px-3">
         <div className="flex min-w-0 items-center gap-2">
           <MonitorUp size={14} className="shrink-0 text-[var(--color-accent)]" />
@@ -116,7 +121,7 @@ export function AppAttachPane({
             type="button"
             onClick={() => void capture()}
             disabled={capturing}
-            className="flex h-7 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)] disabled:opacity-60"
+            className="flex h-7 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2 text-[11px] font-medium text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)] hover:text-[var(--color-accent-hover-fg)] disabled:opacity-60"
             title="capture preview"
           >
             {capturing ? <Loader2 size={12} className="animate-spin" /> : <Camera size={12} />}

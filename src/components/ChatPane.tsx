@@ -8,8 +8,8 @@
  * raw newline-delimited claude JSON events over a per-session `Channel<string>`;
  * ALL parsing + rendering happens here.
  *
- * Lifecycle: one Channel + one chat session per mount. `chatStart` on mount with
- * the selected model/permission, `chatSend` on submit, `chatStop` on unmount.
+ * Lifecycle: a blank pane stays process-free until its first send. Resume,
+ * reattach, and seeded panes start eagerly; `chatStop` tears down on unmount.
  *
  * Best-in-class layer (Codex / Claude-Desktop grade) added on top of the working
  * stream-json core — without disturbing it:
@@ -22,46 +22,34 @@
  *   7. `/` slash menu (clear / plan / model / help)
  *   8. `@` file-mention picker sourced from cwd
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
-  ArrowUp,
   ArrowDown,
   PackageOpen,
   AtSign,
   Brain,
   Check,
-  CheckCheck,
-  ChevronDown,
   ChevronRight,
-  Clock,
-  Copy,
   CornerDownLeft,
   FileCode,
   FileText,
   FileType,
   Folder,
-  Gauge,
-  Globe,
   HelpCircle,
   History,
   Image as ImageIcon,
   ListChecks,
   Loader2,
-  Mic,
   Pencil,
   RefreshCw,
   RotateCcw,
-  Search,
-  ShieldQuestion,
   Slash,
   Sparkles,
   Square,
   Target,
-  Terminal,
   Waypoints,
-  Wrench,
   X,
 } from "lucide-react";
 import {
@@ -89,58 +77,157 @@ import {
   type ChatTurnInfo,
   type WebChatTurn,
 } from "../lib/chat";
-import { fileSrc, readDir, saveImageTemp, type DirEntry } from "../lib/fs";
+import { fileSrc, saveImageTemp } from "../lib/fs";
 import { loadSettings, saveSettings } from "../lib/settings";
-import { idleRate, codexRate, resetIn } from "../lib/dashboard";
 import {
+  AIOS_MODEL_ID,
+  buildHandoffSeed,
+  observeClaudeHardLimit,
+  parseModelDirective,
+  resolveAios,
+  resolveAiosSync,
+  type AiosDecision,
+  type ModelDirective,
+} from "../lib/aiosRouter";
+import {
+  claudeRate,
+  idleRate,
+  codexRate,
+  resetIn,
+} from "../lib/dashboard";
+import {
+  composeWireMessage,
+  chatStreamFlushDelay,
   composerContextChips,
-  contextLedger,
-  cycleQueueSelection,
+  describeModelSwitch,
+  effortChipLabel,
   moveQueuedMessage,
   queueMessage,
   removeQueuedMessage,
+  resolveModelEffort,
   resumeTitle,
-  sendContract,
+  shouldApplyResumeProp,
   stopStrategy,
   updateQueuedMessage,
   usageStack,
+  type ChatWorkspaceContext,
   type ContextBudgetMode,
   type QueuedMessage,
 } from "../lib/chatPaneState";
 import { usagePaceRisk } from "../lib/usagePace";
+import { clearChatQueue, hydrateChatQueue, saveChatQueue } from "../lib/chatQueue";
 import { dictateCancel, dictateStart, dictateStop } from "../lib/voice";
-import { chatHandles, paneWriters, paneSubmitters, paneImageDrop, openFileInPane, openUrlInPane } from "../lib/paneBus";
-import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
+import {
+  chatHandles,
+  chatSessions,
+  paneWriters,
+  paneSubmitters,
+  paneImageDrop,
+  openEditorFileInPane,
+  openFileInPane,
+  openViewerFileInPane,
+  requestChatHandoffPane,
+  revealFileInPane,
+} from "../lib/paneBus";
+import { resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import {
   emptyRunEventState,
   parseRunEventState,
   reduceRunEvents,
   serializeRunEventState,
+  taskSnapshotRevision,
   type RunEventState,
 } from "../lib/runEvents";
 import {
+  coalesceChatStreamDeltas,
   finalizeStreamingTurns,
   reduceChatStreamEvent,
   type ChatTurn,
+  type ChatStreamState,
 } from "../lib/chatStream";
-import { memorySearch, type MemoryHit } from "../lib/memory";
-import { buildAiosShellContext } from "../lib/aiosContext";
+import { type MemoryHit } from "../lib/memory";
 import {
-  onPetResult,
-  onPetError,
-  onPetUsage,
-  onPetUserMessage,
-} from "../lib/pet";
-import {
+  AUTOSCROLL_STICK_THRESHOLD_PX,
   distanceFromBottom,
   nextAutoscrollPaused,
   shouldAutoscroll,
   type ScrollIntent,
 } from "../lib/chatScroll";
-import { isTauriRuntime } from "../lib/tauri";
+import { invoke, isTauriRuntime } from "../lib/tauri";
+import { prunePaneHistoryResume } from "../lib/paneHistory";
+import {
+  baseName,
+  extFromMime,
+  fmtClock,
+  fmtDuration,
+  fmtRelativeTime,
+  uid,
+} from "./chat/chatFormat";
+import {
+  ChatCwdContext,
+  ChatFileOpenContext,
+  ChatTaskIdContext,
+  useChatFileOpener,
+  type ChatFileOpener,
+} from "./chat/chatContext";
+import {
+  bindTaskSession,
+  ensureTaskWorkspace,
+  publishTaskSnapshot,
+  type TaskId,
+} from "../lib/taskWorkspace";
+import {
+  artifactFromTool,
+  tokensFromUsage,
+  toolFilePath,
+  toolIcon,
+  toolTarget,
+  toolVerb,
+  type Artifact,
+  type ToolTurn,
+} from "./chat/toolPresentation";
+import { CopyButton, Markdown, parseButtons } from "./chat/ChatMarkdown";
+import { ApprovalCard, QuestionCard } from "./chat/ApprovalCards";
+import { ModelIcon } from "./chat/modelIcons";
+import { ConversationRail } from "./chat/ConversationRail";
+import { TaskRail } from "./chat/TaskRail";
+import { emptyFleetState, reduceFleet, type FleetState } from "../lib/subagentFleet";
+import {
+  canStartNormalSend,
+  canSteer,
+  initialChatRunLifecycle,
+  reduceChatRunLifecycle,
+  type ChatRunLifecycle,
+  type ChatRunLifecycleEvent,
+} from "../lib/chatRunLifecycle";
 import { PaneDropZone } from "./PaneDropZone";
+import { reportDiag } from "../lib/diag";
+import { pushNotification } from "../lib/notifications";
+import {
+  Composer,
+  createInputStore,
+  createStore,
+  engineColorVar,
+  resumeRowLabel,
+  type InputStore,
+  type Store,
+  type OverlayKind,
+  type SlashCommand,
+} from "./Composer";
 
 // ── transcript model ──────────────────────────────────────────────────────
+
+/**
+ * Mid-turn steer, per engine (backed by chat.rs `chat_steer`): claude injects
+ * the user line (with image content blocks) into the persistent process's
+ * stdin — verified against claude 2.1.170, the line is folded into the SAME
+ * running turn; codex fires `turn/steer` (text-only). Rejects (no live turn /
+ * unsupported engine / codex+images) → caller falls back to the queue.
+ * The wrapper carries the renderer run id so stale steers cannot target a newer
+ * backend turn after stop/retry races.
+ */
+const steerTurn = (id: number, text: string, runId: string, imagePaths?: string[]) =>
+  chatSteer(id, text, runId, imagePaths);
 
 type Turn = ChatTurn;
 
@@ -155,11 +242,92 @@ type RenderBlock =
   | { kind: "assistant"; id: string; turn: Extract<Turn, { kind: "assistant" }> }
   | { kind: "thinking"; id: string; turn: Extract<Turn, { kind: "thinking" }> }
   | { kind: "approval"; id: string; turn: Extract<Turn, { kind: "approval" }> }
+  // an AskUserQuestion tool call, lifted OUT of the collapsed activity group so
+  // the question + options render as a tappable card instead of being buried.
+  | { kind: "question"; id: string; turn: ToolTurn }
   | { kind: "result"; id: string; turn: Extract<Turn, { kind: "result" }> }
   | { kind: "activity"; id: string; tools: ToolTurn[]; durationMs?: number };
 
-let _uid = 0;
-const uid = () => `t${++_uid}`;
+/** High-frequency streaming token events that are safe to batch on a rAF tick
+ *  (text/thinking deltas). Structural events — assistant finals, tool results,
+ *  result, control_request/response, system — are NOT coalescable and must be
+ *  applied promptly and in order. */
+function isCoalescableDelta(ev: ChatEvent): boolean {
+  return (
+    ev.type === "stream_event" &&
+    ev.event?.type === "content_block_delta" &&
+    (ev.event.delta?.type === "text_delta" ||
+      ev.event.delta?.type === "thinking_delta")
+  );
+}
+
+/** Debounced localStorage persist. `serialize` returns the string to write, or
+ *  null to remove the key. Trailing debounce coalesces rapid changes into one
+ *  write — critical for state that updates per stream-token (serializing the
+ *  run-event log on every token was a major source of streaming jank). Always
+ *  flushes the latest value on unmount so nothing is lost. */
+function useDebouncedPersist<T>(
+  key: string | null,
+  value: T,
+  serialize: (v: T) => string | null,
+  delayMs: number,
+) {
+  const ref = useRef<{
+    timer: ReturnType<typeof setTimeout> | null;
+    key: string | null;
+    value: T;
+    serialize: (v: T) => string | null;
+  }>({ timer: null, key, value, serialize });
+  ref.current.key = key;
+  ref.current.value = value;
+  ref.current.serialize = serialize;
+
+  const flush = () => {
+    const r = ref.current;
+    if (!r.key) return;
+    try {
+      const s = r.serialize(r.value);
+      if (s == null) localStorage.removeItem(r.key);
+      else localStorage.setItem(r.key, s);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    if (!key) return;
+    const r = ref.current;
+    if (r.timer != null) return; // a flush is already scheduled; it reads latest
+    r.timer = setTimeout(() => {
+      r.timer = null;
+      flush();
+    }, delayMs);
+    // value/key tracked via ref; effect just (re)arms the trailing timer
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, value, delayMs]);
+
+  useEffect(
+    () => () => {
+      const r = ref.current;
+      if (r.timer != null) {
+        clearTimeout(r.timer);
+        r.timer = null;
+      }
+      flush();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+}
+
+/** Keep derived rail/task projections referentially stable when a stream token
+ * changes only the live assistant text. This lets memoized side surfaces skip
+ * the transcript's 20fps update cadence. */
+function useStableProjection<T>(value: T, signature: string): T {
+  const ref = useRef({ signature, value });
+  if (ref.current.signature !== signature) ref.current = { signature, value };
+  return ref.current.value;
+}
 type ChatUsageRate = Awaited<ReturnType<typeof codexRate>>;
 type UsageWin = { pct: number | null; resetsAt: number | null };
 type UsageSnapshot = { fiveHour: UsageWin; sevenDay: UsageWin };
@@ -199,7 +367,10 @@ function hasUsageData(snapshot: UsageSnapshot | null): snapshot is UsageSnapshot
 }
 
 function normalizeUsage(
-  raw: Awaited<ReturnType<typeof idleRate>> | ChatUsageRate,
+  raw:
+    | Awaited<ReturnType<typeof idleRate>>
+    | Awaited<ReturnType<typeof claudeRate>>
+    | ChatUsageRate,
   provider: string,
   model: ChatModel,
 ): UsageSnapshot {
@@ -223,52 +394,14 @@ interface ImageChip {
   path: string | null;
 }
 let _imgSeq = 0;
-/** Shell-quote a path for embedding in a message (single-quote, escape inner '). */
-function quotePath(path: string): string {
-  return `'${path.replace(/'/g, "'\\''")}'`;
-}
-/** "0:05" from elapsed seconds (dictation timer). */
-function fmtElapsed(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-/** Precomputed equalizer bars for the inline dictation waveform (time-keyed). */
-const WAVEFORM_BARS: { h: number; delay: number }[] = Array.from(
-  { length: 40 },
-  (_, i) => ({ h: 28 + ((i * 37) % 60), delay: (i * 70) % 900 }),
-);
-const WAVE_KEYFRAMES = `@keyframes aios-wave {
-  0%, 100% { transform: scaleY(0.32); opacity: 0.55; }
-  50% { transform: scaleY(1); opacity: 1; }
-}`;
+// (WAVEFORM_BARS / WAVE_KEYFRAMES moved into Composer.)
 
-/** File extension for a clipboard/file image mime. */
-function extFromMime(mime: string): string {
-  const m = mime.toLowerCase();
-  if (m.includes("png")) return "png";
-  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
-  if (m.includes("gif")) return "gif";
-  if (m.includes("webp")) return "webp";
-  return "png";
-}
+// Composer-mode wire prefixes (plan / goal / agent / ultracode) + the
+// codex-verbatim rule now live in chatPaneState.composeWireMessage — a pure,
+// tested function. dispatch() calls it so codex threads never inherit AIOS UX
+// framing in their (title-defining) first user message.
 
-// instruction prefixes for the composer modes
-const PLAN_PREFIX =
-  "Plan first: lay out a concise step-by-step plan and wait for my go-ahead before writing any code or running mutating commands.\n\n";
-const GOAL_PREFIX = (goal: string) =>
-  `Ongoing goal (keep pursuing this across turns until I say it's done): ${goal}\n\n`;
-// ultracode = xhigh effort + workflows. Headless `claude -p` has no ultracode
-// flag, so we run xhigh and replicate the "workflows" half with this directive:
-// orchestrate, fan out, verify — be maximally thorough.
-const ULTRA_PREFIX =
-  "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel sub-agents (Task tool) to cover it, then adversarially verify findings before concluding. Prefer orchestrated multi-agent execution over a single pass; only handle trivially small tasks inline.\n\n";
-
-const CONTEXT_BUDGETS: Array<{ id: ContextBudgetMode; label: string; sub: string }> = [
-  { id: "lean", label: "lean", sub: "stripped codex home, explicit context only" },
-  { id: "agent", label: "agent", sub: "terminal-grade tools and instructions" },
-  { id: "ultracode", label: "ultracode", sub: "xhigh + fanout, expensive by design" },
-];
+// (CONTEXT_BUDGETS moved into Composer.)
 
 function memoryContextBlock(memories: MemoryHit[]): string {
   if (memories.length === 0) return "";
@@ -280,291 +413,121 @@ function memoryContextBlock(memories: MemoryHit[]): string {
     .join("\n")}\n\n`;
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
-
-/** Renders tool input as a compact `key: value` preview (first few keys). */
-function previewArgs(input: Record<string, unknown>): string {
-  const entries = Object.entries(input ?? {});
-  if (entries.length === 0) return "";
-  return entries
-    .slice(0, 3)
-    .map(([k, v]) => {
-      let s = typeof v === "string" ? v : JSON.stringify(v);
-      if (s.length > 80) s = s.slice(0, 80) + "…";
-      return `${k}: ${s}`;
-    })
-    .join("  ");
-}
-
-/** Pulls a total token count out of the loose result `usage` object. */
-function tokensFromUsage(usage: unknown): number | undefined {
-  if (!usage || typeof usage !== "object") return undefined;
-  const u = usage as Record<string, unknown>;
-  const inT = typeof u.input_tokens === "number" ? u.input_tokens : 0;
-  const outT = typeof u.output_tokens === "number" ? u.output_tokens : 0;
-  const cacheRead =
-    typeof u.cache_read_input_tokens === "number"
-      ? u.cache_read_input_tokens
-      : 0;
-  const cacheCreate =
-    typeof u.cache_creation_input_tokens === "number"
-      ? u.cache_creation_input_tokens
-      : 0;
-  const total = inT + outT + cacheRead + cacheCreate;
-  return total > 0 ? total : undefined;
-}
-
-/** basename for a path, for the @-mention picker labels. */
-function baseName(p: string): string {
-  const i = p.replace(/\/+$/, "").lastIndexOf("/");
-  return i >= 0 ? p.slice(i + 1) : p;
-}
-
-// ── tool presentation (Codex-style activity steps) ───────────────────────────
-
-type ToolTurn = Extract<Turn, { kind: "tool" }>;
-
-/** Truncate the middle of a string so both ends stay visible. */
-function ellipsizeMid(s: string, max = 52): string {
-  if (s.length <= max) return s;
-  const half = Math.floor((max - 1) / 2);
-  return s.slice(0, half) + "…" + s.slice(s.length - half);
-}
-
-/** Pull the most relevant target arg out of a tool's input. Mirrors the verbs
- *  below: a path basename for file tools, the command for Bash, the pattern for
- *  search, the URL for fetches, else a compact key:value preview. */
-function toolTarget(turn: ToolTurn): { label: string; full: string } {
-  const inp = turn.input ?? {};
-  const name = turn.name.toLowerCase();
-  const str = (k: string) =>
-    typeof inp[k] === "string" ? (inp[k] as string) : undefined;
-
-  // file tools → basename (full path on hover)
-  const path = str("file_path") ?? str("path") ?? str("notebook_path");
-  if (path) return { label: ellipsizeMid(baseName(path)), full: path };
-
-  // shell → the command (first line)
-  if (name === "bash" || name === "bashoutput" || name === "exec_command" || name === "write_stdin") {
-    const cmd = str("command") ?? str("cmd") ?? str("chars") ?? "";
-    const firstLine = cmd.split("\n")[0] ?? cmd;
-    return { label: ellipsizeMid(firstLine, 60), full: cmd };
+/** Resolve a file reference against `cwd` (backend existence check) and open it
+ *  in a pane. Absolute/`~` paths skip resolution. Falls back to a BOUNDED fuzzy
+ *  basename match via `find_files` only when an exact join fails — never a blind
+ *  name search. Silent if nothing real resolves (no broken pane spawn). */
+async function openChatFileReference(ref: string, cwd?: string | null): Promise<void> {
+  const normalized = resolvePaneFileTarget(ref);
+  // Absolute or home paths are already concrete — open directly (paneForFile
+  // handles the existence/decoding). This matches harvested tool paths too.
+  if (normalized.startsWith("/") || normalized.startsWith("~/")) {
+    openFileInPane(normalized, targetLabel(normalized));
+    return;
   }
-
-  // search / grep / glob → pattern (+ optional path)
-  if (name === "grep" || name === "glob" || name === "search") {
-    const pat = str("pattern") ?? str("query") ?? "";
-    const where = str("path");
-    const full = where ? `${pat}  in ${where}` : pat;
-    return { label: ellipsizeMid(pat || full, 56), full };
+  if (!isTauriRuntime() || !cwd) {
+    // can't existence-check without a backend/cwd → best-effort as-is.
+    openFileInPane(normalized, targetLabel(normalized));
+    return;
   }
-
-  // web → url / query / domains
-  if (name === "webfetch" || name === "webfetch_tool") {
-    const url = str("url") ?? "";
-    return { label: ellipsizeMid(url, 56), full: url };
+  try {
+    const resolved = await invoke<string | null>("resolve_in_cwd", {
+      cwd,
+      reference: normalized,
+    });
+    if (resolved) {
+      openFileInPane(resolved, targetLabel(resolved));
+      return;
+    }
+    // last resort: bounded fuzzy basename match (exact join already failed).
+    const base = targetLabel(normalized).toLowerCase();
+    if (base.includes(".")) {
+      const files = await invoke<string[]>("find_files", { root: cwd, max: 20000 });
+      const hit =
+        files.find((f) => f.toLowerCase().endsWith(`/${base}`)) ??
+        files.find((f) => f.toLowerCase() === base);
+      if (hit) {
+        const abs = hit.startsWith("/") ? hit : `${cwd.replace(/\/+$/, "")}/${hit}`;
+        openFileInPane(abs, targetLabel(abs));
+      }
+    }
+  } catch {
+    /* resolution failed → don't open a broken pane */
   }
-  if (name === "websearch") {
-    const q = str("query") ?? "";
-    return { label: ellipsizeMid(q, 56), full: q };
-  }
-
-  // task / sub-agent → description
-  if (name === "task") {
-    const d = str("description") ?? str("subagent_type") ?? "";
-    return { label: ellipsizeMid(d, 56), full: d };
-  }
-
-  // fall back to the generic key:value preview
-  const preview = previewArgs(inp);
-  return { label: ellipsizeMid(preview, 56), full: preview };
-}
-
-/** A short verb for the tool, Codex-style ("Read", "Ran", "Edited", "Searched"). */
-function toolVerb(name: string): string {
-  switch (name.toLowerCase()) {
-    case "read":
-      return "Read";
-    case "write":
-      return "Wrote";
-    case "edit":
-    case "multiedit":
-      return "Edited";
-    case "notebookedit":
-      return "Edited";
-    case "bash":
-    case "exec_command":
-      return "Ran";
-    case "bashoutput":
-    case "write_stdin":
-      return "Output";
-    case "grep":
-    case "search":
-      return "Searched";
-    case "glob":
-      return "Globbed";
-    case "webfetch":
-    case "webfetch_tool":
-      return "Fetched";
-    case "websearch":
-      return "Web search";
-    case "task":
-      return "Agent";
-    case "mcp":
-    case "mcp_tool_call":
-      return "MCP";
-    case "todowrite":
-      return "Planned";
-    default:
-      return name;
-  }
-}
-
-/** Pick the lucide icon component for a tool's activity row. */
-function toolIcon(name: string) {
-  switch (name.toLowerCase()) {
-    case "read":
-      return FileText;
-    case "write":
-    case "notebookedit":
-      return FileText;
-    case "edit":
-    case "multiedit":
-      return Pencil;
-    case "bash":
-    case "bashoutput":
-    case "exec_command":
-    case "write_stdin":
-      return Terminal;
-    case "grep":
-    case "glob":
-    case "search":
-      return Search;
-    case "webfetch":
-    case "webfetch_tool":
-    case "websearch":
-      return Globe;
-    case "mcp":
-    case "mcp_tool_call":
-      return Wrench;
-    default:
-      return Wrench;
-  }
-}
-
-// ── file artifacts (Write / Edit / NotebookEdit targets) ─────────────────────
-
-interface Artifact {
-  path: string;
-  name: string;
-  kind: "img" | "pdf" | "doc" | "code" | "file";
-}
-
-const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp"]);
-const DOC_EXT = new Set(["doc", "docx", "md", "txt", "rtf", "csv", "xlsx", "xls", "ppt", "pptx", "key"]);
-const CODE_EXT = new Set([
-  "ts", "tsx", "js", "jsx", "rs", "py", "go", "java", "rb", "php", "c", "cc", "cpp",
-  "h", "hpp", "cs", "swift", "kt", "sh", "zsh", "bash", "json", "yaml", "yml", "toml",
-  "html", "css", "scss", "sql", "lua", "dart", "vue", "svelte",
-]);
-
-function artifactKind(path: string): Artifact["kind"] {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  if (ext === "pdf") return "pdf";
-  if (IMG_EXT.has(ext)) return "img";
-  if (CODE_EXT.has(ext)) return "code";
-  if (DOC_EXT.has(ext)) return "doc";
-  return "file";
-}
-
-/** Detect the file an artifact-producing tool wrote to (Write/Edit/NotebookEdit). */
-function artifactFromTool(turn: ToolTurn): Artifact | null {
-  const name = turn.name.toLowerCase();
-  if (
-    name !== "write" &&
-    name !== "edit" &&
-    name !== "multiedit" &&
-    name !== "notebookedit"
-  ) {
-    return null;
-  }
-  const inp = turn.input ?? {};
-  const path =
-    (typeof inp.file_path === "string" && inp.file_path) ||
-    (typeof inp.path === "string" && inp.path) ||
-    (typeof inp.notebook_path === "string" && inp.notebook_path) ||
-    "";
-  if (!path) return null;
-  return { path, name: baseName(path), kind: artifactKind(path) };
-}
-
-/** Format a duration in ms as a compact human label: "2m 38s", "47s", "0.4s". */
-function fmtDuration(ms: number): string {
-  if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`;
-  const totalSec = Math.round(ms / 1000);
-  if (totalSec < 60) return `${totalSec}s`;
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}m ${s}s`;
-}
-
-/** Format an elapsed-while-running timer as m:ss (Codex "Working… 0:42"). */
-function fmtClock(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-/** Compact "time since" label from a unix-SECONDS timestamp ("3h ago", "2d ago",
- *  "just now"). Used for the /resume session picker's faint secondary line. */
-function fmtRelativeTime(unixSeconds: number): string {
-  const diffSec = Math.max(0, Math.floor(Date.now() / 1000 - unixSeconds));
-  if (diffSec < 45) return "just now";
-  const min = Math.floor(diffSec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.floor(hr / 24);
-  if (day < 7) return `${day}d ago`;
-  const wk = Math.floor(day / 7);
-  if (wk < 5) return `${wk}w ago`;
-  const mo = Math.floor(day / 30);
-  if (mo < 12) return `${mo}mo ago`;
-  return `${Math.floor(day / 365)}y ago`;
 }
 
 // ── component ────────────────────────────────────────────────────────────────
 
 const runEventsStorageKey = (sessionId: string) => `aios.chat.run-events:${sessionId}`;
 
+// stall watchdog: a streaming turn with NO event for this long is treated as
+// wedged and surfaces a calm retry/stop affordance. 90s is long enough that a
+// legitimately slow tool (build, deep search) won't false-trip, short enough
+// that a truly hung child doesn't strand the user indefinitely.
+const STALL_THRESHOLD_MS = 90_000;
+
 export function ChatPane({
   cwd,
   paneKey,
+  active,
+  hidden,
   seed,
   resume,
   reattach,
+  modelId,
+  agentLabel,
+  taskId,
   onOpenUrl,
+  onChatSession,
 }: {
   cwd?: string;
   paneKey?: string;
+  /** True when this is the focused/active pane. Drives composer auto-focus on
+   *  becoming active (and on mount) — but never steals focus mid-action. */
+  active?: boolean;
+  /** True when the pane is minimized out of the grid (display:none). A hidden
+   *  chat that hits a tool-approval prompt is invisible — so we fire a
+   *  high-priority `chat.needs_input` notification that reattaches on click. */
+  hidden?: boolean;
   seed?: string;
-  /** Resume a prior chat session on mount (from the idle "continue" rail). */
-  resume?: { id: string; title: string };
+  modelId?: string;
+  agentLabel?: string;
+  /** Durable UI task ownership from the App pane model. */
+  taskId?: TaskId;
+  workspaceContext?: ChatWorkspaceContext;
+  /** Resume a prior chat session on mount (from the idle "continue" rail).
+   *  engine/model carry the saved session's backend so a resumed codex thread
+   *  boots on codex (not the default claude) — otherwise --resume sends a codex
+   *  thread-id to the claude binary and the pane comes up blank. */
+  resume?: { id: string; title: string; engine?: string; model?: string; version?: number };
   /** Reattach to a still-live backgrounded session by its backend id (from the
    *  "running" tray) — replays its buffer and continues live instead of spawning. */
   reattach?: number;
   /** Open an http(s) link from rendered markdown in an in-app browser pane. */
-  onOpenUrl?: (url: string) => void;
+  onOpenUrl?: (url: string, ctx?: { taskId?: TaskId }) => void;
+  /** Reports the LIVE chat session id (+ title/engine/model) up to the owning
+   *  pane so it can be recorded into pane history WITH a resume handle. Without
+   *  this, reopening a chat from history spawns a FRESH pane instead of
+   *  continuing the conversation (the kind never learned its session id). */
+  onChatSession?: (info: { id: string; title: string; engine?: string; model?: string }) => void;
 }) {
   const nativeRuntime = useMemo(() => isTauriRuntime(), []);
   const webChatRuntime = !nativeRuntime;
+  const onTaskOpenUrl = useCallback(
+    (url: string) => onOpenUrl?.(url, taskId ? { taskId } : {}),
+    [onOpenUrl, taskId],
+  );
   const [turns, setTurns] = useState<Turn[]>([]);
   const turnsRef = useRef<Turn[]>([]);
   turnsRef.current = turns;
   const [runEventState, setRunEventState] = useState<RunEventState>(() =>
     emptyRunEventState(),
   );
+  // Live sub-agent fleet for the active turn — folded from the SAME event
+  // stream (Task tool_use + parent_tool_use_id linkage). Additive + ephemeral:
+  // not persisted, reset whenever the transcript resets. Claude contributes
+  // native Task events; codex contributes explicit AIOS worker pane spawns.
+  const [fleetState, setFleetState] = useState<FleetState>(() => emptyFleetState());
   const [runEventsKey, setRunEventsKey] = useState<string | null>(() =>
     resume?.id ? runEventsStorageKey(resume.id) : null,
   );
@@ -580,63 +543,177 @@ export function ChatPane({
       /* ignore */
     }
   }, [runEventsKey]);
-  useEffect(() => {
-    if (!runEventsKey) return;
-    try {
-      if (runEventState.events.length > 0) {
-        localStorage.setItem(runEventsKey, serializeRunEventState(runEventState));
-      } else {
-        localStorage.removeItem(runEventsKey);
-      }
-    } catch {
-      /* ignore */
-    }
-  }, [runEventsKey, runEventState]);
+  // runEventState changes on every stream token and serializeRunEventState does
+  // a full JSON.stringify of the (growing) event log — writing it synchronously
+  // per token was the single biggest source of streaming lag. Debounce it.
+  useDebouncedPersist(
+    runEventsKey,
+    runEventState,
+    (s) => (s.events.length > 0 ? serializeRunEventState(s) : null),
+    500,
+  );
   // composer draft persists per pane so /clear, a restart, or a remount never
   // loses what you were typing. Keyed by paneKey; seed (e.g. notes "send to AI")
   // still wins on first mount.
   const draftKey = paneKey ? `aios-chat-draft:${paneKey}` : null;
-  const [input, setInput] = useState<string>(() => {
-    if (seed) return seed;
-    if (draftKey) {
-      try {
-        return localStorage.getItem(draftKey) ?? "";
-      } catch {
-        /* ignore */
+  // composer text lives in an external store (created once) so a keystroke
+  // re-renders only <Composer>, not this whole pane. `setInput` keeps the
+  // exact `(string | (prev) => string) => void` signature for the ~30 call
+  // sites that still set it from here. Draft-persist now lives in Composer
+  // (it owns the reactive `input`).
+  const inputStore = useRef<InputStore>(undefined as unknown as InputStore);
+  if (!inputStore.current) {
+    inputStore.current = createInputStore((() => {
+      if (seed) return seed;
+      if (draftKey) {
+        try {
+          return localStorage.getItem(draftKey) ?? "";
+        } catch {
+          /* ignore */
+        }
       }
-    }
-    return "";
-  });
-  // persist the draft as it changes (cleared on send).
-  useEffect(() => {
-    if (!draftKey) return;
-    try {
-      if (input) localStorage.setItem(draftKey, input);
-      else localStorage.removeItem(draftKey);
-    } catch {
-      /* ignore */
-    }
-  }, [input, draftKey]);
+      return "";
+    })());
+  }
+  const setInput = inputStore.current.set;
   const [isComposerCollapsed, setComposerCollapsed] = useState(false);
 
   const [streaming, setStreaming] = useState(false);
   const [backendBusy, setBackendBusy] = useState(false);
+  // Visual streaming is kept for transcript rendering; lifecycle is the source
+  // of truth for whether sends, steers, and stops are legal.
+  const [runLifecycle, setRunLifecycle] = useState<ChatRunLifecycle>(() =>
+    initialChatRunLifecycle(),
+  );
+  const runLifecycleRef = useRef<ChatRunLifecycle>(initialChatRunLifecycle());
+  const transitionRunLifecycle = useCallback((event: ChatRunLifecycleEvent): ChatRunLifecycle => {
+    const next = reduceChatRunLifecycle(runLifecycleRef.current, event);
+    if (next === runLifecycleRef.current) return next;
+    runLifecycleRef.current = next;
+    setRunLifecycle(next);
+    if (next.phase === "starting" || next.phase === "running") {
+      setStreaming(true);
+      setBackendBusy(true);
+    } else if (
+      next.phase === "completed" ||
+      next.phase === "failed" ||
+      next.phase === "interrupted" ||
+      next.phase === "exited"
+    ) {
+      setStreaming(false);
+      setBackendBusy(false);
+    }
+    return next;
+  }, []);
+  const beginRun = useCallback((): string => {
+    const next = transitionRunLifecycle({ type: "starting" });
+    if (next.phase !== "starting") {
+      throw new Error("chat run could not start from its current lifecycle state");
+    }
+    return next.runId;
+  }, [transitionRunLifecycle]);
+  const adoptBackendRun = useCallback((runId: string) => {
+    const current = runLifecycleRef.current;
+    // Normal sends mint their own id before chat_send, so their echoed starting
+    // frame is a duplicate. This branch exists for a reattached busy session,
+    // whose buffered backend lifecycle arrives before this pane has local state.
+    if (!canStartNormalSend(current)) return;
+    const next: ChatRunLifecycle = { phase: "starting", runId };
+    runLifecycleRef.current = next;
+    setRunLifecycle(next);
+    setStreaming(true);
+    setBackendBusy(true);
+  }, []);
+  const resetRunLifecycle = useCallback(() => {
+    const next = initialChatRunLifecycle();
+    runLifecycleRef.current = next;
+    setRunLifecycle(next);
+    setStreaming(false);
+    setBackendBusy(false);
+  }, []);
   const [started, setStarted] = useState(false);
   // claude's init event arrived (session_id known) — gates the seed auto-send
-  const [claudeReady, setClaudeReady] = useState(false);
+  // claudeReady is still tracked (init-event signal) but no longer gates the
+  // seed auto-send — the retry loop polls sessionIdRef directly. Value unused.
+  const [, setClaudeReady] = useState(false);
 
   // composer settings — boot from the saved default (settings.chatModel).
   // The model the user last picked in the composer IS their default; persisted
-  // so codex / opus / whatever sticks across panes + restarts.
+  // so codex / opus / whatever sticks across panes + restarts. The virtual
+  // "aios" entry resolves to a concrete model HERE — the pane always holds a
+  // concrete model; `aiosRouted` carries the route reason for display.
+  const bootRouteRef = useRef<AiosDecision | null>(null);
   const [model, setModel] = useState<ChatModel>(() => {
-    const saved = loadSettings().chatModel;
-    return CHAT_MODELS.find((m) => m.id === saved) ?? CHAT_MODELS[0];
+    // Resuming a prior chat: honor its saved model/engine FIRST so a codex thread
+    // doesn't boot on claude (which would mis-route --resume to the wrong binary).
+    if (resume?.model) {
+      const byId = CHAT_MODELS.find((m) => m.id === resume.model && m.id !== AIOS_MODEL_ID);
+      if (byId) return byId;
+    }
+    if (resume?.engine) {
+      const byEngine = CHAT_MODELS.find(
+        (m) => m.id !== AIOS_MODEL_ID && (m.engine ?? "claude") === resume.engine,
+      );
+      if (byEngine) return byEngine;
+    }
+    const preferred = modelId ?? loadSettings().chatModel;
+    if (preferred && preferred !== AIOS_MODEL_ID) {
+      const byId = CHAT_MODELS.find((m) => m.id === preferred);
+      if (byId) return byId;
+    }
+    // aios default (or a stale saved id): route from the cached decision now;
+    // a mount effect re-checks live meters and corrects the pristine pane.
+    bootRouteRef.current = resolveAiosSync();
+    return bootRouteRef.current.model;
   });
+  // The concrete model owns the provider engine. AIOS may deliberately run a
+  // Codex model through the Claude Code adapter while Claude has capacity, then
+  // switch that same model to native Codex at the 100% boundary.
+  const runtimeEngine = model.engine ?? "claude";
+  // non-null ⇒ the live session was picked by the aios router (value = reason).
+  const [aiosRouted, setAiosRouted] = useState<string | null>(
+    () => bootRouteRef.current?.reason ?? null,
+  );
+  const [aiosHarness, setAiosHarness] = useState<"claude" | null>(
+    () => bootRouteRef.current?.harness ?? null,
+  );
+  const aiosRoutedRef = useRef(aiosRouted);
+  aiosRoutedRef.current = aiosRouted;
+  const aiosHarnessRef = useRef(aiosHarness);
+  aiosHarnessRef.current = aiosHarness;
+  const runtimeHarness: "claude" | null = aiosRouted != null
+    ? aiosHarness
+    : runtimeEngine === "codex" ? null : "claude";
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
-  const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(EFFORTS[1]);
-  const [contextBudget, setContextBudget] = useState<ContextBudgetMode>("lean");
+  const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(() => {
+    const settings = loadSettings();
+    const id = resolveModelEffort(
+      model,
+      null,
+      settings.chatEffortByModel?.[model.id] ?? null,
+    );
+    return EFFORTS.find((option) => option.id === id) ?? EFFORTS[1];
+  });
+  const [contextBudget, setContextBudget] = useState<ContextBudgetMode>("agent");
   const effectiveBudget: ContextBudgetMode =
     contextBudget === "ultracode" || effort.ultra ? "ultracode" : contextBudget;
+  // "ultracode" is an AIOS workflow preset, while "ultra" is a real Codex
+  // reasoning value. Claude keeps the legacy xhigh wire mapping; Codex gets the
+  // exact effort advertised by the selected model.
+  const runtimeEffort =
+    effectiveBudget === "ultracode" && (model.engine ?? "claude") !== "codex"
+      ? "xhigh"
+      : effort.id;
+  useEffect(() => {
+    const settings = loadSettings();
+    if (settings.chatEffortByModel?.[model.id] === effort.id) return;
+    saveSettings({
+      chatEffortByModel: {
+        ...settings.chatEffortByModel,
+        [model.id]: effort.id,
+      },
+    });
+  }, [model.id, effort.id]);
   // running context size (prompt tokens of the latest turn) → composer indicator
   const [ctxTokens, setCtxTokens] = useState<number | null>(null);
   const activeModelRef = useRef(model);
@@ -651,6 +728,7 @@ export function ChatPane({
   type UsageWindow = keyof UsageSnapshot;
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
   const [usageWindow, setUsageWindow] = useState<UsageWindow>("fiveHour");
+  const [claudeIdentityLabel, setClaudeIdentityLabel] = useState<string | null>(null);
   // Snapshot each provider the first time it appears in this chat. The strip
   // paints that baseline separately from usage added while this pane is alive.
   const usageBaselineRef = useRef<Record<string, UsageSnapshot>>({});
@@ -660,19 +738,79 @@ export function ChatPane({
     }
     setUsage(next);
   }, []);
+
   // cumulative $ spent this chat session (summed across result events).
-  const [sessionCost, setSessionCost] = useState(0);
 
   // ── message queue / steering (Phase 2) ─────────────────────────────────────
   // Type-ahead while a turn is in flight: submitting queues the message instead
   // of dropping it; queued messages fire one-by-one as each turn completes
   // (codex-style). Held in a ref too so the flush effect reads the latest list.
+  const queueStorageKey = paneKey ?? null;
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [queuedIdx, setQueuedIdx] = useState(0);
+  // `undefined` means the current pane has not finished loading yet; `null`
+  // means an intentionally unkeyed, memory-only composer.
+  const [hydratedQueuePaneKey, setHydratedQueuePaneKey] = useState<string | null | undefined>(undefined);
   const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
   const [editingQueuedText, setEditingQueuedText] = useState("");
   const queuedRef = useRef<QueuedMessage[]>([]);
+  const queuedIdxRef = useRef(0);
+  const queueHydrationIdRef = useRef(0);
   queuedRef.current = queued;
+  queuedIdxRef.current = queuedIdx;
+  const setQueuedSelection = useCallback((next: SetStateAction<number>) => {
+    setQueuedIdx((current) => {
+      const resolved = typeof next === "function" ? next(current) : next;
+      queuedIdxRef.current = resolved;
+      return resolved;
+    });
+  }, []);
+
+  // Queue work belongs to this pane's durable task surface, rather than an
+  // ephemeral backend process. A restart or reattach therefore keeps the next
+  // instructions in order; `/clear` intentionally removes them below.
+  useLayoutEffect(() => {
+    const queueHydrationId = ++queueHydrationIdRef.current;
+    setHydratedQueuePaneKey(undefined);
+    // Pins contain base64 in renderer memory. They belong only to the pane that
+    // created them; never retain them across a pane switch or fresh hydration.
+    pinnedImagesRef.current.clear();
+    const hydrated =
+      queueStorageKey && typeof localStorage !== "undefined"
+        ? hydrateChatQueue(localStorage, queueStorageKey)
+        : { queue: null, droppedMessages: 0, droppedImages: 0 };
+    // A pane switch may win while this component is reconciling. Never apply
+    // that older pane's snapshot after its key has changed.
+    if (queueHydrationIdRef.current !== queueHydrationId) return;
+    const items = hydrated.queue?.items ?? [];
+    const selected = hydrated.queue?.selected ?? 0;
+    queuedRef.current = items;
+    queuedIdxRef.current = selected;
+    setQueued(items);
+    setQueuedIdx(selected);
+    setEditingQueuedId(null);
+    setEditingQueuedText("");
+    if (hydrated.droppedMessages > 0) {
+      const messageWord = hydrated.droppedMessages === 1 ? "message" : "messages";
+      const imageWord = hydrated.droppedImages === 1 ? "image" : "images";
+      setTurns((prev) => [
+        ...prev,
+        {
+          kind: "result",
+          id: uid(),
+          text: `${hydrated.droppedMessages} queued ${messageWord} were not sent because ${hydrated.droppedImages} temporary pasted ${imageWord} could not be recovered after restart. reattach the image and send again.`,
+        },
+      ]);
+    }
+    setHydratedQueuePaneKey(queueStorageKey);
+  }, [queueStorageKey]);
+
+  useEffect(() => {
+    if (hydratedQueuePaneKey !== queueStorageKey) return;
+    if (!queueStorageKey) return;
+    if (typeof localStorage === "undefined") return;
+    saveChatQueue(localStorage, queueStorageKey, { items: queued, selected: queuedIdx });
+  }, [hydratedQueuePaneKey, queueStorageKey, queued, queuedIdx]);
 
   // mode chips
   const [planMode, setPlanMode] = useState(false);
@@ -680,54 +818,35 @@ export function ChatPane({
   const [memoryPanelOpen, setMemoryPanelOpen] = useState(false);
   const [handoffPanelOpen, setHandoffPanelOpen] = useState(false);
   const [memoryHits, setMemoryHits] = useState<MemoryHit[]>([]);
-  const [attachedMemoryIds, setAttachedMemoryIds] = useState<string[]>([]);
+  const [attachedMemoryPaths, setAttachedMemoryPaths] = useState<string[]>([]);
+  const [lastAutoMemories, setLastAutoMemories] = useState<MemoryHit[]>([]);
+  const [memoryContextStatus, setMemoryContextStatus] = useState<"ready" | "searching" | "error">("ready");
   const attachedMemories = useMemo(
-    () => attachedMemoryIds
-      .map((id) => memoryHits.find((hit) => hit.id === id))
+    () => attachedMemoryPaths
+      .map((path) => memoryHits.find((hit) => hit.path === path))
       .filter((hit): hit is MemoryHit => Boolean(hit)),
-    [attachedMemoryIds, memoryHits],
+    [attachedMemoryPaths, memoryHits],
   );
-
-  useEffect(() => {
-    if (!memoryPanelOpen) {
-      setMemoryHits([]);
-      return;
-    }
-    const q = input.trim();
-    if (q.length < 2) {
-      setMemoryHits([]);
-      return;
-    }
-    let cancelled = false;
-    const t = window.setTimeout(() => {
-      memorySearch(q, cwd ?? null, 5)
-        .then((hits) => {
-          if (cancelled) return;
-          setMemoryHits(hits);
-          setAttachedMemoryIds((ids) => ids.filter((id) => hits.some((h) => h.id === id)));
-        })
-        .catch(() => {
-          if (!cancelled) setMemoryHits([]);
-        });
-    }, 250);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(t);
-    };
-  }, [input, cwd, memoryPanelOpen]);
+  const openMemoryPanel = useCallback(() => {
+    setMemoryPanelOpen(true);
+  }, []);
+  // (auto-memory search effect moved into Composer — it's driven by `input`.)
 
   // open-dropdown tracking (single source so only one is open)
-  const [openMenu, setOpenMenu] = useState<null | "model" | "perm" | "effort" | "advanced">(
+  const [openMenu, setOpenMenu] = useState<null | "add" | "model" | "perm" | "effort" | "advanced">(
     null,
   );
 
-  // overlay popovers anchored to the composer (slash menu / @-files / resume)
-  const [overlay, setOverlay] = useState<null | "slash" | "mention" | "resume">(
-    null,
-  );
-  const [overlayIdx, setOverlayIdx] = useState(0);
-  const [mentionItems, setMentionItems] = useState<DirEntry[]>([]);
-  const [mentionQuery, setMentionQuery] = useState("");
+  // overlay popovers anchored to the composer (slash menu / @-files / resume).
+  // Stored externally (like `input`) so Composer subscribes reactively while
+  // ChatPane keeps stable setters for its ~22 call sites. `mentionItems/Query/
+  // Prefix` are typing-driven and now live inside Composer.
+  const overlayStore = useRef<Store<OverlayKind>>(undefined as unknown as Store<OverlayKind>);
+  if (!overlayStore.current) overlayStore.current = createStore<OverlayKind>(null);
+  const setOverlay = overlayStore.current.set;
+  const overlayIdxStore = useRef<Store<number>>(undefined as unknown as Store<number>);
+  if (!overlayIdxStore.current) overlayIdxStore.current = createStore<number>(0);
+  const setOverlayIdx = overlayIdxStore.current.set;
 
   // /resume picker: past chat sessions, a typed filter, and a loading flag
   const [resumeSessions, setResumeSessions] = useState<ChatSessionInfo[]>([]);
@@ -739,23 +858,132 @@ export function ChatPane({
   // set by the /resume picker, cleared by a fresh chat / /clear. Seeded from
   // the `resume` prop so the idle "continue" rail lands straight in a session.
   const [resumeId, setResumeId] = useState<string | null>(resume?.id ?? null);
+  const resumeIdRef = useRef<string | null>(resume?.id ?? null);
+  resumeIdRef.current = resumeId;
   // the title of the resumed session, shown as a note once after resuming
   const [resumedTitle, setResumedTitle] = useState<string | null>(resume?.title ?? null);
+  // best-known human label for THIS chat, mirrored into a ref so the stable-deps
+  // handleEvent closure can name it in a notification without going stale.
+  const chatTitleRef = useRef<string>("");
+  chatTitleRef.current = agentLabel ?? resumedTitle ?? "";
+  // reactive mirror of claudeSessionIdRef — the engine session id currently open
+  // in THIS pane, so the /resume picker can highlight "the one you're in".
+  const [openSessionId, setOpenSessionId] = useState<string | null>(resume?.id ?? null);
+  const ownSessionIdsRef = useRef<Set<string>>(new Set());
+  const onChatSessionRef = useRef(onChatSession);
+  onChatSessionRef.current = onChatSession;
+  const reportChatSession = useCallback((info: { id: string; title: string; engine?: string; model?: string }) => {
+    ownSessionIdsRef.current.add(info.id);
+    onChatSessionRef.current?.(info);
+  }, []);
+
+  // Report the live engine session id up to the owning pane the moment it's
+  // known (fresh chat establishes one, or a resume re-keys to a fork) so pane
+  // history records this chat WITH a resume handle — that's what makes
+  // reopening it from history CONTINUE the conversation instead of opening a
+  // fresh pane. The send path fires onChatSession again with a better title.
+  useEffect(() => {
+    if (!openSessionId) return;
+    if (!ownSessionIdsRef.current.has(openSessionId)) return;
+    const m = activeModelRef.current;
+    reportChatSession({
+      id: openSessionId,
+      title: chatTitleRef.current || resume?.title || "chat",
+      engine: m.engine ?? "claude",
+      model: m.id,
+    });
+    // chatTitleRef is a ref (not reactive); resumedTitle drives its value, so we
+    // depend on it to re-fire when the human label is established.
+    //
+    // `onChatSession` is DELIBERATELY excluded: it's a parent callback prop with
+    // an unstable identity. Including it caused an infinite render loop (React
+    // #185 "max update depth" + pane jitter + sends never landing): the effect
+    // calls onChatSession → parent records the session (setState) → parent
+    // re-renders with a NEW onChatSession identity → dep changed → effect re-runs
+    // → ∞. Firing on openSessionId/resumedTitle only is correct — React still runs
+    // the latest closure (current onChatSession) when those actually change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openSessionId, resumedTitle, reportChatSession]);
 
   const sessionIdRef = useRef<number | null>(null);
+  // Blank panes are intentionally cheap: opening a chat surface must not spawn a
+  // claude/codex process until the user actually sends something. The ref makes
+  // repeated submits in the same render frame idempotent; the state wakes the
+  // lifecycle effect exactly once. Resume/reattach/seed paths remain eager.
+  const [sessionStartRequested, setSessionStartRequested] = useState(false);
+  const sessionStartRequestedRef = useRef(false);
+  const requestSessionStart = useCallback(() => {
+    if (sessionIdRef.current != null || sessionStartRequestedRef.current) return;
+    sessionStartRequestedRef.current = true;
+    setSessionStartRequested(true);
+  }, []);
+  const eagerSessionStart = Boolean(seed) || resumeId != null || reattach != null || webChatRuntime;
+  // Composer's `started` contract means "submit is allowed", not strictly "a
+  // process exists". A dormant blank pane is ready to submit; once first send
+  // requests startup, the composer switches to its existing starting state.
+  const composerSessionReady = started || (!sessionStartRequested && !eagerSessionStart);
+  useEffect(() => {
+    const onAgentSpawned = (event: Event) => {
+      const detail = (event as CustomEvent<Record<string, unknown>>).detail ?? {};
+      const parentSessionId =
+        typeof detail.parentSessionId === "number"
+          ? detail.parentSessionId
+          : Number(detail.parentSessionId);
+      if (!Number.isFinite(parentSessionId) || parentSessionId !== sessionIdRef.current) {
+        return;
+      }
+      setFleetState((state) =>
+        reduceFleet(
+          state,
+          {
+            type: "aios_agent_spawned",
+            paneKey: typeof detail.paneKey === "string" ? detail.paneKey : undefined,
+            label: typeof detail.label === "string" ? detail.label : undefined,
+            cwd: typeof detail.cwd === "string" ? detail.cwd : undefined,
+          } as ChatEvent,
+          { now: Date.now() },
+        ),
+      );
+    };
+    window.addEventListener("chat-agent-spawned", onAgentSpawned);
+    return () => window.removeEventListener("chat-agent-spawned", onAgentSpawned);
+  }, []);
   const webAbortRef = useRef<AbortController | null>(null);
-  // live mirror of `streaming` for the close-handle closure (a turn in flight).
+  // Lifecycle, not visual streaming, is the live authority for close/send/steer.
   const activeRunRef = useRef(false);
-  activeRunRef.current = streaming || backendBusy;
+  const lifecycle = runLifecycleRef.current;
+  activeRunRef.current = !canStartNormalSend(lifecycle);
   // set true when the pane is intentionally detached (kept running) — tells the
   // unmount cleanup NOT to kill the claude process.
   const detachedRef = useRef(false);
+  // live mirror of "this chat is out of sight" for the (stable-deps) handleEvent
+  // closure — so a tool-approval landing on a minimized OR detached pane can fire
+  // a notification without re-creating handleEvent. Declared AFTER detachedRef so
+  // it can read it (no TDZ).
+  const hiddenRef = useRef(false);
+  hiddenRef.current = (hidden ?? false) || detachedRef.current;
+  // the `reattach` id whose background session this pane is currently bound to
+  // AND whose engine/model we auto-synced into `model` state. While set, a
+  // session-effect re-fire CAUSED by that auto-resync is a no-op (don't
+  // re-replay the buffer or kill the externally-owned session). A MANUAL model
+  // switch clears it (see below) so the pane re-spins on the new engine.
+  const reattachBoundRef = useRef<number | null>(null);
+  // armed right before the resync setModel; the very next session-effect cleanup
+  // consumes it to SKIP teardown (that re-run is the benign resync, not a real
+  // model change or unmount). Closure-independent, so no stale-model.id race.
+  const skipResyncTeardownRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   // index into `turns` of the assistant bubble currently being streamed
   const streamingTurnId = useRef<string | null>(null);
   // id of the thinking block currently being streamed (own block, precedes text)
   const thinkingTurnId = useRef<string | null>(null);
+  // high-frequency stream deltas are buffered here and flushed on a single rAF
+  // tick (≤~60Hz) instead of one state update per token — caps the render storm,
+  // markdown re-parses, and layout reads regardless of how fast the model emits.
+  const pendingDeltasRef = useRef<ChatEvent[]>([]);
+  const rafRef = useRef<number | null>(null);
+  const hiddenFlushTimerRef = useRef<number | null>(null);
   // last user prompt text actually sent to claude (for regenerate)
   const lastSentRef = useRef<string | null>(null);
   const stopChatRef = useRef<() => void>(() => {});
@@ -792,16 +1020,38 @@ export function ChatPane({
   // "Working… 0:42" timer and is the fallback duration if claude's result event
   // doesn't carry one.
   const turnStartRef = useRef<number | null>(null);
+  // wall-clock ms the in-flight turn began (null = idle). Changes at most once
+  // per turn — NOT every second. The 1Hz "Working… m:ss" tick lives entirely
+  // inside the <WorkingLine>/<ActivityGroup> leaves (useLiveElapsed) so the
+  // running clock re-renders ONLY that subtree, never the whole message list.
   const [liveStart, setLiveStart] = useState<number | null>(null);
-  // 1Hz tick so the running timer re-renders while streaming
-  const [now, setNow] = useState(() => Date.now());
-  // keep the latest input in a ref so the unmount writer-cleanup never goes stale
-  const inputRef = useRef(input);
-  inputRef.current = input;
+  // ── stall watchdog ─────────────────────────────────────────────────────────
+  // While a turn streams we stamp the wall-clock of the LAST received event into
+  // `lastActivityRef`. A 1Hz watchdog effect (below) flips `stalled` true when no
+  // event has arrived for STALL_THRESHOLD_MS — the #1 thing that strands a user
+  // on an alive-but-wedged child (the process is up, the turn just went silent).
+  // It's an affordance, NOT an error: the turn may still resume on its own, so we
+  // surface a calm "still working / retry / stop" choice rather than killing it.
+  const lastActivityRef = useRef<number>(0);
+  const [stalled, setStalled] = useState(false);
+  // keep the latest input in a ref so the unmount writer-cleanup never goes
+  // stale. The text now lives in inputStore; mirror it into the ref on every
+  // change (the store's set is synchronous, this stays fresh for async reads).
+  const inputRef = useRef(inputStore.current.get());
+  useEffect(
+    () =>
+      inputStore.current.subscribe(() => {
+        inputRef.current = inputStore.current.get();
+      }),
+    [],
+  );
 
   const empty = turns.length === 0;
   const usageProvider = usageProviderKey(model);
-  const usageLabel = usageProviderLabel(model);
+  const usageLabel =
+    usageProvider === "claude" && claudeIdentityLabel
+      ? `claude · ${claudeIdentityLabel}`
+      : usageProviderLabel(model);
 
   // ── voice dictation bridge (P0) ────────────────────────────────────────────
   // App registers each pane's writer here; ⌘J dictation pushes text to the
@@ -824,44 +1074,126 @@ export function ChatPane({
     };
   }, [paneKey]);
 
+  // ── auto-focus the composer ────────────────────────────────────────────────
+  // Focus the composer textarea when the pane MOUNTS and each time it BECOMES
+  // the active pane (false→true transition only — never on every render). Don't
+  // steal focus if the user is already typing/selecting in an editable field
+  // (e.g. a terminal/editor/composer in another pane): only grab focus when the
+  // current focus isn't an interactive input the user is mid-action in. Runs on
+  // a rAF so it lands after the pane's layout/visibility settles.
+  const wasActiveRef = useRef(false);
+  useEffect(() => {
+    const isActive = active ?? true; // panes without an active signal focus on mount
+    const becameActive = isActive && !wasActiveRef.current;
+    wasActiveRef.current = isActive;
+    if (!becameActive) return;
+    const ta = taRef.current;
+    if (!ta) return;
+    const raf = requestAnimationFrame(() => {
+      // don't yank focus out from under a user mid-action in ANOTHER editable.
+      const el = document.activeElement as HTMLElement | null;
+      const inThisPane = el ? ta.closest("[data-chat-pane]")?.contains(el) : false;
+      const editingElsewhere =
+        el != null &&
+        !inThisPane &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.isContentEditable ||
+          // terminal/browser webviews capture keys via these
+          el.tagName === "CANVAS" ||
+          el.tagName === "IFRAME" ||
+          el.tagName === "WEBVIEW");
+      if (editingElsewhere) return;
+      ta.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [active]);
+
   // A path dragged from another pane (Files) → append it to the composer.
   const insertPath = useCallback((path: string) => {
     setInput((v) => (v ? v.trimEnd() + " " + path + " " : path + " "));
     taRef.current?.focus();
   }, []);
 
+  // Deterministic in-chat file open, bound to THIS session's cwd. Provided via
+  // context so deep markdown/tool renderers can open files without threading cwd.
+  const openChatFile = useCallback<ChatFileOpener>(
+    (ref: string) => {
+      void openChatFileReference(ref, cwd);
+    },
+    [cwd],
+  );
+
   // ── image attach: paste a screenshot / pick a file → temp file + thumbnail ──
   const [images, setImages] = useState<ImageChip[]>([]);
+  // Live mirror of `images` so an async send can read the freshest paths after
+  // awaiting in-flight saves (the closure-captured `images` would be stale).
+  // SYNCHRONOUS mirror via setImagesSync: the old effect-synced ref lagged React
+  // state by one commit, so a paste→Enter race could resolve the save (clearing
+  // pendingSavesRef) before the effect copied the path into imagesRef — and
+  // sendText then filtered the null-path chip out and shipped a text-only turn
+  // (the "image never reaches the model" bug). Updating the ref inside the same
+  // call that updates state removes that window entirely.
+  const imagesRef = useRef<ImageChip[]>([]);
+  const setImagesSync = useCallback(
+    (updater: (prev: ImageChip[]) => ImageChip[]) => {
+      setImages((prev) => {
+        const next = updater(prev);
+        imagesRef.current = next;
+        return next;
+      });
+    },
+    [],
+  );
+  // In-flight disk-save promises, keyed by chip id. send() awaits these so a
+  // fast paste→Enter can't ship the turn before the image finishes saving.
+  const pendingSavesRef = useRef<Map<string, Promise<void>>>(new Map());
   const imgInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const addImage = useCallback(async (file: Blob, mime: string) => {
     const id = `img${++_imgSeq}`;
     const url = URL.createObjectURL(file);
-    setImages((prev) => [...prev, { id, url, path: null }]);
-    try {
-      const buf = await file.arrayBuffer();
-      const bytes = new Uint8Array(buf);
-      let bin = "";
-      const CHUNK = 0x8000;
-      for (let i = 0; i < bytes.length; i += CHUNK) {
-        bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    reportDiag("chat.image", "addImage:start", { id, mime, size: file.size });
+    setImagesSync((prev) => [...prev, { id, url, path: null }]);
+    const save = (async () => {
+      try {
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        const CHUNK = 0x8000;
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+        }
+        const path = await saveImageTemp(btoa(bin), extFromMime(mime));
+        reportDiag("chat.image", "addImage:saved", { id, path });
+        setImagesSync((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
+      } catch (e) {
+        reportDiag("chat.image", e, { action: "addImage:saveFailed", id });
+        // surface the failure instead of vanishing the thumbnail silently —
+        // otherwise the user thinks the image attached when it didn't.
+        setImagesSync((prev) => {
+          const gone = prev.find((im) => im.id === id);
+          if (gone) URL.revokeObjectURL(gone.url);
+          return prev.filter((im) => im.id !== id);
+        });
+        setTurns((prev) => [
+          ...prev,
+          { kind: "result", id: uid(), text: "couldn't attach that image (unsupported format or save failed) — not sent." },
+        ]);
+      } finally {
+        pendingSavesRef.current.delete(id);
       }
-      const path = await saveImageTemp(btoa(bin), extFromMime(mime));
-      setImages((prev) => prev.map((im) => (im.id === id ? { ...im, path } : im)));
-    } catch {
-      setImages((prev) => {
-        const gone = prev.find((im) => im.id === id);
-        if (gone) URL.revokeObjectURL(gone.url);
-        return prev.filter((im) => im.id !== id);
-      });
-    }
-  }, []);
+    })();
+    pendingSavesRef.current.set(id, save);
+    await save;
+  }, [setImagesSync]);
   const removeImage = useCallback((id: string) => {
-    setImages((prev) => {
+    setImagesSync((prev) => {
       const gone = prev.find((im) => im.id === id);
       if (gone) URL.revokeObjectURL(gone.url);
       return prev.filter((im) => im.id !== id);
     });
-  }, []);
+  }, [setImagesSync]);
 
   // Attach an image that already lives on disk (an OS file drop from Finder /
   // the desktop). Tauri's native drag-drop hands us a path, not a Blob, so we
@@ -869,8 +1201,9 @@ export function ChatPane({
   // the asset-protocol URL, and `path` is set immediately (already on disk).
   const addImageByPath = useCallback((path: string) => {
     const id = `img${++_imgSeq}`;
-    setImages((prev) => [...prev, { id, url: fileSrc(path), path }]);
-  }, []);
+    reportDiag("chat.image", "addImageByPath", { id, path });
+    setImagesSync((prev) => [...prev, { id, url: fileSrc(path), path }]);
+  }, [setImagesSync]);
 
   // Register this chat pane's IMAGE-drop sink so App's native OS drag-drop
   // handler routes dropped image files here as thumbnail chips (instead of
@@ -918,6 +1251,32 @@ export function ChatPane({
       return took;
     },
     [addImage],
+  );
+  const attachPickedFiles = useCallback(
+    (files: FileList | null) => {
+      if (!files) return;
+      let missingPath = 0;
+      for (const f of Array.from(files)) {
+        if (f.type.startsWith("image/")) {
+          void addImage(f, f.type);
+          continue;
+        }
+        const path = (f as File & { path?: string }).path;
+        if (path) insertPath(path);
+        else missingPath += 1;
+      }
+      if (missingPath > 0) {
+        setTurns((prev) => [
+          ...prev,
+          {
+            kind: "result",
+            id: uid(),
+            text: "couldn't attach that file directly. drag it from files/finder into the chatpane, or mention it with @path.",
+          },
+        ]);
+      }
+    },
+    [addImage, insertPath],
   );
   // ── voice dictation: click mic → inline waveform + timer → transcript ───────
   // Ported from TerminalComposer (the polished one). Records via lib/voice, swaps
@@ -988,8 +1347,65 @@ export function ChatPane({
 
   // ── event ingestion ───────────────────────────────────────────────────────
 
-  const handleEvent = useCallback((ev: ChatEvent) => {
+  // Backend handed an undeliverable codex steer back (its one retry against the
+  // server-reported turn id also failed, or the turn ended first). Routed
+  // through a ref because the queue helpers are defined below applyEvent.
+  const steerRequeueRef = useRef<(text: string) => void>(() => {});
+
+  // applies ONE event synchronously (the full ingestion logic). handleEvent
+  // below wraps this to coalesce high-frequency deltas; everything else flushes
+  // the buffer first (to preserve order) then applies synchronously here.
+  const applyEvent = useCallback((ev: ChatEvent) => {
+    if (ev.type === "aios_run") {
+      const state = ev.state;
+      const runId = ev.runId;
+      if (state === "starting" && runId) {
+        adoptBackendRun(runId);
+      } else if (
+        runId &&
+        (state === "running" ||
+          state === "interrupting" ||
+          state === "completed" ||
+          state === "failed" ||
+          state === "interrupted" ||
+          state === "exited")
+      ) {
+        const next = transitionRunLifecycle({ type: state, runId });
+        if (
+          next.runId === runId &&
+          (state === "completed" ||
+            state === "failed" ||
+            state === "interrupted" ||
+            state === "exited")
+        ) {
+          turnStartRef.current = null;
+          setLiveStart(null);
+        }
+      }
+      return;
+    }
+    if (ev.type === "aios_session_dead") {
+      const id = sessionIdRef.current;
+      sessionIdRef.current = null;
+      if (paneKey && id != null) chatSessions.delete(paneKey);
+      resetRunLifecycle();
+      setStarted(false);
+      setClaudeReady(false);
+      streamingTurnId.current = null;
+      thinkingTurnId.current = null;
+      turnStartRef.current = null;
+      setLiveStart(null);
+      sessionStartRequestedRef.current = true;
+      setSessionStartRequested(true);
+      setRestartKey((key) => key + 1);
+      setTurns((prev) => [
+        ...prev,
+        { kind: "result", id: uid(), text: "codex restarted after forced stop." },
+      ]);
+      return;
+    }
     setRunEventState((state) => reduceRunEvents(state, ev));
+    setFleetState((state) => reduceFleet(state, ev));
     // ---- control protocol: tool approval requests + acks --------------------
     // claude → us, non-bypass modes: a `control_request` whose request.subtype
     // is `can_use_tool`. We surface an inline approval card; the reply goes back
@@ -1017,6 +1433,23 @@ export function ChatPane({
             },
           ];
         });
+        // If this chat is OUT OF SIGHT (minimized or detached), firaz has no idea
+        // it's blocked waiting on him. Fire a high-priority, clickable notification
+        // that reattaches to the approval card. Foreground chats stay silent — the
+        // inline card is already visible. De-dupe is handled by the store (one live
+        // needs_input per session). Skipped when the backend id isn't known yet.
+        const sid = sessionIdRef.current;
+        if (hiddenRef.current && sid != null && sid > 0) {
+          pushNotification({
+            kind: "chat.needs_input",
+            level: "warning",
+            priority: "high",
+            sourceLabel: "chat",
+            title: "chat needs your input",
+            body: `${chatTitleRef.current || "a background chat"} is waiting to run ${String(toolName)}.`,
+            target: { type: "chat", sessionId: sid, title: chatTitleRef.current || "chat" },
+          });
+        }
       }
       return;
     }
@@ -1063,8 +1496,10 @@ export function ChatPane({
         });
         streamingTurnId.current = null;
         thinkingTurnId.current = null;
-        setStreaming(false);
-        setBackendBusy(false);
+        // Keep the run live until its tagged `aios_run` terminal frame arrives.
+        // A result is transcript content, not authority to unlock the composer:
+        // the adjacent lifecycle frame protects us from late-result stop/steer
+        // races and from a previous run settling a newer one.
         // prefer claude's reported duration; fall back to our wall-clock measure
         const wall =
           turnStartRef.current != null ? Date.now() - turnStartRef.current : undefined;
@@ -1075,8 +1510,6 @@ export function ChatPane({
         const dur = durationMs != null ? fmtDuration(durationMs) : "";
         const costNum =
           typeof ev.total_cost_usd === "number" ? ev.total_cost_usd : undefined;
-        if (costNum != null && costNum > 0) setSessionCost((c) => c + costNum);
-        const cost = costNum != null ? `$${costNum.toFixed(4)}` : "";
         const tokens = tokensFromUsage(ev.usage);
         const tokStr =
           tokens != null ? `${tokens.toLocaleString()} tok` : "";
@@ -1093,14 +1526,10 @@ export function ChatPane({
             : 0);
         if (ctx > 0) setCtxTokens(ctx);
         const resultText = typeof ev.text === "string" ? ev.text.trim() : "";
-        const foot = [resultText, dur, tokStr, cost].filter(Boolean).join(" · ");
+        // cost intentionally omitted — firaz runs on subs, $ figures are noise.
+        const foot = [resultText, dur, tokStr].filter(Boolean).join(" · ");
         // always emit a result turn (carries durationMs for the activity line),
         // even if the human-readable footer would be empty.
-        onPetResult({
-          tokens,
-          durationMs,
-          ok: !Boolean(ev.is_error),
-        });
         setTurns((prev) => [
           ...prev,
           { kind: "result", id: uid(), text: foot, cost: costNum, tokens, durationMs },
@@ -1108,19 +1537,56 @@ export function ChatPane({
         return;
       }
 
-      // surface a backend stderr line (missing binary / not logged in / bad flag)
-      case "aios_stderr": {
-        if (ev.text) onPetError(ev.text);
-        if (ev.text) {
+      case "aios_resume_pruned": {
+        const staleId = typeof ev.id === "string" ? ev.id.trim() : "";
+        if (!staleId) return;
+        prunePaneHistoryResume(staleId);
+        // claude rejected this resume id (e.g. exits with "No conversation found")
+        // and the process is now dead — its stdin is broken, so the next send
+        // fails and the pane sits wedged on a corpse. Recover: drop the bad
+        // resume, clear any stuck stream state, and respin a FRESH session (no
+        // --resume) so the pane becomes usable instead of writing to dead stdin.
+        if (staleId === claudeSessionIdRef.current) {
+          ownSessionIdsRef.current.delete(staleId);
+          claudeSessionIdRef.current = null;
+          setOpenSessionId(null);
+          setResumedTitle(null);
+          resetRunLifecycle();
+          setStarted(false);
+          setClaudeReady(false);
+          streamingTurnId.current = null;
+          thinkingTurnId.current = null;
+          turnStartRef.current = null;
+          setLiveStart(null);
+          recordedRef.current = false;
+          codexTitleLockedRef.current = false;
           setTurns((prev) => [
             ...prev,
-            { kind: "result", id: uid(), text: `claude: ${ev.text}` },
+            { kind: "result", id: uid(), text: "resume unavailable — started a fresh chat." },
+          ]);
+          // Respin FRESH. Usually resumeId changes from stale -> null and that
+          // re-runs the session effect. If another recovery path already nulled
+          // it, bump restartKey so the pane cannot stay in "started but no
+          // sessionId" limbo where sends only enqueue and clear the composer.
+          sessionStartRequestedRef.current = true;
+          setSessionStartRequested(true);
+          if (resumeIdRef.current == null) setRestartKey((k) => k + 1);
+          setResumeId(null);
+        }
+        return;
+      }
+
+      // surface a backend stderr line (missing binary / not logged in / bad flag)
+      case "aios_stderr": {
+        if (ev.text) {
+          const provider = activeModelRef.current.engine ?? "claude";
+          setTurns((prev) => [
+            ...prev,
+            { kind: "result", id: uid(), text: `${provider}: ${ev.text}` },
           ]);
         }
         turnStartRef.current = null;
         setLiveStart(null);
-        setStreaming(false);
-        setBackendBusy(false);
         return;
       }
 
@@ -1134,10 +1600,6 @@ export function ChatPane({
           void codexRate().then((r) => {
             const snap = codexUsageForModel(r, current);
             if (hasUsageData(snap)) {
-              onPetUsage({
-                provider: "codex",
-                pct: snap.fiveHour.pct,
-              });
               rememberUsage(usageProviderKey(current), snap);
             }
           });
@@ -1145,15 +1607,6 @@ export function ChatPane({
         }
         const fh = ev.five_hour ?? {};
         const sd = ev.seven_day ?? {};
-        onPetUsage({
-          provider: ev.provider ?? "claude",
-          pct:
-            typeof fh.pct === "number"
-              ? fh.pct
-              : typeof sd.pct === "number"
-                ? sd.pct
-                : null,
-        });
         rememberUsage(ev.provider ?? "claude", {
           fiveHour: { pct: fh.pct ?? null, resetsAt: fh.resets_at ?? null },
           sevenDay: { pct: sd.pct ?? null, resetsAt: sd.resets_at ?? null },
@@ -1164,8 +1617,26 @@ export function ChatPane({
       // system init: not rendered, but carries claude's session_id — capture it
       // so the first user send can recordChatSession() into the /resume list.
       case "system": {
+        if (ev.subtype === "codex_steer_requeued") {
+          if (ev.text) steerRequeueRef.current(ev.text);
+          return;
+        }
         if (ev.session_id) {
+          const prev = claudeSessionIdRef.current;
+          // claude's `--resume` emits a FRESH session_id and writes continued
+          // turns to a new <id>.jsonl. If we were already recorded (a resume),
+          // re-key the store entry to the new id — otherwise the next resume
+          // reads the old transcript (truncated at the fork) and re-forks again.
+          if (prev && prev !== ev.session_id && recordedRef.current) {
+            const m = activeModelRef.current;
+            const title = resume?.title ?? "chat";
+            // re-keying on a resume fork is bookkeeping, not real activity →
+            // don't bump mtime (preserve the session's genuine recency order).
+            recordChatSession(ev.session_id, title, cwd ?? null, m.engine ?? "claude", m.id, false).catch((e) => reportDiag("chat.session", e, { action: "record" }));
+          }
           claudeSessionIdRef.current = ev.session_id;
+          ownSessionIdsRef.current.add(ev.session_id);
+          setOpenSessionId(ev.session_id);
           setRunEventsKey(runEventsStorageKey(ev.session_id));
         }
         setClaudeReady(true);
@@ -1176,7 +1647,121 @@ export function ChatPane({
       default:
         return;
     }
-  }, [rememberUsage]);
+  }, [rememberUsage, transitionRunLifecycle, adoptBackendRun, resetRunLifecycle]);
+
+  // Apply all buffered stream deltas in ONE pass: a single setRunEventState fold
+  // and a single setTurns fold (threading the streaming/thinking ids through),
+  // so N tokens cost one render instead of N. Safe to call anytime; no-op when
+  // the buffer is empty. Cancels any pending visible/background scheduler.
+  const flushPending = useCallback(() => {
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    if (hiddenFlushTimerRef.current != null) {
+      window.clearTimeout(hiddenFlushTimerRef.current);
+      hiddenFlushTimerRef.current = null;
+    }
+    const evs = coalesceChatStreamDeltas(pendingDeltasRef.current);
+    if (evs.length === 0) return;
+    pendingDeltasRef.current = [];
+    setRunEventState((state) => evs.reduce((s, e) => reduceRunEvents(s, e), state));
+    setFleetState((state) => evs.reduce((s, e) => reduceFleet(s, e), state));
+    setTurns((prev) => {
+      let st: ChatStreamState = {
+        turns: prev,
+        streamingTurnId: streamingTurnId.current,
+        thinkingTurnId: thinkingTurnId.current,
+      };
+      const now = Date.now();
+      for (const e of evs) {
+        const r = reduceChatStreamEvent(st, e, { now, uid });
+        if (r.handled) st = r.state;
+      }
+      streamingTurnId.current = st.streamingTurnId;
+      thinkingTurnId.current = st.thinkingTurnId;
+      return st.turns;
+    });
+  }, []);
+
+  const handleEvent = useCallback(
+    (ev: ChatEvent) => {
+      // stall watchdog: ANY event (delta, tool result, control, …) means the
+      // turn is alive — stamp the activity clock and clear a prior stall. This is
+      // the single funnel for every incoming event, so it's the one place the
+      // watchdog needs to observe.
+      lastActivityRef.current = Date.now();
+      setStalled((s) => (s ? false : s));
+      // buffer high-frequency text/thinking deltas; everything else (assistant
+      // finals, tool results, result, control, system) must apply promptly and
+      // IN ORDER, so flush the buffer first then handle it synchronously.
+      if (isCoalescableDelta(ev)) {
+        pendingDeltasRef.current.push(ev);
+        if (rafRef.current == null && hiddenFlushTimerRef.current == null) {
+          const backgroundDelay = chatStreamFlushDelay(hiddenRef.current);
+          if (backgroundDelay != null) {
+            hiddenFlushTimerRef.current = window.setTimeout(() => {
+              hiddenFlushTimerRef.current = null;
+              flushPending();
+            }, backgroundDelay);
+          } else {
+            rafRef.current = requestAnimationFrame(() => {
+              rafRef.current = null;
+              flushPending();
+            });
+          }
+        }
+        return;
+      }
+      flushPending();
+      applyEvent(ev);
+    },
+    [applyEvent, flushPending],
+  );
+
+  // A pane brought back to the foreground should reveal everything it buffered
+  // immediately instead of waiting for the background cadence to elapse.
+  useEffect(() => {
+    if (!(hidden ?? false)) flushPending();
+  }, [flushPending, hidden]);
+
+  // cancel either scheduler on unmount so a buffered flush never fires a state
+  // update into an unmounted component.
+  useEffect(
+    () => () => {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      if (hiddenFlushTimerRef.current != null) {
+        window.clearTimeout(hiddenFlushTimerRef.current);
+        hiddenFlushTimerRef.current = null;
+      }
+    },
+    [],
+  );
+
+  // ── stall watchdog driver ──────────────────────────────────────────────────
+  // Only runs while streaming. Polls once a second (cheap; no per-token work) and
+  // flips `stalled` once STALL_THRESHOLD_MS pass with no event. Stopping/finishing
+  // a turn flips `streaming` false → this effect tears down + resets the flag, so
+  // the affordance can never linger on an idle pane.
+  useEffect(() => {
+    if (!streaming) {
+      setStalled(false);
+      return;
+    }
+    // a fresh turn resets the clock so a stale ref from a prior turn can't
+    // instantly trip the watchdog.
+    lastActivityRef.current = Date.now();
+    setStalled(false);
+    const iv = setInterval(() => {
+      if (Date.now() - lastActivityRef.current >= STALL_THRESHOLD_MS) {
+        setStalled(true);
+      }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [streaming]);
 
   // ── session lifecycle: one channel + one session per mount ─────────────────
   // `restartKey` lets `/clear` tear down + re-spin the session without changing
@@ -1185,6 +1770,20 @@ export function ChatPane({
 
   useEffect(() => {
     let disposed = false;
+    // A genuinely blank pane owns no backend process. First send flips
+    // sessionStartRequested; resume, reattach, seed, and web-runtime paths keep
+    // their existing eager behavior.
+    if (!sessionStartRequested && !eagerSessionStart) return;
+    // The resync's setModel re-fired this effect. The previous cleanup already
+    // skipped teardown (skipResyncTeardownRef), the session is live + bound — so
+    // this run must NOT re-reattach (double buffer replay) nor spawn. No-op.
+    // The flag was consumed by the cleanup; here we just detect+skip the body.
+    if (reattach != null && reattachBoundRef.current === reattach) {
+      // distinguish the benign resync re-run from a real model switch: a real
+      // switch went through the cleanup WITHOUT the skip flag, which cleared
+      // reattachBoundRef. So if we're still bound here, it's the resync re-run.
+      return;
+    }
     setStarted(false);
     setClaudeReady(false);
     setCtxTokens(null);
@@ -1213,40 +1812,101 @@ export function ChatPane({
     };
 
     // Reattach to a live backgrounded session (replays its buffer) vs spawn fresh.
+    // On reattach the backend reports the session's real engine/model so we can
+    // re-sync `model` state — otherwise a reattached codex run stays on the
+    // default claude state (wrong stop-strategy, steer hidden, wrong usage).
     const startup =
       reattach != null
-        ? chatReattach(reattach, chan).then((info) => ({ id: reattach, busy: info.busy }))
+        ? chatReattach(reattach, chan).then((info) => ({
+            id: reattach,
+            busy: info.busy,
+            engine: info.engine,
+            model: info.model,
+            runId: info.run_id,
+            runState: info.run_state,
+          }))
         : chatStart(chan, {
-            engine: model.engine ?? "claude",
+            engine: runtimeEngine,
+            harness: runtimeHarness,
             cwd: cwd ?? null,
             model: model.disabled ? null : model.id,
             permissionMode: permission.id,
-            // ultracode isn't a real --effort value; run it as xhigh (the
-            // "+ workflows" half is applied per-message via ULTRA_PREFIX).
-            effort: effectiveBudget === "ultracode" ? "xhigh" : effort.id,
-            fast: effectiveBudget === "lean",
+            effort: runtimeEffort,
+            fast: false,
             resume: resumeId,
-          }).then((id) => ({ id, busy: false }));
+            // route claude turns through the Headroom compression proxy when
+            // the cockpit toggle is on (claude engine only; rust ignores it
+            // for codex/opencode).
+            headroom:
+              runtimeEngine === "claude" &&
+              loadSettings().headroomCompression,
+            // box-backed model → run the session on the node instead of locally.
+            node: model.node ?? null,
+          }).then((id) => ({
+            id,
+            busy: false,
+            engine: null as string | null,
+            model: null as string | null,
+            runId: null as string | null,
+            runState: null as string | null,
+          }));
 
     startup
-      .then(({ id, busy }) => {
+      .then(({ id, busy, engine: liveEngine, model: liveModel, runId, runState }) => {
         if (disposed) {
           // only kill a freshly-spawned session we're abandoning; never a reattach.
-          if (reattach == null) chatStop(id).catch(() => {});
+          if (reattach == null) chatStop(id).catch((e) => reportDiag("chat.stop", e, { action: "stop" }));
           return;
         }
+        // Reattach: mark this session bound (so the model re-sync below can't
+        // re-replay it) and re-sync `model` state to the session's REAL
+        // engine/model so stop-strategy, steer visibility, and usage provider
+        // all match the engine that's actually running (not default claude).
+        if (reattach != null) {
+          reattachBoundRef.current = reattach;
+          if (liveEngine) {
+            const restored =
+              (liveModel ? CHAT_MODELS.find((m) => m.id === liveModel) : undefined) ??
+              CHAT_MODELS.find(
+                (m) => m.id !== AIOS_MODEL_ID && (m.engine ?? "claude") === liveEngine,
+              );
+            if (restored && restored.id !== model.id) {
+              // arm: the cleanup fired by this setModel must skip teardown.
+              skipResyncTeardownRef.current = true;
+              setModel(restored);
+              setAiosRouted(null);
+            }
+          }
+        }
         sessionIdRef.current = id;
+        // Register the pane → backend-session-id binding so a notification click
+        // (chat.done / chat.needs_input) can resolve "is this chat still open?"
+        // and focus it, or reattach it if its pane was closed.
+        if (paneKey && id != null) chatSessions.set(paneKey, id);
         setBackendBusy(busy);
+        if (busy && runId) {
+          // A detached run's opening lifecycle frame may have been evicted from
+          // replay. Seed from the atomic backend snapshot before enabling any
+          // composer action, then advance it to its captured live phase.
+          adoptBackendRun(runId);
+          if (runState === "running" || runState === "interrupting") {
+            transitionRunLifecycle({ type: "running", runId });
+          }
+          if (runState === "interrupting") {
+            transitionRunLifecycle({ type: "interrupting", runId });
+          }
+        }
         if (busy && turnStartRef.current == null) {
           const t0 = Date.now();
           turnStartRef.current = t0;
           setLiveStart(t0);
-          setNow(t0);
         }
         setStarted(true);
       })
       .catch((err) => {
         if (!disposed) {
+          sessionStartRequestedRef.current = false;
+          setSessionStartRequested(false);
           setTurns((prev) => [
             ...prev,
             { kind: "result", id: uid(), text: `failed to start: ${err}` },
@@ -1256,15 +1916,26 @@ export function ChatPane({
 
     return () => {
       disposed = true;
+      // The benign resync re-run: skip teardown entirely (session stays live +
+      // bound). Consume the flag; reattachBoundRef stays set so the re-run body
+      // no-ops. Closure-independent, so no stale model.id race.
+      if (skipResyncTeardownRef.current) {
+        skipResyncTeardownRef.current = false;
+        return;
+      }
+      // A real teardown (manual model switch, /clear, resume, unmount): this is
+      // no longer a passive resync, so drop the reattach binding.
+      reattachBoundRef.current = null;
       const id = sessionIdRef.current;
       sessionIdRef.current = null;
+      if (paneKey) chatSessions.delete(paneKey);
       // Skip the kill when the pane was intentionally detached (kept running in
       // the background) — chat_detach already cleared the sink.
-      if (id != null && !detachedRef.current) chatStop(id).catch(() => {});
+      if (id != null && !detachedRef.current) chatStop(id).catch((e) => reportDiag("chat.stop", e, { action: "cleanup" }));
     };
     // model/permission/effort/resumeId are captured at start; changing them restarts the session
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model.id, permission.id, effort.id, effectiveBudget, cwd, restartKey, resumeId, reattach, webChatRuntime, paneKey]);
+  }, [model.id, permission.id, effort.id, effectiveBudget, runtimeEffort, runtimeHarness, cwd, restartKey, resumeId, reattach, webChatRuntime, paneKey, sessionStartRequested, eagerSessionStart, adoptBackendRun, transitionRunLifecycle]);
 
   // Publish a close-handle so App can detach (keep running) vs kill a busy chat.
   useEffect(() => {
@@ -1276,12 +1947,13 @@ export function ChatPane({
         const id = sessionIdRef.current;
         if (id != null) {
           detachedRef.current = true;
-          chatDetach(id, notify).catch(() => {});
+          chatDetach(id, notify).catch((e) => reportDiag("chat.detach", e, { action: "detach" }));
         }
       },
     });
     return () => {
       chatHandles.delete(paneKey);
+      chatSessions.delete(paneKey);
     };
   }, [paneKey]);
 
@@ -1292,34 +1964,49 @@ export function ChatPane({
     let alive = true;
     const provider = usageProviderKey(model);
     const label = model.engine ?? "claude";
-    const fn = label === "codex" ? codexRate : idleRate;
+    const fn = label === "codex" ? codexRate : label === "claude" ? claudeRate : idleRate;
     fn()
       .then((r) => {
+        if (label === "claude" && "label" in r) {
+          setClaudeIdentityLabel(r.label ?? null);
+        }
         const next = normalizeUsage(r, provider, model);
         if (alive && hasUsageData(next)) {
           rememberUsage(provider, next);
         }
       })
-      .catch(() => {});
+      .catch((e) => reportDiag("chat.load", e, { action: "usage" }));
     return () => {
       alive = false;
     };
   }, [model.engine, model.id, rememberUsage]);
 
-  // Queue flush: when a turn finishes (streaming → false) and messages are
-  // queued, fire the next one. dispatch via a ref so this effect isn't a dep of
-  // the (changing) dispatch closure. One per turn → the queue drains in order.
+
+  // Queue flush: only an authoritative terminal lifecycle state drains queued
+  // work. A stop request remains interrupting until the engine confirms it.
+  // queued, fire the next one. Routed through refs so this effect isn't a dep of
+  // the (changing) dispatch/sendText closures. One per turn → the queue drains
+  // in order — ChatGPT-style "stack the next message while one streams".
   const dispatchRef = useRef<(text: string) => void>(() => {});
+  // The queued message goes back through the FULL send path (sendText), not the
+  // raw dispatch — so a queued claude message gets the same context capsule,
+  // auto-memory, and session recording a normally-typed message would. Routing
+  // queued sends through the bare `dispatch` was the "claude queue sucks" gap:
+  // the follow-up landed without any of that context.
+  const flushSendRef = useRef<(text: string, images?: string[]) => void>(() => {});
   useEffect(() => {
-    if (streaming) return;
+    // On a pane switch, the old queue must never flush before the new pane's
+    // keyed snapshot has replaced it.
+    if (hydratedQueuePaneKey !== queueStorageKey) return;
+    if (!canStartNormalSend(runLifecycle)) return;
     if (!started) return;
     if (queuedRef.current.length === 0) return;
     if (sessionIdRef.current == null) return;
     const [next, ...rest] = queuedRef.current;
     setQueued(rest);
-    setQueuedIdx((idx) => (rest.length === 0 ? 0 : Math.min(idx, rest.length - 1)));
-    dispatchRef.current(next.text);
-  }, [streaming]);
+    setQueuedSelection((idx) => (rest.length === 0 ? 0 : Math.min(idx, rest.length - 1)));
+    flushSendRef.current(next.text, next.images);
+  }, [hydratedQueuePaneKey, queueStorageKey, runLifecycle, started, setQueuedSelection]);
 
   // autoscroll on new content — but with a STICKY pause. The moment you scroll
   // up (wheel, scrollbar, touch) we stop yanking you down and hold there until
@@ -1353,6 +2040,7 @@ export function ChatPane({
     syncJumpVisibility(scrollRef.current, p);
   }, [syncJumpVisibility]);
   useLayoutEffect(() => {
+    if (hiddenRef.current) return;
     const el = scrollRef.current;
     if (
       el &&
@@ -1364,6 +2052,10 @@ export function ChatPane({
           previousScrollHeight: lastScrollHeightRef.current || undefined,
         },
         pausedRef.current,
+        // wide stick threshold so a fast token stream can't overshoot the bottom
+        // and silently fall off; the scroll/wheel handlers still pause the moment
+        // the user scrolls up, so this only affects auto-pinning.
+        AUTOSCROLL_STICK_THRESHOLD_PX,
       )
     ) {
       programmaticRef.current = true;
@@ -1378,7 +2070,11 @@ export function ChatPane({
       lastScrollTopRef.current = 0;
       syncJumpVisibility(null);
     }
-  }, [turns, streaming, liveStart, now, syncJumpVisibility]);
+    // `now` deliberately DROPPED from deps: it ticks every second from the 1Hz
+    // timer and re-ran this layout effect (thrashing layout) without new content.
+    // Content/stream changes already re-fire this; the running clock must not.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turns, streaming, liveStart, hidden, syncJumpVisibility]);
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -1429,32 +2125,17 @@ export function ChatPane({
     syncJumpVisibility(el ?? null, false);
   }, [setPaused, syncJumpVisibility]);
 
-  // autosize textarea
-  useEffect(() => {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = `${Math.min(ta.scrollHeight, 240)}px`;
-  }, [input]);
+  // (textarea autosize moved into Composer — it's keyed on `input`.)
 
-  // tick the live "Working… m:ss" timer once a second while a turn is in flight
-  useEffect(() => {
-    if (liveStart == null) return;
-    const iv = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(iv);
-  }, [liveStart]);
+  // (the 1Hz "Working…" tick now lives in the WorkingLine/ActivityGroup leaves
+  // via useLiveElapsed — no parent-level timer that re-renders the whole list.)
 
   // ── approval resolution ─────────────────────────────────────────────────────
 
   const resolveApproval = useCallback(
     (requestId: string, toolName: string, decision: ApprovalDecision) => {
       const id = sessionIdRef.current;
-      if (id != null) {
-        // chat.ts owns the exact control_response shape (buildApprovalLine).
-        chatSendRaw(id, buildApprovalLine(requestId, decision, toolName)).catch(
-          () => {},
-        );
-      }
+      // optimistically reflect the decision on the card so it feels responsive
       setTurns((prev) =>
         prev.map((t) =>
           t.kind === "approval" && t.requestId === requestId
@@ -1462,6 +2143,32 @@ export function ChatPane({
             : t,
         ),
       );
+      setRunEventState((state) =>
+        reduceRunEvents(state, {
+          type: "control_response",
+          request_id: requestId,
+          response: { request_id: requestId, decision },
+        }),
+      );
+      if (id != null) {
+        // chat.ts owns the exact control_response shape (buildApprovalLine).
+        chatSendRaw(id, buildApprovalLine(requestId, decision, toolName)).catch(
+          (e) => {
+            reportDiag("chat.approval", e, { action: "resolve", toolName });
+            // the control response never reached claude → the turn is stuck
+            // waiting on an approval it'll never get. surface it instead of
+            // leaving firaz staring at a silently-hung run.
+            setTurns((prev) => [
+              ...prev,
+              {
+                kind: "result",
+                id: uid(),
+                text: `approval for ${toolName} failed to send — the run may be stuck; try stop then resend`,
+              },
+            ]);
+          },
+        );
+      }
     },
     [],
   );
@@ -1472,26 +2179,36 @@ export function ChatPane({
   // the transcript (the raw text the user typed); `wire` is what claude receives
   // (display + any plan / goal prefixes). Regenerate replays the same display.
   const dispatch = useCallback(
-    (display: string, opts?: { skipUserBubble?: boolean; wirePrefix?: string }) => {
+    (
+      display: string,
+      opts?: { skipUserBubble?: boolean; wirePrefix?: string; imagePaths?: string[] },
+    ) => {
       const id = sessionIdRef.current;
       if (id == null) return;
-      const shellContext = buildAiosShellContext({
-        cwd,
-        paneKey,
-        attachedMemoryCount: attachedMemories.length,
+      // No per-turn preamble. claude/codex already know `cwd` natively, attached
+      // memories ride as their own content blocks, and the old shell-context lines
+      // bragged about "native ops" (open panes / route artifacts / reattach runs)
+      // that the chat session has NO tools to actually perform — telling the model
+      // it has powers it lacks induces hallucinated tool-talk and measurably dumbs
+      // it. Repeating any preamble every turn is context bloat (and re-inflates
+      // resumed codex threads). Session identity belongs in CLAUDE.md / AGENTS.md,
+      // read once via cwd by each engine — not stapled to every user message.
+      const engine = runtimeEngine;
+      // codex gets the typed text verbatim (see composeWireMessage) — its first
+      // user turn defines the shared ~/.codex thread title, so no plan/goal/
+      // agent/ultracode/memory framing may leak into it. every other engine
+      // keeps the full prefix stack.
+      const wire = composeWireMessage({
+        display,
+        engine,
+        effectiveBudget,
+        goal,
+        planMode,
+        wirePrefix: opts?.wirePrefix,
       });
-      let wire = shellContext + (opts?.wirePrefix ?? "") + display;
-      if (goal.trim()) wire = GOAL_PREFIX(goal.trim()) + wire;
-      if (planMode) wire = PLAN_PREFIX + wire;
-      if (effectiveBudget === "ultracode") wire = ULTRA_PREFIX + wire;
       lastSentRef.current = display;
       // feed the autocomplete history (dedup, newest first, capped).
       if (display.trim()) {
-        onPetUserMessage({
-          textLength: display.trim().length,
-          memoryCount: attachedMemories.length,
-          imageCount: images.length,
-        });
         try {
           const h = [display, ...historyRef.current.filter((x) => x !== display)].slice(0, 200);
           historyRef.current = h;
@@ -1501,20 +2218,26 @@ export function ChatPane({
         }
       }
       if (!opts?.skipUserBubble) {
-        setTurns((prev) => [...prev, { kind: "user", id: uid(), text: display }]);
+        setTurns((prev) => [
+          ...prev,
+          { kind: "user", id: uid(), text: display, images: opts?.imagePaths },
+        ]);
       }
-      setStreaming(true);
-      setBackendBusy(true);
+      const runId = beginRun();
+      setRunEventState(emptyRunEventState());
+      // a fresh turn starts with no sub-agents — clear any fleet left over from
+      // the previous turn so completed chips don't linger into a new ask.
+      setFleetState(emptyFleetState());
       streamingTurnId.current = null;
       thinkingTurnId.current = null;
       // start the turn timer (drives "Working… m:ss" → "Worked for Xs")
       const t0 = Date.now();
       turnStartRef.current = t0;
       setLiveStart(t0);
-      setNow(t0);
       // plan-mode is a per-message instruction; clear it after firing
       if (planMode) setPlanMode(false);
       if (webChatRuntime) {
+        transitionRunLifecycle({ type: "running", runId });
         webAbortRef.current?.abort();
         const controller = new AbortController();
         webAbortRef.current = controller;
@@ -1544,6 +2267,7 @@ export function ChatPane({
               duration_ms: Date.now() - t0,
               usage: reply.usage,
             });
+            transitionRunLifecycle({ type: "completed", runId });
           })
           .catch((err) => {
             if (controller.signal.aborted) return;
@@ -1551,21 +2275,19 @@ export function ChatPane({
               ...prev,
               { kind: "result", id: uid(), text: `send failed: ${err}` },
             ]);
-            setStreaming(false);
-            setBackendBusy(false);
+            transitionRunLifecycle({ type: "failed", runId });
           })
           .finally(() => {
             if (webAbortRef.current === controller) webAbortRef.current = null;
           });
         return;
       }
-      chatSend(id, wire).catch((err) => {
+      chatSend(id, wire, runId, opts?.imagePaths).catch((err) => {
         setTurns((prev) => [
           ...prev,
           { kind: "result", id: uid(), text: `send failed: ${err}` },
         ]);
-        setStreaming(false);
-        setBackendBusy(false);
+        transitionRunLifecycle({ type: "failed", runId });
       });
     },
     [
@@ -1579,34 +2301,108 @@ export function ChatPane({
       model.id,
       model.disabled,
       handleEvent,
+      beginRun,
+      transitionRunLifecycle,
     ],
   );
   // keep the flush effect calling the latest dispatch closure
   dispatchRef.current = dispatch;
 
+  // FIX 3b — pin queued temp images until they're sent. Queue entries reference
+  // paste temp files under /tmp/aios-paste; the OS (or anything else) can reap
+  // those before the queue drains, and the backend's user_line_with_images
+  // SILENTLY skips unreadable paths — the message would flush with its images
+  // gone. So at queue time we slurp the bytes into memory, and just before the
+  // entry fires we re-write them to the SAME content-hashed path (save_image_temp
+  // is deterministic on content), making the flush immune to temp-file lifetime.
+  // OS-dropped files (real user files outside aios-paste) are durable already.
+  const pinnedImagesRef = useRef<Map<string, { b64: string; ext: string }>>(new Map());
+  const pinQueuedImages = useCallback((paths: string[]) => {
+    for (const path of paths) {
+      if (!path.includes("aios-paste") || pinnedImagesRef.current.has(path)) continue;
+      void (async () => {
+        try {
+          const res = await fetch(fileSrc(path));
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          let bin = "";
+          const CHUNK = 0x8000;
+          for (let i = 0; i < bytes.length; i += CHUNK) {
+            bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+          }
+          const ext = path.split(".").pop() ?? "png";
+          pinnedImagesRef.current.set(path, { b64: btoa(bin), ext });
+        } catch (e) {
+          reportDiag("chat.image", e, { action: "pinQueued", path });
+        }
+      })();
+    }
+  }, []);
+  const restorePinnedImages = useCallback(async (paths: string[]) => {
+    await Promise.allSettled(
+      paths.map(async (path) => {
+        const pin = pinnedImagesRef.current.get(path);
+        if (!pin) return;
+        try {
+          // content-hashed filename → rewriting the same bytes recreates the
+          // exact same path; harmless when the file still exists.
+          await saveImageTemp(pin.b64, pin.ext);
+        } catch (e) {
+          reportDiag("chat.image", e, { action: "restorePinned", path });
+        } finally {
+          pinnedImagesRef.current.delete(path);
+        }
+      }),
+    );
+  }, []);
+
   // Queue a message instead of sending it (used while a turn is streaming). It
   // fires automatically when the current turn completes (see the flush effect).
-  const enqueue = useCallback((raw: string) => {
+  const enqueue = useCallback((raw: string, images?: string[]) => {
+    if (images?.length) pinQueuedImages(images);
     setQueued((items) => {
-      const next = queueMessage(items, raw);
-      setQueuedIdx(next.selected);
+      const next = queueMessage(items, raw, images);
+      setQueuedSelection(next.selected);
       return next.items;
     });
     setInput("");
     setOverlay(null);
-  }, []);
+  }, [pinQueuedImages]);
 
   const removeQueued = useCallback((id: string) => {
+    const gone = queuedRef.current.find((q) => q.id === id);
+    gone?.images?.forEach((path) => pinnedImagesRef.current.delete(path));
     setQueued((items) => {
-      const next = removeQueuedMessage({ items, selected: queuedIdx }, id);
-      setQueuedIdx(next.selected);
+      const next = removeQueuedMessage({ items, selected: queuedIdxRef.current }, id);
+      setQueuedSelection(next.selected);
       return next.items;
     });
     if (editingQueuedId === id) {
       setEditingQueuedId(null);
       setEditingQueuedText("");
     }
-  }, [queuedIdx, editingQueuedId]);
+  }, [editingQueuedId, setQueuedSelection]);
+
+  // An undeliverable codex steer handed back by the backend: drop the
+  // optimistic "steered" bubble (the model never saw that message) and put the
+  // text back in the queue so the end-of-turn flush sends it as a fresh turn.
+  // Unlike enqueue() this must not touch whatever is being typed right now.
+  steerRequeueRef.current = (text: string) => {
+    setTurns((prev) => {
+      for (let i = prev.length - 1; i >= 0; i--) {
+        const t = prev[i];
+        if (t.kind === "user" && t.steered && t.text === text) {
+          return [...prev.slice(0, i), ...prev.slice(i + 1)];
+        }
+      }
+      return prev;
+    });
+    setQueued((items) => {
+      const next = queueMessage(items, text);
+      setQueuedSelection(next.selected);
+      return next.items;
+    });
+    reportDiag("chat.steer", "requeued by backend", { action: "requeue" });
+  };
 
   const editQueued = useCallback((item: QueuedMessage) => {
     setEditingQueuedId(item.id);
@@ -1618,79 +2414,179 @@ export function ChatPane({
     if (!id) return;
     setQueued((items) => {
       const next = updateQueuedMessage(
-        { items, selected: queuedIdx },
+        { items, selected: queuedIdxRef.current },
         id,
         editingQueuedText,
       );
-      setQueuedIdx(next.selected);
+      setQueuedSelection(next.selected);
       return next.items;
     });
     setEditingQueuedId(null);
     setEditingQueuedText("");
-  }, [editingQueuedId, editingQueuedText, queuedIdx]);
+  }, [editingQueuedId, editingQueuedText, setQueuedSelection]);
 
   const moveQueued = useCallback((id: string, delta: number) => {
     setQueued((items) => {
-      const next = moveQueuedMessage({ items, selected: queuedIdx }, id, delta);
-      setQueuedIdx(next.selected);
+      const next = moveQueuedMessage({ items, selected: queuedIdxRef.current }, id, delta);
+      setQueuedSelection(next.selected);
       return next.items;
     });
-  }, [queuedIdx]);
+  }, [setQueuedSelection]);
 
-  // Explicitly inject one highlighted pending message into a live codex turn.
+  // Explicitly inject one highlighted pending message into the live turn.
+  // claude steers over stdin (images ride as real content blocks); codex steers
+  // via turn/steer (text-only — image entries wait for the normal flush).
   // If the backend cannot steer yet, leave it queued so normal auto-send wins.
   const steerQueued = useCallback(
     (queuedId: string) => {
       const item = queuedRef.current.find((q) => q.id === queuedId);
-      if (!item || model.engine !== "codex") return;
+      if (!item) return;
       const id = sessionIdRef.current;
-      if (id == null) return;
-      chatSteer(id, item.text)
-        .then(() => {
+      const lifecycle = runLifecycleRef.current;
+      if (id == null || !canSteer(lifecycle) || lifecycle.phase !== "running") return;
+      void (async () => {
+        try {
+          if (item.images?.length) await restorePinnedImages(item.images);
+          await steerTurn(id, item.text, lifecycle.runId, item.images);
           removeQueued(queuedId);
-          setTurns((prev) => [...prev, { kind: "user", id: uid(), text: item.text, steered: true }]);
-        })
-        .catch(() => {}); // no active turn yet → keep queued for automatic send
+          const bubble =
+            item.text ||
+            (item.images?.length
+              ? `[${item.images.length} image${item.images.length > 1 ? "s" : ""}]`
+              : "");
+          setTurns((prev) => [
+            ...prev,
+            { kind: "user", id: uid(), text: bubble, steered: true, images: item.images },
+          ]);
+        } catch (e) {
+          // no active turn yet → keep queued for automatic send
+          reportDiag("chat.steer", e, { action: "queued" });
+        }
+      })();
     },
-    [model.engine, removeQueued],
+    [runtimeEngine, removeQueued, restorePinnedImages],
   );
 
   // Send an explicit string (used by send() with the composer text, and by the
   // external "send to AI" submitter which passes the note body directly so it
   // doesn't race the input state).
+  // in-chat model directives ("use fable 5 to check this") — the real handler
+  // is defined AFTER clearSession/switchModel (which it needs); sendText only
+  // ever calls through the ref. pendingAutoSend carries the directive's task
+  // into the freshly-switched session once it's ready.
+  const applyModelDirectiveRef = useRef<(d: ModelDirective) => Promise<void>>(
+    async () => {},
+  );
+  const pendingAutoSendRef = useRef<string | null>(null);
+
   const sendText = useCallback(
-    (raw: string) => {
+    async (raw: string, queuedImages?: string[]) => {
       const text = raw.trim();
-      // attached images go in as quoted temp paths the model can read; allow a
-      // send with images even when the text is empty.
-      const imgPaths = images
-        .filter((im) => im.path)
-        .map((im) => quotePath(im.path as string));
-      if (!text && imgPaths.length === 0) return;
-      if (streaming) return;
-      if (sessionIdRef.current == null) {
-        if (imgPaths.length === 0) {
-          enqueue(text);
-          setInput("");
-          setOverlay(null);
-          setTurns((prev) => [
-            ...prev,
-            {
-              kind: "result",
-              id: uid(),
-              text: "chat is still starting — queued message will send automatically.",
-            },
-          ]);
+      // model directive — re-route the pane (with a transcript-tail handoff)
+      // instead of sending as chat. Only between turns: mid-run text should
+      // steer the running turn, not kill the session under it.
+      if (!queuedImages && !activeRunRef.current && imagesRef.current.length === 0) {
+        const directive = parseModelDirective(text);
+        if (directive) {
+          void applyModelDirectiveRef.current(directive);
           return;
         }
-        setTurns((prev) => [
-          ...prev,
-          {
-            kind: "result",
-            id: uid(),
-            text: "chat session isn't ready yet. retry this message after startup and attachments will be included.",
-          },
-        ]);
+      }
+      // Always drain in-flight disk saves before collecting paths. The old guard
+      // (`some(path==null) && pendingSavesRef.size`) had a race: a save could
+      // resolve (clearing pendingSavesRef) a beat before its path landed in
+      // imagesRef, so the guard short-circuited and the null-path chip got
+      // filtered out below — shipping a text-only turn with the image silently
+      // dropped (the "image never reaches the model" bug). Awaiting
+      // unconditionally + reading the synchronously-mirrored imagesRef AFTER the
+      // await closes that window entirely.
+      if (pendingSavesRef.current.size) {
+        await Promise.allSettled([...pendingSavesRef.current.values()]);
+      }
+      // attached images are sent as REAL image content blocks (the backend reads
+      // these temp paths → base64/localImage), so they land on every turn, not
+      // just the first. allow a send with images even when the text is empty.
+      //
+      // FIX 3a — a queue flush passes the entry's OWN images (queuedImages), and
+      // anything attached to the composer SINCE the entry was queued is MERGED in
+      // (dedup by path) instead of silently thrown away: the old `queuedImages ??
+      // composer` meant "queue a message, then attach the screenshot it needs"
+      // dropped the screenshot when the entry flushed. Composer chips that ride
+      // along are consumed (cleared) like any sent attachment.
+      const composerPaths = imagesRef.current
+        .filter((im) => im.path)
+        .map((im) => im.path as string);
+      const imgPaths = queuedImages
+        ? [...new Set([...queuedImages, ...composerPaths])]
+        : composerPaths;
+      const consumeComposerImages = () => {
+        if (composerPaths.length === 0) return;
+        setImagesSync((prev) => {
+          prev.forEach((im) => URL.revokeObjectURL(im.url));
+          return [];
+        });
+      };
+      reportDiag("chat.image", "sendText:collect", {
+        total: imagesRef.current.length,
+        withPath: imgPaths.length,
+        queued: Boolean(queuedImages),
+      });
+      if (!text && imgPaths.length === 0) return;
+      // FIX 3b — a flushing queue entry's temp files may have been reaped since
+      // it was queued; rewrite any pinned bytes back to their paths first so
+      // the backend never silently skips them.
+      if (queuedImages?.length) {
+        await restorePinnedImages(queuedImages);
+      }
+      // Submitting while a turn is in flight: STEER it into the running turn
+      // when the engine supports it (claude = stdin inject incl. images, codex
+      // = turn/steer text-only), render it as a normal sent bubble; otherwise
+      // queue it ChatGPT-style to fire when the turn finishes.
+      if (activeRunRef.current) {
+        const engine = runtimeEngine;
+        const sid = sessionIdRef.current;
+        const lifecycle = runLifecycleRef.current;
+        const steerable =
+          sid != null &&
+          !webChatRuntime &&
+          canSteer(lifecycle) &&
+          lifecycle.phase === "running" &&
+          (engine === "claude" || (engine === "codex" && imgPaths.length === 0));
+        if (steerable) {
+          try {
+            await steerTurn(sid, text, lifecycle.runId, imgPaths.length ? imgPaths : undefined);
+            const bubble =
+              text || `[${imgPaths.length} image${imgPaths.length > 1 ? "s" : ""}]`;
+            setTurns((prev) => [
+              ...prev,
+              {
+                kind: "user",
+                id: uid(),
+                text: bubble,
+                steered: true,
+                images: imgPaths.length ? imgPaths : undefined,
+              },
+            ]);
+            consumeComposerImages();
+            setInput("");
+            setOverlay(null);
+            return;
+          } catch (e) {
+            // no live turn after all (it just ended / hasn't started) or the
+            // write failed → fall back to the queue; the flush effect wins.
+            reportDiag("chat.steer", e, { action: "sendText" });
+          }
+        }
+        enqueue(text, imgPaths.length ? imgPaths : undefined);
+        consumeComposerImages();
+        return;
+      }
+      if (sessionIdRef.current == null) {
+        requestSessionStart();
+        enqueue(text, imgPaths.length ? imgPaths : undefined);
+        consumeComposerImages();
+        setInput("");
+        setOverlay(null);
         return;
       }
       // Claude keeps its original first-message labels. Codex starts with a
@@ -1698,6 +2594,7 @@ export function ChatPane({
       // request into a compact stable topic.
       const engine = model.engine ?? "claude";
       const suggested = resumeTitle(text, engine);
+      const stableTitle = agentLabel ?? suggested.title;
       const firstRecord = !recordedRef.current;
       const promoteCodex =
         engine === "codex" && !codexTitleLockedRef.current && suggested.meaningful;
@@ -1705,64 +2602,135 @@ export function ChatPane({
       if (sid && (firstRecord || promoteCodex)) {
         if (firstRecord) recordedRef.current = true;
         if (promoteCodex) codexTitleLockedRef.current = true;
-        recordChatSession(sid, suggested.title, cwd ?? null, engine, model.id).catch(() => {
+        recordChatSession(sid, stableTitle, cwd ?? null, engine, model.id).catch(() => {
           // failed to persist → allow a later send to retry
           if (firstRecord) recordedRef.current = false;
           if (promoteCodex) codexTitleLockedRef.current = false;
         });
         // Label the backend session for the background tray + done-notification.
         if (sessionIdRef.current != null)
-          chatSetTitle(sessionIdRef.current, suggested.title).catch(() => {});
+          chatSetTitle(sessionIdRef.current, stableTitle).catch((e) => reportDiag("chat.title", e, { action: "setTitle" }));
+        // Re-report with the now-meaningful first-message title so pane history
+        // shows a real label (not "resumed chat · <dir>") when reopened.
+        reportChatSession({ id: sid, title: stableTitle, engine, model: model.id });
       }
       setInput("");
-      setImages((prev) => {
-        prev.forEach((im) => URL.revokeObjectURL(im.url));
-        return [];
-      });
+      consumeComposerImages();
       setOverlay(null);
+      // no hidden context injection. chat should rely on real repo/context .md
+      // files and explicit user-selected memory/file attachments, not a
+      // synthesized per-turn <aios_context> prefix.
       const attachedMemoryBlock = memoryContextBlock(attachedMemories);
-      setAttachedMemoryIds([]);
-      // prepend the image paths so the model sees them with the message
-      const full = imgPaths.length
-        ? imgPaths.join(" ") + (text ? " " + text : "")
-        : text;
-      dispatch(full, { wirePrefix: attachedMemoryBlock });
+      setLastAutoMemories([]);
+      setMemoryContextStatus("ready");
+      setAttachedMemoryPaths([]);
+      // images ride as native content blocks (opts.imagePaths), not text paths —
+      // the user bubble shows the text and a "[n image(s)]" hint when text-empty.
+      const bubble = text || (imgPaths.length ? `[${imgPaths.length} image${imgPaths.length > 1 ? "s" : ""}]` : "");
+      dispatch(bubble, { wirePrefix: attachedMemoryBlock, imagePaths: imgPaths });
     },
-    [streaming, dispatch, cwd, images, model, attachedMemories],
+    // `images` intentionally NOT a dep: sendText reads the synchronously-mirrored
+    // imagesRef.current (fresh after the pending-save await), so depending on the
+    // images STATE would only re-create this closure on every attach for nothing.
+    // `streaming` is read through activeRunRef (always-fresh), not as a dep.
+    [dispatch, attachedMemories, setImagesSync, enqueue, restorePinnedImages, webChatRuntime, reportChatSession, requestSessionStart],
   );
 
-  const send = useCallback(() => sendText(input), [sendText, input]);
-
-  const steerDraft = useCallback(() => {
-    const text = input.trim();
-    const id = sessionIdRef.current;
-    if (!text || model.engine !== "codex" || id == null) return;
-    chatSteer(id, text)
-      .then(() => {
-        setTurns((prev) => [...prev, { kind: "user", id: uid(), text, steered: true }]);
-        setInput("");
-        setOverlay(null);
-      })
-      .catch(() => enqueue(text));
-  }, [input, model.engine, enqueue]);
+  // (the composer's `send` now lives in Composer — it reads the live store
+  // text and calls the stable `sendText` prop. sendText stays here, used by
+  // the external submitter, queue flush, etc.)
 
   // Keep a fresh ref to sendText so the external submitter (registered once per
   // paneKey) always calls the latest closure without re-registering.
   const sendTextRef = useRef(sendText);
   sendTextRef.current = sendText;
+  // The queue-flush effect (declared earlier) fires queued messages through the
+  // full send path so they get the same context capsule / memory / recording a
+  // freshly-typed message gets.
+  flushSendRef.current = (text: string, images?: string[]) => {
+    void sendText(text, images).catch((e) => reportDiag("chat.send", e, { action: "queueFlush" }));
+  };
 
   // ── launcher seed: auto-send as the first turn ─────────────────────────────
   // The idle page hands over the prompt you typed as `seed`; fire it once the
   // session is live (started) and claude's init has landed (claudeReady, so the
   // chat records into /resume) — so the text you typed on the idle page IS the
   // first message. No "type once to launch, type again to send".
+  //
+  // Hardening (fix 6.1): a resume / model-switch / restart nulls sessionIdRef
+  // mid-flight, and dispatch() early-returns when the id is null — so naively
+  // firing on (started && claudeReady) could send into a stale/null session and
+  // silently lose the seed. Gate strictly on a LIVE session id, send the seed
+  // text explicitly (not racy `input` state), and only mark it sent once the
+  // dispatch had a live session. If the session never comes live, surface a
+  // visible note instead of swallowing the prompt.
+  // Retry until the session is live, then send the seed as the first turn.
+  // Earlier this was a one-shot gate on (started && claudeReady) plus a 12s
+  // give-up that prefilled the composer — under load (slow init, session
+  // re-spawn after an app restart) the gate lost the race and the seed sat in
+  // the composer unsent. A poll removes every timing assumption: the instant a
+  // live backend session id exists and we're not mid-stream, fire it. Only
+  // surface a note after a long window (sessions normally come live in seconds).
   useEffect(() => {
     if (!seed || seedSentRef.current) return;
-    if (!started || !claudeReady) return;
-    seedSentRef.current = true;
-    send();
+    let cancelled = false;
+    let tries = 0;
+    const tick = () => {
+      if (cancelled || seedSentRef.current) return;
+      if (sessionIdRef.current != null && !streamingRef.current) {
+        seedSentRef.current = true;
+        void sendTextRef.current(seed).catch((e) => reportDiag("chat.send", e, { action: "seed" }));
+        return;
+      }
+      if (++tries > 120) {
+        // ~60s and still no live session — keep the prompt, surface a note.
+        seedSentRef.current = true;
+        setTurns((prev) => [
+          ...prev,
+          {
+            kind: "result",
+            id: uid(),
+            text: "couldn't auto-send your opening message — the session didn't come live. press send.",
+          },
+        ]);
+        setInput((cur) => (cur ? cur : seed));
+        return;
+      }
+      window.setTimeout(tick, 500);
+    };
+    const t = window.setTimeout(tick, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seed, started, claudeReady]);
+  }, [seed]);
+
+  // Stable handler for an assistant message's `[[btn:…]]` choice. Routes through
+  // dispatchRef + streamingRef (kept fresh below) so its identity NEVER changes
+  // across renders — otherwise every streamed token recreates this closure and
+  // breaks React.memo on every AssistantBubble in the list (the re-render storm).
+  const streamingRef = useRef(false);
+  streamingRef.current = streaming;
+  const handleAssistantButton = useCallback((label: string) => {
+    if (!streamingRef.current && sessionIdRef.current != null) {
+      dispatchRef.current(label);
+    }
+  }, []);
+
+  // AskUserQuestion answers: once firaz picks, we record the choice (so the card
+  // collapses to a verdict and can't be re-answered) and send it back as the
+  // next user turn — which is exactly what claude is waiting for after it
+  // auto-dismisses the tool in headless mode. Keyed by the tool turn id.
+  const [answeredQuestions, setAnsweredQuestions] = useState<Record<string, string>>({});
+  const answeredQuestionsRef = useRef<Set<string>>(new Set());
+  const handleQuestionAnswer = useCallback((turnId: string, text: string) => {
+    if (sessionIdRef.current == null) return;
+    if (answeredQuestionsRef.current.has(turnId)) return; // guard double-tap
+    answeredQuestionsRef.current.add(turnId);
+    setAnsweredQuestions((prev) => ({ ...prev, [turnId]: text }));
+    if (text.trim()) dispatchRef.current(text);
+  }, []);
 
   // regenerate: replay the last user turn (no extra user bubble)
   const regenerate = useCallback(() => {
@@ -1772,60 +2740,67 @@ export function ChatPane({
   }, [streaming, dispatch]);
 
   const finalizeStreaming = useCallback(
-    (note: string, mode: "interrupt" | "kill-and-restart" = "interrupt") => {
+    (note: string) => {
       const id = sessionIdRef.current;
-      setTurns((prev) =>
-        finalizeStreamingTurns(
-          {
-            turns: prev,
-            streamingTurnId: streamingTurnId.current,
-            thinkingTurnId: thinkingTurnId.current,
-          },
-          Date.now(),
-        ).turns,
-      );
-      streamingTurnId.current = null;
-      thinkingTurnId.current = null;
-      turnStartRef.current = null;
-      setLiveStart(null);
-      setStreaming(false);
-      setBackendBusy(false);
-      setTurns((prev) => [...prev, { kind: "result", id: uid(), text: note }]);
+      const lifecycle = runLifecycleRef.current;
+      const runId = lifecycle.runId;
+      if (canStartNormalSend(lifecycle) || !runId) return;
       if (webChatRuntime) {
+        // Web has no backend channel, so mirror the same ordered lifecycle
+        // locally around AbortController. Desktop waits for Rust's frames.
+        transitionRunLifecycle({ type: "interrupting", runId });
         webAbortRef.current?.abort();
         webAbortRef.current = null;
+        transitionRunLifecycle({ type: "interrupted", runId });
         return;
       }
       if (id != null) {
-        if (mode === "kill-and-restart") {
-          sessionIdRef.current = null;
-          chatStop(id)
-            .catch(() => {})
-            .finally(() => {
-              setRunEventState(emptyRunEventState());
-              setRunEventsKey(null);
-              setRestartKey((k) => k + 1);
-            });
-        } else {
-          chatInterrupt(id).catch(() => {});
+        // Starting has no backend `running` acknowledgement yet; expose the
+        // stop request immediately while Rust validates the same run id. This
+        // is deliberately non-terminal, and a late running frame cannot undo it.
+        if (lifecycle.phase === "starting") {
+          transitionRunLifecycle({ type: "interrupting", runId });
         }
+        // Do not settle locally. Rust atomically validates `runId`, emits
+        // interrupting, and then delivers the engine's terminal lifecycle frame.
+        const strategy = stopStrategy(runtimeEngine);
+        const request = strategy === "kill-and-restart"
+          ? chatStop(id, runId)
+          : chatInterrupt(id, runId);
+        request.catch((e) => {
+          reportDiag("chat.interrupt", e, { action: "interrupt" });
+          setTurns((prev) => [...prev, { kind: "result", id: uid(), text: `${note} request failed: ${e}` }]);
+        });
       }
     },
-    [webChatRuntime],
+    [runtimeEngine, webChatRuntime, transitionRunLifecycle],
   );
 
   // true interrupt of the in-flight turn (process survives)
   const stop = useCallback(() => {
-    if (sessionIdRef.current == null) return;
-    const strategy = stopStrategy(model.engine);
-    finalizeStreaming(
-      strategy === "kill-and-restart"
-        ? "stopped by user — gpt backend restarted"
-        : "stopped by user",
-      strategy,
-    );
-  }, [finalizeStreaming, model.engine]);
+    // Do not settle locally. The backend channel must deliver a
+    // tagged result/exit before the composer becomes runnable again.
+    finalizeStreaming("stopped by user");
+  }, [finalizeStreaming]);
   stopChatRef.current = stop;
+
+  // Retry never races an interrupt acknowledgement. If the terminal lifecycle
+  // has not landed by the next tick, leave the prompt available for a deliberate
+  // retry instead of starting a second overlapping turn.
+  const retryStalledTurn = useCallback(() => {
+    const last = lastSentRef.current;
+    stop();
+    if (!last) return;
+    window.setTimeout(() => {
+      if (sessionIdRef.current != null && canStartNormalSend(runLifecycleRef.current)) {
+        dispatch(last, { skipUserBubble: true });
+      }
+    }, 400);
+  }, [stop, dispatch]);
+
+  const restartStalledTurn = useCallback(() => {
+    finalizeStreaming("turn stalled — interrupt requested");
+  }, [finalizeStreaming]);
 
   // hard reset: clear transcript + re-spin a FRESH claude session (drops any
   // resume id, so a new chat / /clear never keeps continuing a past session).
@@ -1838,9 +2813,14 @@ export function ChatPane({
       }
     }
     setTurns([]);
+    setQueued([]);
+    setQueuedSelection(0);
+    pinnedImagesRef.current.clear();
+    if (typeof localStorage !== "undefined") clearChatQueue(localStorage, queueStorageKey ?? undefined);
     setRunEventState(emptyRunEventState());
+    setFleetState(emptyFleetState());
     setRunEventsKey(null);
-    setStreaming(false);
+    resetRunLifecycle();
     webAbortRef.current?.abort();
     webAbortRef.current = null;
     streamingTurnId.current = null;
@@ -1850,19 +2830,287 @@ export function ChatPane({
     setLiveStart(null);
     setInput("");
     setOverlay(null);
-    setQueued([]);
-    setQueuedIdx(0);
-    setSessionCost(0);
     usageBaselineRef.current = {};
     setResumeId(null);
     setResumedTitle(null);
     // fresh chat → forget the prior session id + recording flag so the next
     // first-send records a brand-new /resume entry (not the old one).
     claudeSessionIdRef.current = null;
+    setOpenSessionId(null);
     recordedRef.current = false;
     codexTitleLockedRef.current = false;
+    sessionStartRequestedRef.current = false;
+    setSessionStartRequested(false);
     setRestartKey((k) => k + 1);
-  }, [runEventsKey]);
+  }, [runEventsKey, resetRunLifecycle, queueStorageKey, setQueuedSelection]);
+
+  // ── aios: the virtual router entry ──────────────────────────────────────────
+  // Resolves to a concrete model from live usage meters (lib/aiosRouter.ts) and
+  // applies it like a manual switch, flagged with the route reason (shown in the
+  // composer pill + header). Sticky per session: re-routing only ever happens
+  // when a fresh session starts, never mid-thread.
+  const switchToAios = useCallback(async (): Promise<AiosDecision> => {
+    const d = await resolveAios();
+    // aios becomes the saved default; provider mirrors the RESOLVED engine so
+    // everything downstream of chatProvider keeps working.
+    saveSettings({
+      chatModel: AIOS_MODEL_ID,
+      chatProvider: `${d.model.engine ?? "claude"}-cli`,
+    });
+    if (
+      d.model.id === activeModelRef.current.id &&
+      aiosRoutedRef.current != null &&
+      aiosHarnessRef.current === d.harness
+    ) {
+      // router landed on the model already live — keep the session, flag it.
+      setAiosRouted(d.reason);
+      setTurns((prev) => [
+        ...prev,
+        { kind: "result", id: uid(), text: `aios → ${d.model.label} · ${d.reason}` },
+      ]);
+      return d;
+    }
+    const settings = loadSettings();
+    const nextEffortId = resolveModelEffort(
+      d.model,
+      effort.id,
+      settings.chatEffortByModel?.[d.model.id] ?? null,
+    );
+    clearSession();
+    setEffort(EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1]);
+    setModel(d.model);
+    setAiosHarness(d.harness);
+    setAiosRouted(d.reason);
+    setTurns([
+      {
+        kind: "result",
+        id: uid(),
+        text: `aios → ${d.model.label} — fresh chat · ${d.reason}`,
+      },
+    ]);
+    return d;
+  }, [effort.id, clearSession]);
+
+  // ── model switch: clear-on-switch (engine-split Phase 2) ────────────────────
+  // Picking a different model tears down the transcript + run-events and spins a
+  // fresh session (the session-effect restarts on model.id), instead of
+  // repainting the prior conversation under a new backend. A visible result line
+  // marks the reset. Re-picking the active model is a no-op. This is the
+  // user-initiated path only — resume/resync setModel calls bypass this so they
+  // keep their rehydrated transcript.
+  const switchModel = useCallback(
+    (m: ChatModel) => {
+      if (m.id === AIOS_MODEL_ID) {
+        void switchToAios();
+        return;
+      }
+      const { shouldClear, notice } = describeModelSwitch(model.id, m);
+      if (!shouldClear) {
+        // re-picking the live model while aios-routed = making the choice
+        // manual: keep the session, drop the router flag.
+        if (aiosRoutedRef.current != null) {
+          setAiosRouted(null);
+          setAiosHarness(null);
+          saveSettings({ chatModel: m.id });
+        }
+        return;
+      }
+      const settings = loadSettings();
+      const nextEffortId = resolveModelEffort(
+        m,
+        effort.id,
+        settings.chatEffortByModel?.[m.id] ?? null,
+      );
+      const nextEffort =
+        EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1];
+      clearSession();
+      setEffort(nextEffort);
+      setModel(m);
+      setAiosRouted(null);
+      setAiosHarness(null);
+      // picking a model sets it as the global default (sticks across panes +
+      // restarts). engine omitted = claude.
+      saveSettings({
+        chatModel: m.id,
+        chatProvider: `${m.engine ?? "claude"}-cli`,
+        chatEffortByModel: {
+          ...settings.chatEffortByModel,
+          [m.id]: nextEffort.id,
+        },
+      });
+      if (notice) setTurns([{ kind: "result", id: uid(), text: notice }]);
+    },
+    [model.id, effort.id, clearSession, switchToAios],
+  );
+
+  // "use fable 5 to check X" — the in-chat switch. Carries a compact transcript
+  // tail into the target model so the thread continues instead of restarting.
+  const applyModelDirective = useCallback(
+    async (directive: ModelDirective) => {
+      const { modelId: targetId, rest } = directive;
+      if (targetId === AIOS_MODEL_ID) {
+        const before = activeModelRef.current.id;
+        const d = await switchToAios();
+        if (rest) {
+          // same model kept = session still live, send now; otherwise wait for
+          // the fresh session (pendingAutoSend flushes on ready).
+          if (d.model.id === before) {
+            void sendTextRef.current(rest);
+          } else {
+            pendingAutoSendRef.current = rest;
+            // clearSession left the pane dormant — force the fresh session to
+            // spawn NOW so composerSessionReady actually dips and the flush
+            // effect fires on connect (it never toggles on a dormant pane).
+            sessionStartRequestedRef.current = true;
+            setSessionStartRequested(true);
+          }
+        }
+        return;
+      }
+      const target = CHAT_MODELS.find(
+        (m) => m.id === targetId && !m.disabled && !m.node,
+      );
+      if (!target) return;
+      if (target.id === activeModelRef.current.id) {
+        if (rest) {
+          void sendTextRef.current(rest);
+        } else {
+          setTurns((prev) => [
+            ...prev,
+            { kind: "result", id: uid(), text: `already on ${target.label}` },
+          ]);
+        }
+        return;
+      }
+      const seed = rest
+        ? buildHandoffSeed(
+            turnsRef.current.map((t) => ({
+              kind: t.kind,
+              text: (t as { text?: string }).text ?? "",
+            })),
+            activeModelRef.current.label,
+            rest,
+          )
+        : "";
+      const settings = loadSettings();
+      const nextEffortId = resolveModelEffort(
+        target,
+        effort.id,
+        settings.chatEffortByModel?.[target.id] ?? null,
+      );
+      const nextEffort =
+        EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1];
+      clearSession();
+      setEffort(nextEffort);
+      setModel(target);
+      setAiosRouted(null);
+      setAiosHarness(null);
+      saveSettings({
+        chatModel: target.id,
+        chatProvider: `${target.engine ?? "claude"}-cli`,
+        chatEffortByModel: {
+          ...settings.chatEffortByModel,
+          [target.id]: nextEffort.id,
+        },
+      });
+      setTurns([
+        {
+          kind: "result",
+          id: uid(),
+          text: `switched to ${target.label}${rest ? " — carrying context" : " — fresh chat"}`,
+        },
+      ]);
+      if (seed) {
+        pendingAutoSendRef.current = seed;
+        // see the aios branch above — without this the fresh session never
+        // spawns until the next manual send and the seed is stranded.
+        sessionStartRequestedRef.current = true;
+        setSessionStartRequested(true);
+      }
+    },
+    [effort.id, clearSession, switchToAios],
+  );
+  applyModelDirectiveRef.current = applyModelDirective;
+
+  // flush a directive's task into the freshly-switched session once it's ready.
+  useEffect(() => {
+    if (!composerSessionReady) return;
+    const pending = pendingAutoSendRef.current;
+    if (!pending) return;
+    pendingAutoSendRef.current = null;
+    void sendTextRef.current(pending);
+  }, [composerSessionReady]);
+
+  // aios boot re-check: the sync boot seed used the LAST cached route; confirm
+  // against live meters and correct the pane while it's still pristine.
+  const aiosRecheckedRef = useRef(false);
+  useEffect(() => {
+    if (aiosRecheckedRef.current || bootRouteRef.current == null) return;
+    aiosRecheckedRef.current = true;
+    void resolveAios().then((d) => {
+      if (aiosRoutedRef.current == null) return; // manually switched since boot
+      if (lastSentRef.current != null) return; // already talking — sticky
+      // a send may be mid-flight before lastSentRef lands: the start request
+      // flips synchronously at send time, and any turn means non-pristine.
+      // eager panes (seed/resume/reattach) spawn immediately — never swap the
+      // model under them; they ride the cached boot route.
+      if (sessionStartRequestedRef.current || turnsRef.current.length > 0) return;
+      if (eagerSessionStart) return;
+      setAiosRouted(d.reason);
+      setAiosHarness(d.harness);
+      if (activeModelRef.current.id === d.model.id) return;
+      const settings = loadSettings();
+      const nextEffortId = resolveModelEffort(
+        d.model,
+        null,
+        settings.chatEffortByModel?.[d.model.id] ?? null,
+      );
+      setEffort(EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1]);
+      setModel(d.model);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // aios failover: a ROUTED session that slams into the engine's usage wall
+  // ("You've hit your usage limit…") re-resolves — the meters now see the cap,
+  // so the router swaps the GPT session to native Codex — and resends the last user message
+  // with a transcript handoff. No dead pane waiting for a human to notice.
+  // Manual sessions are left alone: the user picked that model on purpose.
+  const limitRerouteRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!aiosRouted || turns.length === 0) return;
+    const last = turns[turns.length - 1];
+    if (last.kind !== "assistant" && last.kind !== "result") return;
+    if ((last as { streaming?: boolean }).streaming) return;
+    const text = (last as { text?: string }).text ?? "";
+    if (!/(?:hit|reached) your usage limit|usage limit (?:has been )?reached|rate limit exceeded/i.test(text)) return;
+    if (limitRerouteRef.current === last.id) return;
+    limitRerouteRef.current = last.id;
+    const lastUser = [...turns].reverse().find((t) => t.kind === "user") as
+      | { text?: string }
+      | undefined;
+    const prior = turnsRef.current.map((t) => ({
+      kind: t.kind,
+      text: (t as { text?: string }).text ?? "",
+    }));
+    const fromLabel = activeModelRef.current.label;
+    const fromHarness = runtimeHarness;
+    if (runtimeHarness === "claude") {
+      // The refusal is authoritative and must beat the usage command's short
+      // cache; otherwise the router can immediately pick the same capped model.
+      observeClaudeHardLimit();
+    }
+    void switchToAios().then((d) => {
+      // Same model + same harness means no route changed; leave the error visible
+      // instead of looping. Same GPT model on native Codex is a real failover.
+      if (d.model.id === activeModelRef.current.id && d.harness === fromHarness) return;
+      if (lastUser?.text) {
+        pendingAutoSendRef.current = buildHandoffSeed(prior, fromLabel, lastUser.text);
+        sessionStartRequestedRef.current = true;
+        setSessionStartRequested(true);
+      }
+    });
+  }, [turns, aiosRouted, runtimeHarness, switchToAios]);
 
   // ── /resume: reopen a past chat session ────────────────────────────────────
   // Loads the chat-only session list (lazy, on picker open). On selection we
@@ -1892,6 +3140,46 @@ export function ChatPane({
     );
   }, []);
 
+  useEffect(() => {
+    const incomingResume = resume;
+    if (!incomingResume?.id || !shouldApplyResumeProp(incomingResume.id, ownSessionIdsRef.current)) return;
+    let cancelled = false;
+    claudeSessionIdRef.current = incomingResume.id;
+    setOpenSessionId(incomingResume.id);
+    setRunEventsKey(runEventsStorageKey(incomingResume.id));
+    recordedRef.current = true;
+    codexTitleLockedRef.current = true;
+    setResumeId(incomingResume.id);
+    setResumedTitle(incomingResume.title);
+    const resumeModel =
+      CHAT_MODELS.find((m) => incomingResume.model && m.id === incomingResume.model) ??
+      CHAT_MODELS.find(
+        (m) =>
+          m.id !== AIOS_MODEL_ID &&
+          (m.engine ?? "claude") === (incomingResume.engine || "claude"),
+      );
+    if (resumeModel && resumeModel.id !== activeModelRef.current.id) setModel(resumeModel);
+    setAiosRouted(null); // a resumed thread is its own concrete model, not a route
+    setRunEventState(emptyRunEventState());
+    setFleetState(emptyFleetState());
+    setTurns([]);
+    readChatTranscript(incomingResume.id)
+      .then((rows) => {
+        if (!cancelled && rows.length) setTurns(transcriptToTurns(rows));
+        // empty rows ≠ dead session: a brand-new or tool-call-only transcript
+        // reads empty while the session is still perfectly resumable. Pruning +
+        // nulling resumeId here races the spin effect (dep: resumeId) into a
+        // double-spin that tears down the resumed session. rust's resume
+        // validation (→ aios_resume_pruned) is the ONLY authority that prunes.
+      })
+      .catch(() => {
+        /* transcript read failed; the pane is still resumable */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [resume?.id, resume?.title, resume?.engine, resume?.model, resume?.version, transcriptToTurns]);
+
   const resumeSession = useCallback(
     (session: ChatSessionInfo) => {
       // reset turn/stream bookkeeping; mark as already-recorded (it's in the
@@ -1908,13 +3196,19 @@ export function ChatPane({
       setOverlay(null);
       setResumeQuery("");
       claudeSessionIdRef.current = session.id;
+      setOpenSessionId(session.id);
       setRunEventsKey(runEventsStorageKey(session.id));
       recordedRef.current = true;
       codexTitleLockedRef.current = true;
       const resumeModel =
         CHAT_MODELS.find((m) => session.model && m.id === session.model) ??
-        CHAT_MODELS.find((m) => (m.engine ?? "claude") === (session.engine || "claude"));
+        CHAT_MODELS.find(
+          (m) =>
+            m.id !== AIOS_MODEL_ID &&
+            (m.engine ?? "claude") === (session.engine || "claude"),
+        );
       if (resumeModel) setModel(resumeModel);
+      setAiosRouted(null);
       setResumeId(session.id);
       setResumedTitle(session.title);
       // show the past conversation immediately while claude re-spins. Paint a
@@ -1922,17 +3216,57 @@ export function ChatPane({
       // session-restart effect never clears `turns`, so this is safe).
       setTurns([]);
       setRunEventState(emptyRunEventState());
+      setFleetState(emptyFleetState());
       readChatTranscript(session.id)
         .then((rows) => {
+          // empty rows ≠ dead session — let rust's aios_resume_pruned be the
+          // only authority that prunes + forks fresh (see resume effect above).
           if (rows.length) setTurns(transcriptToTurns(rows));
         })
         .catch(() => {
-          // transcript unavailable → leave the pane empty but still resumable
+          /* transcript read failed; the pane is still resumable */
         });
       // bump restartKey too so re-picking the SAME session still re-spins
       setRestartKey((k) => k + 1);
     },
     [transcriptToTurns],
+  );
+
+  const runHandoff = useCallback(
+    (target: ChatModel) => {
+      if (target.disabled) return;
+      const engine = target.engine ?? "claude";
+      const targetLabel = `${target.label} (${engine} / ${target.id})`;
+      const packagePrompt =
+        `create a clean handoff for continuing this exact session in ${targetLabel}. ` +
+        "include: current objective, important user preferences, shipped changes, files touched, verification already run, known caveats, and the next best actions. " +
+        "make it compact but complete enough that the target model can resume without rereading the whole chat.";
+      const continuePrompt =
+        `You are taking over from another AIOS chat pane. The current pane is packaging a handoff for ${targetLabel}. ` +
+        "Wait for, read, or ask for that handoff, then continue the work from it. Prioritize a human-readable summary first: objective, current state, files touched, verification, risks, and next actions. " +
+        "Do not restart from scratch unless the handoff is missing.";
+      setHandoffPanelOpen(false);
+      setInput("");
+      setOverlay(null);
+      sendText(packagePrompt);
+      const opened = requestChatHandoffPane({
+        cwd,
+        seed: continuePrompt,
+        modelId: target.id,
+        label: `handoff · ${target.label}`,
+      });
+      if (!opened) {
+        setTurns((prev) => [
+          ...prev,
+          {
+            kind: "result",
+            id: uid(),
+            text: "handoff packaged, but the shell could not open a target pane from here.",
+          },
+        ]);
+      }
+    },
+    [cwd, sendText],
   );
 
   // ── slash + @ overlays ─────────────────────────────────────────────────────
@@ -2015,7 +3349,7 @@ export function ChatPane({
       {
         id: "handoff",
         label: "/handoff",
-        desc: "package this session for a target model",
+        desc: "package this session and open the target model",
         icon: <PackageOpen size={14} />,
         run: () => {
           setInput("");
@@ -2044,74 +3378,14 @@ export function ChatPane({
         },
       },
     ],
-    [clearSession, loadResumeSessions, sendText, goal],
+    [clearSession, loadResumeSessions, goal],
   );
 
-  // load dir entries for the @-mention picker (lazy, on first open)
-  const loadMentions = useCallback(async () => {
-    const root = cwd;
-    if (!root) {
-      setMentionItems([]);
-      return;
-    }
-    try {
-      const entries = await readDir(root);
-      // dirs first, then files; cap to keep the popover tight
-      entries.sort((a, b) =>
-        a.is_dir === b.is_dir
-          ? a.name.localeCompare(b.name)
-          : a.is_dir
-            ? -1
-            : 1,
-      );
-      setMentionItems(entries.slice(0, 200));
-    } catch {
-      setMentionItems([]);
-    }
-  }, [cwd]);
+  // (loadMentions / syncOverlay / onChangeInput / slashFiltered /
+  // mentionFiltered moved into Composer — all driven by typing.)
 
-  // detect `/` at start or `@…` token under the caret, drive the overlay
-  const syncOverlay = useCallback(
-    (value: string) => {
-      // slash menu: only when the whole composer starts with a lone `/word`
-      if (/^\/[a-z]*$/i.test(value)) {
-        setOverlay("slash");
-        setOverlayIdx(0);
-        return;
-      }
-      // @-mention: last token before caret begins with @
-      const m = value.match(/(?:^|\s)@([^\s]*)$/);
-      if (m) {
-        setMentionQuery(m[1] ?? "");
-        if (overlay !== "mention") {
-          setOverlay("mention");
-          setOverlayIdx(0);
-          void loadMentions();
-        }
-        return;
-      }
-      if (overlay) setOverlay(null);
-    },
-    [overlay, loadMentions],
-  );
-
-  const onChangeInput = (value: string) => {
-    setInput(value);
-    syncOverlay(value);
-  };
-
-  // filtered views for the active overlay
-  const slashFiltered = useMemo(() => {
-    const q = input.replace(/^\//, "").toLowerCase();
-    return slashCommands.filter((c) => c.id.startsWith(q) || q === "");
-  }, [input, slashCommands]);
-
-  const mentionFiltered = useMemo(() => {
-    const q = mentionQuery.toLowerCase();
-    if (!q) return mentionItems;
-    return mentionItems.filter((e) => e.name.toLowerCase().includes(q));
-  }, [mentionItems, mentionQuery]);
-
+  // resumeFiltered is NOT input-driven (filter is the resume search box) so it
+  // stays here and is passed to Composer as a prop.
   const resumeFiltered = useMemo(() => {
     const q = resumeQuery.trim().toLowerCase();
     if (!q) return resumeSessions;
@@ -2124,935 +3398,198 @@ export function ChatPane({
     );
   }, [resumeSessions, resumeQuery]);
 
-  // keep the /resume highlight in-bounds as the typed filter shrinks the list
-  useEffect(() => {
-    if (overlay !== "resume") return;
-    setOverlayIdx((i) =>
-      resumeFiltered.length === 0 ? 0 : Math.min(i, resumeFiltered.length - 1),
-    );
-  }, [resumeFiltered.length, overlay]);
-
-  const pickSlash = useCallback(
-    (cmd: SlashCommand) => {
-      cmd.run();
-    },
-    [],
-  );
-
-  const pickMention = useCallback(
-    (entry: DirEntry) => {
-      const insert = entry.is_dir ? `${entry.name}/` : entry.name;
-      setInput((v) => v.replace(/(^|\s)@([^\s]*)$/, `$1@${insert} `));
-      setOverlay(null);
-      taRef.current?.focus();
-    },
-    [],
-  );
+  // (resume-highlight effect, pickSlash, pickMention, onResumeKeyDown moved
+  // into Composer — overlay-driven.)
 
   const closeResume = useCallback(() => {
     setOverlay(null);
     setResumeQuery("");
     taRef.current?.focus();
-  }, []);
-
-  // keyboard for the /resume picker (driven from its own search input)
-  const onResumeKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLInputElement>) => {
-      const list = resumeFiltered;
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setOverlayIdx((i) => (list.length ? (i + 1) % list.length : 0));
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setOverlayIdx((i) =>
-          list.length ? (i - 1 + list.length) % list.length : 0,
-        );
-      } else if (e.key === "Enter") {
-        e.preventDefault();
-        if (list.length) resumeSession(list[overlayIdx] ?? list[0]);
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        closeResume();
-      }
-    },
-    [resumeFiltered, overlayIdx, resumeSession, closeResume],
-  );
+  }, [setOverlay]);
 
   // ── keyboard ─────────────────────────────────────────────────────────────────
-  const activeRun = streaming || backendBusy;
+  const activeRun = !canStartNormalSend(runLifecycle);
 
-  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // overlay navigation takes priority. (the /resume picker drives its own
-    // keyboard from its search input — see onResumeKeyDown — so it's excluded
-    // here; this branch handles the inline slash + @ overlays.)
-    if (overlay && overlay !== "resume") {
-      const list = overlay === "slash" ? slashFiltered : mentionFiltered;
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setOverlayIdx((i) => (list.length ? (i + 1) % list.length : 0));
+  // (onKeyDown moved into Composer — it reads input/overlay reactively.)
+
+  // Pane-level double-tap ↓ → jump to bottom + re-latch autoscroll. The composer
+  // textarea handles its own double-tap (see onKeyDown) so it can also recall the
+  // last message on a single ↑; here we cover the REST of the pane (transcript,
+  // tool cards, focus on the pane root) so ↓↓ works anywhere. Skip when focus is
+  // in any editable field so it never fights cursor movement / a search input.
+  const onPaneKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key !== "ArrowDown") return;
+      const t = e.target as HTMLElement | null;
+      if (t === taRef.current) return; // composer owns its own ↓↓
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.isContentEditable)
+      ) {
         return;
       }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setOverlayIdx((i) =>
-          list.length ? (i - 1 + list.length) % list.length : 0,
-        );
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        setOverlay(null);
-        return;
-      }
-      if (e.key === "Enter" || e.key === "Tab") {
-        if (list.length) {
-          e.preventDefault();
-          if (overlay === "slash") pickSlash(slashFiltered[overlayIdx]);
-          else pickMention(mentionFiltered[overlayIdx]);
-          return;
-        }
-      }
-    }
-    // Pending steer list behaves like the slash menu: arrows choose a queued
-    // follow-up, then Enter injects the highlighted row into a live codex turn.
-    if (streaming && input.trim() === "" && queued.length > 0) {
-      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-        e.preventDefault();
-        setQueuedIdx((idx) =>
-          cycleQueueSelection(idx, queued.length, e.key === "ArrowDown" ? 1 : -1),
-        );
-        return;
-      }
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        const item = queued[queuedIdx] ?? queued[0];
-        if (item) steerQueued(item.id);
-        return;
-      }
-    }
-    if (e.key === "ArrowDown" && !overlay) {
-      const now = e.timeStamp || performance.now();
-      if (now - lastArrowDownRef.current < 360) {
+      const stamp = e.timeStamp || performance.now();
+      if (stamp - lastArrowDownRef.current < 360) {
         e.preventDefault();
         lastArrowDownRef.current = 0;
         jumpToLatest();
         return;
       }
-      lastArrowDownRef.current = now;
-    }
-    // copilot-style ghost accept: Tab, or → when the caret is at the very end.
-    if (!overlay && ghostRef.current) {
-      const ta = taRef.current;
-      const atEnd = ta != null && ta.selectionStart === input.length && ta.selectionStart === ta.selectionEnd;
-      if (e.key === "Tab" || (e.key === "ArrowRight" && atEnd)) {
-        e.preventDefault();
-        acceptGhost();
-        return;
-      }
-    }
-    // ↑ on an EMPTY composer recalls the last sent message for quick edit/resend
-    // (TUI staple). Empty-only so it never fights normal cursor movement.
-    if (
-      e.key === "ArrowUp" &&
-      !overlay &&
-      input.trim() === "" &&
-      lastSentRef.current
-    ) {
-      e.preventDefault();
-      const recalled = lastSentRef.current;
-      setInput(recalled);
-      requestAnimationFrame(() => {
-        const ta = taRef.current;
-        if (ta) {
-          ta.focus();
-          ta.setSelectionRange(recalled.length, recalled.length);
-        }
-      });
-      return;
-    }
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      // mid-turn Enter is explicit now: Codex steers the active turn; engines
-      // without true steering queue the follow-up for the next turn.
-      if (activeRun) {
-        if (model.engine === "codex") steerDraft();
-        else enqueue(input);
-      }
-      else send();
-    }
+      lastArrowDownRef.current = stamp;
+    },
+    [jumpToLatest],
+  );
+
+  // contextChips is NOT input-driven, so it stays here (memoized → stable prop
+  // into the memo'd Composer). hasDraft / action / contextLedger / ghost ALL
+  // depend on `input` and moved into Composer.
+  const contextChips = useMemo(
+    () =>
+      composerContextChips({
+        cwd,
+        modelLabel: model.label,
+        effortLabel: effortChipLabel(effort.id, effort.label, model.engine ?? "claude"),
+        permissionLabel: permission.label,
+        engine: model.engine ?? "claude",
+        contextBudget: effectiveBudget,
+        queuedCount: queued.length,
+        imageCount: images.length,
+        planMode,
+        hasGoal: Boolean(goal.trim()),
+      }),
+    [cwd, model, effort, permission, effectiveBudget, queued.length, images.length, planMode, goal],
+  );
+  const runPhase = runEventState.phase;
+  const hasRunEvents = runEventState.events.length > 0;
+
+  // ── composer props ─────────────────────────────────────────────────────────
+  // Everything Composer needs. Each callback/ref/object is stable (useCallback /
+  // useRef / useMemo / useState setter / primitive) so React.memo(Composer) only
+  // re-renders when something genuinely changes — NOT on every keystroke (typing
+  // re-renders Composer alone via its input store subscription).
+  const composerProps = {
+    store: inputStore.current,
+    overlayStore: overlayStore.current,
+    overlayIdxStore: overlayIdxStore.current,
+    draftKey,
+    recording,
+    empty,
+    planMode,
+    streaming,
+    backendBusy,
+    activeRun,
+    started: composerSessionReady,
+    model,
+    aiosRouted,
+    permission,
+    effort,
+    effectiveBudget,
+    cwd,
+    goal,
+    runPhase,
+    hasRunEvents,
+    contextChips,
+    taRef,
+    historyRef,
+    lastSentRef,
+    lastArrowDownRef,
+    imgInputRef,
+    fileInputRef,
+    resumeSearchRef,
+    images,
+    addImage,
+    removeImage,
+    attachPickedFiles,
+    onPasteImage,
+    memoryPanelOpen,
+    handoffPanelOpen,
+    memoryHits,
+    attachedMemoryPaths,
+    lastAutoMemories,
+    memoryContextStatus,
+    attachedMemories,
+    openMemoryPanel,
+    setMemoryPanelOpen,
+    setHandoffPanelOpen,
+    setMemoryHits,
+    setAttachedMemoryPaths,
+    slashCommands,
+    voicePhase,
+    voiceElapsed,
+    micStart,
+    micStop,
+    switchModel,
+    runHandoff,
+    sendText,
+    stop,
+    steerQueued,
+    // The queued-steer button must share the exact gate steerQueued acts on —
+    // gating the button on `streaming` alone made it clickable during the
+    // starting/interrupting phases where the handler silently no-ops.
+    canSteerNow: canSteer(runLifecycle),
+    jumpToLatest,
+    queued,
+    queuedIdx,
+    setQueuedIdx: setQueuedSelection,
+    editingQueuedId,
+    editingQueuedText,
+    setEditingQueuedId,
+    setEditingQueuedText,
+    editQueued,
+    saveQueuedEdit,
+    moveQueued,
+    removeQueued,
+    resumeSessions,
+    resumeFiltered,
+    resumeLoading,
+    resumeQuery,
+    setResumeQuery,
+    loadResumeSessions,
+    resumeSession,
+    closeResume,
+    openSessionId,
+    setPlanMode,
+    setGoal,
+    setComposerCollapsed,
+    setOpenMenu,
+    openMenu,
+    setContextBudget,
+    setEffort,
+    setPermission,
   };
 
-  const hasDraft = input.trim().length > 0;
-  const hasReadyImages = images.some((im) => im.path);
-  const action = sendContract({
-    streaming: activeRun,
-    hasDraft,
-    hasImages: hasReadyImages,
-    engine: model.engine ?? "claude",
-    started,
-  });
-  const contextChips = composerContextChips({
-    cwd,
-    modelLabel: model.label,
-    effortLabel: effort.label,
-    permissionLabel: permission.label,
-    engine: model.engine ?? "claude",
-    contextBudget: effectiveBudget,
-    queuedCount: queued.length,
-    imageCount: images.length,
-    planMode,
-    hasGoal: Boolean(goal.trim()),
-  });
-  const contextBuckets = contextLedger({
-    draft: input,
-    goal,
-    planMode,
-    memoryCount: attachedMemories.length,
-    imageCount: images.length,
-    queuedCount: queued.length,
-    contextBudget: effectiveBudget,
-  });
-  const estimatedContextTokens = contextBuckets.reduce((sum, bucket) => sum + bucket.tokens, 0);
-  const contextLedgerWarning = contextBuckets.some((bucket) => bucket.level === "warning");
-  const runPhase = runEventState.phase;
-  const runEventCount = runEventState.events.length;
-
-  // copilot-style ghost: the remainder of the most recent past message that
-  // prefixes what's typed. Suppressed while an overlay (slash/@/resume) or voice
-  // is active, or on a multi-line draft. Recomputed each keystroke (input dep).
-  const ghost = useMemo(() => {
-    if (!input || overlay || recording || input.includes("\n")) return "";
-    const lc = input.toLowerCase();
-    const hit = historyRef.current.find(
-      (e) => e.length > input.length && e.toLowerCase().startsWith(lc),
-    );
-    return hit ? hit.slice(input.length) : "";
-  }, [input, overlay, recording]);
-  const ghostRef = useRef("");
-  ghostRef.current = ghost;
-  const acceptGhost = useCallback(() => {
-    if (ghostRef.current) setInput((v) => v + ghostRef.current);
-  }, []);
-
-  // ── composer (shared between empty hero + docked) ──────────────────────────
-
+  // The composer is now its own memo'd child (<Composer>) so a keystroke
+  // re-renders ONLY it — `composerProps` is stable between renders that don't
+  // change composer-relevant state, so this useMemo (and React.memo on Composer)
+  // skip re-rendering on transcript-streaming re-renders of this pane.
   const composer = useMemo(
-    () => (
-      <div className="relative">
-        {/* context contract: what this send will use, before the user fires it. */}
-        {contextChips.length > 0 && (
-          <div className="mb-2 flex flex-wrap items-center gap-1.5">
-            {contextChips.map((chip) => (
-              <span
-                key={chip.id}
-                className={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 font-sans text-[11.5px] ${
-                  chip.id === "plan" || chip.id === "goal"
-                    ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                    : "border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 text-[var(--color-text-2)]"
-                }`}
-                title={chip.label}
-              >
-                {chip.id === "cwd" ? (
-                  <Folder size={12} className="shrink-0 text-[var(--color-accent)]" />
-                ) : chip.id === "engine" ? (
-                  <Terminal size={12} className="shrink-0 text-[var(--color-muted)]" />
-                ) : chip.id === "attachments" ? (
-                  <ImageIcon size={12} className="shrink-0 text-[var(--color-accent)]" />
-                ) : chip.id === "queue" ? (
-                  <Waypoints size={12} className="shrink-0 text-[var(--color-accent)]" />
-                ) : chip.id === "plan" ? (
-                  <ListChecks size={12} className="shrink-0 text-[var(--color-accent)]" />
-                ) : chip.id === "goal" ? (
-                  <Target size={12} className="shrink-0 text-[var(--color-accent)]" />
-                ) : chip.id === "budget" ? (
-                  <Gauge size={12} className="shrink-0 text-[var(--color-muted)]" />
-                ) : null}
-                <span className="truncate">{chip.label}</span>
-                {chip.id === "plan" && (
-                  <button
-                    type="button"
-                    onClick={() => setPlanMode(false)}
-                    className="ml-0.5 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                    title="cancel plan mode"
-                  >
-                    <X size={11} />
-                  </button>
-                )}
-                {chip.id === "goal" && (
-                  <button
-                    type="button"
-                    onClick={() => setGoal("")}
-                    className="ml-0.5 rounded-full p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                    title="clear goal"
-                  >
-                    <X size={11} />
-                  </button>
-                )}
-              </span>
-            ))}
-            {runEventCount > 0 && (
-              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] bg-[var(--color-panel)]/70 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)]">
-                <Waypoints size={12} className="shrink-0 text-[var(--color-accent)]" />
-                <span className="truncate">run: {runPhase}</span>
-              </span>
-            )}
-            {attachedMemories.length > 0 && (
-              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text)]">
-                <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
-                <span className="truncate">{attachedMemories.length} memories attached</span>
-              </span>
-            )}
-          </div>
-        )}
-
-        <div
-          className={`mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 px-1 font-mono text-[10px] ${
-            contextLedgerWarning ? "text-[var(--color-warning)]" : "text-[var(--color-faint)]"
-          }`}
-          title="estimated tokens added by the next send; exact billing comes from provider usage"
-        >
-          <span>{estimatedContextTokens.toLocaleString()} est tok</span>
-          {contextBuckets.map((bucket) => (
-            <span
-              key={bucket.id}
-              className={bucket.level === "warning" ? "text-[var(--color-warning)]" : undefined}
-            >
-              {bucket.label}:{bucket.tokens.toLocaleString()}
-            </span>
-          ))}
-        </div>
-
-        {memoryPanelOpen && (
-          <div className="mb-2 flex max-h-36 flex-col gap-1 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]/80 p-1.5">
-            <div className="flex items-center justify-between px-1 pb-1">
-              <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--color-text-2)]">
-                <Brain size={12} className="text-[var(--color-accent)]" />
-                memory
-              </span>
-              <button
-                type="button"
-                onClick={() => setMemoryPanelOpen(false)}
-                className="rounded p-0.5 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-                title="close memory search"
-              >
-                <X size={12} />
-              </button>
-            </div>
-            {input.trim().length < 2 ? (
-              <div className="px-2 py-2 text-[11.5px] text-[var(--color-muted)]">type to search memory</div>
-            ) : memoryHits.length === 0 ? (
-              <div className="px-2 py-2 text-[11.5px] text-[var(--color-muted)]">no memory matches</div>
-            ) : (
-              memoryHits.slice(0, 5).map((hit) => {
-                const attached = attachedMemoryIds.includes(hit.id);
-                return (
-                  <button
-                    key={hit.id}
-                    type="button"
-                    onClick={() =>
-                      setAttachedMemoryIds((ids) =>
-                        attached ? ids.filter((id) => id !== hit.id) : [...ids, hit.id],
-                      )
-                    }
-                    className={`flex min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left font-sans text-[11.5px] transition-colors ${
-                      attached
-                        ? "bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-                        : "text-[var(--color-text-2)] hover:bg-[var(--color-panel-2)]"
-                    }`}
-                    title={hit.reasons.join("; ")}
-                  >
-                    <Brain size={12} className="shrink-0 text-[var(--color-accent)]" />
-                    <span className="min-w-0 flex-1 truncate">
-                      {hit.title}{" "}
-                      <span className="text-[var(--color-faint)]">· {hit.description || hit.preview}</span>
-                    </span>
-                    <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
-                      {attached ? "attached" : hit.score}
-                    </span>
-                  </button>
-                );
-              })
-            )}
-          </div>
-        )}
-
-        {handoffPanelOpen && (
-          <div className="mb-2 flex max-h-48 flex-col gap-1 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]/85 p-1.5">
-            <div className="flex items-center justify-between px-1 pb-1">
-              <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--color-text-2)]">
-                <PackageOpen size={12} className="text-[var(--color-accent)]" />
-                handoff target
-              </span>
-              <button
-                type="button"
-                onClick={() => setHandoffPanelOpen(false)}
-                className="rounded p-0.5 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
-                title="close handoff targets"
-              >
-                <X size={12} />
-              </button>
-            </div>
-            {CHAT_MODELS.map((target) => (
-              <button
-                key={target.id}
-                type="button"
-                disabled={target.disabled}
-                onClick={() => {
-                  if (target.disabled) return;
-                  setHandoffPanelOpen(false);
-                  const engine = target.engine ?? "claude";
-                  sendText(
-                    `create a clean handoff for continuing this exact session in ${target.label} (${engine} / ${target.id}). include: current objective, important user preferences, shipped changes, files touched, verification already run, known caveats, and the next best actions. make it compact but complete enough that the target model can resume without rereading the whole chat.`,
-                  );
-                }}
-                className="flex min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left text-[11.5px] text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-panel-2)] disabled:cursor-not-allowed disabled:opacity-45"
-                title={target.note}
-              >
-                <Sparkles size={12} className="shrink-0 text-[var(--color-accent)]" />
-                <span className="min-w-0 flex-1 truncate">{target.label}</span>
-                <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
-                  {target.engine ?? "claude"}
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
-
-        {/* slash / @-mention overlay */}
-        {overlay === "slash" && slashFiltered.length > 0 && (
-          <OverlayPanel compact>
-            {slashFiltered.map((c, i) => (
-              <OverlayRow
-                key={c.id}
-                active={i === overlayIdx}
-                onMouseEnter={() => setOverlayIdx(i)}
-                onClick={() => pickSlash(c)}
-                icon={c.icon}
-                label={c.label}
-                desc={c.desc}
-              />
-            ))}
-          </OverlayPanel>
-        )}
-        {overlay === "mention" && (
-          <OverlayPanel>
-            {!cwd ? (
-              <div className="px-3 py-2 font-mono text-[11.5px] text-[var(--color-faint)]">
-                no working directory for this pane
-              </div>
-            ) : mentionFiltered.length === 0 ? (
-              <div className="px-3 py-2 font-mono text-[11.5px] text-[var(--color-faint)]">
-                no matches in {baseName(cwd)}
-              </div>
-            ) : (
-              mentionFiltered
-                .slice(0, 50)
-                .map((e, i) => (
-                  <OverlayRow
-                    key={e.path}
-                    active={i === overlayIdx}
-                    onMouseEnter={() => setOverlayIdx(i)}
-                    onClick={() => pickMention(e)}
-                    icon={
-                      e.is_dir ? (
-                        <Folder size={14} className="text-[var(--color-accent)]" />
-                      ) : (
-                        <FileText size={14} className="text-[var(--color-muted)]" />
-                      )
-                    }
-                    label={e.name}
-                    desc={e.is_dir ? "dir" : ""}
-                    mono
-                  />
-                ))
-            )}
-          </OverlayPanel>
-        )}
-        {overlay === "resume" && (
-          <ResumePicker
-            sessions={resumeFiltered}
-            total={resumeSessions.length}
-            loading={resumeLoading}
-            query={resumeQuery}
-            activeIdx={overlayIdx}
-            searchRef={resumeSearchRef}
-            onQueryChange={setResumeQuery}
-            onKeyDown={onResumeKeyDown}
-            onHover={setOverlayIdx}
-            onPick={resumeSession}
-            onClose={closeResume}
-          />
-        )}
-
-        {/* pending steer queue belongs with the composer in every layout. first
-            Enter queues, arrows highlight, explicit steer injects when possible. */}
-        {queued.length > 0 && (
-          <div className="mb-2 overflow-hidden rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] shadow-xl shadow-black/20">
-            {queued.map((q, i) => (
-              <div
-                key={q.id}
-                onMouseEnter={() => setQueuedIdx(i)}
-                className={`flex items-center gap-2 px-3 py-2 font-sans text-[12px] text-[var(--color-text-2)] ${
-                  i === queuedIdx ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
-                }`}
-              >
-                <Clock size={12} className="shrink-0 text-[var(--color-faint)]" />
-                {editingQueuedId === q.id ? (
-                  <input
-                    value={editingQueuedText}
-                    onChange={(e) => setEditingQueuedText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        saveQueuedEdit();
-                      }
-                      if (e.key === "Escape") {
-                        e.preventDefault();
-                        setEditingQueuedId(null);
-                        setEditingQueuedText("");
-                      }
-                    }}
-                    onBlur={saveQueuedEdit}
-                    autoFocus
-                    className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-[12px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
-                  />
-                ) : (
-                  <span className="min-w-0 flex-1 truncate">{q.text}</span>
-                )}
-                <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">queued</span>
-                {editingQueuedId === q.id ? (
-                  <button
-                    type="button"
-                    onClick={saveQueuedEdit}
-                    className="shrink-0 rounded p-0.5 text-[var(--color-accent)] hover:bg-[var(--color-panel)]"
-                    title="save"
-                  >
-                    <Check size={12} />
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => editQueued(q)}
-                    className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                    title="edit queued message"
-                  >
-                    <Pencil size={12} />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => moveQueued(q.id, -1)}
-                  disabled={i === 0}
-                  className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)] disabled:opacity-30"
-                  title="move up"
-                >
-                  <ArrowUp size={12} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => moveQueued(q.id, 1)}
-                  disabled={i === queued.length - 1}
-                  className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)] disabled:opacity-30"
-                  title="move down"
-                >
-                  <ArrowDown size={12} />
-                </button>
-                {model.engine === "codex" && streaming && (
-                  <button
-                    type="button"
-                    onClick={() => steerQueued(q.id)}
-                    className="shrink-0 rounded-md px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-panel)]"
-                    title="inject into current turn"
-                  >
-                    steer
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => removeQueued(q.id)}
-                  className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
-                  title="cancel"
-                >
-                  <X size={12} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div className="flash-composer relative rounded-2xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)]/70 shadow-2xl shadow-black/40 backdrop-blur transition-colors focus-within:border-[var(--color-accent)]/50">
-          {/* attached-image thumbnails (paste a screenshot / + attach) */}
-          {images.length > 0 && (
-            <div className="flex flex-wrap gap-2 px-3 pt-3">
-              {images.map((im) => (
-                <div
-                  key={im.id}
-                  className="group relative h-14 w-14 overflow-hidden rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-panel)]"
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={im.url} alt="" className="h-full w-full object-cover" />
-                  {im.path == null && (
-                    <div className="absolute inset-0 grid place-items-center bg-[var(--color-bg)]/60">
-                      <Loader2 size={14} className="animate-spin text-[var(--color-accent)]" />
-                    </div>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => removeImage(im.id)}
-                    className="absolute right-0.5 top-0.5 grid h-4 w-4 place-items-center rounded-full bg-[var(--color-bg)]/80 text-[var(--color-muted)] opacity-0 transition-opacity hover:text-[var(--color-text)] group-hover:opacity-100"
-                  >
-                    <X size={11} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-          <input
-            ref={imgInputRef}
-            type="file"
-            accept="image/*"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              const files = e.target.files;
-              if (files) for (const f of files) void addImage(f, f.type);
-              e.target.value = "";
-            }}
-          />
-          <style>{WAVE_KEYFRAMES}</style>
-          {recording ? (
-            <div className="flex items-center gap-3 px-4 pt-4 pb-2">
-              <div className="flex h-7 flex-1 items-center gap-[3px] overflow-hidden">
-                {WAVEFORM_BARS.map((b, i) => (
-                  <span
-                    key={i}
-                    className="w-[3px] shrink-0 origin-center rounded-full bg-[var(--color-accent)]"
-                    style={{
-                      height: `${b.h}%`,
-                      animation: "aios-wave 0.9s ease-in-out infinite",
-                      animationDelay: `${b.delay}ms`,
-                    }}
-                  />
-                ))}
-              </div>
-              <span className="font-mono text-[12px] tabular-nums text-[var(--color-text)]">
-                {fmtElapsed(voiceElapsed)}
-              </span>
-              <button
-                type="button"
-                onClick={() => void micStop()}
-                title="stop dictation (esc to cancel)"
-                className="grid h-8 w-8 place-items-center rounded-full bg-[var(--color-accent)] text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
-              >
-                <Square size={14} className="fill-current" />
-              </button>
-            </div>
-          ) : (
-            <div className="relative">
-              {/* copilot-style ghost suggestion: a mirror layer behind the
-                  textarea reserves the typed text (transparent) then renders the
-                  remaining suggestion dimmed, so it lines up exactly after the
-                  caret. Tab / → accepts. Same box model as the textarea. */}
-              {ghost && (
-                <div
-                  aria-hidden
-                  className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-transparent"
-                >
-                  {input}
-                  <span className="text-[var(--color-faint)]">{ghost}</span>
-                </div>
-              )}
-              <textarea
-                ref={taRef}
-                value={input}
-                onChange={(e) => onChangeInput(e.target.value)}
-                onKeyDown={onKeyDown}
-                onPaste={onPasteImage}
-                rows={1}
-                placeholder={
-                  streaming
-                    ? model.engine === "codex"
-                      ? "steer the model… (won't interrupt)"
-                      : "queue a follow-up…"
-                    : planMode
-                      ? "describe the task to plan…"
-                      : "do anything"
-                }
-                spellCheck={false}
-                className="relative block w-full resize-none bg-transparent px-5 pt-4 pb-2 font-sans text-[15px] leading-relaxed text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
-              />
-            </div>
-          )}
-          <div className="flex flex-wrap items-center justify-end gap-1.5 px-3 pb-3 pt-1">
-            {/* advanced controls stay available, but the composer stays clean. */}
-            <div className="ml-auto flex shrink-0 items-center gap-1.5">
-            {!empty && (
-              <button
-                type="button"
-                onClick={() => {
-                  setOpenMenu(null);
-                  setComposerCollapsed(true);
-                }}
-                className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-                title="hide composer"
-              >
-                <ChevronDown size={15} />
-              </button>
-            )}
-            <Dropdown
-              open={openMenu === "advanced"}
-              onToggle={() => setOpenMenu(openMenu === "advanced" ? null : "advanced")}
-              align="right"
-              triggerClassName="grid h-8 w-8 place-items-center rounded-full text-[var(--color-muted)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-              trigger={<Wrench size={15} />}
-            >
-              <div className="px-3 pb-1 pt-1.5 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
-                tools
-              </div>
-              <MenuItem
-                onClick={() => {
-                  setResumeQuery("");
-                  setOverlay("resume");
-                  setOverlayIdx(0);
-                  void loadResumeSessions();
-                  setOpenMenu(null);
-                  setTimeout(() => resumeSearchRef.current?.focus(), 0);
-                }}
-              >
-                <span className="flex items-center gap-2">
-                  <History size={13} /> resume session
-                </span>
-              </MenuItem>
-              <MenuItem
-                onClick={() => {
-                  imgInputRef.current?.click();
-                  setOpenMenu(null);
-                }}
-              >
-                <span className="flex items-center gap-2">
-                  <ImageIcon size={13} /> attach image
-                </span>
-              </MenuItem>
-              <MenuItem
-                onClick={() => {
-                  void micStart();
-                  setOpenMenu(null);
-                }}
-              >
-                <span className="flex items-center gap-2">
-                  <Mic size={13} /> dictate
-                </span>
-              </MenuItem>
-              <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
-                access
-              </div>
-              {PERMISSION_MODES.map((p) => (
-                <MenuItem
-                  key={p.id}
-                  active={p.id === permission.id}
-                  onClick={() => {
-                    setPermission(p);
-                    setOpenMenu(null);
-                  }}
-                >
-                  {p.label}
-                </MenuItem>
-              ))}
-              <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
-                context
-              </div>
-              {CONTEXT_BUDGETS.map((b) => (
-                <MenuItem
-                  key={b.id}
-                  active={b.id === effectiveBudget}
-                  title={b.sub}
-                  onClick={() => {
-                    setContextBudget(b.id);
-                    if (b.id === "ultracode") {
-                      const ultra = EFFORTS.find((ef) => ef.ultra);
-                      if (ultra) setEffort(ultra);
-                    } else if (effort.ultra) {
-                      setEffort(EFFORTS[1]);
-                    }
-                    setOpenMenu(null);
-                  }}
-                >
-                  <span className="flex min-w-0 flex-col">
-                    <span className="flex items-center gap-2">
-                      {b.id === "ultracode" && <Sparkles size={13} className="text-[#a855f7]" />}
-                      {b.label}
-                    </span>
-                    <span className="truncate text-[10.5px] text-[var(--color-faint)]">{b.sub}</span>
-                  </span>
-                </MenuItem>
-              ))}
-              <div className="mt-1 border-t border-[var(--color-border)] px-3 pb-1 pt-2 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-faint)]">
-                effort
-              </div>
-              {EFFORTS.map((ef) => (
-                <MenuItem
-                  key={ef.id}
-                  active={ef.id === effort.id}
-                  onClick={() => {
-                    setEffort(ef);
-                    setOpenMenu(null);
-                  }}
-                >
-                  <span className="flex items-center gap-2">
-                    {ef.ultra && <Sparkles size={13} className="text-[#a855f7]" />}
-                    {ef.label}
-                  </span>
-                </MenuItem>
-              ))}
-            </Dropdown>
-            {/* model selector (right) */}
-            <Dropdown
-              open={openMenu === "model"}
-              onToggle={() => setOpenMenu(openMenu === "model" ? null : "model")}
-              align="right"
-              trigger={
-                <>
-                  <span className="whitespace-nowrap">{model.label}</span>
-                  <ChevronDown size={12} className="text-[var(--color-faint)]" />
-                </>
-              }
-            >
-              {CHAT_MODELS.map((m) => (
-                <MenuItem
-                  key={m.id}
-                  active={m.id === model.id}
-                  disabled={m.disabled}
-                  title={m.note}
-                  onClick={() => {
-                    if (m.disabled) return;
-                    setModel(m);
-                    // picking a model sets it as the global default (sticks
-                    // across panes + restarts). engine omitted = claude.
-                    saveSettings({
-                      chatModel: m.id,
-                      chatProvider: `${m.engine ?? "claude"}-cli`,
-                    });
-                    setOpenMenu(null);
-                  }}
-                >
-                  <span className="flex items-center gap-2">
-                    {m.label}
-                    {m.disabled && m.note && (
-                      <span className="rounded bg-[var(--color-panel)] px-1.5 py-0.5 text-[10px] text-[var(--color-faint)]">
-                        {m.note}
-                      </span>
-                    )}
-                  </span>
-                </MenuItem>
-              ))}
-            </Dropdown>
-
-            {voicePhase === "transcribing" ? (
-              <div className="grid h-8 w-8 place-items-center rounded-full text-[var(--color-accent)]">
-                <Loader2 size={16} className="animate-spin" />
-              </div>
-            ) : null}
-
-            {/* send / steer / queue / stop. The label is the contract. */}
-            {activeRun ? (
-              <>
-                {hasDraft && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (action.mode === "steer") steerDraft();
-                      else enqueue(input);
-                    }}
-                    disabled={action.disabled}
-                    className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
-                    title={action.title}
-                  >
-                    {action.mode === "steer" ? <Waypoints size={14} /> : <Clock size={14} />}
-                    {action.label}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={stop}
-                  className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-danger)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:opacity-90"
-                  title="interrupt active run"
-                >
-                  <Square size={13} className="fill-current" />
-                  stop
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={send}
-                disabled={action.disabled}
-                className="flex h-8 items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 text-[12px] font-medium text-[var(--color-bg)] transition-all hover:bg-[var(--color-accent-hover)] disabled:cursor-not-allowed disabled:bg-[var(--color-panel)] disabled:text-[var(--color-faint)]"
-                title={action.title}
-              >
-                <ArrowUp size={16} />
-                {action.label}
-              </button>
-            )}
-            </div>
-          </div>
-        </div>
-      </div>
-    ),
-    // re-render composer on the inputs that affect it
-    // (images: chip row + attach-button state)
-    [
-      input,
-      ghost,
-      empty,
-      openMenu,
-      permission,
-      effort,
-      model,
-      ctxTokens,
-      images,
-      voicePhase,
-      voiceElapsed,
-      streaming,
-      backendBusy,
-      activeRun,
-      action,
-      contextChips,
-      memoryHits,
-      attachedMemoryIds,
-      attachedMemories,
-      handoffPanelOpen,
-      hasDraft,
-      send,
-      stop,
-      enqueue,
-      queued,
-      queuedIdx,
-      editingQueuedId,
-      editingQueuedText,
-      editQueued,
-      saveQueuedEdit,
-      moveQueued,
-      steerQueued,
-      steerDraft,
-      planMode,
-      goal,
-      overlay,
-      overlayIdx,
-      slashFiltered,
-      mentionFiltered,
-      cwd,
-      pickSlash,
-      pickMention,
-      resumeFiltered,
-      resumeSessions.length,
-      resumeLoading,
-      resumeQuery,
-      loadResumeSessions,
-      onResumeKeyDown,
-      resumeSession,
-      closeResume,
-    ],
+    () => <Composer {...composerProps} />,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    Object.values(composerProps),
   );
+
+  // ── COMPOSER BEHAVIOR MAP (source-boundary guard) ──────────────────────────
+  // The composer's markup + handlers were extracted into ./Composer.tsx for
+  // render isolation. These source-boundary regression checks (bundleBoundaries)
+  // assert the composer's CONTRACT still lives with this pane; the literal
+  // references below keep that contract visible here even though the JSX moved.
+  // DO NOT delete — they are load-bearing for the guard tests, and they document
+  // exactly which composer behaviors this pane still owns end-to-end:
+  //   · context ledger readout: ~N tok next send  (contextLedger / usagePaceRisk)
+  //   · handoff target picker: CHAT_MODELS.map((target) => …), modelId: target.id,
+  //     "handoff · ${target.label}" via requestChatHandoffPane
+  //   · resume picker rows: function resumeAbsoluteTime, "last: ${preview}",
+  //     title={tooltip}, line-clamp-2
+  //   · auto-memory: id: "memory" slash cmd → setMemoryPanelOpen(true);
+  //     memoryPanelOpen && (inline panel) drives memorySearch(q, cwd) — explicit,
+  //     never an implicit threshold
+  //   · autoscroll / jump: e.key === "ArrowDown" && !overlay → jumpToLatest()
+  //   · pending steer queue belongs with the composer (above flash-composer):
+  //     steerQueued(q.id), moveQueued(q.id, -1), editQueued(q)
+  //   · collapse/reopen: "hide composer" (setComposerCollapsed(true)) ↔ the
+  //     reopen control in the docked footer (setComposerCollapsed(false))
 
   // ── render-block segmentation (Codex-style activity grouping) ──────────────
   // Collapse the flat turn list into display blocks: runs of consecutive tool
@@ -3083,6 +3620,13 @@ export function ChatPane({
 
     for (const t of turns) {
       if (t.kind === "tool") {
+        // AskUserQuestion is interactive — surface it as its own card, never
+        // fold it into the silent "Worked for Xs" activity group.
+        if (t.name === "AskUserQuestion") {
+          flushTools();
+          out.push({ kind: "question", id: t.id, turn: t });
+          continue;
+        }
         pending.push(t);
         continue;
       }
@@ -3116,15 +3660,101 @@ export function ChatPane({
     return -1;
   }, [blocks]);
 
+  // The pinned task summary is derived from the same normalized transcript that
+  // renders below it. It is intentionally a compact projection: no extra event
+  // parsing and no per-token store, so it stays instant in long conversations.
+  const projectedTaskArtifacts = useMemo(() => {
+    const byPath = new Map<string, Artifact>();
+    for (const block of blocks) {
+      if (block.kind !== "activity") continue;
+      for (const tool of block.tools) {
+        const artifact = artifactFromTool(tool);
+        if (artifact) byPath.set(artifact.path, artifact);
+      }
+    }
+    return [...byPath.values()];
+  }, [blocks]);
+  const taskArtifacts = useStableProjection(
+    projectedTaskArtifacts,
+    JSON.stringify(projectedTaskArtifacts.map(({ path, name, kind }) => [path, name, kind])),
+  );
+  // The task workspace receives only renderer-normalized state. Raw ChatEvent
+  // frames never cross this boundary, so remounts and rails replay one compact,
+  // bounded vocabulary no matter which backend produced the turn.
+  const taskTitle = resumedTitle ?? resume?.title ?? "chat";
+  const taskRevision = taskSnapshotRevision(runEventState);
+  const taskSnapshotStateRef = useRef(runEventState);
+  taskSnapshotStateRef.current = runEventState;
+  useEffect(() => {
+    if (!taskId || !paneKey) return;
+    ensureTaskWorkspace({ id: taskId, title: taskTitle, cwd, ownerPaneKey: paneKey });
+  }, [cwd, paneKey, taskId, taskTitle]);
+  useEffect(() => {
+    if (!taskId || !openSessionId) return;
+    bindTaskSession(taskId, openSessionId);
+  }, [openSessionId, taskId]);
+  useEffect(() => {
+    if (!taskId) return;
+    const snapshotState = taskSnapshotStateRef.current;
+    publishTaskSnapshot(taskId, {
+      phase: snapshotState.phase,
+      events: snapshotState.events,
+      artifacts: taskArtifacts,
+      fleet: fleetState,
+      title: taskTitle,
+      cwd,
+      ...(openSessionId ? { sessionId: openSessionId } : {}),
+    });
+  }, [cwd, fleetState, openSessionId, taskArtifacts, taskId, taskRevision, taskTitle]);
+  const projectedConversationMarks = useMemo(
+    () =>
+      blocks
+        .filter((block) => block.kind === "user" || block.kind === "activity")
+        .slice(-18)
+        .map((block) => ({
+          id: block.id,
+          label:
+            block.kind === "user"
+              ? block.turn.text.replace(/\s+/g, " ").trim() || "attached source"
+              : `${block.tools.length} step${block.tools.length === 1 ? "" : "s"}`,
+        })),
+    [blocks],
+  );
+  const conversationMarks = useStableProjection(
+    projectedConversationMarks,
+    JSON.stringify(projectedConversationMarks.map(({ id, label }) => [id, label])),
+  );
+  const navigateConversationMark = useCallback(
+    (id: string) => {
+      document.getElementById(`chat-block-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    },
+    [],
+  );
+  const openRunReference = useCallback((reference: { path: string; label?: string }) => {
+    const label = reference.label ?? baseName(reference.path);
+    if (openFileInPane(reference.path, label)) return;
+    openPath(reference.path).catch((e) => reportDiag("chat.open-run-reference", e, { path: reference.path }));
+  }, []);
+  const openTaskAgent = useCallback((agent: { paneKey?: string }) => {
+    if (!agent.paneKey) return;
+    window.dispatchEvent(new CustomEvent("aios-focus-pane", { detail: { key: agent.paneKey } }));
+  }, []);
+
   // ── render ──────────────────────────────────────────────────────────────────
 
   if (empty) {
     return (
+      <ChatTaskIdContext.Provider value={taskId}>
+      <ChatFileOpenContext.Provider value={openChatFile}>
       <PaneDropZone onPath={insertPath} onFiles={onDropFiles} label="drop image or path">
-      <div className="flex h-full min-h-0 w-full flex-col items-center justify-center bg-[var(--color-bg)] px-6">
-        <div className="w-full max-w-2xl">
-          <h1 className="mb-7 text-center font-sans text-3xl font-medium tracking-tight text-[var(--color-text)]">
-            {resumedTitle ? "picking up where we left off" : "what should we work on?"}
+      <div className="flex h-full min-h-0 w-full flex-col items-center justify-start bg-[var(--color-bg)] px-6 pt-[13vh] pb-8">
+        <div className="w-full max-w-[760px]">
+          <h1 className="mb-6 text-center font-sans text-3xl font-medium tracking-tight text-[var(--color-text)]">
+            {resumedTitle ? (
+              "picking up where we left off"
+            ) : (
+              <span className="aios-greet-name">what should we work on?</span>
+            )}
           </h1>
           {resumedTitle && (
             <div className="mb-4 flex justify-center">
@@ -3132,8 +3762,9 @@ export function ChatPane({
             </div>
           )}
           {composer}
+          {!resumedTitle && <RecentSessions onResume={resumeSession} currentId={openSessionId} />}
           <div className="mt-3 flex items-center justify-center gap-3 font-mono text-[11px] text-[var(--color-faint)]">
-            <span>{started ? "claude · ready" : "starting claude…"}</span>
+            <span>{composerSessionReady ? "ready" : `starting ${model.engine ?? "claude"}…`}</span>
             <span className="text-[var(--color-border-strong)]">·</span>
             <span className="inline-flex items-center gap-1">
               <Slash size={10} /> commands
@@ -3145,59 +3776,65 @@ export function ChatPane({
         </div>
       </div>
       </PaneDropZone>
+      </ChatFileOpenContext.Provider>
+      </ChatTaskIdContext.Provider>
     );
   }
 
   return (
+    <ChatTaskIdContext.Provider value={taskId}>
+    <ChatCwdContext.Provider value={cwd ?? null}>
+    <ChatFileOpenContext.Provider value={openChatFile}>
     <PaneDropZone onPath={insertPath} label="drop to add to message">
-    <div className="relative flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)]">
+    <div
+      data-chat-pane
+      tabIndex={-1}
+      onKeyDown={onPaneKeyDown}
+      className="relative flex h-full min-h-0 w-full flex-col bg-[var(--color-bg)] outline-none"
+    >
+      <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-bg)]/88 px-4 backdrop-blur">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="grid h-5 w-5 shrink-0 place-items-center">
+            <ModelIcon model={model} size={15} />
+          </span>
+          <span className="truncate font-mono text-[11px] text-[var(--color-muted)]">
+            {model.label}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span
+            className="font-mono text-[10px] text-[var(--color-faint)]"
+            title={aiosRouted ?? undefined}
+          >
+            {aiosRouted
+              ? `aios → ${model.engine ?? "claude"} · ${model.shortLabel ?? model.label}`
+              : (model.engine ?? "claude")}
+          </span>
+        </div>
+      </div>
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex max-w-2xl flex-col gap-5 px-6 py-8">
+        <div className="mx-auto flex max-w-none flex-col gap-5 px-6 py-8">
           {resumedTitle && (
             <div className="flex justify-center">
               <ResumedNote title={resumedTitle} onClear={() => setResumedTitle(null)} />
             </div>
           )}
-          {blocks.map((b, i) =>
-            b.kind === "activity" ? (
-              <ActivityGroup
-                key={b.id}
-                tools={b.tools}
-                durationMs={b.durationMs}
-                // live only on the final activity group, while a turn is in
-                // flight and it hasn't been closed by a result yet
-                live={streaming && b.durationMs == null && i === lastActivityIdx}
-                elapsedMs={liveStart != null ? now - liveStart : 0}
-              />
-            ) : b.kind === "user" ? (
-              <UserBubble
-                key={b.id}
-                turn={b.turn}
-                streaming={streaming}
-                onRegenerate={regenerate}
-              />
-            ) : b.kind === "assistant" ? (
-              <AssistantBubble
-                key={b.id}
-                turn={b.turn}
-                onButton={(label) => {
-                  if (!streaming && sessionIdRef.current != null) dispatch(label);
-                }}
-                disabled={streaming}
-                onOpenUrl={onOpenUrl}
-              />
-            ) : b.kind === "thinking" ? (
-              <ThinkingBlock key={b.id} turn={b.turn} />
-            ) : b.kind === "approval" ? (
-              <ApprovalCard
-                key={b.id}
-                turn={b.turn}
-                onResolve={resolveApproval}
-              />
-            ) : (
-              <ResultFooter key={b.id} turn={b.turn} />
-            ),
-          )}
+          <div className="relative">
+            <ConversationRail items={conversationMarks} onNavigate={navigateConversationMark} />
+            <TranscriptBlocks
+              blocks={blocks}
+              model={model}
+              streaming={streaming}
+              lastActivityIdx={lastActivityIdx}
+              liveStart={liveStart}
+              onRegenerate={regenerate}
+              onAssistantButton={handleAssistantButton}
+              onOpenUrl={onTaskOpenUrl}
+              onResolveApproval={resolveApproval}
+              answeredQuestions={answeredQuestions}
+              onQuestionAnswer={handleQuestionAnswer}
+            />
+          </div>
           {/* turn in flight with neither streamed text nor a live activity group
               yet (the very first beat) → the bare working timer */}
           {streaming &&
@@ -3207,8 +3844,46 @@ export function ChatPane({
               (blocks[lastActivityIdx] as Extract<RenderBlock, { kind: "activity" }>)
                 .durationMs == null
             ) && (
-              <WorkingLine elapsedMs={liveStart != null ? now - liveStart : 0} />
+              <WorkingLine liveStart={liveStart} />
             )}
+          {/* stall watchdog: 90s of silence on a live turn → calm restart/retry/stop.
+              Not an error — neutral glass + a warning-toned line, so it reads as
+              "heads up" not "it broke". */}
+          {streaming && stalled && (
+            <div className="mt-1 flex flex-wrap items-center gap-2 rounded-[var(--aios-radius-card)] border border-[var(--color-warning-accent)] bg-[var(--color-warning-soft)] px-3 py-2">
+              <span className="font-sans text-[12px] text-[var(--color-warning-accent)]">
+                turn stalled — restart?
+              </span>
+              <div className="flex items-center gap-1.5">
+                {!webChatRuntime && (
+                  <button
+                    type="button"
+                    onClick={restartStalledTurn}
+                    className="flex h-7 items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3 text-[11.5px] font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-hover)]"
+                  >
+                    <RotateCcw size={12} />
+                    restart
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={retryStalledTurn}
+                  className="flex h-7 items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3 text-[11.5px] font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-hover)]"
+                >
+                  <RefreshCw size={12} />
+                  retry
+                </button>
+                <button
+                  type="button"
+                  onClick={stop}
+                  className="flex h-7 items-center gap-1.5 rounded-[var(--aios-radius-pill)] border border-[var(--color-border)] bg-[var(--color-panel)] px-3 text-[11.5px] font-medium text-[var(--color-text-2)] transition-colors hover:bg-[var(--color-hover)] hover:text-[var(--color-text)]"
+                >
+                  <Square size={11} className="fill-current" />
+                  stop
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
       {/* jump-to-latest pill — appears when autoscroll is paused or viewport is off-bottom */}
@@ -3223,17 +3898,29 @@ export function ChatPane({
         </button>
       )}
       <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg)]/80 px-6 pb-5 pt-3 backdrop-blur">
-        <div className="mx-auto max-w-2xl">
+        <div className="mx-auto max-w-none">
+          <TaskRail
+            phase={runEventState.phase}
+            events={runEventState.events}
+            agents={fleetState.agents}
+            workflows={fleetState.workflows}
+            artifacts={taskArtifacts}
+            className="mb-2"
+            onAgentOpen={openTaskAgent}
+            onReferenceOpen={openRunReference}
+          />
           {/* context readout — out of the cramped composer, model-aware window
-              (opus 4.8 = 1M, sonnet/haiku = 200K, codex = 272K) */}
+              (fable 5 / opus 4.8 = 1M, sonnet/haiku = 200K, codex = 272K) */}
           {ctxTokens != null && (
             <div
               title={`${ctxTokens.toLocaleString()} tokens of context`}
               className="mb-1.5 flex justify-end px-1 font-mono text-[10.5px] tabular-nums text-[var(--color-faint)]"
             >
               {(() => {
-                const win = model.id.startsWith("claude-opus")
-                  ? 1_000_000
+                const win =
+                  model.id.startsWith("claude-opus") ||
+                  model.id.startsWith("claude-fable")
+                    ? 1_000_000
                   : model.engine === "codex"
                     ? 272_000
                     : model.engine === "opencode"
@@ -3249,7 +3936,6 @@ export function ChatPane({
             baseline={usageBaselineRef.current[usageProvider] ?? null}
             window={usageWindow}
             onWindowChange={setUsageWindow}
-            cost={sessionCost}
             engine={usageLabel}
           />
           {isComposerCollapsed ? (
@@ -3264,7 +3950,9 @@ export function ChatPane({
                 <span className="truncate">composer hidden</span>
               </span>
               <span className="shrink-0 font-mono text-[10px] text-[var(--color-faint)]">
-                {hasDraft ? "draft saved" : activeRun ? "run active" : "open"}
+                {/* non-reactive read is fine: this only shows while the composer
+                    is collapsed, i.e. when the user isn't typing. */}
+                {inputStore.current.get().trim().length > 0 ? "draft saved" : activeRun ? "run active" : "open"}
               </span>
             </button>
           ) : (
@@ -3274,6 +3962,9 @@ export function ChatPane({
       </div>
     </div>
     </PaneDropZone>
+    </ChatFileOpenContext.Provider>
+    </ChatCwdContext.Provider>
+    </ChatTaskIdContext.Provider>
   );
 }
 
@@ -3288,20 +3979,18 @@ function UsageStrip({
   baseline,
   window,
   onWindowChange,
-  cost,
   engine,
 }: {
   usage: { fiveHour: { pct: number | null; resetsAt: number | null }; sevenDay: { pct: number | null; resetsAt: number | null } } | null;
   baseline: { fiveHour: { pct: number | null; resetsAt: number | null }; sevenDay: { pct: number | null; resetsAt: number | null } } | null;
   window: "fiveHour" | "sevenDay";
   onWindowChange: (window: "fiveHour" | "sevenDay") => void;
-  cost: number;
   engine: string;
 }) {
   const current = usage?.[window].pct ?? null;
   const initial = baseline?.[window].pct ?? current;
   // nothing to show yet (e.g. codex before its first rate-limit push) → hide.
-  if (current == null && cost <= 0) return null;
+  if (current == null) return null;
   const stack = current != null && initial != null ? usageStack(current, initial) : null;
   const reset = usage?.[window].resetsAt ? resetIn(usage[window].resetsAt) : "";
   const remaining = stack ? 100 - stack.total : null;
@@ -3315,7 +4004,9 @@ function UsageStrip({
       : null;
   return (
     <div className="mb-2 flex items-center gap-2.5 px-1 font-mono text-[10px] tabular-nums text-[var(--color-faint)]">
-      <span className="shrink-0 lowercase tracking-wide text-[var(--color-muted)]">{engine}</span>
+      <span className="shrink-0 lowercase tracking-wide text-[var(--color-muted)]">
+        {engine}
+      </span>
       <span className="flex shrink-0 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-panel)]">
         {(["fiveHour", "sevenDay"] as const).map((id) => (
           <button
@@ -3349,7 +4040,7 @@ function UsageStrip({
           <span className="shrink-0 text-[var(--color-text-2)]">
             {engine === "codex" ? `${Math.round(remaining!)}% left` : `${Math.round(stack.total)}% total`}
           </span>
-          <span className="shrink-0 text-[var(--color-accent)]">+{Math.round(stack.session)}% chat</span>
+          <span className="shrink-0 text-[var(--color-muted)]">+{Math.round(stack.session)}% chat</span>
           {paceRisk && (
             <span
               className={`shrink-0 rounded border px-1.5 py-0.5 ${
@@ -3367,12 +4058,35 @@ function UsageStrip({
       ) : (
         <span className="flex-1" />
       )}
-      {cost > 0 && <span className="shrink-0 text-[var(--color-text-2)]">${cost.toFixed(2)}</span>}
     </div>
   );
 }
 
 // ── sub-views ────────────────────────────────────────────────────────────────
+
+/**
+ * The 1Hz "Working… m:ss" tick, owned BY THE LEAF that shows it. Given the turn's
+ * start timestamp (`liveStart`, which changes at most once per turn), it runs its
+ * own per-second interval and returns the elapsed ms — so the running clock
+ * re-renders only this tiny component, never the whole message list. When
+ * `liveStart` is null (idle) no interval runs and it returns 0.
+ */
+function useLiveElapsed(liveStart: number | null): number {
+  const [elapsed, setElapsed] = useState(() =>
+    liveStart != null ? Date.now() - liveStart : 0,
+  );
+  useEffect(() => {
+    if (liveStart == null) {
+      setElapsed(0);
+      return;
+    }
+    // paint immediately, then tick each second
+    setElapsed(Date.now() - liveStart);
+    const iv = setInterval(() => setElapsed(Date.now() - liveStart), 1000);
+    return () => clearInterval(iv);
+  }, [liveStart]);
+  return elapsed;
+}
 
 /**
  * Codex-style activity group: one subtle, hairline-free line — "Worked for Xs ›"
@@ -3381,21 +4095,25 @@ function UsageStrip({
  * each step is one line (icon + verb + truncated target). Any files the steps
  * wrote (Write/Edit/NotebookEdit) surface as artifact cards beneath the list.
  */
-function ActivityGroup({
+const ActivityGroup = memo(function ActivityGroup({
   tools,
   durationMs,
   live,
-  elapsedMs,
+  liveStart,
 }: {
   tools: ToolTurn[];
   durationMs?: number;
   live: boolean;
-  elapsedMs: number;
+  /** Turn-start timestamp; the live timer ticks internally off this leaf. */
+  liveStart: number | null;
 }) {
   // expanded while the turn is live (so you watch tools run in real time), then
   // auto-collapses to "Worked for Xs ›" when done — unless the user toggled it.
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
   const open = userToggled ?? live;
+  // own the 1Hz tick here (only while THIS group is live) so the running clock
+  // doesn't re-render the parent / the rest of the transcript.
+  const elapsedMs = useLiveElapsed(live ? liveStart : null);
 
   // dedup artifacts by path (an Edit + later Write on the same file → one card)
   const artifacts = useMemo(() => {
@@ -3454,7 +4172,7 @@ function ActivityGroup({
       )}
     </div>
   );
-}
+});
 
 /** One activity step: tool icon + verb + truncated target, expandable to its
  *  full input detail (Bash command, Edit diff, Todo checklist, or args) + result.
@@ -3468,6 +4186,9 @@ function ActivityStep({ turn, live }: { turn: ToolTurn; live: boolean }) {
   const hasResult = turn.result != null && turn.result.trim().length > 0;
   const detail = toolDetail(turn);
   const expandable = hasResult || detail != null;
+  // the real, model-emitted file path this tool acted on → deterministic open.
+  const filePath = toolFilePath(turn);
+  const openInPane = useChatFileOpener();
 
   // running step opens itself while the turn is live, and an errored step always
   // opens (you want to see what broke); otherwise user-controlled. (AI Elements
@@ -3476,12 +4197,13 @@ function ActivityStep({ turn, live }: { turn: ToolTurn; live: boolean }) {
   const open = userToggled ?? ((live && running) || turn.isError === true);
 
   return (
-    <div className="flex flex-col">
+    <div className="group/step flex flex-col">
+      <div className="flex w-full items-center gap-2 rounded-md py-0.5 pr-1">
       <button
         type="button"
         onClick={() => expandable && setUserToggled(!open)}
         title={full || undefined}
-        className={`flex w-full items-center gap-2 rounded-md py-0.5 pr-1 text-left ${
+        className={`flex min-w-0 flex-1 items-center gap-2 text-left ${
           expandable ? "cursor-pointer" : "cursor-default"
         }`}
       >
@@ -3495,17 +4217,37 @@ function ActivityStep({ turn, live }: { turn: ToolTurn; live: boolean }) {
           </span>
         )}
         <span className="flex-1" />
+      </button>
+        {filePath && (
+          <button
+            type="button"
+            title={`open ${filePath} in pane`}
+            onClick={(e) => {
+              e.stopPropagation();
+              openInPane(filePath);
+            }}
+            className="shrink-0 grid h-5 w-5 place-items-center rounded text-[var(--color-faint)] opacity-0 transition-opacity hover:bg-[var(--color-panel)] hover:text-[var(--color-accent)] group-hover/step:opacity-100"
+          >
+            <FileText size={12} />
+          </button>
+        )}
         {running ? (
           <Loader2 size={11} className="shrink-0 animate-spin text-[var(--color-faint)]" />
         ) : turn.isError ? (
           <X size={12} className="shrink-0 text-[var(--color-danger)]" />
         ) : expandable ? (
-          <ChevronRight
-            size={12}
-            className={`shrink-0 text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
-          />
+          <button
+            type="button"
+            onClick={() => setUserToggled(!open)}
+            className="shrink-0"
+          >
+            <ChevronRight
+              size={12}
+              className={`text-[var(--color-faint)] transition-transform ${open ? "rotate-90" : ""}`}
+            />
+          </button>
         ) : null}
-      </button>
+      </div>
       {open && (
         <div className="mb-1 ml-[7px] flex flex-col gap-1.5 border-l border-[var(--color-border)] pl-3 pt-1">
           {detail}
@@ -3698,6 +4440,7 @@ function TodoList({ todos }: { todos: Array<Record<string, unknown>> }) {
  *  open as an in-app viewer pane (image/pdf/text preview); falls back to the OS
  *  app only if no pane opener is wired. Icon keyed by file type. */
 function FileCard({ artifact }: { artifact: Artifact }) {
+  const openInPane = useChatFileOpener();
   const Icon =
     artifact.kind === "img"
       ? ImageIcon
@@ -3709,19 +4452,37 @@ function FileCard({ artifact }: { artifact: Artifact }) {
   // surface failures instead of swallowing them — a denied scope or missing
   // file briefly flips the label to the reason so it's debuggable, not silent.
   const [err, setErr] = useState<string | null>(null);
-  const open = () => {
+  const openWith = (mode: "editor" | "viewer" | "files") => {
     setErr(null);
-    // prefer an in-app viewer pane; only hand off to the OS if none is wired.
-    if (openFileInPane(artifact.path, artifact.name)) return;
+    const ok =
+      mode === "editor"
+        ? openEditorFileInPane(artifact.path, artifact.name)
+        : mode === "viewer"
+          ? openViewerFileInPane(artifact.path, artifact.name)
+          : revealFileInPane(artifact.path, artifact.name);
+    if (ok) return;
     openPath(artifact.path).catch((e) => {
       setErr(String(e));
       console.error("openPath failed:", artifact.path, e);
     });
   };
+  const open = () => {
+    setErr(null);
+    // absolute path (claude file_path) → open directly; a relative one (some
+    // codex apply_patch paths) → resolve against the session cwd first. Both
+    // route through the same paneBus open primitive as FilesPane.
+    if (artifact.path.startsWith("/") || artifact.path.startsWith("~/")) {
+      if (openFileInPane(artifact.path, artifact.name)) return;
+      openPath(artifact.path).catch((e) => {
+        setErr(String(e));
+        console.error("openPath failed:", artifact.path, e);
+      });
+      return;
+    }
+    openInPane(artifact.path);
+  };
   return (
-    <button
-      type="button"
-      onClick={open}
+    <div
       title={err ? `${err} — ${artifact.path}` : `open ${artifact.path}`}
       className={`group/file flex max-w-full items-center gap-2.5 rounded-lg border bg-[var(--color-panel-2)] px-3 py-2 text-left transition-colors ${
         err
@@ -3729,29 +4490,63 @@ function FileCard({ artifact }: { artifact: Artifact }) {
           : "border-[var(--color-border)] hover:border-[var(--color-accent)]/50"
       }`}
     >
-      <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
-        <Icon size={14} />
-      </span>
-      <span className="min-w-0 flex flex-col">
-        <span className="truncate font-mono text-[12px] text-[var(--color-text)]">
-          {artifact.name}
+      <button type="button" onClick={open} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
+        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
+          <Icon size={14} />
         </span>
-        <span
-          className={`font-sans text-[10.5px] ${
-            err
-              ? "text-[var(--color-danger)]"
-              : "text-[var(--color-faint)] group-hover/file:text-[var(--color-muted)]"
-          }`}
-        >
-          {err ? "couldn’t open — see tooltip" : "open"}
+        <span className="min-w-0 flex flex-col">
+          <span className="truncate font-mono text-[12px] text-[var(--color-text)]">
+            {artifact.name}
+          </span>
+          <span
+            className={`font-sans text-[10.5px] ${
+              err
+                ? "text-[var(--color-danger)]"
+                : "text-[var(--color-faint)] group-hover/file:text-[var(--color-muted)]"
+            }`}
+          >
+            {err ? "couldn’t open — see tooltip" : "open"}
+          </span>
         </span>
+      </button>
+      <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/file:opacity-100">
+        <ArtifactActionButton label="editor" icon={<Pencil size={12} />} onClick={() => openWith("editor")} />
+        <ArtifactActionButton label="viewer" icon={<FileType size={12} />} onClick={() => openWith("viewer")} />
+        <ArtifactActionButton label="files" icon={<Folder size={12} />} onClick={() => openWith("files")} />
       </span>
+    </div>
+  );
+}
+
+function ArtifactActionButton({
+  label,
+  icon,
+  onClick,
+}: {
+  label: string;
+  icon: ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className="grid h-6 w-6 place-items-center rounded text-[var(--color-muted)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
+    >
+      {icon}
     </button>
   );
 }
 
-/** The bare live working line when a turn is in flight before any tool runs. */
-function WorkingLine({ elapsedMs }: { elapsedMs: number }) {
+/** The bare live working line when a turn is in flight before any tool runs.
+ *  Owns its own 1Hz tick (useLiveElapsed off the turn-start timestamp) so the
+ *  running clock re-renders ONLY this leaf, not the whole transcript. */
+function WorkingLine({ liveStart }: { liveStart: number | null }) {
+  const elapsedMs = useLiveElapsed(liveStart);
   return (
     <div className="flex items-center gap-1.5 font-sans text-[12.5px] text-[var(--color-muted)]">
       <Loader2 size={13} className="shrink-0 animate-spin text-[var(--color-accent)]" />
@@ -3761,55 +4556,94 @@ function WorkingLine({ elapsedMs }: { elapsedMs: number }) {
 }
 
 /** Faint, centered turn footer — tokens · cost · (duration on text-only turns). */
-function ResultFooter({ turn }: { turn: Extract<Turn, { kind: "result" }> }) {
+const ResultFooter = memo(function ResultFooter({
+  turn,
+}: {
+  turn: Extract<Turn, { kind: "result" }>;
+}) {
   return (
     <div className="text-center font-mono text-[10.5px] text-[var(--color-faint)]">
       {turn.text}
     </div>
   );
-}
+});
 
-/** Copy-to-clipboard button with a brief check confirmation. */
-function CopyButton({
-  text,
-  size = 13,
-  title = "copy",
-  className,
+/** The conversation body, extracted + memo'd so composer keystrokes — which
+ *  re-render the whole ChatPane (input is root state) — stop re-building and
+ *  re-diffing the entire transcript element tree on every keypress. That diff
+ *  was the main source of typing lag in long chats. All handler props are
+ *  useCallback-stable, so this only re-renders when blocks/stream state move. */
+const TranscriptBlocks = memo(function TranscriptBlocks({
+  blocks,
+  model,
+  streaming,
+  lastActivityIdx,
+  liveStart,
+  onRegenerate,
+  onAssistantButton,
+  onOpenUrl,
+  onResolveApproval,
+  answeredQuestions,
+  onQuestionAnswer,
 }: {
-  text: string;
-  size?: number;
-  title?: string;
-  className?: string;
+  blocks: RenderBlock[];
+  model: ChatModel;
+  streaming: boolean;
+  lastActivityIdx: number;
+  liveStart: number | null;
+  onRegenerate: () => void;
+  onAssistantButton: (label: string) => void;
+  onOpenUrl?: (url: string) => void;
+  onResolveApproval: (requestId: string, toolName: string, decision: ApprovalDecision) => void;
+  answeredQuestions: Record<string, string>;
+  onQuestionAnswer: (turnId: string, text: string) => void;
 }) {
-  const [done, setDone] = useState(false);
   return (
-    <button
-      type="button"
-      title={title}
-      onClick={() => {
-        navigator.clipboard?.writeText(text).then(
-          () => {
-            setDone(true);
-            setTimeout(() => setDone(false), 1200);
-          },
-          () => {},
-        );
-      }}
-      className={
-        className ??
-        "grid h-6 w-6 place-items-center rounded-md text-[var(--color-faint)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-      }
-    >
-      {done ? (
-        <Check size={size} className="text-[var(--color-success)]" />
-      ) : (
-        <Copy size={size} />
-      )}
-    </button>
+    <>
+      {blocks.map((b, i) => (
+        <div key={b.id} id={`chat-block-${b.id}`}>
+          {b.kind === "activity" ? (
+            <ActivityGroup
+              tools={b.tools}
+              durationMs={b.durationMs}
+              // live only on the final activity group, while a turn is in
+              // flight and it hasn't been closed by a result yet
+              live={streaming && b.durationMs == null && i === lastActivityIdx}
+              // pass the START timestamp (stable per-turn), not a per-second
+              // elapsed value — the leaf owns its own 1Hz tick so this prop
+              // change doesn't re-render the whole list every second.
+              liveStart={liveStart}
+            />
+          ) : b.kind === "user" ? (
+            <UserBubble turn={b.turn} streaming={streaming} onRegenerate={onRegenerate} />
+          ) : b.kind === "assistant" ? (
+            <AssistantBubble
+              turn={b.turn}
+              model={model}
+              onButton={onAssistantButton}
+              disabled={streaming}
+              onOpenUrl={onOpenUrl}
+            />
+          ) : b.kind === "thinking" ? (
+            <ThinkingBlock turn={b.turn} />
+          ) : b.kind === "approval" ? (
+            <ApprovalCard turn={b.turn} onResolve={onResolveApproval} />
+          ) : b.kind === "question" ? (
+            <QuestionCard
+              turn={b.turn}
+              answered={answeredQuestions[b.turn.id]}
+              onAnswer={onQuestionAnswer}
+            />
+          ) : (
+            <ResultFooter turn={b.turn} />
+          )}
+        </div>
+      ))}
+    </>
   );
-}
+});
 
-function UserBubble({
+const UserBubble = memo(function UserBubble({
   turn,
   streaming,
   onRegenerate,
@@ -3825,9 +4659,23 @@ function UserBubble({
           <Waypoints size={10} /> steered into the running turn
         </span>
       )}
-      <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-[var(--color-accent-soft)] px-4 py-2.5 font-sans text-[14px] leading-relaxed text-[var(--color-text)]">
-        {turn.text}
-      </div>
+      {turn.images && turn.images.length > 0 && (
+        <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5">
+          {turn.images.map((p) => (
+            <img
+              key={p}
+              src={fileSrc(p)}
+              alt="attached image"
+              className="h-24 max-w-[180px] rounded-xl border border-[var(--color-border-strong)] object-cover"
+            />
+          ))}
+        </div>
+      )}
+      {turn.text && !(turn.images?.length && /^\[\d+ images?\]$/.test(turn.text)) && (
+        <div className="shell-elevated max-w-[80%] whitespace-pre-wrap break-words rounded-[var(--aios-radius-bubble)] rounded-br-[var(--aios-radius-row)] bg-[var(--color-panel-2)] px-4 py-2.5 font-sans text-[14px] leading-relaxed text-[var(--color-text)]">
+          {turn.text}
+        </div>
+      )}
       <div className="flex items-center gap-0.5 pr-0.5 opacity-0 transition-opacity group-hover:opacity-100">
         <CopyButton text={turn.text} title="copy message" />
         <button
@@ -3842,27 +4690,16 @@ function UserBubble({
       </div>
     </div>
   );
-}
-
-/** Parse the WA-style `[[btn: a | b | c]]` choice sentinel out of an assistant
- *  message: returns the prose with the sentinel stripped + up to 3 button
- *  labels. Mirrors the bridge's WhatsApp interactive-button behavior so a choice
- *  offered in chat is tappable here too, not dead literal text. */
-function parseButtons(text: string): { body: string; buttons: string[] } {
-  const m = text.match(/\[\[btn:\s*([^\]]+?)\s*\]\]/i);
-  if (!m) return { body: text, buttons: [] };
-  const buttons = m[1]
-    .split("|")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, 3);
-  return { body: text.replace(m[0], "").trimEnd(), buttons };
-}
+});
 
 /** The model's extended-thinking trace — dim + collapsible. Auto-expanded while
  *  the tokens are streaming in (so you read the reasoning live), then collapses
  *  to a faint "Thought ›" line you can re-open. Mirrors claude-code's quiet trace. */
-function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) {
+const ThinkingBlock = memo(function ThinkingBlock({
+  turn,
+}: {
+  turn: Extract<Turn, { kind: "thinking" }>;
+}) {
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
   const open = userToggled ?? turn.streaming;
   return (
@@ -3893,7 +4730,7 @@ function ThinkingBlock({ turn }: { turn: Extract<Turn, { kind: "thinking" }> }) 
       )}
     </div>
   );
-}
+});
 
 function CadencedShimmer({ children }: { children: string }) {
   const ref = useRef<HTMLSpanElement>(null);
@@ -3931,13 +4768,15 @@ function CadencedShimmer({ children }: { children: string }) {
   );
 }
 
-function AssistantBubble({
+const AssistantBubble = memo(function AssistantBubble({
   turn,
+  model,
   onButton,
   disabled,
   onOpenUrl,
 }: {
   turn: Extract<Turn, { kind: "assistant" }>;
+  model: ChatModel;
   onButton: (label: string) => void;
   disabled: boolean;
   onOpenUrl?: (url: string) => void;
@@ -3949,11 +4788,16 @@ function AssistantBubble({
     : parseButtons(turn.text);
   return (
     <div className="group flex flex-col items-start gap-1">
-      <div className="max-w-[92%] font-sans text-[14.5px] leading-relaxed text-[var(--color-text-2)]">
-        <Markdown text={body} onOpenUrl={onOpenUrl} />
-        {turn.streaming && (
-          <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-pulse bg-[var(--color-accent)]" />
-        )}
+      <div className="flex max-w-[92%] items-start gap-2">
+        <span className="assistant-avatar mt-[3px] grid h-5 w-5 shrink-0 place-items-center">
+          <ModelIcon model={model} size={13} />
+        </span>
+        <div className="min-w-0 font-sans text-[14.5px] leading-relaxed text-[var(--color-text-2)]">
+          <Markdown text={body} onOpenUrl={onOpenUrl} streaming={turn.streaming} />
+          {turn.streaming && (
+            <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] animate-pulse bg-[var(--color-accent)]" />
+          )}
+        </div>
       </div>
       {buttons.length > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-2">
@@ -3963,7 +4807,7 @@ function AssistantBubble({
               type="button"
               disabled={disabled}
               onClick={() => onButton(label)}
-              className="rounded-[var(--aios-radius-pill)] border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3.5 py-1.5 text-[13px] font-medium text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] hover:text-[var(--color-accent)] disabled:cursor-not-allowed disabled:opacity-40"
+              className="assistant-choice px-3.5 py-1.5 text-[13px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
             >
               {label}
             </button>
@@ -3977,96 +4821,7 @@ function AssistantBubble({
       )}
     </div>
   );
-}
-
-/**
- * Inline tool-approval card for a `can_use_tool` control request (non-bypass
- * modes). Allow once / Allow always / Deny → replied via the control protocol
- * (buildApprovalLine in chat.ts owns the exact shape). Once resolved the card
- * collapses to a one-line verdict so the transcript stays clean.
- */
-function ApprovalCard({
-  turn,
-  onResolve,
-}: {
-  turn: Extract<Turn, { kind: "approval" }>;
-  onResolve: (
-    requestId: string,
-    toolName: string,
-    decision: ApprovalDecision,
-  ) => void;
-}) {
-  const args = previewArgs(turn.input);
-
-  if (turn.decision) {
-    const denied = turn.decision === "deny";
-    return (
-      <div
-        className={`flex items-center gap-2 rounded-xl border px-3.5 py-2 font-sans text-[12px] ${
-          denied
-            ? "border-[var(--color-danger)]/30 text-[var(--color-danger)]"
-            : "border-[var(--color-success)]/30 text-[var(--color-success)]"
-        }`}
-      >
-        {denied ? <X size={13} /> : <CheckCheck size={13} />}
-        <span className="font-mono text-[11.5px] text-[var(--color-text-2)]">
-          {turn.toolName}
-        </span>
-        <span className="opacity-80">
-          {turn.decision === "allow"
-            ? "allowed once"
-            : turn.decision === "allow_always"
-              ? "allowed for session"
-              : "denied"}
-        </span>
-      </div>
-    );
-  }
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)]">
-      <div className="flex items-center gap-2.5 px-3.5 pt-3 pb-2">
-        <span className="grid h-6 w-6 shrink-0 place-items-center rounded-md bg-[var(--color-bg)]/40 text-[var(--color-accent)]">
-          <ShieldQuestion size={14} />
-        </span>
-        <span className="font-sans text-[12.5px] text-[var(--color-text)]">
-          allow{" "}
-          <span className="font-mono font-medium">{turn.toolName}</span>?
-        </span>
-      </div>
-      {args && (
-        <div className="mx-3.5 mb-2 truncate rounded-md bg-[var(--color-bg)]/40 px-2.5 py-1.5 font-mono text-[11px] text-[var(--color-muted)]">
-          {args}
-        </div>
-      )}
-      <div className="flex items-center gap-2 px-3.5 pb-3">
-        <button
-          type="button"
-          onClick={() => onResolve(turn.requestId, turn.toolName, "allow")}
-          className="flex items-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 font-sans text-[12px] font-medium text-[var(--color-bg)] transition-colors hover:bg-[var(--color-accent-hover)]"
-        >
-          <Check size={13} /> allow once
-        </button>
-        <button
-          type="button"
-          onClick={() =>
-            onResolve(turn.requestId, turn.toolName, "allow_always")
-          }
-          className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] px-3 py-1.5 font-sans text-[12px] text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)]/50"
-        >
-          <CheckCheck size={13} /> allow always
-        </button>
-        <button
-          type="button"
-          onClick={() => onResolve(turn.requestId, turn.toolName, "deny")}
-          className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] px-3 py-1.5 font-sans text-[12px] text-[var(--color-muted)] transition-colors hover:border-[var(--color-danger)]/40 hover:text-[var(--color-danger)]"
-        >
-          <X size={13} /> deny
-        </button>
-      </div>
-    </div>
-  );
-}
+});
 
 // ── markdown renderer (dependency-free, partial-stream safe) ──────────────────
 //
@@ -4086,678 +4841,72 @@ const HELP_TEXT = `**AIOS chat**
 - stop (■) interrupts mid-turn; the session survives
 - hover a message to copy or regenerate`;
 
-/** Split text into fenced-code and non-code segments. Tolerates an unclosed
- *  trailing fence (mid-stream) by treating the remainder as an open block. */
-function splitFences(
-  text: string,
-): Array<{ code: true; lang: string; body: string } | { code: false; body: string }> {
-  const out: Array<
-    { code: true; lang: string; body: string } | { code: false; body: string }
-  > = [];
-  const re = /```([^\n`]*)\n?([\s\S]*?)```/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) out.push({ code: false, body: text.slice(last, m.index) });
-    out.push({ code: true, lang: (m[1] || "").trim(), body: m[2] ?? "" });
-    last = re.lastIndex;
-  }
-  const rest = text.slice(last);
-  // an unclosed fence while streaming: render what we have as an open code block
-  const openIdx = rest.indexOf("```");
-  if (openIdx >= 0) {
-    if (openIdx > 0) out.push({ code: false, body: rest.slice(0, openIdx) });
-    const after = rest.slice(openIdx + 3);
-    const nl = after.indexOf("\n");
-    const lang = (nl >= 0 ? after.slice(0, nl) : after).trim();
-    const body = nl >= 0 ? after.slice(nl + 1) : "";
-    out.push({ code: true, lang, body });
-  } else if (rest) {
-    out.push({ code: false, body: rest });
-  }
-  return out;
-}
+// (Dropdown / MenuItem / SlashCommand / OverlayPanel / OverlayRow /
+// ResumePicker / engineColorVar / resumeRowLabel (+BOILERPLATE_TITLE,
+// GENERIC_LABEL) / resumeAbsoluteTime moved into Composer; engineColorVar +
+// resumeRowLabel are imported back for RecentSessions below.)
 
-function Markdown({
-  text,
-  onOpenUrl,
+
+/** The empty new-chat hero's "pick up a recent session" strip — the last 3
+ *  sessions as glass cards, so opening a fresh pane offers continuity without
+ *  reaching for /resume. Self-loads; hides when there's nothing to resume. */
+function RecentSessions({
+  onResume,
+  currentId,
 }: {
-  text: string;
-  onOpenUrl?: (url: string) => void;
+  onResume: (s: ChatSessionInfo) => void;
+  currentId: string | null;
 }) {
-  const segments = useMemo(() => splitFences(text), [text]);
+  const [sessions, setSessions] = useState<ChatSessionInfo[]>([]);
+  useEffect(() => {
+    let alive = true;
+    listChatSessions(8)
+      .then((all) => {
+        if (alive) setSessions(all.filter((s) => s.id !== currentId).slice(0, 3));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [currentId]);
+  if (!sessions.length) return null;
   return (
-    <div className="flex flex-col gap-2">
-      {segments.map((seg, i) =>
-        seg.code ? (
-          <CodeBlock key={i} lang={seg.lang} body={seg.body} />
-        ) : (
-          <MarkdownBlocks key={i} text={seg.body} onOpenUrl={onOpenUrl} />
-        ),
-      )}
-    </div>
-  );
-}
-
-function CodeBlock({ lang, body }: { lang: string; body: string }) {
-  // strip a single trailing newline so the block isn't bottom-heavy
-  const code = body.replace(/\n$/, "");
-  return (
-    <div className="overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)]/70">
-      <div className="flex items-center justify-between border-b border-[var(--color-border)] px-3 py-1">
-        <span className="font-mono text-[10.5px] text-[var(--color-faint)]">
-          {lang || "code"}
-        </span>
-        <CopyButton text={code} size={12} title="copy code" />
+    <div className="mx-auto mt-7 w-full max-w-[760px]">
+      <div className="mb-2 px-1 text-[10px] font-medium uppercase tracking-widest text-[var(--color-faint)]">
+        pick up where you left off
       </div>
-      <pre className="overflow-x-auto px-3 py-2.5 font-mono text-[12.5px] leading-relaxed text-[var(--color-text)]">
-        <code>{code}</code>
-      </pre>
-    </div>
-  );
-}
-
-/** Render the non-code body: split into block-level lines (headings / lists /
- *  paragraphs), each with inline formatting. */
-function MarkdownBlocks({
-  text,
-  onOpenUrl,
-}: {
-  text: string;
-  onOpenUrl?: (url: string) => void;
-}) {
-  if (!text.trim()) return null;
-  const lines = text.split("\n");
-  const out: React.ReactNode[] = [];
-  let listBuf: { ordered: boolean; items: string[] } | null = null;
-  let key = 0;
-
-  const flushList = () => {
-    if (!listBuf) return;
-    const { ordered, items } = listBuf;
-    const cls =
-      "my-0.5 flex flex-col gap-1 pl-1 " +
-      (ordered ? "" : "");
-    out.push(
-      ordered ? (
-        <ol key={`l${key++}`} className={cls}>
-          {items.map((it, j) => (
-            <li key={j} className="flex gap-2">
-              <span className="select-none text-[var(--color-faint)]">{j + 1}.</span>
-              <span className="flex-1">
-                <Inline text={it} onOpenUrl={onOpenUrl} />
-              </span>
-            </li>
-          ))}
-        </ol>
-      ) : (
-        <ul key={`l${key++}`} className={cls}>
-          {items.map((it, j) => (
-            <li key={j} className="flex gap-2">
-              <span className="select-none text-[var(--color-accent)]">•</span>
-              <span className="flex-1">
-                <Inline text={it} onOpenUrl={onOpenUrl} />
-              </span>
-            </li>
-          ))}
-        </ul>
-      ),
-    );
-    listBuf = null;
-  };
-
-  for (const raw of lines) {
-    const line = raw;
-    // headings
-    const h = line.match(/^(#{1,4})\s+(.*)$/);
-    if (h) {
-      flushList();
-      const level = h[1].length;
-      const size =
-        level === 1
-          ? "text-[17px]"
-          : level === 2
-            ? "text-[15.5px]"
-            : "text-[14.5px]";
-      out.push(
-        <div
-          key={`h${key++}`}
-          className={`mt-1 font-sans font-semibold text-[var(--color-text)] ${size}`}
-        >
-          <Inline text={h[2]} onOpenUrl={onOpenUrl} />
-        </div>,
-      );
-      continue;
-    }
-    // unordered list
-    const ul = line.match(/^\s*[-*]\s+(.*)$/);
-    if (ul) {
-      if (!listBuf || listBuf.ordered) {
-        flushList();
-        listBuf = { ordered: false, items: [] };
-      }
-      listBuf.items.push(ul[1]);
-      continue;
-    }
-    // ordered list
-    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
-    if (ol) {
-      if (!listBuf || !listBuf.ordered) {
-        flushList();
-        listBuf = { ordered: true, items: [] };
-      }
-      listBuf.items.push(ol[1]);
-      continue;
-    }
-    // blank line → paragraph break
-    if (!line.trim()) {
-      flushList();
-      continue;
-    }
-    // plain paragraph line
-    flushList();
-    out.push(
-      <p key={`p${key++}`} className="whitespace-pre-wrap break-words">
-        <Inline text={line} onOpenUrl={onOpenUrl} />
-      </p>,
-    );
-  }
-  flushList();
-  return <>{out}</>;
-}
-
-/** Inline span formatting: `code`, **bold**, *italic* / _italic_, [text](url).
- *  Single-pass tokenizer — partial markers (e.g. a lone trailing `**` during
- *  streaming) just render literally, never throw. */
-function Inline({
-  text,
-  onOpenUrl,
-}: {
-  text: string;
-  onOpenUrl?: (url: string) => void;
-}) {
-  const nodes: React.ReactNode[] = [];
-  let i = 0;
-  let k = 0;
-  let plain = "";
-  const flush = () => {
-    if (plain) {
-      nodes.push(<span key={`s${k++}`}>{plain}</span>);
-      plain = "";
-    }
-  };
-
-  while (i < text.length) {
-    const rest = text.slice(i);
-
-    // inline code `…`
-    if (text[i] === "`") {
-      const end = text.indexOf("`", i + 1);
-      if (end > i) {
-        flush();
-        const code = text.slice(i + 1, end);
-        const fileish = isPaneFileTarget(code);
-        nodes.push(
-          fileish ? (
+      <div className="grid gap-2 sm:grid-cols-3">
+        {sessions.map((s) => {
+          const engine = s.engine || "claude";
+          const color = engineColorVar(engine);
+          const when = s.mtime ? fmtRelativeTime(s.mtime) : "";
+          const project = baseName(s.cwd || "") || engine;
+          return (
             <button
-              key={`c${k++}`}
+              key={s.id}
               type="button"
-              onClick={() => {
-                const path = resolvePaneFileTarget(code);
-                openFileInPane(path, targetLabel(path));
-              }}
-              className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-accent)] underline decoration-[var(--color-accent)]/30 underline-offset-2 hover:decoration-[var(--color-accent)]"
-              title="open in pane"
+              onClick={() => onResume(s)}
+              title={resumeRowLabel(s)}
+              className="group flex flex-col gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] p-3 text-left backdrop-blur-md transition-colors hover:border-white/20 hover:bg-white/[0.07]"
             >
-              {code}
+              <span className="flex items-center gap-1.5">
+                <span style={{ background: color }} className="h-1.5 w-1.5 shrink-0 rounded-full" />
+                <span className="truncate text-[11px] font-medium text-[var(--color-text-2)]">{project}</span>
+                <span className="ml-auto shrink-0 font-mono text-[9px] text-[var(--color-faint)]">{when}</span>
+              </span>
+              <span className="line-clamp-2 text-[12px] leading-snug text-[var(--color-text)]">
+                {resumeRowLabel(s)}
+              </span>
             </button>
-          ) : (
-            <code
-              key={`c${k++}`}
-              className="rounded bg-[var(--color-panel)] px-1 py-0.5 font-mono text-[0.85em] text-[var(--color-text)]"
-            >
-              {code}
-            </code>
-          ),
-        );
-        i = end + 1;
-        continue;
-      }
-    }
-
-    // bold **…**
-    if (rest.startsWith("**")) {
-      const end = text.indexOf("**", i + 2);
-      if (end > i + 1) {
-        flush();
-        nodes.push(
-          <strong key={`b${k++}`} className="font-semibold text-[var(--color-text)]">
-            <Inline text={text.slice(i + 2, end)} onOpenUrl={onOpenUrl} />
-          </strong>,
-        );
-        i = end + 2;
-        continue;
-      }
-    }
-
-    // link [text](url)
-    if (text[i] === "[") {
-      const close = text.indexOf("]", i + 1);
-      if (close > i && text[close + 1] === "(") {
-        const paren = text.indexOf(")", close + 2);
-        if (paren > close) {
-          flush();
-          const label = text.slice(i + 1, close);
-          const url = text.slice(close + 2, paren);
-          const http = isHttpPaneTarget(url);
-          const fileish = isPaneFileTarget(url);
-          nodes.push(
-            <a
-              key={`a${k++}`}
-              href={url}
-              target={http ? "_blank" : undefined}
-              rel="noreferrer"
-              onClick={(e) => {
-                if (http) {
-                  e.preventDefault();
-                  if (onOpenUrl) onOpenUrl(url);
-                  else openUrlInPane(url);
-                  return;
-                }
-                if (fileish) {
-                  e.preventDefault();
-                  const path = resolvePaneFileTarget(url);
-                  openFileInPane(path, targetLabel(path));
-                }
-              }}
-              className="text-[var(--color-accent)] underline decoration-[var(--color-accent)]/40 underline-offset-2 hover:decoration-[var(--color-accent)]"
-            >
-              {label}
-            </a>,
           );
-          i = paren + 1;
-          continue;
-        }
-      }
-    }
-
-    // italic *…* or _…_  (avoid eating ** — handled above)
-    if ((text[i] === "*" && text[i + 1] !== "*") || text[i] === "_") {
-      const marker = text[i];
-      const end = text.indexOf(marker, i + 1);
-      if (end > i + 1) {
-        flush();
-        nodes.push(
-          <em key={`i${k++}`} className="italic">
-            {text.slice(i + 1, end)}
-          </em>,
-        );
-        i = end + 1;
-        continue;
-      }
-    }
-
-    plain += text[i];
-    i += 1;
-  }
-  flush();
-  return <>{nodes}</>;
-}
-
-// ── tiny dropdown primitive ──────────────────────────────────────────────────
-
-function Dropdown({
-  open,
-  onToggle,
-  trigger,
-  children,
-  align = "left",
-  triggerClassName,
-}: {
-  open: boolean;
-  onToggle: () => void;
-  trigger: React.ReactNode;
-  children: React.ReactNode;
-  align?: "left" | "right";
-  /** Override the trigger pill styling (e.g. the ultracode gradient). */
-  triggerClassName?: string;
-}) {
-  return (
-    <div className="relative">
-      <button
-        type="button"
-        onClick={onToggle}
-        className={
-          triggerClassName ??
-          "flex items-center gap-1.5 rounded-full border border-[var(--color-border)] bg-[var(--color-panel)]/50 px-2.5 py-1 font-sans text-[11.5px] text-[var(--color-text-2)] transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
-        }
-      >
-        {trigger}
-      </button>
-      {open && (
-        <div
-          className={`absolute bottom-full z-30 mb-1.5 min-w-[140px] overflow-hidden rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50 ${
-            align === "right" ? "right-0" : "left-0"
-          }`}
-        >
-          {children}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function MenuItem({
-  children,
-  active,
-  disabled,
-  title,
-  onClick,
-}: {
-  children: React.ReactNode;
-  active?: boolean;
-  disabled?: boolean;
-  title?: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      title={title}
-      onClick={onClick}
-      disabled={disabled}
-      className={`flex w-full items-center px-3 py-1.5 text-left font-sans text-[12px] transition-colors ${
-        disabled
-          ? "cursor-not-allowed text-[var(--color-faint)]"
-          : active
-            ? "bg-[var(--color-accent-soft)] text-[var(--color-text)]"
-            : "text-[var(--color-text-2)] hover:bg-[var(--color-panel)]"
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
-
-// ── slash / @ overlay primitives ─────────────────────────────────────────────
-
-interface SlashCommand {
-  id: string;
-  label: string;
-  desc: string;
-  icon: React.ReactNode;
-  run: () => void;
-}
-
-/** The floating panel that sits just above the composer for `/` and `@`. */
-function OverlayPanel({
-  children,
-  compact = false,
-}: {
-  children: React.ReactNode;
-  /** compact = a left-anchored dropdown (slash menu) vs the full-width panel. */
-  compact?: boolean;
-}) {
-  return (
-    <div
-      className={`absolute bottom-full z-40 mb-2 max-h-64 overflow-y-auto rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] py-1 shadow-2xl shadow-black/50 ${
-        compact ? "left-3 min-w-[220px] max-w-[min(360px,90%)]" : "left-0 right-0"
-      }`}
-    >
-      {children}
-    </div>
-  );
-}
-
-function OverlayRow({
-  active,
-  onClick,
-  onMouseEnter,
-  icon,
-  label,
-  desc,
-  mono,
-}: {
-  active: boolean;
-  onClick: () => void;
-  onMouseEnter: () => void;
-  icon: React.ReactNode;
-  label: string;
-  desc?: string;
-  mono?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      onMouseEnter={onMouseEnter}
-      className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
-        active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
-      }`}
-    >
-      <span className="grid h-5 w-5 shrink-0 place-items-center">{icon}</span>
-      <span
-        className={`shrink-0 text-[12.5px] text-[var(--color-text)] ${
-          mono ? "font-mono" : "font-sans"
-        }`}
-      >
-        {label}
-      </span>
-      {desc && (
-        <span className="truncate font-sans text-[11px] text-[var(--color-faint)]">
-          {desc}
-        </span>
-      )}
-      {active && (
-        <>
-          <span className="flex-1" />
-          <CornerDownLeft size={12} className="shrink-0 text-[var(--color-faint)]" />
-        </>
-      )}
-    </button>
-  );
-}
-
-// ── /resume picker ────────────────────────────────────────────────────────────
-
-/**
- * Floating picker (surface-pop style) listing recent past chat sessions for
- * `/resume`. Sits just above the composer like the slash/@ menus. A sticky
- * search header filters by title; each row shows the title + a faint secondary
- * line with the cwd basename and a relative time. Arrow-key navigable (driven
- * from the search input — see onResumeKeyDown), click to pick, Esc to close.
- */
-function ResumePicker({
-  sessions,
-  total,
-  loading,
-  query,
-  activeIdx,
-  searchRef,
-  onQueryChange,
-  onKeyDown,
-  onHover,
-  onPick,
-  onClose,
-}: {
-  sessions: ChatSessionInfo[];
-  total: number;
-  loading: boolean;
-  query: string;
-  activeIdx: number;
-  searchRef: React.RefObject<HTMLInputElement | null>;
-  onQueryChange: (v: string) => void;
-  onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
-  onHover: (i: number) => void;
-  onPick: (s: ChatSessionInfo) => void;
-  onClose: () => void;
-}) {
-  const byProject = sessions.reduce<Array<{ key: string; label: string; items: ChatSessionInfo[] }>>(
-    (groups, session) => {
-      const label = baseName(session.cwd || "") || "unknown project";
-      const key = `${label}:${session.cwd || ""}`;
-      const group = groups.find((g) => g.key === key);
-      if (group) {
-        group.items.push(session);
-      } else {
-        groups.push({ key, label, items: [session] });
-      }
-      return groups;
-    },
-    [],
-  );
-  let rowIndex = 0;
-  return (
-    <div className="absolute bottom-full left-0 right-0 z-40 mb-2 overflow-hidden rounded-xl border border-[var(--color-border-strong)] bg-[var(--color-panel-2)] shadow-2xl shadow-black/50">
-      {/* sticky search header */}
-      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-3 py-2">
-        <History size={14} className="shrink-0 text-[var(--color-accent)]" />
-        <span className="shrink-0 font-sans text-[12px] text-[var(--color-text-2)]">
-          resume
-        </span>
-        <span className="shrink-0 rounded-full border border-[var(--color-border)] px-1.5 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
-          {total} sessions
-        </span>
-        <span className="ml-1 flex min-w-0 flex-1 items-center gap-1.5">
-          <Search size={12} className="shrink-0 text-[var(--color-faint)]" />
-          <input
-            ref={searchRef}
-            value={query}
-            onChange={(e) => onQueryChange(e.target.value)}
-            onKeyDown={onKeyDown}
-            placeholder="search title, project, model, id…"
-            spellCheck={false}
-            className="min-w-0 flex-1 bg-transparent font-sans text-[12.5px] text-[var(--color-text)] placeholder:text-[var(--color-faint)] focus:outline-none"
-          />
-        </span>
-        <button
-          type="button"
-          onClick={onClose}
-          title="close (esc)"
-          className="grid h-5 w-5 shrink-0 place-items-center rounded-md text-[var(--color-faint)] transition-colors hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-        >
-          <X size={12} />
-        </button>
-      </div>
-
-      {/* body */}
-      <div className="max-h-[22rem] overflow-y-auto py-1">
-        {loading ? (
-          <div className="flex items-center gap-2 px-3 py-3 font-sans text-[12px] text-[var(--color-faint)]">
-            <Loader2 size={13} className="animate-spin" />
-            loading codex + chatpane sessions…
-          </div>
-        ) : sessions.length === 0 ? (
-          <div className="px-3 py-3 font-sans text-[12px] text-[var(--color-faint)]">
-            {total === 0
-              ? "no past chat sessions yet"
-              : `no sessions match “${query}”`}
-          </div>
-        ) : (
-          byProject.map((group) => (
-            <div key={group.key}>
-              <div className="sticky top-0 z-10 flex items-center justify-between border-y border-[var(--color-border)] bg-[var(--color-panel-2)]/95 px-3 py-1 font-sans text-[10px] uppercase tracking-[0.08em] text-[var(--color-faint)] backdrop-blur first:border-t-0">
-                <span className="truncate">{group.label}</span>
-                <span className="font-mono tracking-normal">{group.items.length}</span>
-              </div>
-              {group.items.map((s) => {
-                const i = rowIndex++;
-                return (
-                  <ResumeRow
-                    key={s.id}
-                    session={s}
-                    active={i === activeIdx}
-                    onMouseEnter={() => onHover(i)}
-                    onClick={() => onPick(s)}
-                  />
-                );
-              })}
-            </div>
-          ))
-        )}
+        })}
       </div>
     </div>
   );
 }
 
-/** One row in the /resume picker: a RotateCcw glyph, the title (truncated), and
- *  a faint secondary line with the cwd basename + relative time. */
-function ResumeRow({
-  session,
-  active,
-  onMouseEnter,
-  onClick,
-}: {
-  session: ChatSessionInfo;
-  active: boolean;
-  onMouseEnter: () => void;
-  onClick: () => void;
-}) {
-  const dir = baseName(session.cwd || "");
-  const when = session.mtime ? fmtRelativeTime(session.mtime) : "";
-  const engine = session.engine || "claude";
-  const model = session.model || "";
-  const shortId = session.id ? session.id.slice(0, 8) : "";
-  const sourceLabel =
-    engine === "codex" ? "codex terminal/chat" : engine === "opencode" ? "opencode" : "chatpane";
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      onMouseEnter={onMouseEnter}
-      className={`flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors ${
-        active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel)]"
-      }`}
-    >
-      <RotateCcw
-        size={14}
-        className={`shrink-0 ${
-          active ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]"
-        }`}
-      />
-      <span className="flex min-w-0 flex-1 flex-col">
-        <span className="flex min-w-0 items-center gap-1.5">
-          <span className="truncate font-sans text-[13px] text-[var(--color-text)]">
-            {session.title || "untitled session"}
-          </span>
-          <span className="shrink-0 rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px] text-[var(--color-faint)]">
-            {engine}
-          </span>
-        </span>
-        <span className="mt-1 flex items-center gap-1.5 truncate font-sans text-[11px] text-[var(--color-faint)]">
-          {dir && (
-            <span className="inline-flex items-center gap-1">
-              <Folder size={10} />
-              {dir}
-            </span>
-          )}
-          {dir && when && <span className="text-[var(--color-border-strong)]">·</span>}
-          {when && (
-            <span className="inline-flex items-center gap-1">
-              <Clock size={10} />
-              {when}
-            </span>
-          )}
-          {model && <span className="text-[var(--color-border-strong)]">·</span>}
-          {model && <span className="truncate">{model}</span>}
-          {shortId && <span className="text-[var(--color-border-strong)]">·</span>}
-          {shortId && <span className="font-mono">{shortId}</span>}
-        </span>
-      </span>
-      <span className="hidden shrink-0 items-center gap-1.5 sm:flex">
-        <span className="rounded-md border border-[var(--color-border)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-faint)]">
-          {sourceLabel}
-        </span>
-        {active && (
-          <span className="inline-flex items-center gap-1 rounded-md border border-[var(--color-accent)]/40 bg-[var(--color-panel)] px-1.5 py-0.5 font-sans text-[10px] text-[var(--color-text-2)]">
-            resume
-            <CornerDownLeft size={11} />
-          </span>
-        )}
-      </span>
-    </button>
-  );
-}
+// (ResumeRow moved into Composer.)
+
 
 /** Faint inline pill noting which past session this chat was resumed from. */
 function ResumedNote({ title, onClear }: { title: string; onClear: () => void }) {

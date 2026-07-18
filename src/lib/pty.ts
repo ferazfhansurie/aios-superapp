@@ -35,6 +35,17 @@ export async function listTmuxSessions(): Promise<TmuxSession[]> {
   return invoke<TmuxSession[]>("list_tmux_sessions");
 }
 
+/** Combined roster (oracles + all-tmux sessions) from a SINGLE backend socket
+ *  sweep — one IPC round-trip instead of listOracles()+listTmuxSessions() each
+ *  re-spawning tmux on the oracle socket. Used by the roster's poll. */
+export interface RosterSnapshot {
+  oracles: OracleInfo[];
+  sessions: TmuxSession[];
+}
+export async function listRoster(): Promise<RosterSnapshot> {
+  return invoke<RosterSnapshot>("list_roster");
+}
+
 /** Creates a new oracle session `aios-<identity>`; optional startup command. */
 export async function createOracle(identity: string, command?: string): Promise<string> {
   return invoke<string>("create_oracle", { identity, command: command ?? null });
@@ -59,9 +70,23 @@ export async function killTmuxSession(socket: string, session: string): Promise<
   return invoke("kill_tmux_session", { socket, session });
 }
 
-/** ⌘⌘ appshot: screenshot → routed into an oracle (defaults to master). */
+/**
+ * Launches the installed superapp (`aios-shell`) on a remote GUI node (the
+ * bisnesgpt box) over ssh/tailscale — "open the cockpit on the box from here".
+ * `node` is reserved for the Part F node registry; today it resolves to the box.
+ */
+export async function launchBoxApp(node?: string): Promise<string> {
+  return invoke<string>("launch_box_app", { node: node ?? null });
+}
+
+/** Legacy appshot: screenshot → routed into an oracle (defaults to master). */
 export async function appshot(identity?: string): Promise<string> {
   return invoke<string>("appshot", { identity: identity ?? null });
+}
+
+/** ⌘⌘ appshot: screenshot capture only; the shell attaches it to chat. */
+export async function appshotCapture(): Promise<string> {
+  return invoke<string>("appshot_capture");
 }
 
 /** Spawns the user's login shell in a new PTY. Returns the session id. */
@@ -113,9 +138,50 @@ export async function spawnTmux(
   return invoke<number>("pty_spawn_tmux", { onData, socket, session, cols, rows });
 }
 
-/** Writes input to a session's PTY stdin. */
+/**
+ * Payload of the backend `pty-exit` Tauri event (structured form), emitted when
+ * a session's reader thread exits (PTY closed / process died). The backend has
+ * already evicted the session from its registry by the time this fires, so any
+ * further ptyWrite/ptyPaste to `id` rejects with "dead or unknown".
+ *
+ * - `id` — the PTY session id returned by the spawn call.
+ * - `exitCode` — the child's exit code, or `null` when it wasn't knowable
+ *   (child not reapable within ~250ms, or reader stopped while child lived).
+ *
+ * MIGRATION NOTE (wave-1C → wave-2B): the backend currently emits `pty-exit`
+ * TWICE per exit — first a legacy bare `number` (the session id, consumed by
+ * TerminalRuntime's existing listener), then this structured object. New
+ * listeners must filter with `typeof e.payload === "object"`. Once
+ * TerminalRuntime adopts this shape, the legacy emit gets deleted in pty.rs.
+ */
+export interface PtyExitEvent {
+  id: number;
+  exitCode: number | null;
+}
+
+/**
+ * Writes input to a session's PTY stdin. Rejects with
+ * `"pty session <id> is dead or unknown"` when the session has exited or never
+ * existed — surface this instead of swallowing it (the old silent black hole).
+ */
 export async function ptyWrite(id: number, data: string): Promise<void> {
   return invoke("pty_write", { id, data });
+}
+
+/**
+ * Bracketed-paste write: the backend wraps `text` in ESC[200~ … ESC[201~ so
+ * multiline content lands as ONE atomic paste — use this instead of the
+ * 40/150/600ms chunked ptyWrite timer hacks when pasting.
+ *
+ * Mode tracking (DECSET 2004) isn't possible on the Rust side of the PTY; in
+ * practice it's safe everywhere we spawn: tmux-backed panes parse the markers
+ * themselves (re-bracketing only if the inner app opted in), and zsh/bash/fish
+ * enable bracketed paste by default on raw shell panes.
+ *
+ * Rejects like ptyWrite when the session is dead/unknown.
+ */
+export async function ptyPaste(id: number, text: string): Promise<void> {
+  return invoke("pty_paste", { id, text });
 }
 
 /** Propagates a resize to a session's PTY. */
@@ -126,4 +192,31 @@ export async function ptyResize(id: number, cols: number, rows: number): Promise
 /** Kills a session (for an oracle pane, only detaches the tmux client). */
 export async function ptyKill(id: number): Promise<void> {
   return invoke("pty_kill", { id });
+}
+
+/**
+ * Startup GC (B2): kills orphaned `aios-term-*` tmux sessions that have NO live
+ * restored pane. `keep` is the list of `termSessionName` suffixes for the panes
+ * currently in the layout; the backend reaps only sessions outside that set.
+ * Returns the full session names that were reaped.
+ */
+export async function reapTerminals(keep: string[]): Promise<string[]> {
+  return invoke<string[]>("pty_reap_terminals", { keep });
+}
+
+/**
+ * Orphan GC (wave-1C): kills `aios-term-*` tmux sessions that are BOTH absent
+ * from `liveKeys` AND currently detached. Safer than reapTerminals — the
+ * attached-client check means a second running app instance's sessions are
+ * never touched, and non-`aios-term-` sessions (oracles, bridge) are never
+ * candidates at all.
+ *
+ * `liveKeys` accepts bare suffixes (each pane's `termSessionName`, e.g.
+ * `k3-abcd`) or full session names (`aios-term-k3-abcd`). Returns the full
+ * names actually killed. Windows / no tmux server → [].
+ *
+ * Boot-time invocation is wave-2 (needs the stable-keys layout).
+ */
+export async function ptyGc(liveKeys: string[]): Promise<string[]> {
+  return invoke<string[]>("pty_gc", { liveKeys });
 }

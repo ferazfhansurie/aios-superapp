@@ -1,19 +1,38 @@
 /** A single file rendered in its own pane — images & PDFs via the asset
  *  protocol, text/code/markdown inline. Spawned from the Files pane's
  *  "open in pane" action so any file can live as a standalone pane. */
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ExternalLink, FileText } from "lucide-react";
 
 import { fileSrc, readFilePreview, type FilePreview } from "../lib/fs";
-import { openFileInPane, openUrlInPane } from "../lib/paneBus";
+import { openFileInPane, openUrlInPane, registerPaneDropSink } from "../lib/paneBus";
 import { isHttpPaneTarget, isPaneFileTarget, resolvePaneFileTarget, targetLabel } from "../lib/paneRouting";
 import { OfficePreview } from "./OfficePreview";
+import { PaneDropZone } from "./PaneDropZone";
+import { reportDiag } from "../lib/diag";
 
-export function FileViewerPane({ path }: { path: string }) {
+export function FileViewerPane({ path, paneKey }: { path: string; paneKey?: string }) {
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // Drop a file → open it (deterministic, via paneForFile). Same rationale as
+  // EditorPane: open rather than hot-swap the prop.
+  const onDropFile = useCallback((raw: string) => {
+    const s = raw.trim();
+    if (!s || /^https?:\/\//i.test(s)) return;
+    openFileInPane(s, s.split("/").pop() ?? s);
+  }, []);
+  useEffect(() => {
+    if (!paneKey) return;
+    return registerPaneDropSink(paneKey, (paths) => {
+      const first = paths.find((p) => p && p.trim() && !/^https?:\/\//i.test(p));
+      if (!first) return false;
+      onDropFile(first);
+      return true;
+    });
+  }, [paneKey, onDropFile]);
 
   useEffect(() => {
     let alive = true;
@@ -28,13 +47,14 @@ export function FileViewerPane({ path }: { path: string }) {
   }, [path]);
 
   return (
+    <PaneDropZone onPath={onDropFile} label="drop file to open">
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-pane)]">
       <div className="flex h-8 shrink-0 items-center justify-between border-b border-[var(--color-border)] px-3">
         <span className="truncate font-mono text-[11px] text-[var(--color-text-2)]">
           {preview?.name ?? path.split("/").pop()}
         </span>
         <button
-          onClick={() => openPath(path).catch(() => {})}
+          onClick={() => openPath(path).catch((e) => reportDiag("fileviewer.open", e, { action: "openPath" }))}
           className="rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-panel-2)] hover:text-[var(--color-text)]"
           title="Open externally"
         >
@@ -73,7 +93,7 @@ export function FileViewerPane({ path }: { path: string }) {
             <FileText size={28} />
             <span className="text-[12px]">binary file{preview ? ` · ${(preview.size / 1024).toFixed(0)} KB` : ""}</span>
             <button
-              onClick={() => openPath(path).catch(() => {})}
+              onClick={() => openPath(path).catch((e) => reportDiag("fileviewer.open", e, { action: "openPath" }))}
               className="rounded-md border border-[var(--color-border)] px-3 py-1 text-[11px] hover:border-[var(--color-accent)]/50"
             >
               open externally
@@ -82,11 +102,12 @@ export function FileViewerPane({ path }: { path: string }) {
         )}
       </div>
     </div>
+    </PaneDropZone>
   );
 }
 
 function isMarkdown(path: string): boolean {
-  return /\.(md|markdown)$/i.test(path);
+  return /\.(md|markdown|mdx|mds)$/i.test(path);
 }
 
 function MarkdownDoc({ text, path, truncated }: { text: string; path: string; truncated: boolean }) {

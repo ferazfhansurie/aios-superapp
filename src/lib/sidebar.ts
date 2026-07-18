@@ -7,7 +7,7 @@
 import { SPAWN } from "./apps.ts";
 
 const STORAGE_KEY = "aios.sidebar";
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 6;
 
 /** A space = a named, collapsible section of the rail. The three built-ins
  *  (sessions / tools / pinned) are `system` — they can be renamed + collapsed +
@@ -70,7 +70,7 @@ export function seedDefault(): SidebarState {
     spaces: defaultSpaces(),
     items: SPAWN.map((a) => ({
       id: `app:${a.id}`,
-      label: a.id === "chat" ? "new chat" : a.label,
+      label: a.id === "chat" ? "gui" : a.label,
       iconName: a.id, // resolved back to the lucide icon via SPAWN_BY_ID at render
       kind: { type: "app", appId: a.id } as SidebarItemKind,
       group: a.group as SidebarGroup,
@@ -144,7 +144,7 @@ export function loadSidebar(): SidebarState {
       it.group === "sessions" ? { ...it, group: "tools" } : it,
     );
     const knownSpaces = new Set(spaces.map((s) => s.id));
-    const fixed = remapped.map((it) =>
+    let fixed = remapped.map((it) =>
       knownSpaces.has(it.group) ? it : { ...it, group: "pinned" },
     );
     cache = { version: SCHEMA_VERSION, spaces, items: fixed };

@@ -1,6 +1,9 @@
 /** VS Code-ish file icons: a lucide glyph + a per-language colour keyed by
  *  extension. Keeps the Files tree readable at a glance like the VS Code
- *  explorer. Colours are approximations of the seti-ui palette. */
+ *  explorer. Colours are approximations of the seti-ui palette.
+ *
+ *  Which glyph a file gets is decided by the canonical classifier in
+ *  fileKinds.ts — this module only owns the colour palette + glyph mapping. */
 import {
   File,
   FileCode,
@@ -9,6 +12,8 @@ import {
   Image as ImageIcon,
 } from "lucide-react";
 import type { ComponentType } from "react";
+
+import { extOf, kindForPath, type FileKind } from "./fileKinds";
 
 interface IconProps {
   size?: number;
@@ -38,26 +43,24 @@ const COLOR: Record<string, string> = {
   lock: "#8a8a96",
 };
 
-const CODE_EXT = new Set([
-  "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "dart", "rs", "py", "go",
-  "rb", "php", "java", "kt", "swift", "c", "h", "cpp", "cc", "hpp", "cs", "css",
-  "scss", "less", "html", "htm", "vue", "svelte", "lua", "sql", "sh", "bash",
-  "zsh", "json", "jsonc", "yaml", "yml", "toml", "xml", "ini",
-]);
-const TEXT_EXT = new Set(["md", "markdown", "txt", "rst", "log", "env"]);
-const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "avif"]);
-const DOC_EXT = new Set(["pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "key"]);
+const GLYPH: Record<FileKind, ComponentType<IconProps>> = {
+  image: ImageIcon,
+  pdf: FileType,
+  doc: FileType,
+  code: FileCode,
+  text: FileText,
+  video: File,
+  audio: File,
+  archive: File,
+  font: File,
+  binary: File,
+};
 
 /** Returns the icon component + colour for a filename. */
 export function fileIcon(name: string): {
   Icon: ComponentType<IconProps>;
   color: string;
 } {
-  const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
-  const color = COLOR[ext] ?? "var(--color-muted)";
-  if (IMG_EXT.has(ext)) return { Icon: ImageIcon, color };
-  if (DOC_EXT.has(ext)) return { Icon: FileType, color };
-  if (CODE_EXT.has(ext)) return { Icon: FileCode, color };
-  if (TEXT_EXT.has(ext)) return { Icon: FileText, color };
-  return { Icon: File, color };
+  const color = COLOR[extOf(name)] ?? "var(--color-muted)";
+  return { Icon: GLYPH[kindForPath(name)], color };
 }

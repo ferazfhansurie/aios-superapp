@@ -15,11 +15,7 @@ pub struct DirEntry {
 /// Lists a directory (dirs first, alphabetical, dotfiles hidden). Empty path → $HOME.
 #[tauri::command]
 pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
-    let p = if path.is_empty() {
-        std::env::var("HOME").unwrap_or_else(|_| "/".into())
-    } else {
-        path
-    };
+    let p = if path.is_empty() { home_dir() } else { path };
     let mut entries: Vec<DirEntry> = Vec::new();
     for e in std::fs::read_dir(&p).map_err(|e| e.to_string())? {
         let e = match e {
@@ -52,16 +48,24 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
-/// Like `read_dir` but for the VS Code-style explorer tree: shows dotfiles
-/// (`.claude`, `.vercel`, …) the way VS Code does, hiding only `.git` and
-/// `.DS_Store`. Same sort (dirs first, alphabetical).
+/// Like `read_dir` but for the VS Code-style explorer tree. Two filter knobs:
+///  - `show_hidden` (default false): when false, dotfiles (`.env`, `.claude`, …)
+///    are hidden like VS Code's default; when true they show. `.git`/`.DS_Store`
+///    are ALWAYS hidden (pure noise).
+///  - `show_all` (default false): when false, heavy build/dep dirs (node_modules,
+///    target, dist, .next, …) are pruned the same way the search backend prunes
+///    them (`is_search_pruned_dir`); when true they show.
+/// Same sort (dirs first, alphabetical). Params are `Option` so old callers that
+/// pass neither get the VS Code-ish default (hidden dotfiles, pruned junk).
 #[tauri::command]
-pub fn read_dir_tree(path: String) -> Result<Vec<DirEntry>, String> {
-    let p = if path.is_empty() {
-        std::env::var("HOME").unwrap_or_else(|_| "/".into())
-    } else {
-        path
-    };
+pub fn read_dir_tree(
+    path: String,
+    show_hidden: Option<bool>,
+    show_all: Option<bool>,
+) -> Result<Vec<DirEntry>, String> {
+    let show_hidden = show_hidden.unwrap_or(false);
+    let show_all = show_all.unwrap_or(false);
+    let p = if path.is_empty() { home_dir() } else { path };
     let mut entries: Vec<DirEntry> = Vec::new();
     for e in std::fs::read_dir(&p).map_err(|e| e.to_string())? {
         let e = match e {
@@ -69,7 +73,17 @@ pub fn read_dir_tree(path: String) -> Result<Vec<DirEntry>, String> {
             Err(_) => continue,
         };
         let name = e.file_name().to_string_lossy().to_string();
+        // Always-noise: never surface these.
         if name == ".git" || name == ".DS_Store" {
+            continue;
+        }
+        // Dotfiles hidden by default (VS Code-style); shown only with show_hidden.
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        // Heavy build/dep dirs pruned by default; shown only with show_all. Same
+        // set the file finder / content search prunes, so the tree matches ⌘P.
+        if !show_all && is_search_pruned_dir(&name) {
             continue;
         }
         let meta = e.metadata().ok();
@@ -110,6 +124,30 @@ pub struct GitStatus {
 }
 
 #[derive(Serialize)]
+pub struct GitBranch {
+    name: String,
+    current: bool,
+    remote: bool,
+}
+
+#[derive(Serialize)]
+pub struct GitGraphLine {
+    text: String,
+}
+
+#[derive(Serialize)]
+pub struct GitSnapshot {
+    /// Repo toplevel, or null if `path` isn't inside a git repo.
+    root: Option<String>,
+    current: String,
+    branches: Vec<GitBranch>,
+    entries: Vec<GitEntry>,
+    ahead: u32,
+    behind: u32,
+    graph: Vec<GitGraphLine>,
+}
+
+#[derive(Serialize)]
 pub struct ShellSourceStatus {
     root: Option<String>,
     branch: String,
@@ -122,40 +160,113 @@ pub struct ShellSourceStatus {
 /// `{ root: null, entries: [] }` (never errors) when not in a repo.
 #[tauri::command]
 pub fn git_status(path: String) -> Result<GitStatus, String> {
-    let root = match std::process::Command::new("git")
-        .args(["-C", &path, "rev-parse", "--show-toplevel"])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
+    let root = match git_root_for_path(&path) {
+        Some(root) => root,
+        None => {
+            return Ok(GitStatus {
+                root: None,
+                entries: Vec::new(),
+            })
         }
-        _ => return Ok(GitStatus { root: None, entries: Vec::new() }),
     };
+    let entries = git_status_entries(&root)?;
+    Ok(GitStatus {
+        root: Some(root),
+        entries,
+    })
+}
+
+#[tauri::command]
+pub fn git_snapshot(path: String) -> Result<GitSnapshot, String> {
+    let Some(root) = git_root_for_path(&path) else {
+        return Ok(GitSnapshot {
+            root: None,
+            current: String::new(),
+            branches: Vec::new(),
+            entries: Vec::new(),
+            ahead: 0,
+            behind: 0,
+            graph: Vec::new(),
+        });
+    };
+
+    let current = git_stdout(&root, &["branch", "--show-current"])
+        .or_else(|| git_stdout(&root, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_default();
+    let entries = git_status_entries(&root)?;
+    let branches = git_branches(&root, &current);
+    let (ahead, behind) = git_ahead_behind(&root);
+    let graph = git_stdout(
+        &root,
+        &[
+            "log",
+            "--graph",
+            "--decorate",
+            "--oneline",
+            "--all",
+            "-n",
+            "28",
+            "--date-order",
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .map(|line| GitGraphLine {
+        text: line.to_string(),
+    })
+    .collect();
+
+    Ok(GitSnapshot {
+        root: Some(root),
+        current,
+        branches,
+        entries,
+        ahead,
+        behind,
+        graph,
+    })
+}
+
+#[tauri::command]
+pub fn git_checkout(path: String, branch: String) -> Result<GitSnapshot, String> {
+    let root = git_root_for_path(&path).ok_or_else(|| "not inside a git repository".to_string())?;
+    let branch = validate_git_ref_arg(&branch)?;
     let out = std::process::Command::new("git")
-        .args(["-C", &root, "status", "--porcelain", "--ignored=no"])
+        .args(["-C", &root, "checkout", &branch])
         .output()
         .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        let xy = &line[..2];
-        let mut rest = line[3..].to_string();
-        // renames come as "old -> new" — decorate the new path
-        if let Some(idx) = rest.find(" -> ") {
-            rest = rest[idx + 4..].to_string();
-        }
-        let rel = rest.trim().trim_matches('"');
-        let abs = std::path::Path::new(&root)
-            .join(rel)
-            .to_string_lossy()
-            .to_string();
-        let status = simplify_status(xy).to_string();
-        entries.push(GitEntry { path: abs, status });
+    if !out.status.success() {
+        return Err(command_error("git checkout", &out));
     }
-    Ok(GitStatus { root: Some(root), entries })
+    git_snapshot(root)
+}
+
+#[tauri::command]
+pub fn git_commit(path: String, message: String) -> Result<GitSnapshot, String> {
+    let root = git_root_for_path(&path).ok_or_else(|| "not inside a git repository".to_string())?;
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("commit message is required".to_string());
+    }
+
+    let add = std::process::Command::new("git")
+        .args(["-C", &root, "add", "-A"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !add.status.success() {
+        return Err(command_error("git add", &add));
+    }
+
+    let commit = std::process::Command::new("git")
+        .args(["-C", &root, "commit", "-m", message])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !commit.status.success() {
+        return Err(command_error("git commit", &commit));
+    }
+
+    git_snapshot(root)
 }
 
 #[tauri::command]
@@ -239,6 +350,157 @@ fn simplify_status(xy: &str) -> &'static str {
     }
 }
 
+fn git_root_for_path(path: &str) -> Option<String> {
+    let start = if path.trim().is_empty() {
+        home_dir()
+    } else {
+        path.to_string()
+    };
+    let mut dir = std::path::PathBuf::from(&start);
+    if dir.is_file() {
+        dir.pop();
+    }
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    let dir_s = dir.to_string_lossy().to_string();
+    let out = std::process::Command::new("git")
+        .args(["-C", &dir_s, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_stdout(root: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_status_entries(root: &str) -> Result<Vec<GitEntry>, String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", root, "status", "--porcelain", "--ignored=no"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(command_error("git status", &out));
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let xy = &line[..2];
+        let mut rest = line[3..].to_string();
+        // renames come as "old -> new" — decorate the new path.
+        if let Some(idx) = rest.find(" -> ") {
+            rest = rest[idx + 4..].to_string();
+        }
+        let rel = rest.trim().trim_matches('"');
+        let abs = std::path::Path::new(root)
+            .join(rel)
+            .to_string_lossy()
+            .to_string();
+        let status = simplify_status(xy).to_string();
+        entries.push(GitEntry { path: abs, status });
+    }
+    Ok(entries)
+}
+
+fn git_branches(root: &str, current: &str) -> Vec<GitBranch> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if let Some(local) = git_stdout(root, &["branch", "--format=%(refname:short)"]) {
+        for name in local.lines().map(str::trim).filter(|name| !name.is_empty()) {
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
+            out.push(GitBranch {
+                name: name.to_string(),
+                current: name == current,
+                remote: false,
+            });
+        }
+    }
+
+    if let Some(remote) = git_stdout(root, &["branch", "-r", "--format=%(refname:short)"]) {
+        for name in remote
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if name.ends_with("/HEAD") || name.contains(" -> ") {
+                continue;
+            }
+            if !seen.insert(name.to_string()) {
+                continue;
+            }
+            out.push(GitBranch {
+                name: name.to_string(),
+                current: false,
+                remote: true,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.current
+            .cmp(&a.current)
+            .then(a.remote.cmp(&b.remote))
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    out
+}
+
+fn git_ahead_behind(root: &str) -> (u32, u32) {
+    let Some(text) = git_stdout(
+        root,
+        &["rev-list", "--count", "--left-right", "@{upstream}...HEAD"],
+    ) else {
+        return (0, 0);
+    };
+    let mut parts = text.split_whitespace();
+    let behind = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ahead = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (ahead, behind)
+}
+
+fn validate_git_ref_arg(branch: &str) -> Result<String, String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("branch is required".to_string());
+    }
+    if branch.starts_with('-') || branch.chars().any(|c| c.is_control()) {
+        return Err("invalid branch name".to_string());
+    }
+    Ok(branch.to_string())
+}
+
+fn command_error(label: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        format!("{label}: {stderr}")
+    } else if !stdout.is_empty() {
+        format!("{label}: {stdout}")
+    } else {
+        format!("{label} failed")
+    }
+}
+
 #[derive(Serialize)]
 pub struct RepoPulse {
     /// The input path, echoed back so the frontend can map results.
@@ -274,9 +536,7 @@ pub fn git_pulse(paths: Vec<String>) -> Vec<RepoPulse> {
             .args(["-C", &path, "rev-parse", "--abbrev-ref", "HEAD"])
             .output()
         {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
-            }
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => String::new(),
         };
 
@@ -356,9 +616,18 @@ fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
         return Some((
             "flutter".into(),
             vec![
-                RunCommand { label: "flutter run".into(), cmd: "flutter run".into() },
-                RunCommand { label: "flutter run --release".into(), cmd: "flutter run --release".into() },
-                RunCommand { label: "flutter test".into(), cmd: "flutter test".into() },
+                RunCommand {
+                    label: "flutter run".into(),
+                    cmd: "flutter run".into(),
+                },
+                RunCommand {
+                    label: "flutter run --release".into(),
+                    cmd: "flutter run --release".into(),
+                },
+                RunCommand {
+                    label: "flutter test".into(),
+                    cmd: "flutter test".into(),
+                },
             ],
         ));
     }
@@ -369,9 +638,18 @@ fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
         return Some((
             "rust".into(),
             vec![
-                RunCommand { label: "cargo run".into(), cmd: "cargo run".into() },
-                RunCommand { label: "cargo test".into(), cmd: "cargo test".into() },
-                RunCommand { label: "cargo build".into(), cmd: "cargo build".into() },
+                RunCommand {
+                    label: "cargo run".into(),
+                    cmd: "cargo run".into(),
+                },
+                RunCommand {
+                    label: "cargo test".into(),
+                    cmd: "cargo test".into(),
+                },
+                RunCommand {
+                    label: "cargo build".into(),
+                    cmd: "cargo build".into(),
+                },
             ],
         ));
     }
@@ -379,8 +657,14 @@ fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
         return Some((
             "go".into(),
             vec![
-                RunCommand { label: "go run .".into(), cmd: "go run .".into() },
-                RunCommand { label: "go test ./...".into(), cmd: "go test ./...".into() },
+                RunCommand {
+                    label: "go run .".into(),
+                    cmd: "go run .".into(),
+                },
+                RunCommand {
+                    label: "go test ./...".into(),
+                    cmd: "go test ./...".into(),
+                },
             ],
         ));
     }
@@ -392,13 +676,19 @@ fn project_at(dir: &std::path::Path) -> Option<(String, Vec<RunCommand>)> {
         };
         return Some((
             "python".into(),
-            vec![RunCommand { label: cmd.into(), cmd: cmd.into() }],
+            vec![RunCommand {
+                label: cmd.into(),
+                cmd: cmd.into(),
+            }],
         ));
     }
     if has("Makefile") {
         return Some((
             "make".into(),
-            vec![RunCommand { label: "make".into(), cmd: "make".into() }],
+            vec![RunCommand {
+                label: "make".into(),
+                cmd: "make".into(),
+            }],
         ));
     }
     None
@@ -428,7 +718,11 @@ pub fn detect_project(path: String) -> ProjectRun {
             None => break,
         }
     }
-    ProjectRun { kind: "unknown".into(), root: None, commands: Vec::new() }
+    ProjectRun {
+        kind: "unknown".into(),
+        root: None,
+        commands: Vec::new(),
+    }
 }
 
 #[derive(Serialize)]
@@ -553,12 +847,22 @@ fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
     let mut out = Vec::new();
     if let Ok(text) = std::fs::read_to_string(dir.join("package.json")) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let is_react_native = json
+                .get("dependencies")
+                .and_then(|d| d.as_object())
+                .is_some_and(|d| d.contains_key("react-native"));
             if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
                 let mut names: Vec<&String> = scripts.keys().collect();
                 // priority order first, then the rest alphabetically
-                let prio = ["dev", "start", "serve", "build", "test"];
+                let prio: &[&str] = if is_react_native {
+                    &["android", "ios", "start", "test", "lint"]
+                } else {
+                    &["dev", "start", "serve", "build", "test"]
+                };
                 names.sort_by_key(|n| {
-                    prio.iter().position(|p| *p == n.as_str()).unwrap_or(prio.len() + 1)
+                    prio.iter()
+                        .position(|p| *p == n.as_str())
+                        .unwrap_or(prio.len() + 1)
                 });
                 for name in names {
                     let run = if pm == "npm" {
@@ -566,7 +870,10 @@ fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
                     } else {
                         format!("{pm} {name}")
                     };
-                    out.push(RunCommand { label: run.clone(), cmd: run });
+                    out.push(RunCommand {
+                        label: run.clone(),
+                        cmd: run,
+                    });
                 }
             }
         }
@@ -580,10 +887,29 @@ fn node_scripts(dir: &std::path::Path) -> Vec<RunCommand> {
     out
 }
 
-/// Returns the user's home directory.
+/// Returns the user's home directory (HOME, then USERPROFILE on Windows).
 #[tauri::command]
 pub fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "C:\\".into()
+            } else {
+                "/".into()
+            }
+        })
+}
+
+/// Builds a `file://` URL from an absolute path, cross-platform. On Windows
+/// `C:\Users\…` → `file:///C:/Users/…`; on unix `/tmp/…` → `file:///tmp/…`.
+fn url_from_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
+    }
 }
 
 /// Cap on editable text files: 8 MB. Larger files are refused (the editor isn't
@@ -605,11 +931,61 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "not a UTF-8 text file".to_string())
 }
 
+/// File modification time in unix MILLISECONDS (0 if unavailable). Higher
+/// precision than the seconds used in directory listings, so the editor's
+/// save-conflict guard can tell two saves a fraction of a second apart apart.
+fn file_mtime_ms(path: &std::path::Path) -> f64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// Pure conflict predicate for the editor save guard. `expected` is the mtime
+/// (ms) the editor captured at load; `current` is the on-disk mtime now.
+/// Tolerates sub-millisecond float jitter (a real external write moves the
+/// mtime by far more than 1ms). A zero on either side means "stat unavailable"
+/// — we fail open (no conflict) rather than block saves on filesystems without
+/// mtime support.
+fn mtime_conflicts(expected: f64, current: f64) -> bool {
+    expected > 0.0 && current > 0.0 && (current - expected).abs() > 1.0
+}
+
+/// Returns a file's last-modified time in unix milliseconds (0 if missing /
+/// unavailable). The editor pane captures this on load so it can detect a
+/// conflicting on-disk change before overwriting (AI + human editing the same
+/// file). Cheap stat — safe to call on every open/save.
+#[tauri::command]
+pub fn file_mtime(path: String) -> f64 {
+    file_mtime_ms(std::path::Path::new(&path))
+}
+
 /// Writes UTF-8 contents back to a file (editor save). Writes to a temp file in
 /// the same dir then renames, so a crash mid-write can't truncate the original.
+///
+/// SAVE-CONFLICT GUARD: when `expected_mtime` is provided (the mtime the editor
+/// captured when it loaded the file), the on-disk mtime is re-checked just
+/// before the rename. If it changed, the file was modified by someone else (a
+/// human, or the AI) since load — we abort with a `conflict:<current_mtime>`
+/// error rather than silently clobbering their work. The frontend parses the
+/// `conflict:` prefix to show a reload/overwrite prompt. A bare overwrite (no
+/// guard) is still possible by passing `expected_mtime = None`.
 #[tauri::command]
-pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+pub fn write_text_file(
+    path: String,
+    content: String,
+    expected_mtime: Option<f64>,
+) -> Result<f64, String> {
     let p = std::path::Path::new(&path);
+    // Conflict check (pure predicate in `mtime_conflicts` — unit-tested).
+    if let Some(expected) = expected_mtime {
+        let current = file_mtime_ms(p);
+        if mtime_conflicts(expected, current) {
+            return Err(format!("conflict:{current}"));
+        }
+    }
     let dir = p.parent().ok_or_else(|| "invalid path".to_string())?;
     let tmp = dir.join(format!(
         ".{}.aios-tmp",
@@ -617,7 +993,9 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     ));
     std::fs::write(&tmp, content.as_bytes()).map_err(|e| format!("{e}"))?;
     std::fs::rename(&tmp, p).map_err(|e| format!("{e}"))?;
-    Ok(())
+    // Hand the new mtime back so the editor re-bases its conflict guard without a
+    // second stat round-trip.
+    Ok(file_mtime_ms(p))
 }
 
 /// Delete a single file (used by the notes pane — full CRUD). Refuses to touch
@@ -664,9 +1042,10 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
         .unwrap_or_default();
 
     // Images — frontend renders via the asset protocol, no inline payload.
+    // KEEP IN SYNC with src/lib/fileKinds.ts IMG_EXT
     if matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico"
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif"
     ) {
         return Ok(json!({
             "kind": "image",
@@ -717,6 +1096,7 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
 
     // Quick media detection: route common video formats directly into the in-pane
     // player instead of generic binary rendering.
+    // KEEP IN SYNC with src/lib/fileKinds.ts VIDEO_EXT
     if matches!(ext.as_str(), "mp4" | "mov" | "webm" | "m4v" | "avi" | "mkv") {
         return Ok(json!({
             "kind": "video",
@@ -728,16 +1108,82 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
     }
 
     // Known text/code extensions, OR anything that decodes cleanly as UTF-8.
+    // KEEP IN SYNC with src/lib/fileKinds.ts CODE_EXT ∪ TEXT_EXT
     let texty = matches!(
         ext.as_str(),
-        "txt" | "md" | "markdown" | "json" | "jsonl" | "csv" | "tsv" | "yaml" | "yml"
-            | "toml" | "log" | "ini" | "cfg" | "conf" | "env" | "xml" | "html" | "htm"
-            | "css" | "scss" | "less" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
-            | "rs" | "py" | "rb" | "go" | "java" | "kt" | "kts" | "swift" | "c" | "h"
-            | "cpp" | "cc" | "hpp" | "cs" | "php" | "sh" | "bash" | "zsh" | "fish"
-            | "sql" | "dart" | "lua" | "pl" | "r" | "scala" | "clj" | "ex" | "exs"
-            | "elm" | "vue" | "svelte" | "graphql" | "gql" | "proto" | "dockerfile"
-            | "makefile" | "gradle" | "properties" | "diff" | "patch" | "lock" | "gitignore"
+        "txt"
+            | "md"
+            | "markdown"
+            | "json"
+            | "jsonc"
+            | "jsonl"
+            | "csv"
+            | "tsv"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "log"
+            | "rst"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "env"
+            | "xml"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "less"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "mjs"
+            | "cjs"
+            | "mts"
+            | "cts"
+            | "rs"
+            | "py"
+            | "rb"
+            | "go"
+            | "java"
+            | "kt"
+            | "kts"
+            | "swift"
+            | "c"
+            | "h"
+            | "cpp"
+            | "cc"
+            | "hpp"
+            | "cs"
+            | "php"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "sql"
+            | "dart"
+            | "lua"
+            | "pl"
+            | "r"
+            | "scala"
+            | "clj"
+            | "ex"
+            | "exs"
+            | "elm"
+            | "vue"
+            | "svelte"
+            | "graphql"
+            | "gql"
+            | "proto"
+            | "dockerfile"
+            | "makefile"
+            | "gradle"
+            | "properties"
+            | "diff"
+            | "patch"
+            | "lock"
+            | "gitignore"
     );
 
     match std::str::from_utf8(&bytes) {
@@ -767,31 +1213,69 @@ pub fn read_file_preview(path: String) -> Result<serde_json::Value, String> {
 }
 
 /// Office / document formats LibreOffice can render to PDF.
+/// KEEP IN SYNC with src/lib/fileKinds.ts DOC_EXT (subset — iWork
+/// key/numbers/pages route to the viewer but LibreOffice can't convert them).
 fn is_office_ext(ext: &str) -> bool {
     matches!(
         ext,
-        "doc" | "docx" | "docm" | "dot" | "dotx" | "rtf" | "odt" | "ott" | "fodt"
-            | "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" | "ots" | "fods"
-            | "ppt" | "pptx" | "pptm" | "pps" | "ppsx" | "odp" | "otp" | "fodp"
+        "doc"
+            | "docx"
+            | "docm"
+            | "dot"
+            | "dotx"
+            | "rtf"
+            | "odt"
+            | "ott"
+            | "fodt"
+            | "xls"
+            | "xlsx"
+            | "xlsm"
+            | "xlsb"
+            | "ods"
+            | "ots"
+            | "fods"
+            | "ppt"
+            | "pptx"
+            | "pptm"
+            | "pps"
+            | "ppsx"
+            | "odp"
+            | "otp"
+            | "fodp"
     )
 }
 
 /// Locates the LibreOffice headless binary across the common install spots.
 fn soffice_bin() -> Option<String> {
-    let candidates = [
-        "/opt/homebrew/bin/soffice",
-        "/usr/local/bin/soffice",
-        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-        "/usr/bin/soffice",
-        "/usr/bin/libreoffice",
-    ];
-    for c in candidates {
-        if std::path::Path::new(c).exists() {
-            return Some(c.to_string());
+    #[cfg(windows)]
+    {
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(pf) = std::env::var(var) {
+                let p = format!(r"{pf}\LibreOffice\program\soffice.exe");
+                if std::path::Path::new(&p).exists() {
+                    return Some(p);
+                }
+            }
         }
+        return Some("soffice.exe".to_string());
     }
-    // Last resort: rely on PATH resolution.
-    Some("soffice".to_string())
+    #[cfg(not(windows))]
+    {
+        let candidates = [
+            "/opt/homebrew/bin/soffice",
+            "/usr/local/bin/soffice",
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            "/usr/bin/soffice",
+            "/usr/bin/libreoffice",
+        ];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                return Some(c.to_string());
+            }
+        }
+        // Last resort: rely on PATH resolution.
+        Some("soffice".to_string())
+    }
 }
 
 /// FNV-1a — small, dependency-free hash for cache-key derivation.
@@ -826,7 +1310,8 @@ pub fn convert_office_to_pdf(path: String) -> Result<String, String> {
         .unwrap_or(0);
     let key = fnv1a(&format!("{}|{}|{}", path, mtime, meta.len()));
 
-    let out_dir = std::path::Path::new("/tmp/aios-office-preview").join(format!("{key:x}"));
+    let preview_root = std::env::temp_dir().join("aios-office-preview");
+    let out_dir = preview_root.join(format!("{key:x}"));
     let stem = src
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -842,9 +1327,9 @@ pub fn convert_office_to_pdf(path: String) -> Result<String, String> {
 
     let bin = soffice_bin().ok_or("LibreOffice (soffice) not found")?;
     // Isolated profile so we don't clash with a running LibreOffice instance.
-    let profile = format!(
-        "-env:UserInstallation=file:///tmp/aios-office-preview/.profile-{key:x}"
-    );
+    // Build the file:// URL from the platform temp dir (valid on Windows too).
+    let profile_url = url_from_path(&preview_root.join(format!(".profile-{key:x}")));
+    let profile = format!("-env:UserInstallation={profile_url}");
 
     let output = std::process::Command::new(&bin)
         .arg("--headless")
@@ -930,12 +1415,424 @@ pub fn save_image_temp(data: String, ext: String) -> Result<String, String> {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect();
-    let safe_ext = if safe_ext.is_empty() { "png".into() } else { safe_ext };
+    let safe_ext = if safe_ext.is_empty() {
+        "png".into()
+    } else {
+        safe_ext
+    };
 
-    let dir = std::path::Path::new("/tmp/aios-paste");
+    let dir = std::env::temp_dir().join("aios-paste");
+    let dir = dir.as_path();
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let key = fnv1a(&format!("{}|{}", bytes.len(), bytes.iter().take(4096).fold(0u64, |a, &b| a.wrapping_add(b as u64))));
+    let key = fnv1a(&format!(
+        "{}|{}",
+        bytes.len(),
+        bytes
+            .iter()
+            .take(4096)
+            .fold(0u64, |a, &b| a.wrapping_add(b as u64))
+    ));
     let path = dir.join(format!("paste-{key:x}.{safe_ext}"));
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
+}
+
+// ── Cmd+P file finder + Cmd+Shift+F content search ──────────────────────────
+
+/// Directory names always skipped by the file finder + content search, on top
+/// of whatever `.gitignore` excludes. These are heavy build/dep/vcs dirs the
+/// `ignore` walker doesn't drop by default (it only knows .git).
+fn is_search_pruned_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".turbo"
+            | ".cache"
+            | ".dart_tool"
+            | "Pods"
+            | "vendor"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+    )
+}
+
+/// Builds an `ignore`-crate walker rooted at `root` that honors `.gitignore`
+/// (and global/parent gitignores) and also prunes our extra junk dirs. Shared
+/// by `find_files` and the search fallback so both respect identical rules.
+fn search_walk_builder(root: &str) -> ignore::WalkBuilder {
+    let mut b = ignore::WalkBuilder::new(root);
+    b.hidden(false) // show dotfiles (.claude, .env) like VS Code; we prune junk explicitly
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .filter_entry(|e| {
+            // Prune our extra heavy dirs by name (applies to directories only).
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = e.file_name().to_str() {
+                    return !is_search_pruned_dir(name);
+                }
+            }
+            // Always drop .DS_Store noise.
+            e.file_name().to_str() != Some(".DS_Store")
+        });
+    b
+}
+
+/// Recursively lists file paths under `root`, RELATIVE to `root`, files only.
+/// Honors `.gitignore` (+ global/parent) and prunes heavy dirs (node_modules,
+/// target, dist, .next, …). Capped at `max` (default 20000) so a giant tree
+/// can't run away — returns whatever was found up to the cap. Powers Cmd+P.
+#[tauri::command]
+pub fn find_files(root: String, max: Option<usize>) -> Result<Vec<String>, String> {
+    let cap = max.unwrap_or(20000);
+    let root_path = std::path::Path::new(&root);
+    if !root_path.is_dir() {
+        return Err("root is not a directory".into());
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for dent in search_walk_builder(&root).build() {
+        if out.len() >= cap {
+            break;
+        }
+        let dent = match dent {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        // Files only (depth 0 is the root dir itself).
+        if dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            let rel = dent.path().strip_prefix(root_path).unwrap_or(dent.path());
+            out.push(rel.to_string_lossy().to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Deterministically resolves a file `reference` (as emitted by an LLM in chat
+/// — a bare name, a relative path, or an absolute/`~` path) against the chat
+/// session's working dir. Returns the canonical absolute path ONLY if it points
+/// at a file that actually exists; `None` otherwise. This is the gold-source
+/// check behind chat's "open in pane" affordance — we never search-by-name and
+/// hope. The resolution order mirrors how a human reads a path the model wrote:
+///   1. absolute (`/…`) or home (`~/…`) — used as-is;
+///   2. exact join against `cwd` (`{cwd}/{ref}`) — the common case;
+///   3. nothing matched → `None` (caller may fall back to a bounded fuzzy find).
+/// Symlinks/`..` are collapsed via `canonicalize`, which also confirms existence.
+#[tauri::command]
+pub fn resolve_in_cwd(cwd: String, reference: String) -> Option<String> {
+    let r = reference.trim();
+    if r.is_empty() {
+        return None;
+    }
+    // strip a trailing :line[:col] suffix (e.g. "src/x.rs:42") the model may add.
+    let r = r
+        .rsplit_once(':')
+        .and_then(|(head, tail)| {
+            if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() {
+                Some(head)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(r);
+
+    let candidate: std::path::PathBuf = if let Some(rest) = r.strip_prefix("~/") {
+        std::path::Path::new(&home_dir()).join(rest)
+    } else if r == "~" {
+        std::path::PathBuf::from(home_dir())
+    } else if r.starts_with('/') {
+        std::path::PathBuf::from(r)
+    } else if cwd.trim().is_empty() {
+        // no cwd to anchor a relative ref against → can't resolve deterministically.
+        return None;
+    } else {
+        std::path::Path::new(&cwd).join(r)
+    };
+
+    let canon = candidate.canonicalize().ok()?;
+    if canon.is_file() {
+        Some(canon.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+/// One content-search match. `path` is relative to the search root, `line`/`col`
+/// are 1-based, `text` is the matching line trimmed + capped at ~300 chars.
+#[derive(Serialize)]
+pub struct SearchHit {
+    path: String,
+    line: u32,
+    col: u32,
+    text: String,
+}
+
+const HIT_TEXT_CAP: usize = 300;
+
+/// Trims a matching line and caps it at `HIT_TEXT_CAP` chars (char-boundary safe).
+fn cap_hit_text(s: &str) -> String {
+    let t = s.trim();
+    if t.chars().count() <= HIT_TEXT_CAP {
+        return t.to_string();
+    }
+    t.chars().take(HIT_TEXT_CAP).collect()
+}
+
+/// Locates a real `rg` (ripgrep) binary on disk. Returns `None` if not found,
+/// in which case the Rust fallback scanner is used. (We avoid bare "rg" /
+/// PATH lookup because the GUI-launched process has a minimal PATH.)
+fn ripgrep_bin() -> Option<String> {
+    let candidates = ["/opt/homebrew/bin/rg", "/usr/local/bin/rg", "/usr/bin/rg"];
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+/// Case-insensitive literal substring search of file CONTENTS under `root`.
+/// Honors the same ignore rules as `find_files`. Returns up to `max` hits
+/// (default 1000). Uses `rg --json` when a ripgrep binary is present (fast +
+/// correct, skips binaries); falls back to a Rust line scanner via the
+/// `ignore` walker otherwise. Powers Cmd+Shift+F.
+#[tauri::command]
+pub fn search_in_files(
+    root: String,
+    query: String,
+    max: Option<usize>,
+) -> Result<Vec<SearchHit>, String> {
+    let cap = max.unwrap_or(1000);
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_path = std::path::Path::new(&root);
+    if !root_path.is_dir() {
+        return Err("root is not a directory".into());
+    }
+
+    if let Some(rg) = ripgrep_bin() {
+        return search_with_rg(&rg, root_path, &query, cap);
+    }
+    search_with_ignore(root_path, &query, cap)
+}
+
+/// Runs `rg --json` for a fixed (literal), case-insensitive substring search and
+/// parses the streaming JSON match objects into `SearchHit`s.
+fn search_with_rg(
+    rg: &str,
+    root: &std::path::Path,
+    query: &str,
+    cap: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let output = std::process::Command::new(rg)
+        .arg("--json")
+        .arg("--fixed-strings") // literal, not regex
+        .arg("--ignore-case")
+        .arg("--max-count")
+        .arg(cap.to_string()) // per-file cap; total bounded below too
+        .arg("--")
+        .arg(query)
+        .arg(".")
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("failed to launch rg: {e}"))?;
+
+    // rg exits 1 when there are no matches — that's not an error for us.
+    if !output.status.success() && output.status.code() != Some(1) {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("rg failed: {}", err.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for line in stdout.lines() {
+        if hits.len() >= cap {
+            break;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("match") {
+            continue;
+        }
+        let data = match v.get("data") {
+            Some(d) => d,
+            None => continue,
+        };
+        let path = data
+            .get("path")
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim_start_matches("./")
+            .to_string();
+        let line_no = data
+            .get("line_number")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0) as u32;
+        let text = data
+            .get("lines")
+            .and_then(|l| l.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        // First submatch column (byte offset → 1-based col, best-effort).
+        let col = data
+            .get("submatches")
+            .and_then(|s| s.as_array())
+            .and_then(|a| a.first())
+            .and_then(|m| m.get("start"))
+            .and_then(|n| n.as_u64())
+            .map(|n| n as u32 + 1)
+            .unwrap_or(1);
+        hits.push(SearchHit {
+            path,
+            line: line_no,
+            col,
+            text: cap_hit_text(text),
+        });
+    }
+    Ok(hits)
+}
+
+/// Pure-Rust fallback: walk via the `ignore` crate and scan each text file line
+/// by line for a case-insensitive literal substring. Skips files that aren't
+/// valid UTF-8 (binary) and large files.
+fn search_with_ignore(
+    root: &std::path::Path,
+    query: &str,
+    cap: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let needle = query.to_lowercase();
+    let mut hits: Vec<SearchHit> = Vec::new();
+
+    for dent in search_walk_builder(&root.to_string_lossy()).build() {
+        if hits.len() >= cap {
+            break;
+        }
+        let dent = match dent {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        // Skip very large files outright (binary or generated blobs).
+        if dent
+            .metadata()
+            .map(|m| m.len() > EDIT_TEXT_CAP)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let bytes = match std::fs::read(dent.path()) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Binary heuristic: a NUL byte → skip.
+        if bytes.contains(&0) {
+            continue;
+        }
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rel = dent
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(dent.path())
+            .to_string_lossy()
+            .to_string();
+        for (i, line) in content.lines().enumerate() {
+            if hits.len() >= cap {
+                break;
+            }
+            let lower = line.to_lowercase();
+            if let Some(byte_idx) = lower.find(&needle) {
+                // byte index in the lowercased line ≈ col for ascii; good enough.
+                let col = line[..byte_idx.min(line.len())].chars().count() as u32 + 1;
+                hits.push(SearchHit {
+                    path: rel.clone(),
+                    line: (i + 1) as u32,
+                    col,
+                    text: cap_hit_text(line),
+                });
+            }
+        }
+    }
+    Ok(hits)
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod save_conflict_tests {
+    use super::{file_mtime_ms, mtime_conflicts, write_text_file};
+
+    #[test]
+    fn exact_match_is_not_a_conflict() {
+        assert!(!mtime_conflicts(1_700_000_000_000.0, 1_700_000_000_000.0));
+    }
+
+    #[test]
+    fn sub_millisecond_jitter_is_tolerated() {
+        assert!(!mtime_conflicts(1_700_000_000_000.0, 1_700_000_000_000.9));
+        assert!(!mtime_conflicts(1_700_000_000_000.9, 1_700_000_000_000.0));
+    }
+
+    #[test]
+    fn real_external_change_conflicts_both_directions() {
+        // newer on disk than expected (the normal clobber case)
+        assert!(mtime_conflicts(1_700_000_000_000.0, 1_700_000_000_500.0));
+        // older on disk (file restored / touched backwards) still counts
+        assert!(mtime_conflicts(1_700_000_000_500.0, 1_700_000_000_000.0));
+    }
+
+    #[test]
+    fn unavailable_stat_fails_open() {
+        // either side 0 = "couldn't stat" — never block the save on that
+        assert!(!mtime_conflicts(0.0, 1_700_000_000_000.0));
+        assert!(!mtime_conflicts(1_700_000_000_000.0, 0.0));
+        assert!(!mtime_conflicts(0.0, 0.0));
+    }
+
+    #[test]
+    fn write_refuses_on_stale_mtime_and_preserves_disk() {
+        let dir = std::env::temp_dir().join(format!("aios-conflict-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("guarded.txt");
+        std::fs::write(&f, "theirs").unwrap();
+        let path = f.to_string_lossy().to_string();
+
+        // an expected mtime far in the past = the file changed since "load"
+        let stale = file_mtime_ms(&f) - 60_000.0;
+        let err = write_text_file(path.clone(), "mine".into(), Some(stale)).unwrap_err();
+        assert!(err.starts_with("conflict:"), "got: {err}");
+        // structured payload = the current on-disk mtime, parseable as f64
+        assert!(err["conflict:".len()..].parse::<f64>().is_ok());
+        // and the on-disk content was NOT clobbered
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "theirs");
+
+        // matching mtime → write succeeds and returns the new mtime
+        let now = file_mtime_ms(&f);
+        let new_mtime = write_text_file(path.clone(), "mine".into(), Some(now)).unwrap();
+        assert!(new_mtime > 0.0);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "mine");
+
+        // no expected_mtime = unguarded force write (keep-mine path)
+        std::fs::write(&f, "theirs again").unwrap();
+        let forced = write_text_file(path, "mine wins".into(), None).unwrap();
+        assert!(forced > 0.0);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "mine wins");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.adletic.aios",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -27,7 +27,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/**", "/tmp/**"]
+        "scope": ["$HOME/**", "/tmp/**", "$TEMP/**", "/private/var/folders/**", "/var/folders/**"]
       }
     }
   },
@@ -42,7 +42,6 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "Apple Development: Firaz Fhansurie (KL78M575FW)",
       "entitlements": "./Entitlements.plist"
     }
   }

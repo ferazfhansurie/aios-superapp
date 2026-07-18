@@ -18,12 +18,22 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["unstable", "protocol-asset"] }
+# Engine-agnostic chat-session core shared with the headless `aios-noded` daemon
+# (cross-machine sync). Holds the wire format + engine adapters so the box and
+# the laptop run one runtime, not two copies. See crates/aios-chat-core.
+aios-chat-core = { path = "crates/aios-chat-core" }
+# `devtools`: keep the WKWebView Web Inspector available in RELEASE builds too
+# (not just debug) — firaz uses this app as his dev browser, so `open_devtools`
+# must compile in the shipped binary, hence the explicit feature (the API is
+# otherwise gated behind `debug_assertions`).
+tauri = { version = "2", features = ["unstable", "protocol-asset", "devtools"] }
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 walkdir = "2"
+ignore = "0.4"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 portable-pty = "0.8"
 parking_lot = "0.12"
@@ -37,11 +47,53 @@ sqlx = { version = "0.8", default-features = false, features = [
   "bigdecimal",
   "uuid",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+# ── CDP "real Chrome as a pane" spike (cdp.rs) ────────────────────────────────
+# WS client for the Chrome DevTools Protocol (Page.startScreencast frames +
+# Input.* forwarding). Plain ws:// to 127.0.0.1 only — no TLS features needed.
+# The /json/version discovery GET is hand-rolled over tokio::net::TcpStream so
+# we don't pull a whole HTTP client (reqwest) for one localhost request.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+# Read-only reader for Codex's shared thread catalog (~/.codex/state_5.sqlite).
+# `bundled` compiles our own libsqlite3 (no system-lib dependency). We ONLY ever
+# open Codex's live db in immutable/read-only URI mode — never lock or mutate it,
+# since Codex Desktop may hold it open. No other sqlite dep existed in the tree.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # macOS-only: flip the WKWebView element-fullscreen preference (off by default)
 # so YouTube/video fullscreen works inside browser panes. Pinned to the same
 # objc2-web-kit version tauri 2.11 uses so the WKWebView types unify.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKWebViewConfiguration", "WKPreferences"] }
+block2 = "0.6"
+objc2 = "0.6"
+# `NSKeyValueObserving` + `WKNavigation`/`WKNavigationDelegate`: the browser
+# nav-state observer (browser.rs `nav_state` module) KVO-watches each child
+# WKWebView and proxies its navigation delegate for didFail* load errors.
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDate", "NSSet", "NSArray", "NSError", "NSHTTPCookie", "NSDictionary", "NSURL", "NSKeyValueObserving"] }
+objc2-web-kit = { version = "0.3", features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKFindConfiguration", "WKFindResult", "WKWebsiteDataStore", "WKWebsiteDataRecord", "WKHTTPCookieStore", "WKNavigation", "WKNavigationDelegate", "objc2-app-kit", "block2"] }
 
+# ── ScreenCaptureKit "native app as a pane" spike (appcast.rs) ───────────────
+# Live-mirror a single foreign macOS window into an AIOS pane: SCK captures the
+# window's backing store as GPU-resident IOSurface frames, which we assign to a
+# CALayer-backed NSView child of the main window (zero-copy, frames never touch
+# JS). Lower-level objc2-* bindings (NOT the high-level `screencapturekit`
+# crate) are used so every type unifies with the objc2 0.6 / objc2-* 0.3 stack
+# objc2-web-kit already pins — a divergent objc2 version would make the WKWebView
+# and SCK NSObject worlds incompatible. Requires macOS 12.3+. See SPIKE-screencapturekit.md.
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSColor", "NSEvent"] }
+objc2-screen-capture-kit = { version = "0.3", features = ["SCStream", "SCShareableContent", "SCError", "objc2-core-media", "objc2-core-graphics", "block2", "dispatch2"] }
+objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMTime"] }
+objc2-core-video = { version = "0.3", features = ["CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVBuffer", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3", features = ["IOSurface", "IOSurfaceRef", "objc2"] }
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "objc2-core-foundation"] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+dispatch2 = "0.3"
+# Phase B input forwarding (appcast.rs): synthesize + post CGEvents to the
+# captured app's process. Already in the tree transitively (via web-kit/ICU);
+# pulled in directly so we can enable the `elcapitan` feature (CGEventPostToPid /
+# `post_to_pid`) and `highsierra` (CGEventCreateScrollWheelEvent2 / scroll). The
+# high-level `CGEvent` wrapper is its own foreign_type — we only touch its
+# geometry::CGPoint at the post boundary, everything else stays objc2.
+core-graphics = { version = "0.25", features = ["elcapitan", "highsierra"] }
+core-foundation = "0.10"

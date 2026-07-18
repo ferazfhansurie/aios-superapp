@@ -39,3 +39,31 @@ export function rememberUrl(key: string | undefined, url: string): void {
     /* quota / unavailable — best-effort */
   }
 }
+
+/** Drop the remembered url for a key (pane closed for good → don't restore it). */
+export function forgetUrl(key: string | undefined): void {
+  if (!key) return;
+  try {
+    const mem = read();
+    if (!(key in mem)) return;
+    delete mem[key];
+    localStorage.setItem(KEY, JSON.stringify(mem));
+  } catch {
+    /* best-effort */
+  }
+}
+
+// ── session-restore: per-pane-key last url ───────────────────────────────────
+// Item 4. A GENERIC (un-pinned) browser pane has no stable sidebar id, but its
+// pane KEY *is* persisted in the layout (App.tsx B1) and reused on restore. So a
+// browser pane uses its own pane key as the memKey — this same `aios.browser.
+// lastUrl` map then records its last url, and on restore the pane reads it back
+// to reopen where it left off. recallUrl/rememberUrl above already key by an
+// arbitrary string, so no new store is needed — the pane key just joins the
+// pinned-site ids in the same map. These aliases make the intent explicit at
+// the call sites and let App resolve a restored pane's url before mount.
+
+/** Last url recorded for a browser pane key (session restore). */
+export const recallPaneUrl = recallUrl;
+/** Record a browser pane's current url under its pane key (session restore). */
+export const rememberPaneUrl = rememberUrl;

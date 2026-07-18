@@ -14,6 +14,7 @@ dist-ssr
 
 # Rust / Tauri build artifacts
 src-tauri/target
+**/target/
 
 # Editor directories and files
 .vscode/*
@@ -35,10 +36,25 @@ src-tauri/target/
 # OS / editor cruft
 .DS_Store
 *.dmg
+*.app.zip
+*-smoke.png
 
 # Local env
 .env
 .env.*
 
+# Windows port: local screenshots + secrets (never commit)
+windows-*.png
+*.key
+src-tauri/.motion.key
+
+# playwright e2e harness artifacts (dogfood) — shots land in ~/.aios/state/dogfood/shots
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
 # agent worktrees + local session state
 .claude/
+.superpowers/
+scripts\aios-watch.log

@@ -14,6 +14,7 @@ const STORAGE_KEY = "aios.theme";
 
 const listeners = new Set<(t: Theme) => void>();
 let systemMql: MediaQueryList | null = null;
+let activeAccent: Accent | null = null;
 
 /** Read the stored theme preference. Defaults to "system". */
 export function getTheme(): Theme {
@@ -47,6 +48,8 @@ export function resolveTheme(t: Theme = getTheme()): "light" | "dark" {
 export function applyTheme(t: Theme = getTheme()): void {
   if (typeof document === "undefined") return;
   document.documentElement.dataset.theme = resolveTheme(t);
+  // Inline accents win over CSS theme layers, so refresh after a transition.
+  applyAccent();
 }
 
 /** Persist + apply a theme, then notify subscribers. */
@@ -68,10 +71,10 @@ export function subscribe(fn: (t: Theme) => void): () => void {
 
 /* ── accent ──────────────────────────────────────────────────────────────
  * A small palette of brand-preset accents PLUS arbitrary custom hex colors.
- * orange is the AIOS default (mirrors the App.css --color-accent: #f26522).
+ * orange is the AIOS default (mirrors the App.css --color-accent: #fb6a22).
  *
  * The whole accent family (accent / hover / dim / soft / cursor / selection /
- * fg) is DERIVED programmatically from a single base hex — see
+ * fg / hover-fg) is DERIVED programmatically from a single base hex — see
  * deriveAccentVars(). Presets and custom colors go through the exact same
  * derivation, so a preset and a hand-picked hex of the same value look
  * identical. Presets only carry their base hex; everything else is computed.
@@ -93,7 +96,7 @@ export type Accent = AccentPreset | string;
 
 /** preset id → base hex. order = swatch row order (orange = default, first). */
 export const ACCENT_PRESETS: Record<AccentPreset, string> = {
-  orange: "#f26522",
+  orange: "#fb6a22",
   blue: "#339cff",
   green: "#40c977",
   violet: "#924ff7",
@@ -110,6 +113,9 @@ export const ACCENT_ORDER: AccentPreset[] = [
   "rose",
   "amber",
 ];
+
+/** The default orange is tuned separately for light surfaces at runtime. */
+const LIGHT_DEFAULT_ORANGE = "#e25507";
 
 /* ── color math ───────────────────────────────────────────────────────── */
 
@@ -179,6 +185,8 @@ export interface AccentVars {
   selection: string;
   /** readable text/icon color on top of an accent fill (#000 or #fff). */
   accentFg: string;
+  /** readable text/icon color on top of the accent hover fill. */
+  accentHoverFg: string;
 }
 
 /**
@@ -200,15 +208,18 @@ export function deriveAccentVars(baseHex: string): AccentVars {
 
   // hover: light colors look better slightly darkened; dark colors lifted.
   const hover = rgbToHex(shade(rgb, lum > 0.5 ? -0.12 : 0.18));
+  const hoverLum = luminance(parseHex(hover)!);
   // dim: always a darker, lower-emphasis variant.
   const dim = rgbToHex(shade(rgb, -0.4));
 
   const softAlpha = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.15)`;
   const selAlpha = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.28)`;
 
-  // contrast: WCAG luminance threshold ~0.45 picks black on bright accents
-  // (amber/yellow/lime) and white on the rest.
-  const fg = lum > 0.45 ? "#000000" : "#ffffff";
+  // Contrast: at this WCAG crossover black becomes the clearer choice.
+  // This makes the default #fb6a22 use black while custom accents still
+  // receive the safer black-or-white foreground.
+  const fg = lum >= 0.179 ? "#000000" : "#ffffff";
+  const hoverFg = hoverLum >= 0.179 ? "#000000" : "#ffffff";
 
   return {
     accent: base,
@@ -218,6 +229,7 @@ export function deriveAccentVars(baseHex: string): AccentVars {
     cursor: base,
     selection: selAlpha,
     accentFg: fg,
+    accentHoverFg: hoverFg,
   };
 }
 
@@ -240,6 +252,7 @@ const accentListeners = new Set<(a: Accent) => void>();
 
 /** Read the stored accent. Defaults to "orange" (the App.css default). */
 export function getAccent(): Accent {
+  if (activeAccent) return activeAccent;
   try {
     const v = localStorage.getItem(ACCENT_KEY);
     if (v) {
@@ -289,12 +302,17 @@ function pushRecent(hex: string): void {
 /**
  * Push the accent family onto :root inline styles, overriding the App.css
  * defaults at runtime. Additive — touches only --color-accent* + cursor /
- * selection / accent-fg, never the theme (light/dark) tokens. Accepts a
+ * selection / accent-fg / accent-hover-fg, never theme (light/dark) tokens.
+ * Accepts a
  * preset id OR an arbitrary "#rrggbb" hex (both derive through the same ramp).
  */
 export function applyAccent(a: Accent = getAccent()): void {
   if (typeof document === "undefined") return;
-  const vars = deriveAccentVars(accentToHex(a));
+  const base = a === "orange" && document.documentElement.dataset.theme === "light"
+    ? LIGHT_DEFAULT_ORANGE
+    : accentToHex(a);
+  const vars = deriveAccentVars(base);
+  activeAccent = a;
   const root = document.documentElement.style;
   root.setProperty("--color-accent", vars.accent);
   root.setProperty("--color-accent-hover", vars.accentHover);
@@ -303,6 +321,7 @@ export function applyAccent(a: Accent = getAccent()): void {
   root.setProperty("--color-cursor", vars.cursor);
   root.setProperty("--color-selection", vars.selection);
   root.setProperty("--color-accent-fg", vars.accentFg);
+  root.setProperty("--color-accent-hover-fg", vars.accentHoverFg);
   document.documentElement.dataset.accent = isCustomAccent(a) ? "custom" : a;
 }
 
@@ -337,7 +356,6 @@ export function subscribeAccent(fn: (a: Accent) => void): () => void {
  */
 export function initTheme(): () => void {
   applyTheme();
-  applyAccent();
 
   if (typeof window !== "undefined" && window.matchMedia) {
     systemMql = window.matchMedia("(prefers-color-scheme: dark)");

@@ -12,6 +12,7 @@ export type NotificationNativeMode = "off" | "important" | "all";
 
 export interface AppSettings {
   // general
+  userName: string;
   reopenLastLayout: boolean;
   confirmCloseOraclePane: boolean;
   defaultPaneType: PaneType;
@@ -49,6 +50,28 @@ export interface AppSettings {
   // picked model id (null = provider default).
   chatProvider: string;
   chatModel: string | null;
+  /** Last valid effort per model id. */
+  chatEffortByModel: Record<string, string>;
+  /** One-way defaults migration for newly opened blank chat panes. */
+  chatDefaultsVersion: number;
+
+  // aios router — the virtual "aios" picker entry resolves through this role
+  // architecture (lib/aiosRouter.ts):
+  //   main — GPT model used through Claude Code below 100%, native at the cap
+  //   deep — retained as an explicit/manual Claude role
+  //   bulk — explicit heavy-work directive (kept for manual routing)
+  // paceMargin is retained for settings compatibility but no longer drives
+  // automatic routing. last is only a synchronous pane-boot hint.
+  aiosRouterRoles: { main: string; deep: string; bulk: string };
+  aiosRouterPaceMargin: number;
+  aiosRouterLast: string | null;
+  aiosRouterLastHarness: "claude" | "native";
+
+  // route claude chat turns through the local Headroom compression proxy
+  // (ANTHROPIC_BASE_URL → http://127.0.0.1:8787). Compresses tool outputs / RAG
+  // before they hit the LLM (60-95% fewer tokens); never touches your prompt.
+  // Requires the headroom proxy running (com.firaz.headroom-proxy launchd).
+  headroomCompression: boolean;
 
   // where "send to AI" actions route (notes pane "send", future quick-sends):
   //   "codex-code"  → a terminal pane running `codex`
@@ -72,6 +95,7 @@ export function applyFlashLevel(level: FlashLevel = loadSettings().flashLevel): 
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
+  userName: "",
   reopenLastLayout: true,
   confirmCloseOraclePane: true,
   defaultPaneType: "terminal",
@@ -93,14 +117,27 @@ export const DEFAULT_SETTINGS: AppSettings = {
   graphPhysicsStrength: 50,
 
   chatProvider: "codex-cli",
-  chatModel: null,
+  chatModel: "aios",
+  chatEffortByModel: { "gpt-5.6-terra": "low" },
+  chatDefaultsVersion: 2,
+
+  aiosRouterRoles: {
+    main: "gpt-5.6-sol",
+    deep: "claude-fable-5",
+    bulk: "claude-opus-4-8",
+  },
+  aiosRouterPaceMargin: 15,
+  aiosRouterLast: null,
+  aiosRouterLastHarness: "claude",
+
+  headroomCompression: false,
 
   defaultAi: "codex-code",
 };
 
-/** Read-only display value — the memory vault lives here on this machine. */
+/** Read-only display value — the vault is auto-resolved from your home dir. */
 export const MEMORY_VAULT_PATH =
-  "~/.claude/projects/-Users-firazfhansurie/memory";
+  "~/.claude/projects/<your-home>/memory (auto-resolved)";
 
 type Listener = (s: AppSettings) => void;
 const listeners = new Set<Listener>();
@@ -127,6 +164,24 @@ export function loadSettings(): AppSettings {
       // not keep users stuck on loud topbar modes after reinstall.
       if (parsed.topBarMode === "full" || parsed.topBarMode === "compact") {
         parsed.topBarMode = "hidden";
+      }
+      // Firaz's requested fresh-chat baseline: Terra is the daily driver and
+      // low effort is the fast default. This migrates existing installs once;
+      // a later explicit picker choice still remains the user's preference.
+      if ((parsed.chatDefaultsVersion ?? 0) < 1) {
+        parsed.chatModel = "gpt-5.6-terra";
+        parsed.chatProvider = "codex-cli";
+        parsed.chatEffortByModel = {
+          ...(parsed.chatEffortByModel ?? {}),
+          "gpt-5.6-terra": "low",
+        };
+        parsed.chatDefaultsVersion = 1;
+      }
+      // v2: aios (the usage-pace router) becomes the fresh-chat default. A
+      // later explicit picker choice still overrides, like any default.
+      if ((parsed.chatDefaultsVersion ?? 0) < 2) {
+        parsed.chatModel = "aios";
+        parsed.chatDefaultsVersion = 2;
       }
       cache = { ...DEFAULT_SETTINGS, ...parsed };
     } else {

@@ -5,9 +5,81 @@ import test from "node:test";
 import {
   emptyRunEventState,
   parseRunEventState,
+  projectRun,
   reduceRunEvents,
   serializeRunEventState,
+  taskSnapshotRevision,
 } from "./runEvents.ts";
+
+test("projectRun keeps concurrent actions authoritative and derives lifecycle metadata", () => {
+  const projection = projectRun(
+    [
+      { type: "action.started", id: "read-1", runId: "run-7", parentId: "agent-1", name: "Read", input: { file_path: "src/a.ts" }, at: 100 },
+      { type: "action.started", id: "bash-1", runId: "run-7", name: "Bash", input: { command: "pnpm test" }, at: 110 },
+      { type: "action.completed", id: "read-1", runId: "run-7", output: "ok", at: 145 },
+    ],
+    { phase: "acting", now: 160 },
+  );
+
+  assert.equal(projection.runId, "run-7");
+  assert.deepEqual(projection.activeActionIds, ["bash-1"]);
+  assert.deepEqual(projection.actions.map((action) => ({
+    id: action.id,
+    kind: action.kind,
+    status: action.status,
+    target: action.target,
+    durationMs: action.durationMs,
+    parentId: action.parentId,
+  })), [
+    { id: "read-1", kind: "read", status: "completed", target: "src/a.ts", durationMs: 45, parentId: "agent-1" },
+    { id: "bash-1", kind: "command", status: "running", target: "pnpm test", durationMs: 50, parentId: undefined },
+  ]);
+});
+
+test("projectRun records permission decisions and changed/artifact references", () => {
+  const projection = projectRun(
+    [
+      { type: "permission.requested", id: "approval-1", runId: "run-8", toolName: "Edit", input: { file_path: "src/app.ts" }, at: 10 },
+      { type: "permission.decided", id: "approval-1", runId: "run-8", decision: "allow", at: 12 },
+      { type: "action.started", id: "edit-1", runId: "run-8", name: "Edit", input: { file_path: "src/app.ts" }, at: 13 },
+      { type: "action.completed", id: "edit-1", runId: "run-8", output: "updated", at: 20 },
+    ],
+    { phase: "completed", now: 20, artifacts: [{ path: "dist/report.pdf", name: "report.pdf", kind: "pdf" }] },
+  );
+
+  assert.deepEqual(projection.permissions.map(({ id, status, decision }) => ({ id, status, decision })), [
+    { id: "approval-1", status: "decided", decision: "allow" },
+  ]);
+  assert.deepEqual(projection.references, [
+    { type: "changed", path: "src/app.ts", actionId: "edit-1" },
+    { type: "artifact", path: "dist/report.pdf", label: "report.pdf" },
+  ]);
+});
+
+test("projectRun joins agent parent-child lifecycle to nested actions", () => {
+  const projection = projectRun(
+    [{ type: "action.started", id: "child-tool", parentId: "child", name: "Grep", input: { pattern: "TODO" }, at: 15 }],
+    {
+      phase: "acting",
+      now: 25,
+      agents: [
+        { id: "parent", label: "audit", status: "running", startedAt: 5 },
+        { id: "child", parentId: "parent", label: "search", status: "done", startedAt: 10, endedAt: 20 },
+      ],
+    },
+  );
+
+  assert.deepEqual(projection.agents.map((agent) => ({
+    id: agent.id,
+    parentId: agent.parentId,
+    status: agent.status,
+    durationMs: agent.durationMs,
+    actionIds: agent.actionIds,
+  })), [
+    { id: "parent", parentId: undefined, status: "running", durationMs: 20, actionIds: [] },
+    { id: "child", parentId: "parent", status: "completed", durationMs: 10, actionIds: ["child-tool"] },
+  ]);
+});
 
 test("reduceRunEvents captures thinking and text deltas as structured events", () => {
   let state = emptyRunEventState();
@@ -46,6 +118,40 @@ test("reduceRunEvents captures thinking and text deltas as structured events", (
       { type: "message.delta", text: "done", at: 11 },
     ],
   );
+});
+
+test("reduceRunEvents coalesces contiguous token deltas into one timeline event", () => {
+  let state = emptyRunEventState();
+  for (const text of ["one ", "two ", "three"]) {
+    state = reduceRunEvents(state, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+    });
+  }
+
+  assert.equal(state.events.length, 1);
+  assert.equal(state.events[0].type, "message.delta");
+  assert.equal(state.events[0].text, "one two three");
+});
+
+test("taskSnapshotRevision ignores word-by-word deltas but advances on structural events", () => {
+  let state = emptyRunEventState();
+  state = reduceRunEvents(state, {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: "one" } },
+  });
+  const writingRevision = taskSnapshotRevision(state);
+  state = reduceRunEvents(state, {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: " two" } },
+  });
+  assert.equal(taskSnapshotRevision(state), writingRevision);
+
+  state = reduceRunEvents(state, {
+    type: "assistant",
+    message: { content: [{ type: "tool_use", id: "tool-1", name: "Read", input: {} }] },
+  });
+  assert.notEqual(taskSnapshotRevision(state), writingRevision);
 });
 
 test("reduceRunEvents captures tool lifecycle", () => {
@@ -201,4 +307,22 @@ test("run event state parser rejects malformed storage", () => {
       activeActionId: undefined,
     },
   );
+});
+
+test("reduceRunEvents bounds the in-memory event log over a long session", () => {
+  let state = emptyRunEventState();
+  // feed far more text deltas than the in-memory cap (1000)
+  for (let i = 0; i < 3000; i++) {
+    state = reduceRunEvents(state, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: `t${i}` } },
+    });
+  }
+  assert.ok(
+    state.events.length <= 1000,
+    `expected in-memory events bounded to <=1000, got ${state.events.length}`,
+  );
+  // the tail (most recent) must be retained
+  const last = state.events[state.events.length - 1];
+  assert.ok(JSON.stringify(last).includes("t2999"), "most recent event should be kept");
 });

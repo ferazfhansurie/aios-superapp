@@ -12,14 +12,32 @@ export interface MemoryNode {
   description: string;
   /** Absolute path to the source file. */
   path: string;
+  /** Source vault label. */
+  vault?: string;
+  /** Absolute path to the source vault. */
+  vault_path?: string;
+  /** File modified time, unix seconds. */
+  mtime?: number;
   /** Outbound `[[wikilink]]` targets that resolve to a known node. */
   links: string[];
+  /** Inbound links from notes that reference this node. */
+  backlinks: string[];
+  /** Notes mentioned in this body but not yet linked with `[[...]]`. */
+  suggested_links: string[];
+  /** Link count used to size important memories. */
+  degree: number;
+  /** Stable visual cluster, usually user/project/feedback/reference. */
+  cluster: string;
+  /** True when the node has no committed inbound/outbound links. */
+  orphan: boolean;
 }
 
 /** A directed link between two nodes (file → referenced note). */
 export interface MemoryEdge {
   source: string;
   target: string;
+  kind?: string;
+  weight?: number;
 }
 
 /** Full graph payload returned by the `memory_graph` command. */
@@ -27,6 +45,7 @@ export interface MemoryGraph {
   nodes: MemoryNode[];
   edges: MemoryEdge[];
   vault_path: string;
+  vaults?: Array<{ path: string; label: string; primary: boolean }>;
   count: number;
 }
 
@@ -36,6 +55,8 @@ export interface MemoryHit {
   type: string;
   description: string;
   path: string;
+  vault?: string;
+  mtime?: number;
   score: number;
   reasons: string[];
   preview: string;
@@ -58,4 +79,28 @@ export async function memorySearch(
   limit = 8,
 ): Promise<MemoryHit[]> {
   return invoke<MemoryHit[]>("memory_search", { query, cwd: cwd ?? null, limit });
+}
+
+export async function memorySave(
+  name: string,
+  nodeType: string,
+  description: string,
+  body: string,
+  oldName?: string | null,
+): Promise<string> {
+  return invoke<string>("memory_save", {
+    name,
+    nodeType,
+    description,
+    body,
+    oldName: oldName ?? null,
+  });
+}
+
+export async function memorySaveRaw(path: string, body: string): Promise<void> {
+  return invoke<void>("memory_save_raw", { path, body });
+}
+
+export async function memoryDeletePath(path: string): Promise<void> {
+  return invoke<void>("memory_delete_path", { path });
 }

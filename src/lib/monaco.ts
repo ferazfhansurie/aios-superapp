@@ -11,6 +11,8 @@ import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
 import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
 
+import { initLspBridge } from "./lsp/monacoBridge";
+
 export { languageForPath } from "./editorLanguage";
 
 let initialized = false;
@@ -43,6 +45,9 @@ export function initMonaco(): typeof monaco {
 
   registerDart(monaco);
   defineTheme(monaco);
+  // LSP bridge (TRACK B): hover/def/completion providers + diagnostics wiring.
+  // Inert until a language server actually starts (manager.ts handles that).
+  initLspBridge(monaco);
   return monaco;
 }
 

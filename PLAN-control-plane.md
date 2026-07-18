@@ -415,8 +415,8 @@ lands. Only Phase 1 onward touches `App.tsx`, which must rebase on the in-flight
 doc-links work.
 
 ## Critical Files for Implementation
-- /Users/firazfhansurie/Repo/firaz/aios/shell/src/App.tsx
-- /Users/firazfhansurie/Repo/firaz/aios/shell/src-tauri/src/lib.rs
-- /Users/firazfhansurie/Repo/firaz/aios/shell/src-tauri/Cargo.toml
-- /Users/firazfhansurie/Repo/firaz/aios-bridge/mcp/aios-spawn-tab/index.js
-- /Users/firazfhansurie/Repo/firaz/aios/shell/src/lib/apps.ts
+- src/App.tsx
+- src-tauri/src/lib.rs
+- src-tauri/Cargo.toml
+- ../aios-bridge/mcp/aios-spawn-tab/index.js
+- src/lib/apps.ts

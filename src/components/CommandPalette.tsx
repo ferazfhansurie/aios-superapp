@@ -3,9 +3,22 @@
  *  scoring), keyboard nav, grouped results, match highlighting. No deps beyond
  *  React + lucide-react. App.tsx owns the `open` state + global ⌘K listener and
  *  passes a `commands` array — see the usage snippet in the PR notes. */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+
+/** Max rows rendered at once. Scoring still ranks the full set; we just never
+ *  paint more than this many buttons (the rest are unreachable noise anyway).
+ *  Caps DOM churn so typing stays smooth even with hundreds of commands. */
+const MAX_RESULTS = 50;
 
 import { Brain, CornerDownLeft, MessageSquare, Search } from "lucide-react";
+import { reportUsage } from "../lib/diag";
+
+/** Run a palette command + emit a light usage event (kind:"usage") keyed by the
+ *  command id — seeds the "what I use" prioritization. No argument values. */
+function runCommand(c: Command) {
+  reportUsage("command-palette", c.id);
+  c.run();
+}
 
 export interface Command {
   id: string;
@@ -22,7 +35,7 @@ export interface Command {
 /** Subsequence fuzzy match. Returns matched-char indices (into `title`) + a
  *  score, or null on no match. Scoring rewards contiguous runs and matches at
  *  word boundaries / the very start; later matches decay. Higher = better. */
-function fuzzyMatch(query: string, title: string): { score: number; idx: number[] } | null {
+export function fuzzyMatch(query: string, title: string): { score: number; idx: number[] } | null {
   const q = query.toLowerCase();
   const t = title.toLowerCase();
   if (!q) return { score: 0, idx: [] };
@@ -77,24 +90,35 @@ function scoreCommand(query: string, c: Command): { score: number; idx: number[]
   return { score: best, idx: onTitle ? onTitle.idx : [] };
 }
 
-/** Render a title with matched chars wrapped in accent spans. */
-function Highlight({ text, idx }: { text: string; idx: number[] }) {
+/** Render a title with matched chars wrapped in accent spans. Emits one span
+ *  per contiguous RUN (matched vs plain) rather than per character, so a 40-char
+ *  title makes ~3 nodes instead of 40 — keeps the list cheap to repaint. Memoized
+ *  so unchanged rows don't re-render while typing. */
+export const Highlight = memo(function Highlight({ text, idx }: { text: string; idx: number[] }) {
   if (!idx.length) return <>{text}</>;
   const set = new Set(idx);
   const out: React.ReactNode[] = [];
-  for (let i = 0; i < text.length; i++) {
-    if (set.has(i)) {
-      out.push(
-        <span key={i} className="font-medium text-[var(--color-accent)]">
-          {text[i]}
-        </span>,
-      );
-    } else {
-      out.push(<span key={i}>{text[i]}</span>);
-    }
+  let i = 0;
+  let part = 0;
+  while (i < text.length) {
+    const on = set.has(i);
+    let j = i + 1;
+    while (j < text.length && set.has(j) === on) j++;
+    const seg = text.slice(i, j);
+    out.push(
+      on ? (
+        <span key={part} className="font-medium text-[var(--color-accent)]">
+          {seg}
+        </span>
+      ) : (
+        <span key={part}>{seg}</span>
+      ),
+    );
+    i = j;
+    part++;
   }
   return <>{out}</>;
-}
+});
 
 interface Scored extends Command {
   _idx: number[];
@@ -115,6 +139,9 @@ export function CommandPalette({
   onDeepSearch?: (query: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  // Defer the value the scorer reads so keystrokes paint instantly and the
+  // (heavier) re-rank/re-render runs at lower priority — React's built-in debounce.
+  const deferredQuery = useDeferredValue(query);
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -131,7 +158,7 @@ export function CommandPalette({
 
   // flat, ranked, group-ordered list. Stable order when query is empty.
   const results = useMemo<Scored[]>(() => {
-    const q = query.trim();
+    const q = deferredQuery.trim();
     const intentCommands: Command[] = q.length >= 2
       ? [
           ...(onAsk
@@ -162,10 +189,10 @@ export function CommandPalette({
       : [];
     const scored: Scored[] = [];
     for (const c of [...intentCommands, ...commands]) {
-      const m = scoreCommand(query, c);
+      const m = scoreCommand(deferredQuery, c);
       if (m) scored.push({ ...c, _idx: m.idx, _score: m.score });
     }
-    if (query) {
+    if (deferredQuery) {
       scored.sort((a, b) => b._score - a._score);
     }
     // group while preserving (sorted) order — first-seen group wins position.
@@ -181,8 +208,8 @@ export function CommandPalette({
     }
     const flat: Scored[] = [];
     for (const g of order) flat.push(...byGroup.get(g)!);
-    return flat;
-  }, [commands, onAsk, onDeepSearch, query]);
+    return flat.slice(0, MAX_RESULTS);
+  }, [commands, onAsk, onDeepSearch, deferredQuery]);
 
   // clamp selection when results shrink
   useEffect(() => {
@@ -207,7 +234,7 @@ export function CommandPalette({
     const c = results[sel];
     if (!c) return;
     onClose();
-    c.run();
+    runCommand(c);
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -242,6 +269,7 @@ export function CommandPalette({
   const selAction = selCmd?.actionLabel ?? "select";
 
   return (
+    <>
     <div
       className="fixed inset-0 z-50 flex justify-center bg-black/50 backdrop-blur-sm"
       onMouseDown={(e) => {
@@ -301,7 +329,7 @@ export function CommandPalette({
                       onMouseMove={() => setSel(pos)}
                       onClick={() => {
                         onClose();
-                        c.run();
+                        runCommand(c);
                       }}
                       className={`relative flex w-full items-center gap-3 rounded-[var(--aios-radius-md)] px-2.5 py-2 text-left transition-colors ${
                         active ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-panel-2)]/50"
@@ -349,5 +377,6 @@ export function CommandPalette({
         </div>
       </div>
     </div>
+    </>
   );
 }

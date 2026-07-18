@@ -37,6 +37,11 @@ export function ResizableGrid({
   const [colFr, setColFr] = useState<number[]>(() => Array(cols).fill(1));
   const [rowFr, setRowFr] = useState<number[]>(() => Array(rows).fill(1));
   const drag = useRef<DragState | null>(null);
+  // Coalesce pointer-move resizes into ONE setState per animation frame. A drag
+  // fires onPointerMove at 60-120Hz; without this, each event triggered a full
+  // grid re-render (and every pane under it). rAF caps it to the display rate.
+  const rafRef = useRef<number | null>(null);
+  const pendingFr = useRef<{ axis: "col" | "row"; i: number; a: number; b: number } | null>(null);
 
   // Reset tracks to equal shares whenever the grid shape changes.
   useEffect(() => {
@@ -46,10 +51,38 @@ export function ResizableGrid({
     setRowFr(storageKey ? (loadGridTracks(storageKey, cols, rows)?.rows ?? Array(rows).fill(1)) : Array(rows).fill(1));
   }, [cols, rows, storageKey]);
 
+  // Debounce the persist: a drag mutates colFr/rowFr every frame, and a raw
+  // localStorage.setItem per frame is a synchronous main-thread write that
+  // janks the drag. Only write 250ms after the last change (i.e. once you stop).
   useEffect(() => {
     if (!storageKey || colFr.length !== cols || rowFr.length !== rows) return;
-    saveGridTracks(storageKey, colFr, rowFr);
+    const t = setTimeout(() => saveGridTracks(storageKey, colFr, rowFr), 250);
+    return () => clearTimeout(t);
   }, [storageKey, colFr, rowFr, cols, rows]);
+
+  // Apply the latest pending track sizes once per frame, then clear the rAF.
+  const flushResize = () => {
+    rafRef.current = null;
+    const p = pendingFr.current;
+    if (!p) return;
+    pendingFr.current = null;
+    const next = (prev: number[]) => {
+      const arr = [...prev];
+      arr[p.i] = p.a;
+      arr[p.i + 1] = p.b;
+      return arr;
+    };
+    if (p.axis === "col") setColFr(next);
+    else setRowFr(next);
+  };
+
+  // Cancel a queued frame on unmount so a flush never fires into a dead grid.
+  useEffect(
+    () => () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    },
+    [],
+  );
 
   const totalCol = colFr.reduce((a, b) => a + b, 0);
   const totalRow = rowFr.reduce((a, b) => a + b, 0);
@@ -80,14 +113,9 @@ export function ResizableGrid({
     const min = d.total * MIN_FRAC;
     const a = Math.min(Math.max(d.a0 + delta, min), pairSum - min);
     const b = pairSum - a;
-    const next = (prev: number[]) => {
-      const arr = [...prev];
-      arr[d.i] = a;
-      arr[d.i + 1] = b;
-      return arr;
-    };
-    if (d.axis === "col") setColFr(next);
-    else setRowFr(next);
+    // Stash the latest sizes and coalesce to one setState per frame.
+    pendingFr.current = { axis: d.axis, i: d.i, a, b };
+    if (rafRef.current == null) rafRef.current = requestAnimationFrame(flushResize);
   };
 
   const endDrag = (e: React.PointerEvent) => {
@@ -98,6 +126,13 @@ export function ResizableGrid({
         /* noop */
       }
       drag.current = null;
+      // Apply the final position immediately so the grid settles exactly where
+      // the pointer was released (don't wait on the queued frame).
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      flushResize();
     }
   };
 

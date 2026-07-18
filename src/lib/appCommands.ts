@@ -1,45 +1,24 @@
 import { createElement } from "react";
 import {
-  Camera,
   Layers,
   Maximize2,
-  MessageCircle,
-  MessageSquare,
   PanelLeft,
   Play,
-  Radio,
-  RefreshCw,
-  Settings,
   Rows2,
 } from "lucide-react";
 
 import type { Command as PaletteCommand } from "../components/CommandPalette.tsx";
-import type { ChatSessionInfo } from "./chat.ts";
-import type { Customer } from "./inbox.ts";
-import type { OracleInfo } from "./pty.ts";
-import type { ProjectInfo } from "./run.ts";
 import { SPAWN, type PaneContent } from "./apps.ts";
 import { commandToPaletteCommand, createCommand, type AiosCommand } from "./commands.ts";
 
 export interface AppCommandDeps {
   activeKey: string | null;
   panesCount: number;
-  home: string | null;
-  chats: ChatSessionInfo[];
-  oracles: OracleInfo[];
-  customers: Customer[];
-  projects: ProjectInfo[];
   spawn: (kind: PaneContent, label: string) => void;
-  resumeChat: (chat: ChatSessionInfo) => void;
-  addOracle: (identity: string) => void;
-  runProject: (project: ProjectInfo) => void;
   runF5: () => void;
-  reloadProjects: () => void;
-  fireAppshot: () => void;
   setSidebarOpen: (updater: (value: boolean) => boolean) => void;
   setTopBarMode: (mode: "compact" | "hidden") => void;
   setOverviewOpen: (open: boolean) => void;
-  setSettingsOpen: (open: boolean) => void;
   setHiddenKeys: (keys: string[]) => void;
   setMaximizedKey: (key: string | null) => void;
 }
@@ -48,12 +27,6 @@ interface RegistryEntry {
   command: AiosCommand;
   group: string;
   actionLabel: string;
-}
-
-function relPath(home: string | null, path: string): string {
-  return home && path.startsWith(home)
-    ? path.slice(home.length).replace(/^\//, "")
-    : path;
 }
 
 export function buildAppCommands(deps: AppCommandDeps): PaletteCommand[] {
@@ -78,58 +51,6 @@ export function buildAppCommands(deps: AppCommandDeps): PaletteCommand[] {
       }),
       group: "open",
       actionLabel: "open",
-    })),
-    ...deps.chats.map((c) => ({
-      command: createCommand({
-        id: `chat.resume.${c.id}`,
-        label: c.title || "untitled chat",
-        description: c.cwd ? c.cwd.split("/").pop() : undefined,
-        scope: "chat",
-        icon: createElement(MessageSquare, { size: 14 }),
-        keywords: ["chat", "session", "continue", "resume", c.cwd ?? ""],
-        run: () => deps.resumeChat(c),
-      }),
-      group: "resume",
-      actionLabel: "resume",
-    })),
-    ...deps.oracles.map((o) => ({
-      command: createCommand({
-        id: `oracle.attach.${o.identity}`,
-        label: `oracle: ${o.display_name}`,
-        description: o.running ? "running" : "idle",
-        scope: "global",
-        icon: createElement(Radio, { size: 14 }),
-        keywords: ["oracle", "agent", "attach", "session", o.identity],
-        run: () => deps.addOracle(o.identity),
-      }),
-      group: "fleet",
-      actionLabel: "attach",
-    })),
-    ...deps.customers.slice(0, 8).map((c) => ({
-      command: createCommand({
-        id: `customer.open.${c.id}`,
-        label: c.name,
-        description: c.lastAgo ? `${c.lastAgo} ago` : undefined,
-        scope: "global",
-        icon: createElement(MessageCircle, { size: 14 }),
-        keywords: ["customer", "message", "whatsapp", "inbox", c.handle],
-        run: () => deps.spawn({ type: "customers" }, "customers"),
-      }),
-      group: "customers",
-      actionLabel: "open inbox",
-    })),
-    ...deps.projects.map((p) => ({
-      command: createCommand({
-        id: `project.run.${p.root}`,
-        label: `run ${p.name}`,
-        description: `${p.kind} · ${relPath(deps.home, p.root)}`,
-        scope: "run",
-        icon: createElement(Play, { size: 14 }),
-        keywords: ["run", "start", "launch", "project", p.name, p.kind, relPath(deps.home, p.root)],
-        run: () => deps.runProject(p),
-      }),
-      group: "run",
-      actionLabel: "run",
     })),
     {
       command: createCommand({
@@ -176,7 +97,7 @@ export function buildAppCommands(deps: AppCommandDeps): PaletteCommand[] {
         description: "⌘`",
         scope: "pane",
         icon: createElement(Layers, { size: 14 }),
-        keywords: ["overview", "mission", "control", "switch", "panes", "windows", "fan", "out"],
+        keywords: ["overview", "control", "switch", "panes", "windows", "fan", "out"],
         enabled: () => deps.panesCount > 0,
         run: () => deps.setOverviewOpen(true),
       }),
@@ -211,46 +132,6 @@ export function buildAppCommands(deps: AppCommandDeps): PaletteCommand[] {
       }),
       group: "actions",
       actionLabel: "run",
-    },
-    {
-      command: createCommand({
-        id: "project.rescan",
-        label: "rescan projects",
-        description: "refresh ~/Repo run targets",
-        scope: "run",
-        icon: createElement(RefreshCw, { size: 14 }),
-        keywords: ["refresh", "reload", "rescan", "scan", "projects", "repo", "missing", "cmd k", "command palette"],
-        run: deps.reloadProjects,
-      }),
-      group: "run",
-      actionLabel: "scan",
-    },
-    {
-      command: createCommand({
-        id: "oracle.appshot",
-        label: "appshot - screenshot to oracle",
-        description: "⌘⌘",
-        scope: "global",
-        danger: "external",
-        icon: createElement(Camera, { size: 14 }),
-        keywords: ["screenshot", "capture", "oracle"],
-        run: deps.fireAppshot,
-      }),
-      group: "actions",
-      actionLabel: "run",
-    },
-    {
-      command: createCommand({
-        id: "app.settings.open",
-        label: "settings",
-        description: "⌘,",
-        scope: "global",
-        icon: createElement(Settings, { size: 14 }),
-        keywords: ["preferences", "theme", "appearance"],
-        run: () => deps.setSettingsOpen(true),
-      }),
-      group: "app",
-      actionLabel: "open",
     },
   ];
 

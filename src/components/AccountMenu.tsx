@@ -94,7 +94,7 @@ export function AccountMenu({
         type="button"
         onClick={() => fileRef.current?.click()}
         title={avatar ? "Change profile picture" : "Set a profile picture"}
-        className="group relative grid h-7 w-7 shrink-0 place-items-center overflow-hidden rounded-full bg-[var(--color-accent)] text-[11px] font-bold text-[var(--color-bg)]"
+        className="group relative grid h-7 w-7 shrink-0 place-items-center overflow-hidden rounded-full bg-[var(--color-accent)] text-[11px] font-bold text-[var(--color-accent-fg)]"
       >
         {avatar ? (
           <img src={avatar} alt="firaz" className="h-full w-full object-cover" />

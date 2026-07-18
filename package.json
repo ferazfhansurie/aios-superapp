@@ -6,12 +6,18 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test:chatpane": "node --experimental-strip-types --test src/lib/chatPaneState.test.ts src/lib/chatScroll.test.ts src/lib/runEvents.test.ts src/lib/commands.test.ts src/lib/paneLayout.test.ts src/lib/aiosContext.test.ts src/lib/idleDashboardLayout.test.ts src/lib/bundleBoundaries.test.ts",
+    "test:router": "node --experimental-strip-types --test src/lib/aiosRouter.test.ts",
+    "test:codex-adapter": "node --test scripts/codex-anthropic-adapter.test.mjs",
+    "install:codex-adapter": "zsh scripts/install-codex-anthropic-adapter.sh",
+    "test:chatpane": "node --experimental-strip-types --test src/components/chat/taskRailState.test.ts src/lib/accentFillContracts.test.ts src/lib/agentActions.test.ts src/lib/agentController.test.ts src/lib/bundleBoundaries.test.ts src/lib/chatLifecycleTransport.test.ts src/lib/chatPaneState.test.ts src/lib/chatQueue.test.ts src/lib/chatRunLifecycle.test.ts src/lib/chatScroll.test.ts src/lib/chatStream.test.ts src/lib/codexShellGeometry.test.ts src/lib/codexThemeTokens.test.ts src/lib/commands.test.ts src/lib/controlCenter.test.ts src/lib/fileKinds.test.ts src/lib/liveRoom.test.ts src/lib/mirror.test.ts src/lib/moneyAgents.test.ts src/lib/notifications.test.ts src/lib/paneHistory.test.ts src/lib/paneLayout.test.ts src/lib/paneOpenActions.test.ts src/lib/paneRouting.test.ts src/lib/runEvents.test.ts src/lib/safeStorage.test.ts src/lib/sidebar.test.ts src/lib/subagentFleet.test.ts src/lib/terminalOutputPump.test.ts src/lib/theme.test.ts src/lib/urlNormalize.test.ts src/lib/usagePace.test.ts",
+    "test:lsp": "node --experimental-strip-types --test src/lib/lsp/protocol.test.ts",
+    "test:e2e": "playwright test",
+    "install:mac-local": "bash scripts/install-mac-local.sh",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:cfo": "node --experimental-strip-types --test scripts/cfo-state.test.mjs scripts/cfo-conversation.test.mjs src/lib/finance.test.ts"
   },
   "dependencies": {
-    "3d-force-graph": "^1.80.0",
     "@tailwindcss/vite": "^4.3.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
@@ -19,25 +25,23 @@
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
-    "class-variance-authority": "^0.7.1",
-    "clsx": "^2.1.1",
     "lucide-react": "^1.16.0",
     "monaco-editor": "^0.55.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "react-resizable-panels": "^2.1.9",
-    "tailwind-merge": "^3.6.0",
-    "tailwindcss": "^4.3.0",
-    "three": "0.184.0"
+    "tailwindcss": "^4.3.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.0",
     "@tauri-apps/cli": "^2",
+    "@types/node": "^26.0.0",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
-    "@types/three": "^0.184.1",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "typescript-language-server": "^5.3.0",
+    "vite": "^7.0.4",
+    "vscode-languageserver-protocol": "^3.18.0"
   },
   "packageManager": "pnpm@10.33.0+sha512.10568bb4a6afb58c9eb3630da90cc9516417abebd3fabbe6739f0ae795728da1491e9db5a544c76ad8eb7570f5c4bb3d6c637b2cb41bfdcdb47fa823c8649319"
 }

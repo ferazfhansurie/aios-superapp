@@ -80,3 +80,17 @@ test("nextAutoscrollPaused pauses on manual scroll up and resumes only at bottom
     false,
   );
 });
+
+test("nextAutoscrollPaused un-pauses during a fast stream within the 96px stick window", () => {
+  // distanceFromBottom = 1400 - 1050 - 300 = 50: past the crisp 8px pause
+  // window but well inside the 96px stick window. With a "down" intent the
+  // user has returned to the bottom and autoscroll must re-stick.
+  assert.equal(
+    nextAutoscrollPaused(
+      true,
+      { scrollHeight: 1400, scrollTop: 1050, clientHeight: 300 },
+      "down",
+    ),
+    false,
+  );
+});
