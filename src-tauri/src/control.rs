@@ -517,14 +517,12 @@ pub fn loop_list() -> Vec<serde_json::Value> {
             "managed" => 0,
             _ => 1,
         };
-        source_rank(a)
-            .cmp(&source_rank(b))
-            .then_with(|| {
-                a["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .cmp(b["name"].as_str().unwrap_or(""))
-            })
+        source_rank(a).cmp(&source_rank(b)).then_with(|| {
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["name"].as_str().unwrap_or(""))
+        })
     });
     out
 }
@@ -1099,11 +1097,22 @@ pub fn loop_add_project(
     }
     let label = {
         let l = label.trim();
-        if l.is_empty() { key.clone() } else { l.to_string() }
+        if l.is_empty() {
+            key.clone()
+        } else {
+            l.to_string()
+        }
     };
-    let posture = if posture.trim() == "prep-only" { "prep-only" } else { "branch-only" };
+    let posture = if posture.trim() == "prep-only" {
+        "prep-only"
+    } else {
+        "branch-only"
+    };
     let clean = |v: Vec<String>| -> Vec<String> {
-        v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        v.into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     };
     let state = aios_state_dir().ok_or("no HOME")?;
     let path = state.join("loops/projects.json");
@@ -1377,7 +1386,9 @@ pub fn ticket_read(name: String, queue: String) -> Result<String, String> {
     let name = name.trim().to_string();
     if name.is_empty()
         || name.len() > 128
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return Err("invalid ticket name".into());
     }
@@ -1395,7 +1406,9 @@ fn safe_ticket_name(raw: &str) -> Option<String> {
     if t.is_empty() || t.len() > 128 {
         return None;
     }
-    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if t.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         Some(t.to_string())
     } else {
         None
@@ -1439,7 +1452,12 @@ pub fn ticket_comment(name: String, queue: String, text: String) -> Result<(), S
 #[tauri::command]
 pub fn ticket_set_status(name: String, queue: String, status: String) -> Result<(), String> {
     let status = status.trim();
-    if status.is_empty() || status.len() > 32 || !status.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if status.is_empty()
+        || status.len() > 32
+        || !status
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
         return Err("invalid status".into());
     }
     ticket_set_frontmatter_field(&name, &queue, "status", status)
@@ -1455,7 +1473,12 @@ pub fn ticket_set_priority(name: String, queue: String, priority: String) -> Res
     ticket_set_frontmatter_field(&name, &queue, "priority", priority)
 }
 
-fn ticket_set_frontmatter_field(name: &str, queue: &str, field: &str, value: &str) -> Result<(), String> {
+fn ticket_set_frontmatter_field(
+    name: &str,
+    queue: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
     let path = ticket_path(&name, &queue)?;
     let content = std::fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
     let mut out = String::new();

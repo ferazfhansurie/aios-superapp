@@ -43,6 +43,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -52,9 +53,11 @@ use tauri::{AppHandle, Emitter};
 // Engine-agnostic wire format + the `Engine` tag now live in `aios-chat-core`
 // so the headless `aios-noded` daemon shares them verbatim (cross-machine sync).
 use aios_chat_core::adapt::{adapt_codex_line, adapt_opencode_line};
+#[cfg(test)]
+use aios_chat_core::codex_rpc::adapt_codex_appserver_frame;
 use aios_chat_core::codex_rpc::{
-    adapt_codex_appserver_frame, codex_error_result_line, codex_fire_interrupt, codex_fire_steer,
-    codex_fire_turn, codex_next_rpc, codex_rpc_write, NEXT_REQ,
+    adapt_codex_appserver_frame_before_emit, codex_error_result_line, codex_fire_interrupt,
+    codex_fire_steer, codex_fire_turn, codex_next_rpc, codex_rpc_write, NEXT_REQ,
 };
 use aios_chat_core::session::{
     buffer_push, fan_out, fan_out_split, ChatSession, PendingCodexControl,
@@ -68,6 +71,13 @@ use aios_chat_core::{Engine, OutputSink};
 /// a fast turn), the renderer gets a steady, batched feed. Lower = snappier but
 /// more IPC; higher = fewer events but choppier text reveal.
 const COALESCE_FLUSH_MS: u64 = 50;
+
+/// Agent mode in the chatpane gets one orchestration layer. The main Claude
+/// session may fan out to `aios-worker`, but that worker cannot invoke `Agent`
+/// again. Without this explicit capability boundary, the global recursive-agent
+/// instruction causes general-purpose workers to spawn another copy of
+/// themselves synchronously until every generation waits forever.
+const CLAUDE_CHAT_AGENTS: &str = r#"{"aios-worker":{"description":"Executes one bounded chatpane task directly without further delegation","prompt":"Execute the delegated task directly. Use your available tools, return a concise result to the parent, and never delegate or spawn another agent.","disallowedTools":["Agent"],"model":"inherit"}}"#;
 
 /// A run of same-kind token deltas being accumulated before flush. `template` is
 /// the FIRST line of the run, parsed once; on flush we swap its delta text for
@@ -330,14 +340,16 @@ fn begin_run(sess: &Arc<ChatSession>, run_id: String) {
     });
     fan_out(
         sess,
-        &format!(r#"{{"type":"aios_run","state":"starting","runId":"{}"}}"#, json_escape(&run_id)),
+        &format!(
+            r#"{{"type":"aios_run","state":"starting","runId":"{}"}}"#,
+            json_escape(&run_id)
+        ),
     );
 }
 
 fn active_run_matches(session_id: u32, run_id: &str) -> bool {
     with_runs(|runs| {
-        runs
-            .get(&session_id)
+        runs.get(&session_id)
             .is_some_and(|active| active.run_id == run_id)
     })
 }
@@ -347,7 +359,10 @@ fn emit_running(sess: &Arc<ChatSession>) {
     if let Some(run_id) = run_id {
         fan_out(
             sess,
-            &format!(r#"{{"type":"aios_run","state":"running","runId":"{}"}}"#, json_escape(&run_id)),
+            &format!(
+                r#"{{"type":"aios_run","state":"running","runId":"{}"}}"#,
+                json_escape(&run_id)
+            ),
         );
     }
 }
@@ -368,7 +383,10 @@ fn mark_interrupting(sess: &Arc<ChatSession>, run_id: &str) -> Result<(), String
     }
     fan_out(
         sess,
-        &format!(r#"{{"type":"aios_run","state":"interrupting","runId":"{}"}}"#, json_escape(run_id)),
+        &format!(
+            r#"{{"type":"aios_run","state":"interrupting","runId":"{}"}}"#,
+            json_escape(run_id)
+        ),
     );
     Ok(())
 }
@@ -376,21 +394,25 @@ fn mark_interrupting(sess: &Arc<ChatSession>, run_id: &str) -> Result<(), String
 fn emit_terminal(sess: &Arc<ChatSession>, fallback: &str) {
     let active = with_runs(|runs| runs.remove(&sess.id));
     let Some(active) = active else { return };
-    let state = if active.interrupting { "interrupted" } else { fallback };
+    let state = if active.interrupting {
+        "interrupted"
+    } else {
+        fallback
+    };
     fan_out(
         sess,
-        &format!(r#"{{"type":"aios_run","state":"{}","runId":"{}"}}"#, state, json_escape(&active.run_id)),
+        &format!(
+            r#"{{"type":"aios_run","state":"{}","runId":"{}"}}"#,
+            state,
+            json_escape(&active.run_id)
+        ),
     );
 }
 
 /// Store one global warm app-server and return displaced session ids for
 /// teardown. A per-profile cache multiplies native processes as panes/models
 /// change; one spare captures the startup win without unbounded retention.
-fn store_single_warm_codex(
-    warm: &mut HashMap<String, u32>,
-    key: String,
-    id: u32,
-) -> Vec<u32> {
+fn store_single_warm_codex(warm: &mut HashMap<String, u32>, key: String, id: u32) -> Vec<u32> {
     let evicted = warm
         .drain()
         .filter_map(|(_, existing)| (existing != id).then_some(existing))
@@ -752,6 +774,7 @@ pub fn chat_start(
     app: AppHandle,
     on_event: Channel<String>,
     engine: Option<String>,
+    harness: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
@@ -775,7 +798,14 @@ pub fn chat_start(
         return Ok(id);
     }
 
-    let eng = Engine::parse(engine.as_deref());
+    let requested_engine = Engine::parse(engine.as_deref());
+    let claude_adapter_harness =
+        harness.as_deref() == Some("claude") && matches!(requested_engine, Engine::Codex);
+    let eng = if claude_adapter_harness {
+        Engine::Claude
+    } else {
+        requested_engine
+    };
     // codex (ChatGPT sub) → persistent codex app-server process (JSON-RPC).
     if matches!(eng, Engine::Codex) {
         if resume.as_deref().filter(|s| !s.is_empty()).is_none() && !fast.unwrap_or(false) {
@@ -813,7 +843,46 @@ pub fn chat_start(
         .arg("--input-format")
         .arg("stream-json")
         .arg("--include-partial-messages")
-        .arg("--verbose");
+        .arg("--verbose")
+        .arg("--agents")
+        .arg(CLAUDE_CHAT_AGENTS);
+
+    if claude_adapter_harness {
+        let home = std::env::var("HOME").map_err(|_| "HOME is unavailable".to_string())?;
+        let secret_path = std::env::var("AIOS_CODEX_ADAPTER_SECRET_FILE")
+            .unwrap_or_else(|_| format!("{home}/.aios/state/codex-anthropic-adapter/secret"));
+        let secret = std::fs::read_to_string(&secret_path)
+            .map_err(|_| "Codex Claude adapter is not installed".to_string())?;
+        let secret = secret.trim();
+        if secret.is_empty() {
+            return Err("Codex Claude adapter credential is empty".into());
+        }
+        let url = std::env::var("AIOS_CODEX_ADAPTER_URL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8791".to_string());
+        // Keep Claude's claude.ai OAuth login active so organization connectors
+        // remain available. API/auth-token env vars make Claude switch auth mode
+        // and explicitly disable those connectors. The loopback adapter uses a
+        // separate private header instead; Claude still sends its normal OAuth
+        // bearer, but the adapter never consumes or logs it.
+        cmd.env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env("ANTHROPIC_BASE_URL", url)
+            .env(
+                "ANTHROPIC_CUSTOM_HEADERS",
+                format!("x-aios-adapter-secret: {secret}"),
+            );
+    } else {
+        // Native Claude must never inherit adapter routing from the GUI app's
+        // launch environment. `open -a` can preserve ANTHROPIC_BASE_URL and the
+        // private adapter header from the shell that installed/relaunched AIOS;
+        // without this boundary a pane labelled "fable 5 · claude" silently
+        // talks to 127.0.0.1:8791, reports zero Claude usage, and its workers
+        // repeat the adapter's "do not use tools" instruction.
+        cmd.env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("ANTHROPIC_CUSTOM_HEADERS");
+    }
 
     // Multi-account: run this session AS a specific claude login by pointing
     // CLAUDE_CONFIG_DIR at that account's config dir (firaz has two Max subs).
@@ -833,9 +902,7 @@ pub fn chat_start(
     // would pass a home check and then kill the fhe spawn instantly.
     let requested_resume_id = resume.filter(|s| !s.is_empty());
     let (resume_id, pruned_resume_id) = match account_dir.as_deref() {
-        Some(dir) => {
-            validate_claude_resume_in_dir(std::path::Path::new(dir), requested_resume_id)
-        }
+        Some(dir) => validate_claude_resume_in_dir(std::path::Path::new(dir), requested_resume_id),
         None => match std::env::var("HOME") {
             Ok(home) => {
                 validate_claude_resume_in_home(std::path::Path::new(&home), requested_resume_id)
@@ -1340,7 +1407,9 @@ fn codex_appserver_bin() -> String {
     // `resolve_bin` checks stable GUI-safe locations such as
     // /opt/homebrew/bin before PATH, where Firaz's up-to-date Codex cask lives.
     let installed = resolve_bin("codex", "AIOS_CODEX_BIN", &[]);
-    let installed = std::path::Path::new(&installed).exists().then_some(installed);
+    let installed = std::path::Path::new(&installed)
+        .exists()
+        .then_some(installed);
     let cached_snapshot = std::env::var("HOME").ok().and_then(|home| {
         let path = format!("{home}/.codex-chat/packages/standalone/current/codex");
         std::path::Path::new(&path).exists().then_some(path)
@@ -1358,7 +1427,9 @@ fn codex_send_turn(
 ) -> Result<(), String> {
     let tid = sess.thread_id.lock().clone();
     match tid {
-        Some(t) if !t.is_empty() => codex_fire_turn(sess, &t, &text, image_paths),
+        Some(t) if !t.is_empty() => {
+            codex_fire_turn(sess, &t, &text, image_paths).map_err(|error| error.to_string())?
+        }
         _ => *sess.pending_turn.lock() = Some((text, image_paths.to_vec())),
     }
     Ok(())
@@ -1395,8 +1466,7 @@ fn codex_steer(sess: &Arc<ChatSession>, text: &str) -> Result<(), String> {
         return Err("no active codex turn to steer".into());
     }
     drop(pending);
-    codex_fire_steer(sess, &tid, &turn, text);
-    Ok(())
+    codex_fire_steer(sess, &tid, &turn, text).map_err(|error| error.to_string())
 }
 
 fn codex_finish_stopped_turn(sess: &Arc<ChatSession>) {
@@ -1411,6 +1481,55 @@ fn codex_finish_stopped_turn(sess: &Arc<ChatSession>) {
         // explicitly after the result to preserve transcript/lifecycle order.
         emit_terminal(sess, "interrupted");
     }
+}
+
+const CODEX_INTERRUPT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Codex normally confirms an interrupt with `turn/completed`, but a wedged
+/// tool can prevent that forever. The deadline is tied to this session's busy
+/// flag: normal settlement wins by clearing it; otherwise this watchdog closes
+/// the transcript and lifecycle exactly once.
+fn arm_codex_interrupt_deadline(sess: Arc<ChatSession>, deadline: Duration) {
+    let Some(watched_run_id) = with_runs(|runs| runs.get(&sess.id).map(|run| run.run_id.clone()))
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
+        let _operation = sess.operation_lock.lock();
+        // A graceful interrupt may settle and a new turn may begin before this
+        // timer wakes. Never let an old watchdog touch that newer run.
+        if !active_run_matches(sess.id, &watched_run_id) {
+            return;
+        }
+        if sess.busy.swap(false, Ordering::SeqCst) {
+            // Escalation must stop the work, not merely free the UI. A wedged
+            // app-server may ignore JSON-RPC forever, so close its input then
+            // kill and reap it. The stored thread id remains available to the
+            // host's normal resume/replacement path.
+            sess.stdin.lock().take();
+            if let Some(mut child) = sess.child.lock().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            *sess.active_turn.lock() = None;
+            sess.pending_controls.lock().clear();
+            fan_out(
+                &sess,
+                &codex_error_result_line(&sess, "interrupt timed out; turn stopped locally"),
+            );
+            emit_terminal(&sess, "interrupted");
+            // The app-server pipe is gone. Remove the dead registry entry and
+            // tell the renderer to spin up a fresh session before the next send.
+            with_sessions(|sessions| {
+                sessions.remove(&sess.id);
+            });
+            fan_out(
+                &sess,
+                r#"{"type":"aios_session_dead","reason":"interrupt_timeout"}"#,
+            );
+        }
+    });
 }
 
 /// Interrupts the in-flight codex turn via `turn/interrupt` (keeps process+thread).
@@ -1432,6 +1551,8 @@ fn codex_interrupt(sess: &Arc<ChatSession>) -> Result<(), String> {
             // the adapter sends it as soon as the id lands.
             pending.clear();
             pending.push_back(PendingCodexControl::Interrupt);
+            drop(pending);
+            arm_codex_interrupt_deadline(Arc::clone(sess), CODEX_INTERRUPT_DEADLINE);
             return Ok(());
         }
         pending.clear();
@@ -1441,7 +1562,8 @@ fn codex_interrupt(sess: &Arc<ChatSession>) -> Result<(), String> {
     }
     pending.clear();
     drop(pending);
-    codex_fire_interrupt(sess, &tid, &active_turn);
+    codex_fire_interrupt(sess, &tid, &active_turn).map_err(|error| error.to_string())?;
+    arm_codex_interrupt_deadline(Arc::clone(sess), CODEX_INTERRUPT_DEADLINE);
     Ok(())
 }
 
@@ -1542,7 +1664,9 @@ fn start_codex_appserver(
         cwd: Mutex::new(dir),
         model: Mutex::new(model.filter(|s| !s.is_empty())),
         effort: Mutex::new(effort.filter(|s| !s.is_empty())),
-        sink: Mutex::new(on_event.map(|chan| Box::new(ChannelSink::new(chan)) as Box<dyn OutputSink>)),
+        sink: Mutex::new(
+            on_event.map(|chan| Box::new(ChannelSink::new(chan)) as Box<dyn OutputSink>),
+        ),
         buffer: Mutex::new(VecDeque::with_capacity(256)),
         buffer_bytes: AtomicUsize::new(0),
         claude_id: Mutex::new(None),
@@ -1576,11 +1700,13 @@ fn start_codex_appserver(
                 "capabilities": { "experimentalApi": false, "requestAttestation": false }
             }
         }),
-    );
+    )
+    .map_err(|error| error.to_string())?;
     codex_rpc_write(
         &session,
         &json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
-    );
+    )
+    .map_err(|error| error.to_string())?;
     // thread/start (or resume a prior thread). The composer's permission picker
     // maps to codex's sandbox + approval policy so codex can actually BUILD when
     // you give it write access (not just answer). `never` approval keeps the chat
@@ -1628,7 +1754,7 @@ fn start_codex_appserver(
     codex_rpc_write(
         &session,
         &json!({ "jsonrpc": "2.0", "id": codex_next_rpc(&session), "method": method, "params": params }),
-    );
+    ).map_err(|error| error.to_string())?;
 
     // stdout reader: newline JSON-RPC frames → adapt → ingest.
     let sess = Arc::clone(&session);
@@ -1651,13 +1777,15 @@ fn start_codex_appserver(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        // Codex cannot safely accept a steer until the app-server
-                        // has minted a turn id. Advertise `running` at that exact
-                        // notification, before its adapted output reaches the pane.
-                        if codex_turn_started(trimmed) {
-                            emit_running(&sess);
-                        }
-                        for out in adapt_codex_appserver_frame(&sess, trimmed) {
+                        // Commit the server-minted active turn id before the
+                        // renderer sees `running`; an immediate steer from that
+                        // event can then target the turn instead of being queued.
+                        let is_turn_started = codex_turn_started(trimmed);
+                        for out in adapt_codex_appserver_frame_before_emit(&sess, trimmed, || {
+                            if is_turn_started {
+                                emit_running(&sess);
+                            }
+                        }) {
                             ingest_line(&sess, &app_rdr, &out);
                         }
                     }
@@ -1718,16 +1846,7 @@ pub fn chat_prewarm_codex(
             warm.remove(&key);
         });
     }
-    let id = start_codex_appserver(
-        app,
-        None,
-        cwd,
-        model,
-        permission_mode,
-        effort,
-        None,
-        false,
-    )?;
+    let id = start_codex_appserver(app, None, cwd, model, permission_mode, effort, None, false)?;
     let evicted = with_warm_codex(|warm| store_single_warm_codex(warm, key, id));
     for old_id in evicted {
         // Best effort: the old spare has no attached pane, so removing it from
@@ -2290,8 +2409,7 @@ pub fn chat_steer(
         return Err("stale or missing chat run".into());
     }
     let steerable = with_runs(|runs| {
-        runs
-            .get(&session_id)
+        runs.get(&session_id)
             .is_some_and(|active| active.run_id == run_id && !active.interrupting)
     });
     if !steerable {
@@ -2369,7 +2487,8 @@ pub fn chat_send_raw(session_id: u32, line: String) -> Result<(), String> {
                                 "id": rpc_id,
                                 "result": { "decision": decision }
                             }),
-                        );
+                        )
+                        .map_err(|error| error.to_string())?;
                     }
                 }
             }
@@ -2404,8 +2523,7 @@ pub fn chat_stop(session_id: u32, run_id: Option<String>) -> Result<(), String> 
         }
     }
     let removed = with_sessions(|m| {
-        if m
-            .get(&session_id)
+        if m.get(&session_id)
             .is_some_and(|current| Arc::ptr_eq(current, &session))
         {
             m.remove(&session_id)
@@ -2771,7 +2889,10 @@ fn read_codex_catalog_sqlite(db: &std::path::Path) -> Result<Vec<ChatSessionInfo
             let archived: i64 = r.get(7).unwrap_or(0);
             Ok(ChatSessionInfo {
                 id,
-                title: title.clone().or_else(|| preview.clone()).unwrap_or_default(),
+                title: title
+                    .clone()
+                    .or_else(|| preview.clone())
+                    .unwrap_or_default(),
                 cwd: cwd.unwrap_or_default(),
                 mtime: upd.max(0) as u64,
                 engine: "codex".to_string(),
@@ -2843,8 +2964,16 @@ fn rollout_catalog_entry(path: &std::path::Path) -> Option<ChatSessionInfo> {
         };
         if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
             if let Some(p) = v.get("payload") {
-                id = p.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                cwd = p.get("cwd").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                id = p
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                cwd = p
+                    .get("cwd")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 source = p
                     .get("originator")
                     .and_then(|x| x.as_str())
@@ -3320,8 +3449,8 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::io::Read;
     use std::process::{Child, ChildStdout, Command, Stdio};
-    use std::sync::mpsc;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -3424,8 +3553,13 @@ mod tests {
         assert!(e.contains("stdin"), "got: {e}");
         // codex steering is text-only: image-carrying messages must stay queued.
         register_test_session(900_003, Engine::Codex, true);
-        let e =
-            super::chat_steer(900_003, "x".into(), Some(vec!["/tmp/i.png".into()]), "test-run-900003".into()).unwrap_err();
+        let e = super::chat_steer(
+            900_003,
+            "x".into(),
+            Some(vec!["/tmp/i.png".into()]),
+            "test-run-900003".into(),
+        )
+        .unwrap_err();
         assert!(e.contains("text-only"), "got: {e}");
         // opencode has no mid-turn channel at all.
         register_test_session(900_004, Engine::Opencode, true);
@@ -3473,7 +3607,10 @@ mod tests {
             .filter(|l| l.contains("turn/steer"))
             .collect();
         assert_eq!(steers.len(), 2, "original + exactly one retry: {captured}");
-        assert!(steers[1].contains(r#""expectedTurnId":"turn-new""#), "retry must use the server-reported id: {captured}");
+        assert!(
+            steers[1].contains(r#""expectedTurnId":"turn-new""#),
+            "retry must use the server-reported id: {captured}"
+        );
         // A SECOND rejection of the (marked) retry re-queues to the frontend
         // instead of looping — and still leaves the live turn's state intact.
         let out = super::adapt_codex_appserver_frame(
@@ -3485,8 +3622,14 @@ mod tests {
             out[0].contains("codex_steer_requeued") && out[0].contains("new instruction"),
             "got: {out:?}"
         );
-        assert!(out[0].contains(r#""type":"system""#), "must not be a fatal result line: {out:?}");
-        assert!(sess.active_turn.lock().is_some(), "steer failure must not clear the running turn");
+        assert!(
+            out[0].contains(r#""type":"system""#),
+            "must not be a fatal result line: {out:?}"
+        );
+        assert!(
+            sess.active_turn.lock().is_some(),
+            "steer failure must not clear the running turn"
+        );
     }
 
     #[test]
@@ -3526,7 +3669,10 @@ mod tests {
             .iter()
             .position(|l| l.contains(r#""type":"result""#))
             .unwrap_or_else(|| panic!("missing result frame: {out:?}"));
-        assert!(requeue_idx < result_idx, "requeue must precede the result: {out:?}");
+        assert!(
+            requeue_idx < result_idx,
+            "requeue must precede the result: {out:?}"
+        );
     }
 
     #[test]
@@ -3539,7 +3685,9 @@ mod tests {
         assert!(error.contains("stdin"), "got: {error}");
         let sess = super::with_sessions(|m| m.get(&id).cloned()).expect("session");
         let frames = sess.buffer.lock().iter().cloned().collect::<Vec<_>>();
-        assert!(frames.iter().any(|frame| frame.contains(r#""state":"interrupting""#)));
+        assert!(frames
+            .iter()
+            .any(|frame| frame.contains(r#""state":"interrupting""#)));
         let result_idx = frames
             .iter()
             .position(|frame| frame.contains(r#""type":"result""#))
@@ -3548,7 +3696,10 @@ mod tests {
             .iter()
             .position(|frame| frame.contains(r#""state":"interrupted""#))
             .expect("terminal frame");
-        assert!(result_idx < terminal_idx, "result must close the transcript first: {frames:?}");
+        assert!(
+            result_idx < terminal_idx,
+            "result must close the transcript first: {frames:?}"
+        );
         assert!(frames.iter().any(|frame| {
             frame.contains(r#""state":"interrupted""#) && frame.contains(&run_id)
         }));
@@ -3576,7 +3727,9 @@ mod tests {
                 super::chat_stop(id, Some(run_id))
             }
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).expect("stop started");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop started");
         std::thread::sleep(Duration::from_millis(20));
         assert!(
             super::with_sessions(|m| m.contains_key(&id)),
@@ -3605,11 +3758,15 @@ mod tests {
             );
             done_tx.send(()).expect("done");
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).expect("reader started");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader started");
         assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
         assert!(sess.active_turn.lock().is_none());
         drop(operation);
-        done_rx.recv_timeout(Duration::from_secs(1)).expect("reader finished");
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader finished");
         reader.join().expect("reader join");
         assert_eq!(sess.active_turn.lock().as_deref(), Some("turn-lock"));
     }
@@ -3638,7 +3795,9 @@ mod tests {
         assert!(frames[1].contains(r#""state":"running""#));
         assert!(frames[2].contains(r#""state":"interrupting""#));
         assert!(frames[3].contains(r#""state":"interrupted""#));
-        assert!(frames.iter().all(|frame| frame.contains(r#""runId":"render-run-a""#)));
+        assert!(frames
+            .iter()
+            .all(|frame| frame.contains(r#""runId":"render-run-a""#)));
     }
 
     #[test]
@@ -3721,7 +3880,10 @@ mod tests {
 
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(out[0].contains(r#""is_error":true"#), "{out:?}");
-        assert!(out[0].contains("requires a newer version of Codex"), "{out:?}");
+        assert!(
+            out[0].contains("requires a newer version of Codex"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -3770,6 +3932,69 @@ mod tests {
         assert_eq!(request["method"], "turn/interrupt");
         assert_eq!(request["params"]["threadId"], "thread-1");
         assert_eq!(request["params"]["turnId"], "turn-7");
+    }
+
+    #[test]
+    fn codex_interrupt_deadline_synthesizes_one_terminal_result() {
+        let id = 900_108;
+        register_test_session(id, Engine::Codex, true);
+        let sess = super::with_sessions(|m| m.get(&id).cloned()).expect("session");
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("wedged process");
+        *sess.child.lock() = Some(child);
+        super::arm_codex_interrupt_deadline(Arc::clone(&sess), Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(40));
+        super::arm_codex_interrupt_deadline(Arc::clone(&sess), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(10));
+        let frames = sess.buffer.lock().iter().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|line| line.contains(r#""type":"result""#))
+                .count(),
+            1,
+            "{frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|line| line.contains(r#""state":"interrupted""#))
+                .count(),
+            1,
+            "{frames:?}"
+        );
+        assert!(
+            sess.child.lock().is_none(),
+            "deadline must reap the wedged process"
+        );
+        super::with_sessions(|m| {
+            m.remove(&id);
+        });
+    }
+
+    #[test]
+    fn old_codex_interrupt_deadline_never_kills_a_new_run() {
+        let id = 900_109;
+        register_test_session(id, Engine::Codex, true);
+        let sess = super::with_sessions(|m| m.get(&id).cloned()).expect("session");
+        let old_run = format!("test-run-{id}");
+        super::arm_codex_interrupt_deadline(Arc::clone(&sess), Duration::from_millis(20));
+        super::emit_terminal(&sess, "interrupted");
+        super::begin_run(&sess, format!("{old_run}-next"));
+        sess.busy.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            sess.busy.load(Ordering::SeqCst),
+            "stale watchdog touched the next run"
+        );
+        super::with_sessions(|m| {
+            m.remove(&id);
+        });
+        super::with_runs(|runs| {
+            runs.remove(&id);
+        });
     }
 
     #[test]
@@ -3833,11 +4058,7 @@ mod tests {
     #[test]
     fn codex_prewarm_registry_keeps_only_one_spare() {
         let mut warm = HashMap::from([("old-profile".to_string(), 41_u32)]);
-        let evicted = super::store_single_warm_codex(
-            &mut warm,
-            "new-profile".to_string(),
-            42,
-        );
+        let evicted = super::store_single_warm_codex(&mut warm, "new-profile".to_string(), 42);
 
         assert_eq!(warm, HashMap::from([("new-profile".to_string(), 42)]));
         assert_eq!(evicted, vec![41]);
@@ -4050,8 +4271,7 @@ js_repl = false
     #[test]
     fn list_chat_sessions_merges_codex_desktop_thread_absent_from_store() {
         use rusqlite::Connection;
-        let root =
-            std::env::temp_dir().join(format!("aios-catalog-merge-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("aios-catalog-merge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // AIOS-local codex thread (present in BOTH store + catalog → must dedup).
         let local_id = "019f1111-aaaa-bbbb-cccc-000000000001";
@@ -4116,8 +4336,8 @@ js_repl = false
 
     #[test]
     fn codex_catalog_falls_back_to_rollout_scan_without_sqlite() {
-        let root = std::env::temp_dir()
-            .join(format!("aios-catalog-fallback-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("aios-catalog-fallback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // No state_5.sqlite → must scan rollout metadata instead.
         let id = "019f3333-1111-2222-3333-000000000003";

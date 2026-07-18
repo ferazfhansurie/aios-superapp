@@ -7,6 +7,8 @@ on:
   push:
     branches: [master]
     tags: ["v*"]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 jobs:
@@ -38,6 +40,18 @@ jobs:
 
       - name: install frontend deps
         run: pnpm install --frozen-lockfile
+
+      - name: verify frontend and shared contracts
+        run: |
+          pnpm build
+          pnpm test:router
+          pnpm test:codex-adapter
+          pnpm test:chatpane
+          pnpm test:lsp
+          pnpm test:cfo
+
+      - name: verify rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: use ad-hoc mac signing in ci
         if: runner.os == 'macOS'

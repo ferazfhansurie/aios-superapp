@@ -28,3 +28,12 @@ test("detects stale and month mismatch", () => {
   assert.equal(d.stale, true);
   assert.equal(d.monthMismatch, true);
 });
+
+test("keeps receivables out of actual cash and exposes projected cash", () => {
+  const d = deriveFinanceSnapshot({ ...snapshot, cash: 2513.68, business_cash: 2350, cash_floor: 4000, receivables: [{ id: "faeez", person: "Faeez", gross: 2700, deductions: 600, amount: 2100, note: "medicine and petrol" }] }, new Date("2026-07-17T00:01:00+08:00"));
+  assert.equal(d.receivableTotal, 2100);
+  assert.equal(d.liquidCash, 4863.68);
+  assert.equal(d.projectedCash, 6963.68);
+  assert.equal(d.cashFloorGap, 0);
+  assert.equal(d.projectedFloorGap, 0);
+});

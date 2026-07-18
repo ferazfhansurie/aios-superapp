@@ -82,6 +82,7 @@ import { loadSettings, saveSettings } from "../lib/settings";
 import {
   AIOS_MODEL_ID,
   buildHandoffSeed,
+  observeClaudeHardLimit,
   parseModelDirective,
   resolveAios,
   resolveAiosSync,
@@ -188,9 +189,8 @@ import {
 import { CopyButton, Markdown, parseButtons } from "./chat/ChatMarkdown";
 import { ApprovalCard, QuestionCard } from "./chat/ApprovalCards";
 import { ModelIcon } from "./chat/modelIcons";
-import { TaskActivity } from "./chat/TaskActivity";
 import { ConversationRail } from "./chat/ConversationRail";
-import { TaskSummary, type TaskSource } from "./chat/TaskSummary";
+import { TaskRail } from "./chat/TaskRail";
 import { emptyFleetState, reduceFleet, type FleetState } from "../lib/subagentFleet";
 import {
   canStartNormalSend,
@@ -666,12 +666,24 @@ export function ChatPane({
     bootRouteRef.current = resolveAiosSync();
     return bootRouteRef.current.model;
   });
+  // The concrete model owns the provider engine. AIOS may deliberately run a
+  // Codex model through the Claude Code adapter while Claude has capacity, then
+  // switch that same model to native Codex at the 100% boundary.
+  const runtimeEngine = model.engine ?? "claude";
   // non-null ⇒ the live session was picked by the aios router (value = reason).
   const [aiosRouted, setAiosRouted] = useState<string | null>(
     () => bootRouteRef.current?.reason ?? null,
   );
+  const [aiosHarness, setAiosHarness] = useState<"claude" | null>(
+    () => bootRouteRef.current?.harness ?? null,
+  );
   const aiosRoutedRef = useRef(aiosRouted);
   aiosRoutedRef.current = aiosRouted;
+  const aiosHarnessRef = useRef(aiosHarness);
+  aiosHarnessRef.current = aiosHarness;
+  const runtimeHarness: "claude" | null = aiosRouted != null
+    ? aiosHarness
+    : runtimeEngine === "codex" ? null : "claude";
   const [permission, setPermission] = useState(PERMISSION_MODES[0]);
   const [effort, setEffort] = useState<(typeof EFFORTS)[number]>(() => {
     const settings = loadSettings();
@@ -736,7 +748,6 @@ export function ChatPane({
   const queueStorageKey = paneKey ?? null;
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [queuedIdx, setQueuedIdx] = useState(0);
-  const [taskSummaryOpen, setTaskSummaryOpen] = useState(true);
   // `undefined` means the current pane has not finished loading yet; `null`
   // means an intentionally unkeyed, memory-only composer.
   const [hydratedQueuePaneKey, setHydratedQueuePaneKey] = useState<string | null | undefined>(undefined);
@@ -1373,6 +1384,26 @@ export function ChatPane({
       }
       return;
     }
+    if (ev.type === "aios_session_dead") {
+      const id = sessionIdRef.current;
+      sessionIdRef.current = null;
+      if (paneKey && id != null) chatSessions.delete(paneKey);
+      resetRunLifecycle();
+      setStarted(false);
+      setClaudeReady(false);
+      streamingTurnId.current = null;
+      thinkingTurnId.current = null;
+      turnStartRef.current = null;
+      setLiveStart(null);
+      sessionStartRequestedRef.current = true;
+      setSessionStartRequested(true);
+      setRestartKey((key) => key + 1);
+      setTurns((prev) => [
+        ...prev,
+        { kind: "result", id: uid(), text: "codex restarted after forced stop." },
+      ]);
+      return;
+    }
     setRunEventState((state) => reduceRunEvents(state, ev));
     setFleetState((state) => reduceFleet(state, ev));
     // ---- control protocol: tool approval requests + acks --------------------
@@ -1795,7 +1826,8 @@ export function ChatPane({
             runState: info.run_state,
           }))
         : chatStart(chan, {
-            engine: model.engine ?? "claude",
+            engine: runtimeEngine,
+            harness: runtimeHarness,
             cwd: cwd ?? null,
             model: model.disabled ? null : model.id,
             permissionMode: permission.id,
@@ -1806,7 +1838,7 @@ export function ChatPane({
             // the cockpit toggle is on (claude engine only; rust ignores it
             // for codex/opencode).
             headroom:
-              (model.engine ?? "claude") === "claude" &&
+              runtimeEngine === "claude" &&
               loadSettings().headroomCompression,
             // box-backed model → run the session on the node instead of locally.
             node: model.node ?? null,
@@ -1903,7 +1935,7 @@ export function ChatPane({
     };
     // model/permission/effort/resumeId are captured at start; changing them restarts the session
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model.id, permission.id, effort.id, effectiveBudget, runtimeEffort, cwd, restartKey, resumeId, reattach, webChatRuntime, paneKey, sessionStartRequested, eagerSessionStart, adoptBackendRun, transitionRunLifecycle]);
+  }, [model.id, permission.id, effort.id, effectiveBudget, runtimeEffort, runtimeHarness, cwd, restartKey, resumeId, reattach, webChatRuntime, paneKey, sessionStartRequested, eagerSessionStart, adoptBackendRun, transitionRunLifecycle]);
 
   // Publish a close-handle so App can detach (keep running) vs kill a busy chat.
   useEffect(() => {
@@ -2111,6 +2143,13 @@ export function ChatPane({
             : t,
         ),
       );
+      setRunEventState((state) =>
+        reduceRunEvents(state, {
+          type: "control_response",
+          request_id: requestId,
+          response: { request_id: requestId, decision },
+        }),
+      );
       if (id != null) {
         // chat.ts owns the exact control_response shape (buildApprovalLine).
         chatSendRaw(id, buildApprovalLine(requestId, decision, toolName)).catch(
@@ -2154,7 +2193,7 @@ export function ChatPane({
       // it. Repeating any preamble every turn is context bloat (and re-inflates
       // resumed codex threads). Session identity belongs in CLAUDE.md / AGENTS.md,
       // read once via cwd by each engine — not stapled to every user message.
-      const engine = model.engine ?? "claude";
+      const engine = runtimeEngine;
       // codex gets the typed text verbatim (see composeWireMessage) — its first
       // user turn defines the shared ~/.codex thread title, so no plan/goal/
       // agent/ultracode/memory framing may leak into it. every other engine
@@ -2185,6 +2224,7 @@ export function ChatPane({
         ]);
       }
       const runId = beginRun();
+      setRunEventState(emptyRunEventState());
       // a fresh turn starts with no sub-agents — clear any fleet left over from
       // the previous turn so completed chips don't linger into a new ask.
       setFleetState(emptyFleetState());
@@ -2400,9 +2440,7 @@ export function ChatPane({
   const steerQueued = useCallback(
     (queuedId: string) => {
       const item = queuedRef.current.find((q) => q.id === queuedId);
-      const engine = model.engine ?? "claude";
-      if (!item || (engine !== "codex" && engine !== "claude")) return;
-      if (engine === "codex" && item.images?.length) return;
+      if (!item) return;
       const id = sessionIdRef.current;
       const lifecycle = runLifecycleRef.current;
       if (id == null || !canSteer(lifecycle) || lifecycle.phase !== "running") return;
@@ -2426,7 +2464,7 @@ export function ChatPane({
         }
       })();
     },
-    [model.engine, removeQueued, restorePinnedImages],
+    [runtimeEngine, removeQueued, restorePinnedImages],
   );
 
   // Send an explicit string (used by send() with the composer text, and by the
@@ -2505,7 +2543,7 @@ export function ChatPane({
       // = turn/steer text-only), render it as a normal sent bubble; otherwise
       // queue it ChatGPT-style to fire when the turn finishes.
       if (activeRunRef.current) {
-        const engine = model.engine ?? "claude";
+        const engine = runtimeEngine;
         const sid = sessionIdRef.current;
         const lifecycle = runLifecycleRef.current;
         const steerable =
@@ -2725,7 +2763,7 @@ export function ChatPane({
         }
         // Do not settle locally. Rust atomically validates `runId`, emits
         // interrupting, and then delivers the engine's terminal lifecycle frame.
-        const strategy = stopStrategy(model.engine);
+        const strategy = stopStrategy(runtimeEngine);
         const request = strategy === "kill-and-restart"
           ? chatStop(id, runId)
           : chatInterrupt(id, runId);
@@ -2735,7 +2773,7 @@ export function ChatPane({
         });
       }
     },
-    [model.engine, webChatRuntime, transitionRunLifecycle],
+    [runtimeEngine, webChatRuntime, transitionRunLifecycle],
   );
 
   // true interrupt of the in-flight turn (process survives)
@@ -2819,7 +2857,11 @@ export function ChatPane({
       chatModel: AIOS_MODEL_ID,
       chatProvider: `${d.model.engine ?? "claude"}-cli`,
     });
-    if (d.model.id === activeModelRef.current.id) {
+    if (
+      d.model.id === activeModelRef.current.id &&
+      aiosRoutedRef.current != null &&
+      aiosHarnessRef.current === d.harness
+    ) {
       // router landed on the model already live — keep the session, flag it.
       setAiosRouted(d.reason);
       setTurns((prev) => [
@@ -2837,6 +2879,7 @@ export function ChatPane({
     clearSession();
     setEffort(EFFORTS.find((option) => option.id === nextEffortId) ?? EFFORTS[1]);
     setModel(d.model);
+    setAiosHarness(d.harness);
     setAiosRouted(d.reason);
     setTurns([
       {
@@ -2867,6 +2910,7 @@ export function ChatPane({
         // manual: keep the session, drop the router flag.
         if (aiosRoutedRef.current != null) {
           setAiosRouted(null);
+          setAiosHarness(null);
           saveSettings({ chatModel: m.id });
         }
         return;
@@ -2883,6 +2927,7 @@ export function ChatPane({
       setEffort(nextEffort);
       setModel(m);
       setAiosRouted(null);
+      setAiosHarness(null);
       // picking a model sets it as the global default (sticks across panes +
       // restarts). engine omitted = claude.
       saveSettings({
@@ -2959,6 +3004,7 @@ export function ChatPane({
       setEffort(nextEffort);
       setModel(target);
       setAiosRouted(null);
+      setAiosHarness(null);
       saveSettings({
         chatModel: target.id,
         chatProvider: `${target.engine ?? "claude"}-cli`,
@@ -3011,6 +3057,7 @@ export function ChatPane({
       if (sessionStartRequestedRef.current || turnsRef.current.length > 0) return;
       if (eagerSessionStart) return;
       setAiosRouted(d.reason);
+      setAiosHarness(d.harness);
       if (activeModelRef.current.id === d.model.id) return;
       const settings = loadSettings();
       const nextEffortId = resolveModelEffort(
@@ -3026,7 +3073,7 @@ export function ChatPane({
 
   // aios failover: a ROUTED session that slams into the engine's usage wall
   // ("You've hit your usage limit…") re-resolves — the meters now see the cap,
-  // so the router lands on the bulk lane — and resends the last user message
+  // so the router swaps the GPT session to native Codex — and resends the last user message
   // with a transcript handoff. No dead pane waiting for a human to notice.
   // Manual sessions are left alone: the user picked that model on purpose.
   const limitRerouteRef = useRef<string | null>(null);
@@ -3036,7 +3083,7 @@ export function ChatPane({
     if (last.kind !== "assistant" && last.kind !== "result") return;
     if ((last as { streaming?: boolean }).streaming) return;
     const text = (last as { text?: string }).text ?? "";
-    if (!/(?:hit|reached) your usage limit/i.test(text)) return;
+    if (!/(?:hit|reached) your usage limit|usage limit (?:has been )?reached|rate limit exceeded/i.test(text)) return;
     if (limitRerouteRef.current === last.id) return;
     limitRerouteRef.current = last.id;
     const lastUser = [...turns].reverse().find((t) => t.kind === "user") as
@@ -3047,17 +3094,23 @@ export function ChatPane({
       text: (t as { text?: string }).text ?? "",
     }));
     const fromLabel = activeModelRef.current.label;
+    const fromHarness = runtimeHarness;
+    if (runtimeHarness === "claude") {
+      // The refusal is authoritative and must beat the usage command's short
+      // cache; otherwise the router can immediately pick the same capped model.
+      observeClaudeHardLimit();
+    }
     void switchToAios().then((d) => {
-      // router landed back on the same (capped) model → both lanes are walls;
-      // leave the error visible instead of looping.
-      if (d.model.id === activeModelRef.current.id) return;
+      // Same model + same harness means no route changed; leave the error visible
+      // instead of looping. Same GPT model on native Codex is a real failover.
+      if (d.model.id === activeModelRef.current.id && d.harness === fromHarness) return;
       if (lastUser?.text) {
         pendingAutoSendRef.current = buildHandoffSeed(prior, fromLabel, lastUser.text);
         sessionStartRequestedRef.current = true;
         setSessionStartRequested(true);
       }
     });
-  }, [turns, aiosRouted, switchToAios]);
+  }, [turns, aiosRouted, runtimeHarness, switchToAios]);
 
   // ── /resume: reopen a past chat session ────────────────────────────────────
   // Loads the chat-only session list (lazy, on picker open). On selection we
@@ -3625,23 +3678,6 @@ export function ChatPane({
     projectedTaskArtifacts,
     JSON.stringify(projectedTaskArtifacts.map(({ path, name, kind }) => [path, name, kind])),
   );
-  const projectedTaskSources = useMemo<TaskSource[]>(() => {
-    const seen = new Set<string>();
-    const sources: TaskSource[] = [];
-    for (const turn of turns) {
-      if (turn.kind !== "user") continue;
-      for (const path of turn.images ?? []) {
-        if (seen.has(path)) continue;
-        seen.add(path);
-        sources.push({ path, label: baseName(path) });
-      }
-    }
-    return sources;
-  }, [turns]);
-  const taskSources = useStableProjection(
-    projectedTaskSources,
-    JSON.stringify(projectedTaskSources.map(({ path, label }) => [path, label])),
-  );
   // The task workspace receives only renderer-normalized state. Raw ChatEvent
   // frames never cross this boundary, so remounts and rails replay one compact,
   // bounded vocabulary no matter which backend produced the turn.
@@ -3694,24 +3730,14 @@ export function ChatPane({
     },
     [],
   );
-  const draftOutput = useCallback(() => {
-    setInput("create a file or site");
-    requestAnimationFrame(() => taRef.current?.focus());
-  }, [setInput]);
-  const openTaskArtifact = useCallback((artifact: Artifact) => {
-    if (openFileInPane(artifact.path, artifact.name)) return;
-    openPath(artifact.path).catch((e) => reportDiag("chat.open-output", e, { path: artifact.path }));
+  const openRunReference = useCallback((reference: { path: string; label?: string }) => {
+    const label = reference.label ?? baseName(reference.path);
+    if (openFileInPane(reference.path, label)) return;
+    openPath(reference.path).catch((e) => reportDiag("chat.open-run-reference", e, { path: reference.path }));
   }, []);
-  const openTaskSource = useCallback((source: TaskSource) => {
-    if (openViewerFileInPane(source.path, source.label)) return;
-    openPath(source.path).catch((e) => reportDiag("chat.open-source", e, { path: source.path }));
-  }, []);
-  const showTaskAgents = useCallback(() => {
-    setTaskSummaryOpen(false);
-    requestAnimationFrame(() => {
-      const el = scrollRef.current;
-      if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-    });
+  const openTaskAgent = useCallback((agent: { paneKey?: string }) => {
+    if (!agent.paneKey) return;
+    window.dispatchEvent(new CustomEvent("aios-focus-pane", { detail: { key: agent.paneKey } }));
   }, []);
 
   // ── render ──────────────────────────────────────────────────────────────────
@@ -3776,18 +3802,6 @@ export function ChatPane({
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setTaskSummaryOpen((open) => !open)}
-            title="toggle pinned task summary"
-            className={`grid h-6 w-6 place-items-center rounded-md transition-colors ${
-              taskSummaryOpen
-                ? "bg-[var(--color-panel-2)] text-[var(--color-text)]"
-                : "text-[var(--color-faint)] hover:bg-[var(--color-panel)] hover:text-[var(--color-text)]"
-            }`}
-          >
-            <ListChecks size={14} />
-          </button>
           <span
             className="font-mono text-[10px] text-[var(--color-faint)]"
             title={aiosRouted ?? undefined}
@@ -3803,23 +3817,6 @@ export function ChatPane({
           {resumedTitle && (
             <div className="flex justify-center">
               <ResumedNote title={resumedTitle} onClear={() => setResumedTitle(null)} />
-            </div>
-          )}
-          {taskSummaryOpen && (
-            <div className="flex justify-end">
-              <TaskSummary
-                taskId={taskId}
-                model={model}
-                aiosRouted={aiosRouted}
-                artifacts={taskArtifacts}
-                agents={fleetState.agents}
-                workflows={fleetState.workflows}
-                sources={taskSources}
-                onCreateOutput={draftOutput}
-                onOpenArtifact={openTaskArtifact}
-                onOpenSource={openTaskSource}
-                onShowAgents={showTaskAgents}
-              />
             </div>
           )}
           <div className="relative">
@@ -3838,14 +3835,6 @@ export function ChatPane({
               onQuestionAnswer={handleQuestionAnswer}
             />
           </div>
-          {/* Compact Codex-style task narrative. It consumes only fleet state
-              already normalized by the renderer and retains settled workers. */}
-          {(fleetState.agents.length > 0 || fleetState.workflows.length > 0) && (
-            <TaskActivity
-              agents={fleetState.agents}
-              workflows={fleetState.workflows}
-            />
-          )}
           {/* turn in flight with neither streamed text nor a live activity group
               yet (the very first beat) → the bare working timer */}
           {streaming &&
@@ -3910,6 +3899,16 @@ export function ChatPane({
       )}
       <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg)]/80 px-6 pb-5 pt-3 backdrop-blur">
         <div className="mx-auto max-w-none">
+          <TaskRail
+            phase={runEventState.phase}
+            events={runEventState.events}
+            agents={fleetState.agents}
+            workflows={fleetState.workflows}
+            artifacts={taskArtifacts}
+            className="mb-2"
+            onAgentOpen={openTaskAgent}
+            onReferenceOpen={openRunReference}
+          />
           {/* context readout — out of the cramped composer, model-aware window
               (fable 5 / opus 4.8 = 1M, sonnet/haiku = 200K, codex = 272K) */}
           {ctxTokens != null && (

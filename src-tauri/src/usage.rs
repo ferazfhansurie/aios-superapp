@@ -67,9 +67,8 @@ pub fn claude_usage_value(_app: Option<&AppHandle>) -> Value {
         }
     }
 
-    let data = attach_terminal_claude_identity(
-        claude_usage_from_statusline().unwrap_or(Value::Null),
-    );
+    let data =
+        attach_terminal_claude_identity(claude_usage_from_statusline().unwrap_or(Value::Null));
     if claude_usage_has_signal(&data) {
         write_claude_usage_cache(&data);
     }
@@ -195,7 +194,11 @@ pub(crate) fn claude_accounts_config() -> Vec<ClaudeAccount> {
 }
 
 fn resolve_account_token(source: &Value) -> Option<String> {
-    match source.get("kind").and_then(|k| k.as_str()).unwrap_or("default") {
+    match source
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("default")
+    {
         "default" => claude_oauth_token(),
         "keychain" => {
             let service = source.get("service")?.as_str()?.to_string();
@@ -346,7 +349,9 @@ fn keychain_credentials_text(service: &str, account: Option<&str>) -> Option<Str
     if !out.status.success() {
         return None;
     }
-    String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
+    String::from_utf8(out.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1283,7 +1288,10 @@ mod tests {
             resolve_account_token(&json!({ "kind": "token", "value": " sk-ant-oat01-x " })),
             Some("sk-ant-oat01-x".to_string())
         );
-        assert_eq!(resolve_account_token(&json!({ "kind": "token", "value": "" })), None);
+        assert_eq!(
+            resolve_account_token(&json!({ "kind": "token", "value": "" })),
+            None
+        );
 
         let dir = std::env::temp_dir().join("aios-usage-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1294,9 +1302,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_account_token(
-                &json!({ "kind": "env_file", "path": path.to_string_lossy() })
-            ),
+            resolve_account_token(&json!({ "kind": "env_file", "path": path.to_string_lossy() })),
             Some("sk-ant-oat01-fhe".to_string())
         );
     }

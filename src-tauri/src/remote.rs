@@ -369,15 +369,19 @@ fn cleanup(local_id: u32) {
 }
 
 fn emit_run(handle: &RemoteHandle, state: &str, run_id: &str) {
-    let _ = handle.on_event.send(
-        json!({ "type": "aios_run", "state": state, "runId": run_id }).to_string(),
-    );
+    let _ = handle
+        .on_event
+        .send(json!({ "type": "aios_run", "state": state, "runId": run_id }).to_string());
 }
 
 fn finish_handle_run(handle: &RemoteHandle, fallback: &str) {
     let active = handle.run.lock().take();
     let Some(active) = active else { return };
-    let state = if active.interrupting { "interrupted" } else { fallback };
+    let state = if active.interrupting {
+        "interrupted"
+    } else {
+        fallback
+    };
     emit_run(handle, state, &active.id);
 }
 

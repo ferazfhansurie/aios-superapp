@@ -32,13 +32,18 @@ pub static NEXT_REQ: AtomicU64 = AtomicU64::new(1);
 
 /// Writes one JSON-RPC value (newline-terminated) to a codex app-server session's
 /// stdin — handshake, turns, interrupts, and server-request replies all go here.
-pub fn codex_rpc_write(sess: &Arc<ChatSession>, val: &serde_json::Value) {
+pub fn codex_rpc_write(sess: &Arc<ChatSession>, val: &serde_json::Value) -> std::io::Result<()> {
     let mut line = val.to_string();
     line.push('\n');
-    if let Some(stdin) = sess.stdin.lock().as_mut() {
-        let _ = stdin.write_all(line.as_bytes());
-        let _ = stdin.flush();
-    }
+    let mut stdin = sess.stdin.lock();
+    let stdin = stdin.as_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "codex stdin is unavailable",
+        )
+    })?;
+    stdin.write_all(line.as_bytes())?;
+    stdin.flush()
 }
 
 /// Next JSON-RPC request id for this session.
@@ -65,7 +70,7 @@ pub fn codex_fire_turn(
     thread_id: &str,
     text: &str,
     image_paths: &[String],
-) {
+) -> std::io::Result<()> {
     let id = codex_next_rpc(sess);
     let mut params = json!({
         "threadId": thread_id,
@@ -80,13 +85,18 @@ pub fn codex_fire_turn(
     codex_rpc_write(
         sess,
         &json!({ "jsonrpc": "2.0", "id": id, "method": "turn/start", "params": params }),
-    );
+    )
 }
 
 /// Sends a same-turn steer once the app-server's `turn/started` notification has
 /// supplied the required active turn id.
-pub fn codex_fire_steer(sess: &Arc<ChatSession>, thread_id: &str, turn_id: &str, text: &str) {
-    codex_fire_steer_attempt(sess, thread_id, turn_id, text, false);
+pub fn codex_fire_steer(
+    sess: &Arc<ChatSession>,
+    thread_id: &str,
+    turn_id: &str,
+    text: &str,
+) -> std::io::Result<()> {
+    codex_fire_steer_attempt(sess, thread_id, turn_id, text, false)
 }
 
 /// The raw steer write. Registers the request id in `pending_steers` first so
@@ -99,12 +109,12 @@ fn codex_fire_steer_attempt(
     turn_id: &str,
     text: &str,
     retried: bool,
-) {
+) -> std::io::Result<()> {
     let id = codex_next_rpc(sess);
     sess.pending_steers
         .lock()
         .insert(id, (text.to_string(), retried));
-    codex_rpc_write(
+    if let Err(error) = codex_rpc_write(
         sess,
         &json!({
             "jsonrpc": "2.0", "id": id, "method": "turn/steer",
@@ -114,7 +124,11 @@ fn codex_fire_steer_attempt(
                 "input": [{ "type": "text", "text": text }],
             }
         }),
-    );
+    ) {
+        sess.pending_steers.lock().remove(&id);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Parses the server's ACTUAL active turn id out of codex's steer rejection —
@@ -139,7 +153,11 @@ fn codex_steer_requeue_line(text: &str) -> String {
 
 /// Sends a turn-scoped interrupt. Codex app-server v2 requires BOTH ids; sending
 /// only `threadId` is rejected while the model keeps working.
-pub fn codex_fire_interrupt(sess: &Arc<ChatSession>, thread_id: &str, turn_id: &str) {
+pub fn codex_fire_interrupt(
+    sess: &Arc<ChatSession>,
+    thread_id: &str,
+    turn_id: &str,
+) -> std::io::Result<()> {
     let id = codex_next_rpc(sess);
     codex_rpc_write(
         sess,
@@ -147,7 +165,7 @@ pub fn codex_fire_interrupt(sess: &Arc<ChatSession>, thread_id: &str, turn_id: &
             "jsonrpc": "2.0", "id": id, "method": "turn/interrupt",
             "params": { "threadId": thread_id, "turnId": turn_id }
         }),
-    );
+    )
 }
 
 /// Adapts one codex app-server JSON-RPC frame to zero-or-more claude stream-json
@@ -155,6 +173,21 @@ pub fn codex_fire_interrupt(sess: &Arc<ChatSession>, thread_id: &str, turn_id: &
 /// turns) via `codex_rpc_write` — so it is line→lines PLUS a stdin side-effect,
 /// identical on the laptop and the box.
 pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<String> {
+    adapt_codex_appserver_frame_before_emit(sess, line, || {})
+}
+
+/// Adapts a frame while guaranteeing that a `turn/started` id is committed
+/// before the host publishes its renderer-facing `running` lifecycle event.
+/// Hosts should put that publication in `before_emit`; all other frames simply
+/// call it after their ordinary pre-adaptation state (which is a no-op today).
+pub fn adapt_codex_appserver_frame_before_emit<F>(
+    sess: &Arc<ChatSession>,
+    line: &str,
+    before_emit: F,
+) -> Vec<String>
+where
+    F: FnOnce(),
+{
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
@@ -166,6 +199,19 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
     let method = v.get("method").and_then(|x| x.as_str());
     let has_id = v.get("id").is_some();
     let mut out = Vec::new();
+    let turn_started_id = (method == Some("turn/started"))
+        .then(|| {
+            v.get("params")
+                .and_then(|p| p.get("turn"))
+                .and_then(|t| t.get("id"))
+                .and_then(|x| x.as_str())
+                .map(str::to_owned)
+        })
+        .flatten();
+    if let Some(id) = turn_started_id {
+        *sess.active_turn.lock() = Some(id);
+    }
+    before_emit();
 
     // server→client request. In `on-request` approval mode (the composer's "ask
     // each time"), codex asks BEFORE running a command / applying a patch via
@@ -219,7 +265,11 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
         }
         // non-approval server request: ack so nothing stalls.
         if let Some(idv) = v.get("id") {
-            codex_rpc_write(sess, &json!({ "jsonrpc": "2.0", "id": idv, "result": {} }));
+            if let Err(error) =
+                codex_rpc_write(sess, &json!({ "jsonrpc": "2.0", "id": idv, "result": {} }))
+            {
+                out.push(codex_error_result_line(sess, &error.to_string()));
+            }
         }
         return out;
     }
@@ -247,8 +297,9 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
                         let tid = sess.thread_id.lock().clone().unwrap_or_default();
                         if !tid.is_empty() {
                             *sess.active_turn.lock() = Some(actual.clone());
-                            codex_fire_steer_attempt(sess, &tid, &actual, &text, true);
-                            return out;
+                            if codex_fire_steer_attempt(sess, &tid, &actual, &text, true).is_ok() {
+                                return out;
+                            }
                         }
                     }
                 }
@@ -301,7 +352,9 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
             }
             // Fire any turn queued before the thread existed.
             if let Some((text, images)) = sess.pending_turn.lock().take() {
-                codex_fire_turn(sess, tid, &text, &images);
+                if let Err(error) = codex_fire_turn(sess, tid, &text, &images) {
+                    out.push(codex_error_result_line(sess, &error.to_string()));
+                }
             }
         }
         return out;
@@ -455,10 +508,14 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
                 for control in controls {
                     match control {
                         PendingCodexControl::Steer(text) => {
-                            codex_fire_steer(sess, &thread_id, id, &text)
+                            if codex_fire_steer(sess, &thread_id, id, &text).is_err() {
+                                out.push(codex_steer_requeue_line(&text));
+                            }
                         }
                         PendingCodexControl::Interrupt => {
-                            codex_fire_interrupt(sess, &thread_id, id)
+                            if let Err(error) = codex_fire_interrupt(sess, &thread_id, id) {
+                                out.push(codex_error_result_line(sess, &error.to_string()));
+                            }
                         }
                     }
                 }
@@ -534,7 +591,11 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
                     .and_then(|p| p.get("error"))
                     .and_then(|e| e.get("message"))
                     .and_then(|x| x.as_str())
-                    .or_else(|| params.and_then(|p| p.get("message")).and_then(|x| x.as_str()))
+                    .or_else(|| {
+                        params
+                            .and_then(|p| p.get("message"))
+                            .and_then(|x| x.as_str())
+                    })
                     .unwrap_or("codex turn failed");
                 out.push(codex_error_result_line(sess, message));
             }
@@ -542,4 +603,61 @@ pub fn adapt_codex_appserver_frame(sess: &Arc<ChatSession>, line: &str) -> Vec<S
         _ => {} // thread/started, item/started, deltas, mcp status — ignored in v1
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Engine, NoopEvents, OutputSink};
+    use std::process::{Command, Stdio};
+
+    struct NullSink;
+    impl OutputSink for NullSink {
+        fn send(&self, _: &str) {}
+    }
+
+    fn session() -> Arc<ChatSession> {
+        Arc::new(ChatSession::spawned(
+            1,
+            Engine::Codex,
+            None,
+            None,
+            Box::new(NullSink),
+            Box::new(NoopEvents),
+        ))
+    }
+
+    #[test]
+    fn rpc_write_reports_missing_stdin() {
+        let error = codex_rpc_write(&session(), &json!({"method":"turn/start"}))
+            .expect_err("a missing transport must not look accepted");
+        assert!(error.to_string().contains("stdin"), "{error}");
+    }
+
+    #[test]
+    fn rpc_write_propagates_broken_pipe() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn closed reader");
+        let stdin = child.stdin.take().expect("stdin");
+        child.wait().expect("exit");
+        let sess = session();
+        *sess.stdin.lock() = Some(stdin);
+        let error = codex_rpc_write(&sess, &json!({"method":"turn/start"}))
+            .expect_err("broken pipe must reach the caller");
+        assert!(matches!(error.kind(), std::io::ErrorKind::BrokenPipe));
+    }
+
+    #[test]
+    fn turn_started_state_is_visible_before_running_callback() {
+        let sess = session();
+        adapt_codex_appserver_frame_before_emit(
+            &sess,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}"#,
+            || assert_eq!(sess.active_turn.lock().as_deref(), Some("turn-1")),
+        );
+    }
 }

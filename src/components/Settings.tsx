@@ -1299,17 +1299,16 @@ export function Settings({
                   <div className="py-3">
                     <div className="text-[13px] text-[var(--color-text)]">aios router</div>
                     <p className="mb-1 mt-0.5 text-[11px] leading-snug text-[var(--color-muted)]">
-                      the "aios" picker entry routes through this architecture:
-                      main wins by default; deep is summon-only ("use deep" in
-                      chat); bulk does heavy lifting and drains the prepaid
-                      claude sub when main's 7-day budget runs ahead of pace.
-                      every route shows its reason in the chat pane.
+                      new sessions use the fable route until Claude's real 5h
+                      meter reaches 100%, then use the Codex failover. when the
+                      meter resets to zero, new sessions return to fable. active
+                      sessions stay on their current model.
                     </p>
                     {(
                       [
-                        ["main", "daily driver — everything by default"],
-                        ["deep", "judgment tier — summon with \"use deep\", never auto"],
-                        ["bulk", "heavy lifting + burn tier when main runs hot"],
+                        ["main", "Codex failover — Claude at 100% or hard-limited"],
+                        ["deep", "fable route — preferred while Claude has 5h capacity"],
+                        ["bulk", "manual heavy-work route — summon with \"use bulk\""],
                       ] as const
                     ).map(([role, sub]) => (
                       <Row key={role} label={role} sub={sub}>
@@ -1332,23 +1331,6 @@ export function Settings({
                         </select>
                       </Row>
                     ))}
-                    <Row
-                      label="pace margin"
-                      sub="pct-points the target's 7d meter may run ahead of the week clock before diverting to the burn tier"
-                    >
-                      <input
-                        type="number"
-                        min={5}
-                        max={50}
-                        value={s.aiosRouterPaceMargin}
-                        onChange={(e) => {
-                          const v = Number(e.target.value);
-                          if (Number.isFinite(v))
-                            patch({ aiosRouterPaceMargin: Math.min(50, Math.max(5, v)) });
-                        }}
-                        className="w-16 rounded-md border border-[var(--color-border)] bg-[var(--color-panel-2)]/50 px-2 py-1 text-right text-[11px] text-[var(--color-text)]"
-                      />
-                    </Row>
                   </div>
 
                   {/* headroom — real, wired control. */}

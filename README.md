@@ -14,7 +14,7 @@ and it runs on your own AI subscriptions with no keys baked in.
 
 <br />
 
-[![platform](https://img.shields.io/badge/platform-macOS-000?logo=apple&logoColor=white)](#-requirements)
+[![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-000)](#-requirements)
 [![built with Tauri](https://img.shields.io/badge/built%20with-Tauri%20v2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
 [![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-stable-000?logo=rust&logoColor=white)](https://rustup.rs)
@@ -240,10 +240,11 @@ discovered `~/Repo` projects), **view**, **actions**, and **app**.
 
 ## 🚀 Requirements
 
-- **macOS** (primary target; the Tauri shell is cross-platform but the agent
-  integrations assume a Unix host).
+- **macOS 10.15+** or **Windows 10/11**. Windows uses native PowerShell/ConPTY;
+  Unix-only fleet features degrade gracefully when tmux is unavailable.
 - **Rust** (stable, via [rustup](https://rustup.rs)) — for the Tauri backend.
-- **Node** 18+ and **pnpm** — for the frontend.
+- **Node** 20+ and **pnpm** — for the frontend. Windows contributors may use
+  the documented npm launcher in [WINDOWS.md](./WINDOWS.md).
 - _Optional:_ **tmux** + a `claude` CLI on your `PATH` — for the chat pane and
   the oracle roster. Without them those panes are simply empty.
 - _Optional:_ a **whisper.cpp** server on `:9000` — for push-to-talk voice.
@@ -256,6 +257,10 @@ pnpm install          # install frontend deps
 pnpm tauri dev        # run AIOS in dev (hot-reload frontend + backend)
 pnpm tauri build      # produce a release bundle (.app / .msi / binary)
 ```
+
+Windows setup, PowerShell launchers, supported features, and known limitations
+are documented in [WINDOWS.md](./WINDOWS.md). Every push to `master` is built on
+both macOS and Windows by GitHub Actions; version tags create a draft release.
 
 (`pnpm tauri` proxies the Tauri CLI; `pnpm dev` runs just the Vite frontend on
 `:1420`.)
@@ -333,7 +338,8 @@ Shipped and stable today: everything in **What's inside** above. On deck:
   richer markdown (tables, task lists, syntax highlighting).
 - **Model-agnostic chat** — a live model catalog, OpenRouter key onboarding, and
   BYO-key native APIs (OpenAI / OpenRouter / Ollama) with secure key storage.
-- **Windows port** — a ConPTY-host daemon for tmux-style detach/reattach.
+- **Windows parity** — persistent terminal detach/reattach and the remaining
+  Unix-only fleet integrations.
 
 ## 🙏 Credits
 

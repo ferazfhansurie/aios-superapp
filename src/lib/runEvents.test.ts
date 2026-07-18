@@ -5,10 +5,81 @@ import test from "node:test";
 import {
   emptyRunEventState,
   parseRunEventState,
+  projectRun,
   reduceRunEvents,
   serializeRunEventState,
   taskSnapshotRevision,
 } from "./runEvents.ts";
+
+test("projectRun keeps concurrent actions authoritative and derives lifecycle metadata", () => {
+  const projection = projectRun(
+    [
+      { type: "action.started", id: "read-1", runId: "run-7", parentId: "agent-1", name: "Read", input: { file_path: "src/a.ts" }, at: 100 },
+      { type: "action.started", id: "bash-1", runId: "run-7", name: "Bash", input: { command: "pnpm test" }, at: 110 },
+      { type: "action.completed", id: "read-1", runId: "run-7", output: "ok", at: 145 },
+    ],
+    { phase: "acting", now: 160 },
+  );
+
+  assert.equal(projection.runId, "run-7");
+  assert.deepEqual(projection.activeActionIds, ["bash-1"]);
+  assert.deepEqual(projection.actions.map((action) => ({
+    id: action.id,
+    kind: action.kind,
+    status: action.status,
+    target: action.target,
+    durationMs: action.durationMs,
+    parentId: action.parentId,
+  })), [
+    { id: "read-1", kind: "read", status: "completed", target: "src/a.ts", durationMs: 45, parentId: "agent-1" },
+    { id: "bash-1", kind: "command", status: "running", target: "pnpm test", durationMs: 50, parentId: undefined },
+  ]);
+});
+
+test("projectRun records permission decisions and changed/artifact references", () => {
+  const projection = projectRun(
+    [
+      { type: "permission.requested", id: "approval-1", runId: "run-8", toolName: "Edit", input: { file_path: "src/app.ts" }, at: 10 },
+      { type: "permission.decided", id: "approval-1", runId: "run-8", decision: "allow", at: 12 },
+      { type: "action.started", id: "edit-1", runId: "run-8", name: "Edit", input: { file_path: "src/app.ts" }, at: 13 },
+      { type: "action.completed", id: "edit-1", runId: "run-8", output: "updated", at: 20 },
+    ],
+    { phase: "completed", now: 20, artifacts: [{ path: "dist/report.pdf", name: "report.pdf", kind: "pdf" }] },
+  );
+
+  assert.deepEqual(projection.permissions.map(({ id, status, decision }) => ({ id, status, decision })), [
+    { id: "approval-1", status: "decided", decision: "allow" },
+  ]);
+  assert.deepEqual(projection.references, [
+    { type: "changed", path: "src/app.ts", actionId: "edit-1" },
+    { type: "artifact", path: "dist/report.pdf", label: "report.pdf" },
+  ]);
+});
+
+test("projectRun joins agent parent-child lifecycle to nested actions", () => {
+  const projection = projectRun(
+    [{ type: "action.started", id: "child-tool", parentId: "child", name: "Grep", input: { pattern: "TODO" }, at: 15 }],
+    {
+      phase: "acting",
+      now: 25,
+      agents: [
+        { id: "parent", label: "audit", status: "running", startedAt: 5 },
+        { id: "child", parentId: "parent", label: "search", status: "done", startedAt: 10, endedAt: 20 },
+      ],
+    },
+  );
+
+  assert.deepEqual(projection.agents.map((agent) => ({
+    id: agent.id,
+    parentId: agent.parentId,
+    status: agent.status,
+    durationMs: agent.durationMs,
+    actionIds: agent.actionIds,
+  })), [
+    { id: "parent", parentId: undefined, status: "running", durationMs: 20, actionIds: [] },
+    { id: "child", parentId: "parent", status: "completed", durationMs: 10, actionIds: ["child-tool"] },
+  ]);
+});
 
 test("reduceRunEvents captures thinking and text deltas as structured events", () => {
   let state = emptyRunEventState();

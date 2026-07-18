@@ -56,3 +56,76 @@ test("result rendering does not settle a turn before its tagged lifecycle termin
   // unlocks the composer.
   assert.match(pane, /next\.phase === "completed"[\s\S]{0,900}setStreaming\(false\)/);
 });
+
+test("a routed Claude hard-limit refusal overrides stale router telemetry", () => {
+  const pane = read("../components/ChatPane.tsx");
+  const failover = pane.slice(
+    pane.indexOf("const limitRerouteRef"),
+    pane.indexOf("// ── /resume:"),
+  );
+
+  assert.match(pane, /observeClaudeHardLimit/);
+  assert.match(failover, /runtimeHarness === "claude"[\s\S]{0,300}observeClaudeHardLimit\(\)/);
+  assert.match(failover, /observeClaudeHardLimit\(\)[\s\S]{0,500}switchToAios\(\)/);
+});
+
+test("chatpane switches the AIOS Codex model harness at the Claude cap boundary", () => {
+  const pane = read("../components/ChatPane.tsx");
+  const composer = read("../components/Composer.tsx");
+  const chat = read("./chat.ts");
+  const backend = read("../../src-tauri/src/chat.rs");
+  assert.match(pane, /const runtimeEngine = model\.engine \?\? "claude"/);
+  assert.match(pane, /const runtimeHarness:[\s\S]{0,240}aiosRouted != null[\s\S]{0,240}aiosHarness/);
+  assert.match(pane, /harness: runtimeHarness/);
+  assert.doesNotMatch(pane, /setHarness/);
+  assert.doesNotMatch(composer, /codex native/);
+  assert.doesNotMatch(composer, /switchHarness/);
+  assert.doesNotMatch(composer, /"harness"/);
+  assert.doesNotMatch(read("../components/Settings.tsx"), /default harness|chatHarness/);
+  assert.doesNotMatch(read("./settings.ts"), /chatHarness/);
+  assert.match(chat, /export type ChatHarness = "claude"/);
+  assert.match(chat, /harness: opts\.harness \?\? null/);
+  assert.match(backend, /AIOS_CODEX_ADAPTER_SECRET_FILE/);
+});
+
+test("claude chat sessions expose a non-recursive worker agent", () => {
+  const backend = read("../../src-tauri/src/chat.rs");
+  assert.match(backend, /\.arg\("--agents"\)/);
+  assert.match(backend, /aios-worker/);
+  assert.match(backend, /"disallowedTools":\["Agent"\]/);
+});
+
+test("native Claude sessions cannot inherit the Codex adapter route", () => {
+  const backend = read("../../src-tauri/src/chat.rs");
+  assert.match(
+    backend,
+    /claude_adapter_harness\s*=\s*harness\.as_deref\(\)\s*==\s*Some\("claude"\)\s*&&\s*matches!\(requested_engine,\s*Engine::Codex\)/,
+  );
+  assert.match(
+    backend,
+    /if claude_adapter_harness \{[\s\S]*?ANTHROPIC_BASE_URL[\s\S]*?\} else \{[\s\S]*?env_remove\("ANTHROPIC_BASE_URL"\)[\s\S]*?env_remove\("ANTHROPIC_CUSTOM_HEADERS"\)/,
+  );
+});
+
+test("the selected model engine owns runtime image and steering semantics", () => {
+  const pane = read("../components/ChatPane.tsx");
+  assert.match(pane, /const runtimeEngine = model\.engine \?\? "claude"/);
+  assert.match(pane, /const engine = runtimeEngine;[\s\S]*?engine === "claude" \|\| \(engine === "codex" && imgPaths\.length === 0\)/);
+  assert.match(pane, /stopStrategy\(runtimeEngine\)/);
+});
+
+test("ChatPane mounts the normalized run cockpit instead of the legacy fleet footer", () => {
+  const pane = read("../components/ChatPane.tsx");
+
+  assert.match(pane, /import \{ TaskRail \} from "\.\/chat\/TaskRail"/);
+  assert.match(pane, /<TaskRail[\s\S]{0,700}events=\{runEventState\.events\}/);
+  assert.doesNotMatch(pane, /<TaskActivity/);
+});
+
+test("the task router summary describes Claude-harness GPT and native Codex failover", () => {
+  const summary = read("../components/chat/TaskSummary.tsx");
+
+  assert.match(summary, /gpt via claude code below 100%/);
+  assert.match(summary, /native codex at claude 100%/);
+  assert.doesNotMatch(summary, /ahead of pace|draining claude via bulk|pace \+/);
+});

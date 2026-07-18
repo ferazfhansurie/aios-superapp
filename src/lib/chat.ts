@@ -29,6 +29,8 @@
 import { Channel } from "@tauri-apps/api/core";
 import { invoke } from "./tauri";
 
+export type ChatHarness = "claude";
+
 /** Options for starting a chat session. All optional. */
 export interface ChatStartOpts {
   /** Which engine drives the session: "claude" (default) | "codex" | "opencode".
@@ -36,6 +38,9 @@ export interface ChatStartOpts {
    *  providers (incl free models). The backend normalizes every engine's output
    *  into claude's event shape, so the pane renders them identically. */
   engine?: string | null;
+  /** Chatpane runtime harness. Claude models run natively; Codex models run
+   *  through AIOS's localhost Anthropic adapter inside Claude Code. */
+  harness?: ChatHarness | null;
   /** Working directory for the claude process (so tools hit the right repo). */
   cwd?: string | null;
   /** Model id or alias, e.g. `claude-opus-4-8` or `opus`. */
@@ -363,6 +368,7 @@ export async function chatStart(
   return invoke<number>("chat_start", {
     onEvent,
     engine: opts.engine ?? null,
+    harness: opts.harness ?? null,
     cwd: opts.cwd ?? null,
     model: opts.model ?? null,
     permissionMode: opts.permissionMode ?? null,

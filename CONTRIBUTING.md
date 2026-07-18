@@ -1,4 +1,4 @@
-# Contributing to Cockpit
+# Contributing to AIOS
 
 Thanks for wanting to hack on Cockpit. It's small on purpose — keep it that way.
 
@@ -9,15 +9,22 @@ pnpm install
 pnpm tauri dev
 ```
 
-You'll need Rust (stable, via [rustup](https://rustup.rs)), Node 18+, and pnpm.
-On macOS the Tauri prerequisites come with the Xcode command-line tools.
+You'll need Rust (stable, via [rustup](https://rustup.rs)), Node 20+, and pnpm.
+On macOS the Tauri prerequisites come with the Xcode command-line tools. On
+Windows, install the Visual Studio 2022 C++ build tools described in
+[WINDOWS.md](./WINDOWS.md).
 
 Before opening a PR:
 
 ```bash
 pnpm build              # type-check + build the frontend (tsc + vite)
+pnpm test:router
+pnpm test:codex-adapter
+pnpm test:chatpane
+pnpm test:lsp
+pnpm test:cfo
 cargo fmt --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
 
 ## Project layout

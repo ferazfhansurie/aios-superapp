@@ -241,6 +241,17 @@ fn seed_unix_cli_path(cmd: &mut CommandBuilder) {
     cmd.env("PATH", entries.join(":"));
 }
 
+/// Keep interactive panes colorful even when the desktop was launched from a
+/// headless process carrying `NO_COLOR=1` and `TERM=dumb`.
+fn enable_interactive_color(cmd: &mut CommandBuilder) {
+    cmd.env_remove("NO_COLOR");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("CLICOLOR", "1");
+    cmd.env("CLICOLOR_FORCE", "1");
+    cmd.env("FORCE_COLOR", "1");
+}
+
 /// Spawns the user's login shell in a new PTY pane.
 #[tauri::command]
 pub fn pty_spawn(
@@ -261,8 +272,7 @@ pub fn pty_spawn(
         c.arg("-l");
         c
     };
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
+    enable_interactive_color(&mut cmd);
     #[cfg(not(windows))]
     seed_unix_cli_path(&mut cmd);
     match cwd {
@@ -303,8 +313,7 @@ pub fn pty_spawn_oracle(
         cmd.arg(format!(
         "{tmux} -L adletic set -g mouse on \\; set -g status off \\; set -ag terminal-overrides ',xterm-256color:RGB,alacritty:RGB' 2>/dev/null; exec {tmux} -L adletic attach -t aios-{identity}"
     ));
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        enable_interactive_color(&mut cmd);
         spawn_internal(app, &state, on_data, cmd, cols, rows)
     }
 }
@@ -358,8 +367,7 @@ pub fn pty_spawn_terminal(
             cmdb.arg(c);
         }
     }
-    cmdb.env("TERM", "xterm-256color");
-    cmdb.env("COLORTERM", "truecolor");
+    enable_interactive_color(&mut cmdb);
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         cmdb.cwd(home);
     }
@@ -440,12 +448,13 @@ pub fn pty_spawn_terminal(
     // pty_kill. mouse is also set globally in ~/.config/adletic/tmux.conf; this
     // inline set is a belt-and-braces fallback for a server started without it.
     cmdb.arg(format!(
-        "{create} 2>/dev/null; \
+        "{tmux} -L adletic set-environment -gu NO_COLOR 2>/dev/null; \
+         {tmux} -L adletic set-environment -g TERM xterm-256color \\; set-environment -g COLORTERM truecolor \\; set-environment -g CLICOLOR_FORCE 1 \\; set-environment -g FORCE_COLOR 1 2>/dev/null; \
+         {create} 2>/dev/null; \
          {tmux} -L adletic set -g mouse on \\; set -g status off \\; set -ag terminal-overrides ',xterm-256color:RGB,alacritty:RGB' 2>/dev/null; \
          exec {tmux} -L adletic attach -t {session}"
     ));
-    cmdb.env("TERM", "xterm-256color");
-    cmdb.env("COLORTERM", "truecolor");
+    enable_interactive_color(&mut cmdb);
     spawn_internal(app, &state, on_data, cmdb, cols, rows)
 }
 
@@ -484,8 +493,7 @@ pub fn pty_spawn_tmux(
         cmd.arg(format!(
         "{tmux} -L {socket} set -g mouse on \\; set -g status off \\; set -ag terminal-overrides ',xterm-256color:RGB,alacritty:RGB' 2>/dev/null; exec {tmux} -L {socket} attach -t {session}"
     ));
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        enable_interactive_color(&mut cmd);
         spawn_internal(app, &state, on_data, cmd, cols, rows)
     }
 }

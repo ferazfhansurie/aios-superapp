@@ -3,32 +3,29 @@
  *  Not a real backend: picking "aios" resolves to a concrete `ChatModel` here,
  *  and the pane keeps that concrete model in state (so ALL existing engine
  *  plumbing — spawn, usage strip, effort mapping — is untouched). The route
- *  logic encodes firaz's model architecture + economics:
+ *  logic is intentionally simple: run the main GPT model through the Claude
+ *  Code harness while its real 5h meter is below 100%, switch that same model
+ *  to native Codex at 100% (or an authoritative hard-limit response), then
+ *  return new sessions to the Claude harness when the fresh meter resets to
+ *  zero. The pane stores the concrete result, keeping active sessions
+ *  sticky while new sessions follow the latest meter.
  *
- *  - MAIN (gpt-5.6 sol) is smarter AND cheaper → wins by default, always.
- *  - DEEP (fable 5) is judgment: architecture calls, hard debugging, final
- *    passes. Never auto-routed — summoned ("use deep" / "use fable").
- *  - BULK (opus 4.8) is heavy lifting AND the burn tier: the claude max sub
- *    is prepaid, so when main's 7d budget runs ahead of pace, bulk absorbs
- *    load — draining the sub through opus, which burns far less quota than
- *    fable for the same work. (codex's 5h window is soft; 7d is the scarce
- *    resource.)
- *  - hard failover both directions when either side is capped.
- *
- *  Roles live in settings (`aiosRouterRoles` / `aiosRouterPaceMargin`) so new
- *  models are a settings change, not a code change. Every decision carries a
+ *  Roles live in settings (`aiosRouterRoles`) so new models are a settings
+ *  change, not a code change. Every decision carries a
  *  human-readable `reason` — surfaced in the pane so routing is never a black
  *  box.
  */
 
 import { CHAT_MODELS, type ChatModel } from "./chat";
-import { claudeRate, codexRate } from "./dashboard";
+import { claudeRate } from "./dashboard";
 import { loadSettings, saveSettings } from "./settings";
+import { decideAiosProvider } from "./aiosRouterPolicy";
 
 export const AIOS_MODEL_ID = "aios";
 
 export interface AiosDecision {
   model: ChatModel;
+  harness: "claude" | null;
   reason: string;
 }
 
@@ -64,6 +61,18 @@ export function aiosRoles(): AiosRoles {
 
 const WINDOW_7D_MS = 7 * 24 * 3600 * 1000;
 
+// Hard-limit responses arrive on the chat transport and are more authoritative
+// than the usage endpoint's short-lived cache. The transport calls this as soon
+// as Claude refuses a turn; a fresh zero meter clears it on the next resolve.
+let claudeHardLimited = false;
+let lastClaudeResetAt: number | null = null;
+let hardLimitResetAt: number | null = null;
+
+export function observeClaudeHardLimit(): void {
+  claudeHardLimited = true;
+  hardLimitResetAt = lastClaudeResetAt;
+}
+
 /** % of the 7d window already elapsed, from its reset timestamp (s or ms).
  *  Exported for the router panel (TaskSummary) so pace math stays in one place. */
 export function windowElapsedPct(resetsAt: number | null): number | null {
@@ -75,60 +84,53 @@ export function windowElapsedPct(resetsAt: number | null): number | null {
 }
 
 /** Sync seed for pane boot (useState initializers can't await): the last
- *  resolved model, else main. `resolveAios()` corrects it before the first
+ *  resolved model, else fable. `resolveAios()` corrects it before the first
  *  send if the meters disagree. */
 export function resolveAiosSync(): AiosDecision {
-  const cached = concrete(loadSettings().aiosRouterLast);
-  if (cached) return { model: cached, reason: "last route (meters refreshing)" };
   const { main } = aiosRoles();
-  return { model: main, reason: `main · ${main.label}` };
+  if (claudeHardLimited) {
+    return { model: main, harness: null, reason: `claude hard limit → native codex · ${main.label}` };
+  }
+  const cachedHarness = loadSettings().aiosRouterLastHarness;
+  return cachedHarness === "native"
+    ? { model: main, harness: null, reason: `last route → native codex · ${main.label}` }
+    : { model: main, harness: "claude", reason: `last route → ${main.label} via claude code` };
 }
 
-/** The real route decision: reads both meters, applies pace + failover.
- *  deep is deliberately absent here — it's summon-only, never auto. */
+/** The real route decision. The last route is never an input: it is only a
+ * synchronous boot hint while this fresh meter read is in flight. */
 export async function resolveAios(): Promise<AiosDecision> {
-  const { main, bulk } = aiosRoles();
-  let decision: AiosDecision = { model: main, reason: `main · ${main.label}` };
+  const { main } = aiosRoles();
+  let decision: AiosDecision = { model: main, harness: "claude", reason: `claude meter unknown → ${main.label} via claude code` };
   try {
-    const [codex, claude] = await Promise.all([codexRate(), claudeRate()]);
-    const main7d = codex.sevenDay.pct;
-    const main5h = codex.fiveHour.pct;
-    const claudeNearCap =
-      (claude.sevenDay.pct ?? 0) >= 85 || (claude.fiveHour.pct ?? 0) >= 90;
-    const clock = windowElapsedPct(codex.sevenDay.resetsAt);
-    const margin = loadSettings().aiosRouterPaceMargin;
-    // 5h is only SOFT until the overage credits run out (seen live 2026-07-11:
-    // "0% left" + hard refusal) — a maxed 5h meter is a divert signal, same as
-    // a capped 7d. claude near-cap still wins: never route INTO a wall.
-    const capped =
-      (main7d != null && main7d >= 97) || (main5h != null && main5h >= 99);
-    if (capped && !claudeNearCap) {
-      const which =
-        main5h != null && main5h >= 99 ? `5h capped (${main5h}%)` : `7d capped (${main7d}%)`;
-      decision = {
-        model: bulk,
-        reason: `${main.label} ${which} → bulk · ${bulk.label}`,
-      };
-    } else if (
-      main7d != null &&
-      clock != null &&
-      !claudeNearCap &&
-      main7d - clock >= margin
-    ) {
-      decision = {
-        model: bulk,
-        reason: `${main.label} 7d ahead of pace (${main7d}% used · ${clock}% through the week) → draining claude via bulk · ${bulk.label}`,
-      };
-    } else if (main7d != null && clock != null) {
-      decision = {
-        model: main,
-        reason: `main on pace (${main7d}% used · ${clock}% through the week)`,
-      };
+    const claude = await claudeRate();
+    const pct = claude.fiveHour.pct;
+    const resetAt = claude.fiveHour.resetsAt;
+    const resetWindowAdvanced =
+      pct === 0 && resetAt != null && hardLimitResetAt != null && resetAt !== hardLimitResetAt;
+    if (resetWindowAdvanced) {
+      claudeHardLimited = false;
+      hardLimitResetAt = null;
     }
+    if (resetAt != null) lastClaudeResetAt = resetAt;
+    const provider = decideAiosProvider({
+      claudeFiveHourPct: pct,
+      claudeHardLimited,
+      resetWindowAdvanced,
+    });
+    decision = provider === "claude"
+      ? { model: main, harness: "claude", reason: pct == null ? `claude meter unknown → ${main.label} via claude code` : `claude 5h ${pct}% → ${main.label} via claude code` }
+      : { model: main, harness: null, reason: claudeHardLimited ? `claude hard limit → native codex · ${main.label}` : `claude 5h capped (${pct}%) → native codex · ${main.label}` };
   } catch {
-    // meters unavailable → main; never block a chat on a meter.
+    // Unknown meter prefers fable unless the transport observed a hard refusal.
+    if (claudeHardLimited) {
+      decision = { model: main, harness: null, reason: `claude hard limit → native codex · ${main.label}` };
+    }
   }
-  saveSettings({ aiosRouterLast: decision.model.id });
+  saveSettings({
+    aiosRouterLast: decision.model.id,
+    aiosRouterLastHarness: decision.harness === "claude" ? "claude" : "native",
+  });
   return decision;
 }
 

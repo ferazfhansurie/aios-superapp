@@ -65,6 +65,28 @@ test("budget changes without changing spend", async () => {
   assert.equal(json.spent, 6300);
 });
 
+test("tracks receivables separately from bank cash and derives projected cash", async () => {
+  const { state } = await fixture();
+  await run(state, initArgs);
+  const changed = await run(state, ["set-receivable", "--id", "faeez", "--person", "Faeez", "--gross", "2700", "--deductions", "600", "--note", "RM550 medicine + RM50 petrol"]);
+  assert.equal(changed.code, 0, changed.stderr);
+  const json = JSON.parse(changed.stdout);
+  assert.equal(json.cash, 5400);
+  assert.equal(json.receivables[0].amount, 2100);
+  assert.equal(json.projected_cash, 7500);
+});
+
+test("tracks business cash separately and derives total liquid cash", async () => {
+  const { state } = await fixture();
+  await run(state, initArgs);
+  const changed = await run(state, ["set-balance", "--field", "business_cash", "--amount", "2350"]);
+  assert.equal(changed.code, 0, changed.stderr);
+  const json = JSON.parse(changed.stdout);
+  assert.equal(json.cash, 5400);
+  assert.equal(json.business_cash, 2350);
+  assert.equal(json.liquid_cash, 7750);
+});
+
 test("enforces signs, month timestamps, and non-negative spend", async () => {
   const { state } = await fixture();
   await run(state, initArgs);

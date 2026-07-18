@@ -66,14 +66,14 @@ const GOAL_PREFIX = (goal: string) =>
 // chat pane only claude ships the Task tool; opencode/spark have direct file +
 // shell tools but no subagent spawn, so they're told to DO THE WORK inline.
 const AGENT_PREFIX_ORCHESTRATE =
-  "Agent mode is ON. For any task with 2+ independent tracks, use your native subagent/Task tooling to fan out instead of doing everything serially. Keep each spawned agent's purpose specific so the chatpane can show what it's doing.\n\n";
+  "Agent mode is ON. For any task with 2+ independent tracks, fan out with the native Agent tool using only the `aios-worker` subagent type. Keep each worker's purpose specific so the chatpane can show what it's doing. Workers execute their bounded task directly and must not delegate further.\n\n";
 const AGENT_PREFIX_DIRECT =
   "Agent mode is ON. You have direct file-edit and shell tools — use them to do the work yourself in THIS session. There is no external orchestrator, task queue, or execution bridge to hand work to; do not wait for one. For a task with independent parts, sequence them yourself. Only open a visible `aios-agent` worker pane if Firaz explicitly asks.\n\n";
 // ultracode = xhigh effort + workflows. Headless `claude -p` has no ultracode
 // flag, so we run xhigh and replicate the "workflows" half with this directive:
 // orchestrate, fan out, verify — be maximally thorough.
 const ULTRA_PREFIX_ORCHESTRATE =
-  "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel sub-agents via your native Task tooling, then adversarially verify findings before concluding. Prefer orchestrated multi-agent execution over a single pass; only handle trivially small tasks inline.\n\n";
+  "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. For any substantial task, decompose it and fan out parallel `aios-worker` subagents via your native Agent tool, then adversarially verify findings before concluding. Workers execute their bounded task directly and must not delegate further. Prefer one orchestration layer over a single pass; only handle trivially small tasks inline.\n\n";
 const ULTRA_PREFIX_DIRECT =
   "Ultracode mode is ON. Maximize thoroughness and correctness — token cost is not a constraint. You have direct file-edit and shell tools; do the work yourself in THIS session — there is no external orchestrator or execution bridge to fan out to. Sequence independent parts yourself, then re-check your work adversarially before concluding.\n\n";
 

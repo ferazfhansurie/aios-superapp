@@ -93,7 +93,11 @@ pub fn codex_delta_phase(params: Option<&Value>) -> Option<&str> {
         })
 }
 
-pub fn codex_delta_is_answer(sess: &Arc<ChatSession>, method: &str, params: Option<&Value>) -> bool {
+pub fn codex_delta_is_answer(
+    sess: &Arc<ChatSession>,
+    method: &str,
+    params: Option<&Value>,
+) -> bool {
     if method.contains("reasoning")
         || matches!(
             codex_delta_phase(params),
@@ -120,12 +124,7 @@ pub fn codex_item_type(item: &Value) -> &str {
 pub fn codex_is_action_item(item: &Value) -> bool {
     !matches!(
         codex_item_type(item),
-        ""
-            | "userMessage"
-            | "user_message"
-            | "agentMessage"
-            | "agent_message"
-            | "reasoning"
+        "" | "userMessage" | "user_message" | "agentMessage" | "agent_message" | "reasoning"
     )
 }
 
@@ -350,7 +349,9 @@ pub fn codex_usage_event(rl: &serde_json::Value) -> String {
 /// bucket; accepts both camelCase and snake_case shapes across codex versions.
 /// Returns the literal JSON object string ready to splice into the result line.
 pub fn codex_usage_to_claude(usage: Option<&serde_json::Value>) -> String {
-    let Some(u) = usage else { return "{}".to_string() };
+    let Some(u) = usage else {
+        return "{}".to_string();
+    };
     let num = |keys: &[&str]| -> u64 {
         for k in keys {
             if let Some(n) = u.get(*k).and_then(|x| x.as_u64()) {

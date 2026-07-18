@@ -460,7 +460,11 @@ test("modePrefixFor returns no mode prefix for codex, banners for others", () =>
   assert.equal(modePrefixFor("codex", "ultracode"), "");
   // claude (native subagents) gets the orchestrate banners
   assert.match(modePrefixFor("claude", "agent"), /^Agent mode is ON\. For any task/);
+  assert.match(modePrefixFor("claude", "agent"), /aios-worker/);
+  assert.match(modePrefixFor("claude", "agent"), /must not delegate further/);
   assert.match(modePrefixFor("claude", "ultracode"), /^Ultracode mode is ON\./);
+  assert.match(modePrefixFor("claude", "ultracode"), /aios-worker/);
+  assert.match(modePrefixFor("claude", "ultracode"), /must not delegate further/);
   // opencode (direct tools, no fan-out) gets the DIRECT banners, never codex-empty
   assert.match(modePrefixFor("opencode", "agent"), /direct file-edit and shell tools/);
   assert.match(modePrefixFor("opencode", "ultracode"), /^Ultracode mode is ON\./);

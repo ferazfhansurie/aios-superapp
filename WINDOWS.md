@@ -1,9 +1,8 @@
 # Running AIOS (Cockpit) on Windows
 
-This is the Windows port of the AIOS shell. The app is **Tauri v2 (Rust) + React/Vite**.
-Firaz develops on macOS (`origin/master`); this branch makes it run natively on
-Windows. All Windows changes are cross-platform-guarded (`cfg!(windows)` +
-`USERPROFILE` fallbacks), so they don't break the Mac build.
+AIOS is a **Tauri v2 (Rust) + React/Vite** desktop app with native Windows
+support. Platform-specific behavior is guarded with `cfg!(windows)` and
+`USERPROFILE` fallbacks so the same `master` branch builds on macOS and Windows.
 
 ---
 
@@ -17,7 +16,7 @@ Install these once (per machine):
 | **VS Build Tools 2022** + "Desktop development with C++" | <https://aka.ms/vs/17/release/vs_BuildTools.exe> | links the Rust binary |
 | **Node 18+** | <https://nodejs.org> | frontend (`npm`) |
 | **WebView2** | preinstalled on Win 11 | renders the UI |
-| **claude CLI** | `claude.exe` on PATH (you have it at `~\.local\bin`) | chat pane (runs on your subscription) |
+| **claude CLI** | `claude.exe` on PATH | chat pane (runs on your subscription) |
 
 > We use **npm** on Windows (not pnpm) — pnpm 11's build-approval gate blocks
 > esbuild's install. This is the only deliberate divergence from Firaz's setup.
@@ -49,7 +48,7 @@ First Rust build takes a few minutes; after that it's cached and fast.
 
 ## Syncing Firaz's updates
 
-Firaz pushes to `origin/master` constantly. Two ways to stay current:
+Two ways to stay current with `origin/master`:
 
 ### Automatic (recommended) — set it once, forget it
 ```powershell
@@ -73,8 +72,9 @@ up an update.
 What the sync does:
 1. `git fetch` and shows you exactly which commits + files Firaz changed.
 2. Merges `origin/master` into our branch.
-3. Auto-resolves the one expected conflict (`pnpm-lock.yaml` — we use npm).
-4. If Firaz changed the *same lines* we did, it **stops and lists the files** for
+3. Auto-resolves the expected package-manager conflict (`pnpm-lock.yaml` — the
+   Windows launcher uses npm).
+4. If upstream changed the *same lines*, it **stops and lists the files** for
    a human to resolve (rare — our changes are isolated to `cfg!(windows)` blocks).
 5. Reinstalls deps, type-checks the frontend, and compiles the Rust backend — so
    you know immediately if one of his changes needs a Windows tweak.

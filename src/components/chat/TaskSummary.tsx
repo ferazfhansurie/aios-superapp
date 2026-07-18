@@ -5,9 +5,8 @@ import type { Artifact } from "./toolPresentation";
 import type { FleetAgent, FleetWorkflow } from "../../lib/subagentFleet";
 import { getTaskWorkspace, subscribeTaskWorkspace, type TaskId } from "../../lib/taskWorkspace";
 import type { ChatModel } from "../../lib/chat";
-import { claudeRate, codexRate, type ClaudeRate, type CodexRate } from "../../lib/dashboard";
-import { loadSettings } from "../../lib/settings";
-import { aiosRoles, windowElapsedPct } from "../../lib/aiosRouter";
+import { claudeRate, type ClaudeRate } from "../../lib/dashboard";
+import { aiosRoles } from "../../lib/aiosRouter";
 import { AiosMark, ModelIcon } from "./modelIcons";
 
 export interface TaskSource {
@@ -156,12 +155,10 @@ export const TaskSummary = memo(function TaskSummary({
  *  the live meters the router decides on. Self-contained polling (60s, only
  *  while the panel is open) so the streaming path stays untouched. */
 function RouterSection({ model, aiosRouted }: { model: ChatModel; aiosRouted: string | null }) {
-  const [codex, setCodex] = useState<CodexRate | null>(null);
   const [claude, setClaude] = useState<ClaudeRate | null>(null);
   useEffect(() => {
     let alive = true;
     const pull = () => {
-      void codexRate().then((r) => alive && setCodex(r)).catch(() => {});
       void claudeRate().then((r) => alive && setClaude(r)).catch(() => {});
     };
     pull();
@@ -172,12 +169,7 @@ function RouterSection({ model, aiosRouted }: { model: ChatModel; aiosRouted: st
     };
   }, []);
 
-  const s = loadSettings();
   const roles = aiosRoles();
-  const codex7d = codex?.sevenDay.pct ?? null;
-  const clock = windowElapsedPct(codex?.sevenDay.resetsAt ?? null);
-  const paceDelta = codex7d != null && clock != null ? codex7d - clock : null;
-  const paceHot = paceDelta != null && paceDelta >= s.aiosRouterPaceMargin;
 
   const meter = (label: string, pct: number | null, extra?: ReactNode) => (
     <div className="flex items-center gap-2 font-mono text-[11px] text-[var(--color-muted)]">
@@ -220,20 +212,18 @@ function RouterSection({ model, aiosRouted }: { model: ChatModel; aiosRouted: st
         <div className="mt-1 flex flex-col gap-1 text-[12.5px] text-[var(--color-muted)]">
           {(
             [
-              [roles.main, "main", "everything, default", false],
-              [roles.deep, "deep", "judgment · \"use deep\"", false],
-              [roles.bulk, "bulk", `heavy + burn · pace +${s.aiosRouterPaceMargin}`, paceHot],
+              [roles.main, "claude code", "gpt via claude code below 100%"],
+              [roles.main, "native", "native codex at claude 100%"],
+              [roles.bulk, "manual", "heavy work · use bulk"],
             ] as const
-          ).map(([m, role, what, hot]) => (
+          ).map(([m, role, what]) => (
             <div key={role} className="flex items-center gap-2">
               <ModelIcon model={m} size={13} />
               <span className="text-[var(--color-text-2)]">{m.label}</span>
               <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-[var(--color-faint)]">
                 {role}
               </span>
-              <span
-                className={`ml-auto text-[11px] ${hot ? "text-[var(--color-accent)]" : "text-[var(--color-faint)]"}`}
-              >
+              <span className="ml-auto text-[11px] text-[var(--color-faint)]">
                 {what}
               </span>
             </div>
@@ -242,21 +232,8 @@ function RouterSection({ model, aiosRouted }: { model: ChatModel; aiosRouted: st
 
         {/* live meters the router decides on */}
         <div className="mt-1 flex flex-col gap-1">
-          {meter(
-            "codex 7d",
-            codex7d,
-            paceDelta != null ? (
-              <span
-                className={`shrink-0 font-mono text-[10px] ${paceHot ? "text-[var(--color-accent)]" : "text-[var(--color-faint)]"}`}
-                title={clock != null ? `${clock}% through the week` : undefined}
-              >
-                {paceDelta >= 0 ? `+${Math.round(paceDelta)}` : Math.round(paceDelta)} pace
-              </span>
-            ) : undefined,
-          )}
-          {meter("codex 5h", codex?.fiveHour.pct ?? null)}
-          {meter("claude 7d", claude?.sevenDay.pct ?? null)}
           {meter("claude 5h", claude?.fiveHour.pct ?? null)}
+          {meter("claude 7d", claude?.sevenDay.pct ?? null)}
         </div>
       </div>
     </SummarySection>

@@ -26,7 +26,8 @@ function argsMap(args) {
 
 function validate(doc) {
   if (doc.schema_version !== 1 || !/^\d{4}-\d{2}$/.test(doc.month)) throw new Error("invalid schema or month");
-  const core = ["income_received", "opening_spent", "spend_budget", "cash", "cash_floor", "card_debt", "next_month_cash_target"];
+  doc.business_cash ??= 0;
+  const core = ["income_received", "opening_spent", "spend_budget", "cash", "business_cash", "cash_floor", "card_debt", "next_month_cash_target"];
   for (const key of core) if (!Number.isFinite(doc[key]) || doc[key] < 0) throw new Error(`invalid ${key}`);
   const ids = new Set();
   for (const a of doc.adjustments || []) {
@@ -39,13 +40,23 @@ function validate(doc) {
     const localMonth = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kuala_Lumpur", year: "numeric", month: "2-digit" }).format(new Date(a.at)).replace("-", "-");
     if (localMonth !== doc.month) throw new Error("adjustment timestamp outside month");
   }
+  const receivableIds = new Set();
+  for (const r of doc.receivables || []) {
+    if (!r.id || receivableIds.has(r.id)) throw new Error("duplicate receivable id");
+    receivableIds.add(r.id);
+    for (const key of ["gross", "deductions", "amount"]) if (!Number.isFinite(r[key]) || r[key] < 0) throw new Error(`invalid receivable ${key}`);
+    if (money(r.gross - r.deductions) !== r.amount) throw new Error("receivable amount mismatch");
+  }
   if (derive(doc).spent < 0) throw new Error("spent cannot be negative");
   return doc;
 }
 
 function derive(doc) {
   const spent = money(doc.opening_spent + (doc.adjustments || []).reduce((s, a) => s + a.amount, 0));
-  return { ...doc, spent, remaining_budget: money(doc.spend_budget - spent), net_cash: money(doc.cash - doc.card_debt) };
+  const receivableTotal = money((doc.receivables || []).reduce((s, r) => s + r.amount, 0));
+  const businessCash = money(doc.business_cash || 0);
+  const liquidCash = money(doc.cash + businessCash);
+  return { ...doc, business_cash: businessCash, spent, remaining_budget: money(doc.spend_budget - spent), liquid_cash: liquidCash, net_cash: money(liquidCash - doc.card_debt), receivable_total: receivableTotal, projected_cash: money(liquidCash + receivableTotal) };
 }
 
 async function readDoc(path = statePath()) {
@@ -77,8 +88,8 @@ function newDoc(o) {
   const doc = {
     schema_version: 1, revision: 1, updated_at: new Date().toISOString(), currency: "MYR", month: o.month,
     income_received: money(o.income), opening_spent: money(o["opening-spent"]), spend_budget: money(o.budget),
-    cash: money(o.cash), cash_floor: money(o["cash-floor"]), card_debt: money(o["card-debt"]),
-    next_month_cash_target: money(o["next-target"]), adjustments: [],
+    cash: money(o.cash), business_cash: 0, cash_floor: money(o["cash-floor"]), card_debt: money(o["card-debt"]),
+    next_month_cash_target: money(o["next-target"]), adjustments: [], receivables: [],
   };
   return validate(doc);
 }
@@ -121,10 +132,18 @@ export async function execute(command, argv) {
       if (month !== doc.month || targetPath !== statePath()) throw new Error("budget month mismatch");
       doc.spend_budget = money(o.amount);
     } else if (command === "set-balance") {
-      const fields = { cash: "cash", card_debt: "card_debt", income_received: "income_received", cash_floor: "cash_floor", next_month_cash_target: "next_month_cash_target" };
+      const fields = { cash: "cash", business_cash: "business_cash", card_debt: "card_debt", income_received: "income_received", cash_floor: "cash_floor", next_month_cash_target: "next_month_cash_target" };
       const field = fields[o.field];
       if (!field) throw new Error("invalid balance field");
       doc[field] = money(o.amount);
+    } else if (command === "set-receivable") {
+      const gross = money(o.gross);
+      const deductions = money(o.deductions || 0);
+      if (!o.id || !o.person || gross < deductions) throw new Error("invalid receivable");
+      const receivable = { id: o.id, person: o.person, gross, deductions, amount: money(gross - deductions), note: o.note || "" };
+      doc.receivables ||= [];
+      const index = doc.receivables.findIndex((r) => r.id === o.id);
+      if (index >= 0) doc.receivables[index] = receivable; else doc.receivables.push(receivable);
     } else throw new Error(`unknown command: ${command}`);
     doc.revision += 1;
     doc.updated_at = new Date().toISOString();

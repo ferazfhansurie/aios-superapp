@@ -466,7 +466,7 @@ test("chatpane stop waits for the backend lifecycle terminal frame", () => {
   assert.match(rust, /codex_interrupt/);
   assert.match(
     chatPane,
-    /const strategy = stopStrategy\(model\.engine\);[\s\S]{0,300}strategy === "kill-and-restart"[\s\S]{0,160}\? chatStop\(id, runId\)[\s\S]{0,160}: chatInterrupt\(id, runId\)/,
+    /const strategy = stopStrategy\(runtimeEngine\);[\s\S]{0,300}strategy === "kill-and-restart"[\s\S]{0,160}\? chatStop\(id, runId\)[\s\S]{0,160}: chatInterrupt\(id, runId\)/,
   );
   // Teardown is intentionally untagged: it may run after a pane is detached
   // or its lifecycle state has already been cleared.

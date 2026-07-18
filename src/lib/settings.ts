@@ -57,15 +57,15 @@ export interface AppSettings {
 
   // aios router — the virtual "aios" picker entry resolves through this role
   // architecture (lib/aiosRouter.ts):
-  //   main — daily driver, wins by default (smart + cheap)
-  //   deep — judgment tier, summoned ("use deep" / "use fable"), never auto
-  //   bulk — heavy lifting AND the burn tier: drains the prepaid claude sub
-  //          when main's 7d budget runs ahead of pace
-  // paceMargin = pct-points main's 7d meter may run ahead of the week clock
-  // before diverting to bulk. last = cached route for sync pane boot.
+  //   main — GPT model used through Claude Code below 100%, native at the cap
+  //   deep — retained as an explicit/manual Claude role
+  //   bulk — explicit heavy-work directive (kept for manual routing)
+  // paceMargin is retained for settings compatibility but no longer drives
+  // automatic routing. last is only a synchronous pane-boot hint.
   aiosRouterRoles: { main: string; deep: string; bulk: string };
   aiosRouterPaceMargin: number;
   aiosRouterLast: string | null;
+  aiosRouterLastHarness: "claude" | "native";
 
   // route claude chat turns through the local Headroom compression proxy
   // (ANTHROPIC_BASE_URL → http://127.0.0.1:8787). Compresses tool outputs / RAG
@@ -128,6 +128,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   aiosRouterPaceMargin: 15,
   aiosRouterLast: null,
+  aiosRouterLastHarness: "claude",
 
   headroomCompression: false,
 
